@@ -33,6 +33,13 @@ describe.skipIf(!existsSync(fixturePath))("workspace billing with isolated Postg
 		for (const [principal, role] of [[manager, "admin"], [member, "member"]] as const) await database.query('INSERT INTO public."allauthWorkspaceMember" (id,"workspaceId","userId",role) VALUES ($1,$2,$3,$4)', [randomUUID(), id, principal.user.id, role]);
 		return id;
 	}
+	async function inboxClaimTime() {
+		// PostgreSQL records availability to the microsecond. Round up for the JS clock.
+		const { rows } = await database.query<{ now: Date }>(
+			"SELECT date_trunc('milliseconds', clock_timestamp()) + interval '1 millisecond' AS now",
+		);
+		return rows[0]!.now;
+	}
 	function provider() {
 		const state = { subscriptions: [] as Stripe.Subscription[], invoices: [] as Stripe.Invoice[], sessions: new Map<string, Stripe.Checkout.Session>() };
 		const result = {
@@ -149,7 +156,8 @@ describe.skipIf(!existsSync(fixturePath))("workspace billing with isolated Postg
 		await receive(); await receive();
 		stripe.state.subscriptions = [subscription(id, "canceled")];
 		const reconcile = vi.fn(reconcileWorkspaceBilling);
-		const results = await Promise.all([processBillingJobs(env, { provider: stripe.api, maximum: 1, reconcile }), processBillingJobs(env, { provider: stripe.api, maximum: 1, reconcile })]);
+		const now = await inboxClaimTime();
+		const results = await Promise.all([processBillingJobs(env, { provider: stripe.api, maximum: 1, now, reconcile }), processBillingJobs(env, { provider: stripe.api, maximum: 1, now, reconcile })]);
 		expect(results.reduce((total, result) => total + result.claimed, 0)).toBe(1); expect(reconcile).toHaveBeenCalledTimes(1);
 		expect((await readLocalWorkspaceBilling(id, env))?.stripeStatus).toBe("canceled");
 		expect((await readWorkspaceEntitlements(id, env)).plan).toBe("free");
@@ -231,7 +239,7 @@ describe.skipIf(!existsSync(fixturePath))("workspace billing with isolated Postg
 		const row = (await readLocalWorkspaceBilling(id, env))!; const eventId = `evt_lease_${id}`;
 		await database.query('INSERT INTO public."allauthBillingWebhook"(id,"stripeAccountId","stripeLivemode",type,"customerId","objectId","occurredAt") VALUES($1,\'acct_fixture\',false,\'invoice.paid\',$2,\'in_fixture\',NOW())', [eventId, row.stripeCustomerId]);
 		const reconcile = vi.fn(async () => { await database.query('UPDATE public."allauthBillingWebhook" SET "leaseId"=\'replacement-lease\' WHERE id=$1', [eventId]); return true; });
-		const result = await processBillingJobs(env, { provider: stripe.api, maximum: 1, reconcile });
+		const result = await processBillingJobs(env, { provider: stripe.api, maximum: 1, now: await inboxClaimTime(), reconcile });
 		expect(result).toMatchObject({ claimed: 1, processed: 0, ignored: 0 });
 		expect((await database.query('SELECT status,"leaseId" FROM public."allauthBillingWebhook" WHERE id=$1', [eventId])).rows[0]).toEqual({ status: "processing", leaseId: "replacement-lease" });
 	});
@@ -243,7 +251,7 @@ describe.skipIf(!existsSync(fixturePath))("workspace billing with isolated Postg
 		await deliver({ ...env, ALLAUTH_STRIPE_LIVEMODE: "true", ALLAUTH_STRIPE_SECRET_KEY: "rk_live_fixture" }, true);
 		await deliver({ ...env, ALLAUTH_STRIPE_ACCOUNT_ID: "acct_other" }, false);
 		expect((await database.query('SELECT id FROM public."allauthBillingWebhook" WHERE id=$1', [eventId])).rows).toHaveLength(3);
-		const result = await processBillingJobs(env, { provider: stripe.api, maximum: 1, reconcile: async () => true }); expect(result).toMatchObject({ claimed: 1, processed: 1, ignored: 0 });
+		const result = await processBillingJobs(env, { provider: stripe.api, maximum: 1, now: await inboxClaimTime(), reconcile: async () => true }); expect(result).toMatchObject({ claimed: 1, processed: 1, ignored: 0 });
 		const rows = (await database.query<{ stripeAccountId: string; stripeLivemode: boolean; status: string }>('SELECT "stripeAccountId","stripeLivemode",status FROM public."allauthBillingWebhook" WHERE id=$1', [eventId])).rows;
 		expect(rows.find(value => value.stripeAccountId === "acct_fixture" && !value.stripeLivemode)?.status).toBe("processed");
 		expect(rows.filter(value => value.stripeAccountId !== "acct_fixture" || value.stripeLivemode).every(value => value.status === "pending")).toBe(true);
