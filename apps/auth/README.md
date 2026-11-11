@@ -2,7 +2,7 @@
 
 AllAuth provides hosted or self-hosted authentication, account security and organization management. The service lives in `apps/auth` and uses the Better Auth packages in this repository, with a React SDK and separate application environments.
 
-The complete [platform source](https://github.com/thegarty/allauth-platform) is available under the [MIT license](../../LICENSE.md). Better Auth, Better Auth UI and other third-party notices remain intact. Publishing source does not publish the SDK to a package registry or change retained release artifacts.
+The complete [platform source](https://github.com/allauth-co/allauth-platform) is available under the [MIT license](../../LICENSE.md). Better Auth, Better Auth UI and other third-party notices remain intact. Publishing source does not publish the SDK to a package registry or change retained release artifacts.
 
 - [Self-hosting and recovery](../../docs/SELF_HOSTING.md)
 - [Hosted plans](https://allauth.co/pricing)

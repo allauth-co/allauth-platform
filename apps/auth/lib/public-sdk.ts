@@ -2,7 +2,7 @@ import type { Metadata, MetadataRoute } from "next";
 import { sdkReleases } from "./notifications/releases";
 import { platformReleases } from "./notifications/releases";
 import type { PlatformRelease, SdkRelease } from "./notifications/releases";
-import { commercialPublicPaths, publicSiteOrigin, sdkRepositoryUrl } from "./public-site";
+import { commercialPublicPaths, publicSiteOrigin } from "./public-site";
 
 export type PublicRelease = SdkRelease | PlatformRelease;
 export const publicReleases: readonly PublicRelease[] = [...sdkReleases, ...platformReleases].sort((left, right) => (verifiedReleaseDate(right) ? Date.parse(verifiedReleaseDate(right)!) : 0) - (verifiedReleaseDate(left) ? Date.parse(verifiedReleaseDate(left)!) : 0));
@@ -15,6 +15,12 @@ export function publicReleaseUrl(release: Pick<PublicRelease, "slug">): string {
 /** Archive timestamps and reconstruction dates are not original publication dates. */
 export function verifiedReleaseDate(release: PublicRelease): string | undefined {
 	return release.dateConfidence === "known" && release.publishedAt && Number.isFinite(Date.parse(release.publishedAt)) ? release.publishedAt : undefined;
+}
+
+/** Versioned links retain their recorded repository when current ownership or navigation changes. */
+export function sdkReleaseRepositoryUrl(release: Pick<SdkRelease, "sourceUrl">): string {
+	const source = new URL(release.sourceUrl);
+	return `${source.origin}${source.pathname.split("/tree/")[0]}`;
 }
 
 /** Canonical metadata is shared by the public SDK and release pages. */
@@ -43,7 +49,7 @@ export function releaseStructuredData(release: PublicRelease) {
 		"@context": "https://schema.org", "@type": "SoftwareSourceCode",
 		"@id": `${publicReleaseUrl(release)}#sdk`, name: release.title, description: release.summary,
 		url: publicReleaseUrl(release), version: release.version, programmingLanguage: "TypeScript", runtimePlatform: "React",
-		codeRepository: sdkRepositoryUrl, downloadUrl: release.downloadUrl,
+		codeRepository: sdkReleaseRepositoryUrl(release), downloadUrl: release.downloadUrl,
 		...(publishedAt ? { datePublished: publishedAt } : {}),
 	};
 }

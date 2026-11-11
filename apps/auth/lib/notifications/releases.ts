@@ -180,7 +180,7 @@ export const platformReleases: readonly PlatformRelease[] = [
 		dateConfidence: "known",
 		compatibility: "platform-update",
 		changelogUrl: "https://allauth.co/releases/platform-commercial-preview-2026-11-11",
-		sourceUrl: "https://github.com/thegarty/allauth-platform/tree/platform-commercial-preview-2026-11-11",
+		sourceUrl: "https://github.com/allauth-co/allauth-platform/tree/platform-commercial-preview-2026-11-11",
 		announce: false,
 		provenance: [{ kind: "release", details: "Preview notes prepared on 11 November 2026 after local billing, entitlement, PostgreSQL concurrency, SDK-compatibility, typecheck and real Stripe sandbox checks. Hosted checkout and enforcement are explicitly disabled for the infrastructure rollout. Production deployment, source publication and live-launch evidence are recorded separately in the release receipt; this preview does not claim those outcomes.", files: ["lib/billing", "migrations/017-workspace-billing.sql", "migrations/018-commercial-entitlements.sql", "compose.self-host.yml", "docs/SELF_HOSTING.md"] }],
 	},

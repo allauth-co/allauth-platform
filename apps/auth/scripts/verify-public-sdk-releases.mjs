@@ -2,7 +2,8 @@ import { readFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { pathToFileURL } from "node:url";
 
-const repository = "https://github.com/thegarty/allauth-sdk";
+const repository = "https://github.com/allauth-co/allauth-sdk";
+const historicalRepository = "https://github.com/thegarty/allauth-sdk";
 
 /** Check public release metadata before publishing the service's matching release catalog. */
 export function verifyPublicSdkReleases(integrity, releases, archiveSizes) {
@@ -18,7 +19,7 @@ export function verifyPublicSdkReleases(integrity, releases, archiveSizes) {
 		const version = /^allauth-react-(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)\.tgz$/.exec(filename)?.[1];
 		const tag = `v${version}`;
 		const release = releases.find((item) => item.tag_name === tag);
-		if (!version || !release || release.draft || release.prerelease || release.immutable !== true || release.html_url !== `${repository}/releases/tag/${tag}` || typeof release.body !== "string" || !release.body.trim()) {
+		if (!version || !release || release.draft || release.prerelease || release.immutable !== true || ![repository, historicalRepository].some(source => release.html_url === `${source}/releases/tag/${tag}`) || typeof release.body !== "string" || !release.body.trim()) {
 			throw new Error(`SDK publication: ${tag} needs public notes and an immutable published release.`);
 		}
 		const assets = Array.isArray(release.assets) ? release.assets : [];
@@ -45,7 +46,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
 	}
 	const releases = [];
 	for (let page = 1; page <= 100; page++) {
-		const response = await fetch(`https://api.github.com/repos/thegarty/allauth-sdk/releases?per_page=100&page=${page}`, {
+		const response = await fetch(`https://api.github.com/repos/allauth-co/allauth-sdk/releases?per_page=100&page=${page}`, {
 			headers: { Accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2026-03-10", "User-Agent": "AllAuth-release-verification" },
 			signal: AbortSignal.timeout(30_000),
 		});

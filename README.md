@@ -2,13 +2,13 @@
 
 AllAuth is an authentication platform with account security, organization management and separate application environments. Use the managed service at [allauth.co](https://allauth.co), or run the complete platform on your own infrastructure.
 
-The complete [platform source](https://github.com/thegarty/allauth-platform) is available under the [MIT license](LICENSE.md). Hosted Free includes AllAuth attribution, up to 20 members per end-user organization and five impersonations per workspace per UTC calendar month. Pro is $9.99 USD per workspace per month plus applicable tax and removes attribution and those quotas, subject to fair use. Self-hosted instances include all features without a hosted subscription.
+The complete [platform source](https://github.com/allauth-co/allauth-platform) is available under the [MIT license](LICENSE.md). Hosted Free includes AllAuth attribution, up to 20 members per end-user organization and five impersonations per workspace per UTC calendar month. Pro is $9.99 USD per workspace per month plus applicable tax and removes attribution and those quotas, subject to fair use. Self-hosted instances include all features without a hosted subscription.
 
 - [Self-hosting, backups and upgrades](docs/SELF_HOSTING.md)
 - [Service overview](apps/auth/README.md)
 - [Hosted plans and limits](https://allauth.co/pricing)
 - [Release requirements](apps/auth/RELEASING.md)
-- [Public SDK source and immutable releases](https://github.com/thegarty/allauth-sdk)
+- [Public SDK source and immutable releases](https://github.com/allauth-co/allauth-sdk)
 - [Contributing](CONTRIBUTING.md), [security reporting](SECURITY.md) and [third-party notices](THIRD_PARTY_NOTICES.md)
 
 The service builds from the repository root using `apps/auth/Dockerfile`. Runtime credentials, customer data and private operational evidence do not belong in public source. SDK versions, tags, archives and checksums remain immutable.

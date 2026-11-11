@@ -9,6 +9,7 @@ import { postgresDatabase } from "../auth";
 import { readApplicationBranding, readApplicationSettings, writeApplicationSettings } from "../branding/repository";
 import { defaultApplicationBranding } from "../branding/validation";
 import type { ControlPrincipal } from "../control/types";
+import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
 import { guardCommercialAdapter, readWorkspaceEntitlements, synchronizeCommercialConfiguration } from "./entitlements";
 
 const fixturePath = new URL("../../../../.secrets/local-postgres.json", import.meta.url);
@@ -73,7 +74,7 @@ describe.skipIf(!existsSync(fixturePath))("hosted entitlement PostgreSQL guards"
 	});
 	afterAll(async () => {
 		if (nativePool) await nativePool.end(); if (pool) await pool.end();
-		if (administrator) { await administrator.query(`DROP DATABASE IF EXISTS "${databaseName}" WITH(FORCE)`); await administrator.end(); }
+		if (administrator) { try { await dropClosedFixtureDatabase(administrator, databaseName); } finally { await administrator.end(); } }
 	});
 	it("serializes concurrent additions at member 20 and preserves existing over-limit organisations", async () => {
 		const id = await organization(); for (let n = 1; n <= 19; n++) await member(id, n);

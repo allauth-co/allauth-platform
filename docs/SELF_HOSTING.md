@@ -1,6 +1,6 @@
 # Self-host AllAuth
 
-Run the complete AllAuth platform with Node.js, PostgreSQL and your own domain. Self-hosted mode includes all features without an AllAuth subscription or Stripe configuration. You operate the service and pay infrastructure and provider costs. The [platform repository](https://github.com/thegarty/allauth-platform) contains the service, required packages, tests and deployment files used in this guide.
+Run the complete AllAuth platform with Node.js, PostgreSQL and your own domain. Self-hosted mode includes all features without an AllAuth subscription or Stripe configuration. You operate the service and pay infrastructure and provider costs. The [platform repository](https://github.com/allauth-co/allauth-platform) contains the service, required packages, tests and deployment files used in this guide.
 
 ## Docker Compose with HTTPS
 

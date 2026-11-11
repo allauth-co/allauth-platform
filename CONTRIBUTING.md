@@ -1,6 +1,6 @@
 # Contributing to AllAuth
 
-AllAuth's service is in `apps/auth`. Better Auth packages retain upstream names, attribution and licenses. Report AllAuth issues in the [platform repository](https://github.com/thegarty/allauth-platform/issues). For issues reproduced in unmodified Better Auth, use [the upstream project](https://github.com/better-auth/better-auth). Security reports follow [SECURITY.md](SECURITY.md), not public issues.
+AllAuth's service is in `apps/auth`. Better Auth packages retain upstream names, attribution and licenses. Report AllAuth issues in the [platform repository](https://github.com/allauth-co/allauth-platform/issues). For issues reproduced in unmodified Better Auth, use [the upstream project](https://github.com/better-auth/better-auth). Security reports follow [SECURITY.md](SECURITY.md), not public issues.
 
 Use pnpm and the repository's Node version. Install with `pnpm install --frozen-lockfile`, build with `pnpm build`, then install the service workspace with `pnpm --dir apps/auth install --frozen-lockfile`. See [self-hosting and local development](docs/SELF_HOSTING.md) for isolated database/provider setup.
 

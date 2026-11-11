@@ -18,6 +18,14 @@ test("release publication requires the immutable public tag and exact package di
 	assert.equal(verifyPublicSdkReleases(integrity, [published], archiveSizes), 1);
 });
 
+test("repository transfer accepts canonical and retained release URLs without trusting another repository or tag", () => {
+	assert.equal(verifyPublicSdkReleases(integrity, [{ ...published, html_url: "https://github.com/allauth-co/allauth-sdk/releases/tag/v1.4.3" }], archiveSizes), 1);
+	assert.equal(verifyPublicSdkReleases(integrity, [published], archiveSizes), 1);
+	for (const html_url of ["https://github.com/another-owner/allauth-sdk/releases/tag/v1.4.3", "https://github.com/allauth-co/allauth-sdk/releases/tag/v1.4.4", "https://github.com/allauth-co/another-sdk/releases/tag/v1.4.3"]) {
+		assert.throws(() => verifyPublicSdkReleases(integrity, [{ ...published, html_url }], archiveSizes), /SDK publication/);
+	}
+});
+
 test("unpublished, draft, mutable, mismatched and incomplete releases block publication", () => {
 	for (const releases of [[], [{ ...published, draft: true }], [{ ...published, immutable: false }], [{ ...published, assets: [{ name: "allauth-react-1.4.3.tgz", digest: `sha256:${"b".repeat(64)}` }] }], [{ ...published, assets: published.assets.slice(0, 1) }]]) {
 		assert.throws(() => verifyPublicSdkReleases(integrity, releases, archiveSizes), /SDK publication/);

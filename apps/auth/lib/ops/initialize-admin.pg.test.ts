@@ -4,6 +4,7 @@ import { Pool } from "pg";
 import { verifyPassword } from "better-auth/crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { initializeSelfHostedAdministrator } from "./initialize-admin";
+import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
 
 const fixturePath = new URL("../../../../.secrets/local-postgres.json", import.meta.url);
 describe.skipIf(!existsSync(fixturePath))("self-hosted initial administrator", () => {
@@ -18,7 +19,7 @@ describe.skipIf(!existsSync(fixturePath))("self-hosted initial administrator", (
 		database = new Pool({ connectionString: url.toString(), max: 3 });
 		for (const name of ["001-initial-auth.sql", "002-control-plane.sql"]) await database.query(readFileSync(new URL(`../../migrations/${name}`, import.meta.url), "utf8"));
 	});
-	afterAll(async () => { if (database) await database.end(); if (administrator) { await administrator.query(`DROP DATABASE IF EXISTS "${databaseName}" WITH (FORCE)`); await administrator.end(); } });
+	afterAll(async () => { if (database) await database.end(); if (administrator) { try { await dropClosedFixtureDatabase(administrator, databaseName); } finally { await administrator.end(); } } });
 	const input = { email: "Operator@fixture.example", name: "Operator", password: "fixture-only-initial-password" };
 	it("rejects hosted mode and invalid input before any identity is created", async () => {
 		await expect(initializeSelfHostedAdministrator(database, "hosted", input)).rejects.toThrow("self-hosted");

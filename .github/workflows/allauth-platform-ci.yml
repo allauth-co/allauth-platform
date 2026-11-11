@@ -63,6 +63,7 @@ jobs:
         run: >-
           pnpm exec vitest run --root apps/auth --config vitest.config.ts
           lib/billing/state.test.ts lib/billing/webhook.test.ts
+          lib/testing/postgres-fixture.test.ts
           lib/billing/billing.pg.test.ts lib/billing/entitlements.test.ts lib/billing/entitlements.pg.test.ts
           lib/ops/initialize-admin.pg.test.ts lib/self-host-email.test.ts
           lib/commercial/public-pages.test.ts lib/console/workspace-billing-render.test.ts

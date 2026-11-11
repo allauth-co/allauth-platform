@@ -1,11 +1,19 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
-import { publicCredentialFindings, publicSourceExclusion, publicSourceText, publicWorkerConfiguration } from "./public-source-policy.mjs";
+import { publicCredentialFindings, publicServiceGuideSource, publicSourceExclusion, publicSourceText, publicWorkerConfiguration } from "./public-source-policy.mjs";
 
 test("excludes operational records and credentials while keeping product code, tests and public docs", () => {
 	for (const name of ["CLOUDFLARE_SETUP.md", "design-qa.md", "apps/auth/design-qa.md", "apps/auth/SESSION_INTROSPECTION_VALIDATION.md", "apps/auth/docs/clerk-reference-review.md", "apps/auth/releases/receipt.md", "apps/auth/.dev.vars", "apps/auth/.env.production"]) assert.ok(publicSourceExclusion(name), name);
 	for (const name of ["apps/auth/lib/auth.ts", "apps/auth/lib/projects/runtime.test.ts", "apps/auth/lib/projects/registry-audit.pg.test.ts", "apps/auth/INTEGRATION.md", "docs/SELF_HOSTING.md", "apps/auth/.env.example", "deploy/self-host/.env.example"]) assert.equal(publicSourceExclusion(name), undefined, name);
+});
+
+test("keeps the public service README when replaying an already-public source export", () => {
+	const publicGuide = "# AllAuth platform service\n\nPublic overview.";
+	assert.equal(publicServiceGuideSource(["apps/auth/README.md", "apps/auth/README.public.md"], publicGuide), "apps/auth/README.public.md");
+	assert.equal(publicServiceGuideSource(["apps/auth/README.md"], publicGuide), "apps/auth/README.md");
+	assert.throws(() => publicServiceGuideSource(["apps/auth/README.md"], "# AllAuth production service\nPrivate operations."), /verified public service guide/);
+	assert.throws(() => publicServiceGuideSource([], ""), /verified public service guide/);
 });
 
 test("retains the integration contract while replacing operational sections and dangling evidence links", async () => {

@@ -71,10 +71,16 @@ async function checkProjectProvisioning(origin) {
 	const owner = await fetch(`${origin}/api/auth/get-session`, { headers });
 	assert.equal(owner.status, 200, "The native signed fixture cookie must authenticate in the compiled image");
 	assert.equal((await owner.json())?.user.id, userId);
+	const workspaceResponse = await fetch(`${origin}/api/workspaces`, {
+		method: "POST", headers: { ...headers, "content-type": "application/json" },
+		body: JSON.stringify({ name: "Container Fixture", slug: `container-workspace-${suffix}` }),
+	});
+	assert.equal(workspaceResponse.status, 201, "Create an explicit owner workspace before provisioning an application");
+	const { workspace } = await workspaceResponse.json();
 	const slug = `container-fixture-${suffix}`;
 	const projectResponse = await fetch(`${origin}/api/admin/projects`, {
 		method: "POST", headers: { ...headers, "content-type": "application/json" },
-		body: JSON.stringify({ name: "Container Fixture", slug, primaryOrigin: "https://app.fixture.example", origins: [] }),
+		body: JSON.stringify({ name: "Container Fixture", slug, workspaceId: workspace.id, primaryOrigin: "https://app.fixture.example", origins: [] }),
 	});
 	assert.equal(projectResponse.status, 201, "The compiled project route must provision all packaged runtime migrations");
 	const { project } = await projectResponse.json();
@@ -91,7 +97,7 @@ async function checkProjectProvisioning(origin) {
 	}
 	const developmentResponse = await fetch(`${origin}/api/admin/projects`, {
 		method: "POST", headers: { ...headers, "content-type": "application/json" },
-		body: JSON.stringify({ name: "Container Fixture", slug: `${slug}-dev`, primaryOrigin: "http://localhost:3300", origins: [], applicationId: project.applicationId, environment: "development" }),
+		body: JSON.stringify({ name: "Container Fixture", slug: `${slug}-dev`, workspaceId: workspace.id, primaryOrigin: "http://localhost:3300", origins: [], applicationId: project.applicationId, environment: "development" }),
 	});
 	assert.equal(developmentResponse.status, 201, "A sibling environment must provision a separate realm");
 	const { project: development } = await developmentResponse.json();
@@ -102,7 +108,7 @@ async function checkProjectProvisioning(origin) {
 	assert.equal(await query(`SELECT COUNT(*) FROM "${developmentSchema}"."user"`), "0");
 	const duplicateEnvironment = await fetch(`${origin}/api/admin/projects`, {
 		method: "POST", headers: { ...headers, "content-type": "application/json" },
-		body: JSON.stringify({ name: "Duplicate", slug: `${slug}-duplicate`, primaryOrigin: "http://localhost:3301", origins: [], applicationId: project.applicationId, environment: "development" }),
+		body: JSON.stringify({ name: "Duplicate", slug: `${slug}-duplicate`, workspaceId: workspace.id, primaryOrigin: "http://localhost:3301", origins: [], applicationId: project.applicationId, environment: "development" }),
 	});
 	assert.equal(duplicateEnvironment.status, 409, "Each application may have only one realm per environment");
 	assert.equal(await query('SELECT COUNT(*) FROM public."allauthProject"'), "2", "Rejected duplicate environments must roll back");
@@ -124,7 +130,7 @@ async function checkProjectProvisioning(origin) {
 	const config = await fetch(`${origin}${project.authPath}/sdk/config`, { headers: { "x-real-ip": "192.0.2.44" } });
 	assert.equal(config.status, 200, "The newly provisioned realm must load its packaged native plugins");
 	const { branding, ...capabilities } = await config.json();
-	assert.deepEqual(capabilities, { emailPassword: true, google: false, organizations: true, twoFactor: true });
+	for (const [key, value] of Object.entries({ emailPassword: true, google: false, organizations: true, twoFactor: true })) assert.equal(capabilities[key], value, `Retained SDK capability ${key} remains compatible`);
 	assert.deepEqual(branding, { name: "Container Fixture", supportEmail: null, logoUrl: null, logoDarkUrl: null, faviconUrl: null, primaryColor: "#315bff", darkPrimaryColor: "#7892ff", showPoweredBy: true }, "A new application must expose shared default branding before its first settings write");
 	assert.equal(config.headers.get("cache-control"), "no-store");
 	const tenantSession = await fetch(`${origin}${project.authPath}/get-session`, { headers });
@@ -231,7 +237,7 @@ try {
 		"A mismatched schema must not be ready",
 	);
 	console.log(
-		"Container checks passed: readiness before/after migration, checksum mismatch, hosted sign-in, static asset, linked auth runtime, native fixture cookie, all eight migrations, isolated application environments, duplicate-environment rollback, scoped configuration and analytics.",
+		"Container checks passed: readiness before/after migration, checksum mismatch, hosted sign-in, static asset, linked auth runtime, native fixture cookie, workspace ownership, packaged migrations, isolated application environments, duplicate-environment rollback, scoped configuration and analytics.",
 	);
 } finally {
 	await docker(["rm", "-f", "-v", application, database]).catch(() => {});

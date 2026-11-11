@@ -3,16 +3,18 @@ import { execFileSync } from "node:child_process";
 import { lstat, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { publicCredentialFindings, publicSourceExclusion, publicSourceText, publicWorkerConfiguration } from "./public-source-policy.mjs";
+import { publicCredentialFindings, publicServiceGuideSource, publicSourceExclusion, publicSourceText, publicWorkerConfiguration } from "./public-source-policy.mjs";
 
 const root = fileURLToPath(new URL("../../../", import.meta.url));
 const outputArgument = process.argv.indexOf("--output");
 const destination = outputArgument >= 0 ? path.resolve(process.argv[outputArgument + 1] || "") : undefined;
 if (destination && !destination.startsWith(path.join(root, "output") + path.sep)) throw new Error("Source exports must use a new directory under repository-root output/.");
 const names = [...new Set(execFileSync("git", ["ls-files", "--cached", "--others", "--exclude-standard", "-z"], { cwd: root, maxBuffer: 32 * 1024 * 1024 }).toString().split("\0").filter(Boolean))].sort();
+const guideCandidate = names.includes("apps/auth/README.public.md") ? "apps/auth/README.public.md" : "apps/auth/README.md";
+const publicGuide = publicServiceGuideSource(names, await readFile(path.join(root, guideCandidate), "utf8"));
 const files = []; const excluded = []; const findings = []; const prepared = []; const transformed = [];
 for (const source of names) {
-	const reason = publicSourceExclusion(source);
+	const reason = source === publicGuide ? undefined : publicSourceExclusion(source);
 	if (reason) { excluded.push({ path: source, reason }); continue; }
 	const file = path.join(root, source);
 	const metadata = await lstat(file);
@@ -27,7 +29,7 @@ for (const source of names) {
 	files.push({ path: target, sha256: checksum, bytes: content.length, mode: metadata.mode & 0o777 });
 	prepared.push({ target, content, mode: metadata.mode & 0o777 });
 }
-const report = { generatedAt: new Date().toISOString(), sourceRepository: "thegarty/allauth", intendedPublicRepository: "thegarty/allauth-platform", files, excluded, transformed, credentialFindings: findings, note: "Clean source snapshot only; no Git history, credentials or operational receipts. Generic Worker configs, public documentation and consistent synthetic tenant fixtures replace private deployment references. Known upstream cryptographic test fixtures are retained by checksum. Pattern scanning complements manual review and is not a security certification." };
+const report = { generatedAt: new Date().toISOString(), sourceRepository: "thegarty/allauth", intendedPublicRepository: "allauth-co/allauth-platform", files, excluded, transformed, credentialFindings: findings, note: "Clean source snapshot only; no Git history, credentials or operational receipts. Generic Worker configs, public documentation and consistent synthetic tenant fixtures replace private deployment references. Known upstream cryptographic test fixtures are retained by checksum. Pattern scanning complements manual review and is not a security certification." };
 const reportDirectory = path.join(root, "output"); await mkdir(reportDirectory, { recursive: true });
 const reportPath = path.join(reportDirectory, "public-source-audit.json");
 await writeFile(reportPath, JSON.stringify(report, null, 2) + "\n");

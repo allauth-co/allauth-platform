@@ -5,6 +5,7 @@ import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import type { AuthEnvironment } from "../configuration";
 import type { ControlPrincipal } from "../control/types";
+import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
 import { projectRegistryPool } from "../projects/registry";
 import { createWorkspace, deleteWorkspace } from "../workspaces/repository";
 import { readWorkspaceEntitlements, synchronizeCommercialConfiguration } from "./entitlements";
@@ -69,7 +70,7 @@ describe.skipIf(!existsSync(fixturePath))("workspace billing with isolated Postg
 	}, 30_000);
 	 afterAll(async () => {
 		if (database) await database.end();
-		if (administrator) { await administrator.query(`DROP DATABASE IF EXISTS "${databaseName}" WITH (FORCE)`); await administrator.end(); }
+		if (administrator) { try { await dropClosedFixtureDatabase(administrator, databaseName); } finally { await administrator.end(); } }
 		vi.unstubAllEnvs();
 	});
 

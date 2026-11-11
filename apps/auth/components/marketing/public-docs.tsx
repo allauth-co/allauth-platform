@@ -1,9 +1,8 @@
 import Link from "next/link";
 import type { ReactNode } from "react";
 import type { SdkRelease } from "@/lib/notifications/releases";
-import { publicReleaseUrl, verifiedReleaseDate } from "@/lib/public-sdk";
+import { publicReleaseUrl, sdkReleaseRepositoryUrl, verifiedReleaseDate } from "@/lib/public-sdk";
 import type { PublicRelease } from "@/lib/public-sdk";
-import { sdkRepositoryUrl } from "@/lib/public-site";
 import { MarketingFooter } from "./site-footer";
 import { MarketingHeader } from "./site-header";
 import "./homepage.css";
@@ -20,7 +19,7 @@ export function ReleaseDate({ release }: { release: PublicRelease }) {
 }
 
 export function ReleaseLinks({ release }: { release: SdkRelease }) {
-	return <div className="public-docs-links"><a href={release.downloadUrl}>Download {release.version}</a><a href={release.sourceUrl}>Source at v{release.version}</a><a href={`${sdkRepositoryUrl}/releases/tag/v${release.version}`}>GitHub release</a></div>;
+	return <div className="public-docs-links"><a href={release.downloadUrl}>Download {release.version}</a><a href={release.sourceUrl}>Source at v{release.version}</a><a href={`${sdkReleaseRepositoryUrl(release)}/releases/tag/v${release.version}`}>GitHub release</a></div>;
 }
 
 export function ReleaseSummary({ release }: { release: PublicRelease }) {

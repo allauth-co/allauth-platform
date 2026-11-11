@@ -13,6 +13,13 @@ const upstreamPublicFixtures = new Map([
 	["packages/sso/src/saml/assertions.test.ts", "f82ef6a5aa370218ffae2ff2da06195dd2486c7bf386fe811faefb73098a95d6"],
 ]);
 
+/** Select the replacement guide in a private checkout or retain the verified public guide on re-export. */
+export function publicServiceGuideSource(names, content) {
+	const selected = names.includes("apps/auth/README.public.md") ? "apps/auth/README.public.md" : names.includes("apps/auth/README.md") ? "apps/auth/README.md" : undefined;
+	if (!selected || !content.startsWith("# AllAuth platform service\n")) throw new Error("A verified public service guide is required before exporting source.");
+	return selected;
+}
+
 /** Keep product implementations and tests while excluding private deployment records and generated material. */
 export function publicSourceExclusion(name) {
 	if (/(^|\/)(?:node_modules|\.git|\.secrets|output|\.next|\.open-next|\.wrangler|coverage|test-results|playwright-report|certificates)(?:\/|$)/.test(name)) return "private or generated directory";
