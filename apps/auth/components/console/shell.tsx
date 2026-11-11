@@ -53,6 +53,7 @@ import type { CreatedApplication } from "./application-connection";
 import {
 	canManageWorkspace,
 	useConsoleWorkspaces,
+	useSelectedConsoleWorkspace,
 	workspaceProjectQueryKey,
 	workspaceProjectsPath,
 } from "./workspace-client";
@@ -93,8 +94,13 @@ export function ConsoleShell({
 	);
 	const workspaceTab = search.getAll("tab");
 	const workspaces = useConsoleWorkspaces();
-	const explicitWorkspace = workspaces.data?.workspaces.find(
-		(item) => item.id === workspaceParam,
+	const selection = useSelectedConsoleWorkspace(workspaceParam, workspaces.data);
+	const canLoadProjects = !!workspaces.data && (
+		workspaceParam !== undefined
+			? canManageWorkspace(selection.workspace)
+			: project !== undefined && (
+				workspaces.data.platformAdmin || workspaces.data.workspaces.some(canManageWorkspace)
+			)
 	);
 	const projects = useQuery({
 		queryKey: workspaceProjectQueryKey(workspaceParam),
@@ -102,24 +108,19 @@ export function ConsoleShell({
 			managementRequest<{ projects: ConsoleProject[] }>(
 				workspaceProjectsPath(workspaceParam),
 			),
-		enabled:
-			!!workspaces.data &&
-			(workspaceParam !== undefined
-				? canManageWorkspace(explicitWorkspace)
-				: project !== undefined &&
-					(workspaces.data.platformAdmin ||
-						workspaces.data.workspaces.some(canManageWorkspace))),
+		enabled: canLoadProjects,
 	});
+	const availableProjects = canLoadProjects && !projects.error ? projects.data?.projects ?? [] : [];
 	const selected = selectedConsoleProject(
-		projects.data?.projects ?? [],
+		availableProjects,
 		project,
 		workspaceParam,
 	);
 	const workspaceId = workspaceParam ?? selected?.workspaceId;
-	const workspace = workspaces.data?.workspaces.find(
-		(item) => item.id === workspaceId,
-	);
-	const scopedProjects = (projects.data?.projects || []).filter(
+	const workspace = workspaceParam === undefined
+		? workspaces.data?.workspaces.find((item) => item.id === workspaceId)
+		: selection.workspace;
+	const scopedProjects = availableProjects.filter(
 		(item) => !workspaceId || item.workspaceId === workspaceId,
 	);
 	const applicationOptions = groupApplications(scopedProjects).map(
@@ -144,7 +145,7 @@ export function ConsoleShell({
 			router.push(managementHref("/admin/projects", undefined, workspaceId));
 			return;
 		}
-		const item = projects.data?.projects.find((entry) => entry.slug === slug);
+		const item = scopedProjects.find((entry) => entry.slug === slug);
 		if (!item) return;
 		router.push(consoleProjectSelectionHref(pathname, item, selected));
 	};
@@ -168,9 +169,9 @@ export function ConsoleShell({
 		(platform && workspaces.data?.platformAdmin
 			? "Platform administration"
 			: workspaceId !== undefined
-				? workspaces.data
-					? "Unavailable workspace"
-					: "Loading workspace…"
+				? workspaces.isPending || selection.isPending
+					? "Loading workspace…"
+					: "Unavailable workspace"
 				: "All workspaces");
 	const configure =
 		(selected !== undefined || platform) &&
@@ -485,7 +486,7 @@ export function ConsoleShell({
 						/>
 					</div>
 				</div>
-				{(projects.error || workspaces.error) && (
+				{(projects.error || workspaces.error || selection.error) && (
 					<p role="alert" className="console-header-error">
 						Console navigation could not be loaded. Refresh to try again.
 					</p>

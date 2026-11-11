@@ -42,6 +42,12 @@ describe("explicit account to console navigation", () => {
 		expect(safeConsoleReturnTo(`${scopedConsole}&tab=settings&tab=unrelated`)).toBe(scopedConsole);
 	});
 
+	it("returns to the unscoped platform workspace directory", () => {
+		const directory = "/admin/platform/workspaces";
+		expect(safeConsoleReturnTo(directory)).toBe(directory);
+		expect(safeConsoleReturnTo(`${directory}?workspace=workspace-a&project=store-dev`)).toBe(directory);
+	});
+
 	it.each([
 		"https://allauth.co/admin/users",
 		"https://evil.example/admin/users",

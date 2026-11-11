@@ -4,7 +4,7 @@ import { AppSelect, AppSelectOption } from "@/components/ui/app-select";
 import { useQuery } from "@tanstack/react-query";
 import {
 	Activity,
-	ArrowUpRight,
+	ArrowRight,
 	Building2,
 	Info,
 	RefreshCw,
@@ -161,7 +161,7 @@ export function ConsoleAnalytics({ project }: { project?: string }) {
 			{overview.data && (
 				<div className="console-total-strip">
 					{[
-						["Users", overview.data.totals.users, "/admin/users"],
+						[project === undefined ? "AllAuth accounts" : "Users", overview.data.totals.users, "/admin/users"],
 						[
 							"Organizations",
 							overview.data.totals.organizations,
@@ -186,7 +186,7 @@ export function ConsoleAnalytics({ project }: { project?: string }) {
 						>
 							<span className="flex justify-between">
 								{label}
-								<ArrowUpRight size={12} />
+								<ArrowRight size={12} aria-hidden="true" />
 							</span>
 							<strong>{Number(value).toLocaleString()}</strong>
 						</Link>
@@ -371,7 +371,7 @@ export function ConsoleAnalytics({ project }: { project?: string }) {
 									}
 								>
 									View {labels[cohort].toLowerCase()} {entity}
-									<ArrowUpRight size={12} className="ml-2" />
+									<ArrowRight size={12} className="ml-2" aria-hidden="true" />
 								</Button>
 							</div>
 							{data.coverage.current !== "complete" && (

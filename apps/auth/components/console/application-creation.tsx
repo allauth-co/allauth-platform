@@ -14,6 +14,7 @@ import type { ApplicationCreationDraft } from "@/lib/console/application-creatio
 import { DetailPanel, managementRequest } from "./common";
 import type { CreatedApplication } from "./application-connection";
 import type { ConsoleProject } from "./shell";
+import { workspaceDetailQueryKey } from "./workspace-client";
 import type { ConsoleWorkspace } from "./workspace-client";
 
 export interface ApplicationCreationTarget {
@@ -65,6 +66,7 @@ export function ApplicationCreationPanel({
 			await Promise.all([
 				cache.invalidateQueries({ queryKey: ["platform-projects"] }),
 				cache.invalidateQueries({ queryKey: ["console-workspaces"] }),
+				cache.invalidateQueries({ queryKey: workspaceDetailQueryKey(target.workspace.id) }),
 			]);
 			onCreated(result);
 		} catch (cause) {

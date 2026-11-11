@@ -80,6 +80,21 @@ describe("workspace console boundaries", () => {
 			"application",
 		);
 	});
+	it("separates the platform directories from the application user view", () => {
+		const platform = primaryConsoleNavigationGroup(consoleNavigationGroups({
+			platformAdmin: true,
+			platform: true,
+		}));
+		expect(platform.links).toContainEqual(["/admin/users", "AllAuth accounts"]);
+		expect(platform.links).toContainEqual(["/admin/platform/workspaces", "Workspace directory"]);
+		const application = primaryConsoleNavigationGroup(consoleNavigationGroups({
+			workspace: { name: "Store workspace", role: "platform-admin" },
+			application: { name: "Store" },
+			platformAdmin: true,
+		}));
+		expect(application.links).toContainEqual(["/admin/users", "Users"]);
+		expect(application.links).not.toContainEqual(["/admin/platform/workspaces", "Workspace directory"]);
+	});
 	it("uses only safe global navigation when no context is available", () => {
 		expect(primaryConsoleNavigationGroup([])).toEqual({
 			scope: "global",

@@ -40,11 +40,8 @@ vi.mock("@tanstack/react-query", () => ({
 	},
 }));
 vi.mock("@/components/console/workspace-client", async () => {
-	const helpers = await import("@/lib/console/workspace-navigation");
 	return {
-		canManageWorkspace: helpers.canManageWorkspace,
-		workspaceProjectQueryKey: helpers.workspaceProjectQueryKey,
-		workspaceProjectsPath: helpers.workspaceProjectsPath,
+		...(await vi.importActual<typeof import("@/components/console/workspace-client")>("@/components/console/workspace-client")),
 		useConsoleWorkspaces: () => ({
 			data: {
 				platformAdmin: state.platformAdmin,

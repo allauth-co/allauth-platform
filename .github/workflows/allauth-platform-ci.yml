@@ -59,7 +59,7 @@ jobs:
           // Historical marker used by the tests' isolated-fixture allowlist.
           writeFileSync('.secrets/local-postgres.json', JSON.stringify({ container: 'allauth-production-test-20261007', DATABASE_URL: 'postgresql://allauth:allauth-ci-only@127.0.0.1:55445/allauth' }), { mode: 0o600 });
           JS
-      - name: Test billing, entitlements, self-hosting and public pages
+      - name: Test billing, platform administration, self-hosting and public pages
         run: >-
           pnpm exec vitest run --root apps/auth --config vitest.config.ts
           lib/billing/state.test.ts lib/billing/webhook.test.ts
@@ -68,6 +68,9 @@ jobs:
           lib/ops/initialize-admin.pg.test.ts lib/self-host-email.test.ts
           lib/commercial/public-pages.test.ts lib/console/workspace-billing-render.test.ts
           lib/console/workspace-navigation.test.ts lib/console/user-menu-navigation.test.ts
+          lib/workspaces/workspaces.pg.test.ts lib/console/platform-accounts-render.test.ts
+          lib/console/platform-workspace-directory-page.test.ts lib/console/platform-workspace-directory-render.test.ts
+          lib/console/workspace-deep-links-render.test.ts
           lib/console/compact-shell.test.ts lib/homepage.test.ts lib/public-sdk.test.ts
       - name: Verify SDK and build service
         run: |

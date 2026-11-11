@@ -62,3 +62,23 @@ create another workspace under the account's ownership limit. Anonymous,
 unverified, banned, directory-disabled, impersonated and expired sessions cannot
 check availability. Writes require the platform's same origin. Application
 end-user credentials and tenant-scoped requests cannot use these platform APIs.
+
+## Platform administration
+
+Open **Platform administration** in the workspace picker or from the protected
+**AllAuth platform** workspace. **AllAuth accounts** shows platform accounts by
+creation date. Open an account's **Workspace access** tab to see its memberships
+and roles. **Workspace directory** searches workspaces across the platform and
+links to each workspace's Applications, Team and Billing pages.
+
+`GET /api/admin/platform/workspaces` requires a current verified platform
+administrator session. It accepts `search` for workspace names, slugs and owner
+names or email addresses. Pagination uses `limit` (1–100, default 25) and
+`offset` (0–100,000, default 0). Supply `accountId` to list the memberships of one
+platform account.
+
+The response is `{ workspaces, total, limit, offset }`. Rows contain workspace
+identity and creation date, the protected flag, current owners and counts for
+applications, environments and members. `membershipRole` gives the selected
+account's stored role when `accountId` is supplied. Team counts include accepted
+memberships. Application end-user directories remain scoped to their environments.

@@ -22,11 +22,15 @@ import { assertWorkspaceAccountDeletion } from "./authorization";
 import { closeProjectInstances, withProjectAuth } from "../projects/runtime";
 import { authConfigurationRoute } from "../auth-policy/route";
 import { GET as consoleUsers } from "../../app/api/admin/users/route";
+import { GET as consoleUser } from "../../app/api/admin/users/[userId]/route";
 import { GET as discovery } from "../../app/.well-known/openid-configuration/route";
 import { auth } from "../auth";
 import { POST as workspacePOST } from "../../app/api/workspaces/route";
 import { GET as workspaceSlugGET } from "../../app/api/workspaces/slug/route";
 import { POST as projectPOST } from "../../app/api/admin/projects/route";
+import { GET as platformWorkspacesGET } from "../../app/api/admin/platform/workspaces/route";
+import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
+import type { PlatformWorkspaceDirectoryPage } from "./platform-directory";
 
 const fixturePath = new URL("../../../../.secrets/local-postgres.json", import.meta.url);
 describe.skipIf(!existsSync(fixturePath))("real PostgreSQL client console workspaces", () => {
@@ -71,7 +75,10 @@ describe.skipIf(!existsSync(fixturePath))("real PostgreSQL client console worksp
 		await closeProjectInstances();
 		if (rootUsed) { const configured = (await auth.$context).options.database; if (configured && typeof configured === "object" && "db" in configured) await (configured.db as ControlDatabase).destroy(); }
 		vi.restoreAllMocks(); if (database) await database.destroy(); if (env) await projectRegistryPool(env).end();
-		if (administratorPool) { await administratorPool.query(`DROP DATABASE IF EXISTS "${databaseName}" WITH (FORCE)`); await administratorPool.end(); }
+		if (administratorPool) {
+			try { await dropClosedFixtureDatabase(administratorPool, databaseName); }
+			finally { await administratorPool.end(); }
+		}
 		vi.unstubAllGlobals(); vi.unstubAllEnvs();
 	});
 	it("uses actual verified ordinary root sessions and excludes unrelated/protected workspaces", async () => {
@@ -403,5 +410,145 @@ describe.skipIf(!existsSync(fixturePath))("real PostgreSQL client console worksp
 		const pool = projectRegistryPool(env); await pool.query('CREATE FUNCTION public.fixture_reject_workspace_audit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.type=\'workspace.created\' THEN RAISE EXCEPTION \'fixture rejected audit\'; END IF; RETURN NEW; END; $$'); await pool.query('CREATE TRIGGER fixture_reject_workspace_audit BEFORE INSERT ON public."allauthEvent" FOR EACH ROW EXECUTE FUNCTION public.fixture_reject_workspace_audit()');
 		try { await expect(createWorkspace(global.principal, { name: "Rejected Workspace", slug: "rejected-workspace" }, env)).rejects.toThrow("fixture rejected audit"); expect((await pool.query('SELECT id FROM public."allauthWorkspace" WHERE slug=\'rejected-workspace\'')).rows).toHaveLength(0); }
 		finally { await pool.query('DROP TRIGGER fixture_reject_workspace_audit ON public."allauthEvent"'); await pool.query('DROP FUNCTION public.fixture_reject_workspace_audit()'); }
+	});
+
+	describe("platform workspace directory", () => {
+		const firstWorkspace = "directory-fixture-001";
+		const fixtureSearch = "Directory fixture";
+		const createdAt = "2025-03-04T01:02:03.000Z";
+		let secondaryOwner: Actor;
+		let tenantId: string;
+		let tenantHeaders: Headers;
+		beforeAll(async () => {
+			secondaryOwner = await actor("directory-second-owner@fixture.example");
+			const pool = projectRegistryPool(env);
+			await pool.query(`
+				INSERT INTO public."allauthWorkspace" (id, name, slug, "createdAt")
+				SELECT 'directory-fixture-' || number, 'Directory fixture ' || number || suffix,
+					'directory-fixture-' || number, $1
+				FROM generate_series(1, 106) AS n
+				CROSS JOIN LATERAL (SELECT lpad(n::text, 3, '0') AS number,
+					CASE WHEN n=106 THEN ' !%_' ELSE '' END AS suffix) AS label
+			`, [createdAt]);
+			await pool.query(`
+				INSERT INTO public."allauthWorkspaceMember" (id, "workspaceId", "userId", role)
+				SELECT 'seat-' || id, id, $1, 'owner' FROM public."allauthWorkspace" WHERE slug LIKE 'directory-fixture-%'
+			`, [global.principal.user.id]);
+			await pool.query(`
+				INSERT INTO public."allauthWorkspaceMember" (id, "workspaceId", "userId", role) VALUES
+					('directory-owner-seat', $1, $2, 'owner'),
+					('directory-secondary-owner-seat', $1, $3, 'owner'),
+					('directory-member-seat', $1, $4, 'member'),
+					('directory-admin-seat', 'directory-fixture-002', $2, 'admin'),
+					('directory-later-member-seat', 'directory-fixture-003', $2, 'member');
+			`, [firstWorkspace, alice.principal.user.id, secondaryOwner.principal.user.id, carol.principal.user.id]);
+			await pool.query(`INSERT INTO public.organization (id,name,slug,"createdAt") VALUES ($1,'Native organization','directory-native-org',now())`, [firstWorkspace]);
+			await pool.query(`INSERT INTO public.member (id,"organizationId","userId",role,"createdAt") VALUES ('directory-native-owner',$1,$2,'owner',now())`, [firstWorkspace, bob.principal.user.id]);
+			await pool.query(`INSERT INTO public."allauthWorkspaceInvitation" (id,"workspaceId",email,role,"expiresAt") VALUES ('directory-pending-owner',$1,'directory-pending-owner@fixture.example','owner',now()+interval '1 day')`, [firstWorkspace]);
+			const credentials = { clientId: "fixture-directory-broker", clientSecret: "fixture-directory-broker-secret" };
+			const scope = { workspaceId: firstWorkspace, principal: global.principal };
+			const provision = (slug: string, environment: "development" | "production", applicationId?: string) => provisionProject({ name: slug, slug, primaryOrigin: `https://${slug}.fixture.example`, origins: [], environment, applicationId }, credentials, global.principal.user.id, env, scope);
+			const production = await provision("directory-fixture-production", "production");
+			await provision("directory-fixture-development", "development", production.applicationId);
+			await provision("directory-fixture-other", "production");
+			await withProjectAuth(production.slug, async (instance) => {
+				const context = await instance.$context;
+				const password = "fixture-directory-tenant-password";
+				const tenant = await runWithEndpointContext({ context: context as unknown as AuthContext, path: "/local-fixture-seed", headers: alice.headers }, () => context.internalAdapter.createUser({ name: "Tenant shadow owner", email: alice.principal.user.email, emailVerified: true, role: "admin" }, { method: "admin" }));
+				const passwordHash = await runWithEndpointContext({ context: context as unknown as AuthContext, path: "/local-fixture-seed", headers: alice.headers }, () => context.password.hash(password));
+				await context.internalAdapter.linkAccount({ providerId: "credential", accountId: tenant.id, userId: tenant.id, password: passwordHash });
+				const login = await instance.api.signInEmail({ body: { email: tenant.email, password }, headers: new Headers({ origin: "http://localhost:3000", "x-real-ip": "192.0.2.92" }), asResponse: true });
+				expect(login.status).toBe(200);
+				tenantHeaders = new Headers({ cookie: login.headers.getSetCookie().map((value) => value.split(";", 1)[0]).join("; ") });
+				expect((await instance.api.getSession({ headers: tenantHeaders }))?.user.role).toBe("admin");
+				tenantId = tenant.id;
+			}, env);
+		}, 30000);
+		const request = (query = new URLSearchParams(), headers = global.headers) => {
+			rootUsed = true;
+			return platformWorkspacesGET(new Request(`http://localhost:3000/api/admin/platform/workspaces?${query}`, { headers }));
+		};
+		async function page(query: Record<string, string>): Promise<PlatformWorkspaceDirectoryPage> {
+			const response = await request(new URLSearchParams(query));
+			expect(response.status).toBe(200);
+			expect(response.headers.get("cache-control")).toBe("no-store");
+			return response.json();
+		}
+
+		it("paginates all matches in stable order and searches beyond the selector limit", async () => {
+			const first = await page({ search: fixtureSearch, limit: "100" });
+			expect(first).toMatchObject({ total: 106, offset: 0, limit: 100 });
+			expect(first.workspaces).toHaveLength(100);
+			expect(first.workspaces.at(-1)?.id).toBe("directory-fixture-100");
+			const second = await page({ search: fixtureSearch, offset: "100" });
+			expect(second).toMatchObject({ total: 106, offset: 100, limit: 25 });
+			expect(second.workspaces.map((row) => row.id)).toEqual(Array.from({ length: 6 }, (_, index) => `directory-fixture-${101 + index}`));
+			expect(await page({ search: fixtureSearch, offset: "106" })).toEqual({ total: 106, offset: 106, limit: 25, workspaces: [] });
+			for (const search of ["!%_", "%", "_", "DIRECTORY-FIXTURE-106"]) {
+				expect((await page({ search })).workspaces.map((row) => row.id)).toEqual(["directory-fixture-106"]);
+			}
+			expect((await page({ search: "' OR 1=1 --" })).total).toBe(0);
+		});
+
+		it("projects root owners and counts, and filters exact stored memberships across roles", async () => {
+			const { workspaces } = await page({ search: secondaryOwner.principal.user.email.toUpperCase() });
+			expect(workspaces).toEqual([{
+				id: firstWorkspace, name: "Directory fixture 001", slug: firstWorkspace, createdAt, protected: false,
+				owners: [alice, secondaryOwner, global].map(({ principal: { user: { id, name, email } } }) => ({ id, name, email })),
+				memberCount: 4, applicationCount: 2, environmentCount: 3, membershipRole: null,
+			}]);
+			expect((await page({ search: secondaryOwner.principal.user.name })).workspaces.map((row) => row.id)).toEqual([firstWorkspace]);
+			expect((await page({ search: "directory-pending-owner@fixture.example" })).total).toBe(0);
+			expect((await page({ search: "Tenant shadow owner" })).total).toBe(0);
+			expect((await page({ search: fixtureSearch, accountId: alice.principal.user.id })).workspaces.map(({ id, membershipRole }) => [id, membershipRole])).toEqual([
+				[firstWorkspace, "owner"], ["directory-fixture-002", "admin"], ["directory-fixture-003", "member"],
+			]);
+			for (const accountId of [alice.principal.user.email, bob.principal.user.id, tenantId]) {
+				expect((await page({ search: fixtureSearch, accountId })).total).toBe(0);
+			}
+			expect((await page({ search: "AllAuth platform" })).workspaces).toMatchObject([{ id: platformWorkspaceId, protected: true, owners: [], memberCount: 0, membershipRole: null }]);
+		});
+
+		it("requires fresh root platform authority for workspace and account reads", async () => {
+			const unattached = await actor("directory-unattached@fixture.example");
+			const userId = unattached.principal.user.id;
+			const accountList = (headers: Headers) => consoleUsers(new Request(`http://localhost:3000/api/admin/users?${new URLSearchParams({ search: userId })}`, { headers }));
+			const accountDetail = (headers: Headers) => consoleUser(new Request(`http://localhost:3000/api/admin/users/${encodeURIComponent(userId)}`, { headers }), { params: Promise.resolve({ userId }) });
+			const statusCodes = async (headers: Headers) => (await Promise.all([request(new URLSearchParams(), headers), accountList(headers), accountDetail(headers)])).map((response) => response.status);
+			const accounts = await accountList(global.headers);
+			const account = await accountDetail(global.headers);
+			expect(accounts.status).toBe(200);
+			expect(account.status).toBe(200);
+			expect(await accounts.json()).toMatchObject({ total: 1, users: [{ id: userId }] });
+			expect(await account.json()).toMatchObject({ user: { id: userId } });
+			expect(await page({ accountId: userId })).toEqual({ workspaces: [], total: 0, offset: 0, limit: 25 });
+			expect(await statusCodes(new Headers())).toEqual([401, 401, 401]);
+			expect(await statusCodes(tenantHeaders)).toEqual([401, 401, 401]);
+			for (const scoped of [alice, carol, secondaryOwner]) {
+				expect(await statusCodes(scoped.headers)).toEqual([403, 403, 403]);
+			}
+			const bearer = new Headers(global.headers);
+			bearer.set("authorization", "Bearer local-fixture-token");
+			expect(await statusCodes(bearer)).toEqual([403, 403, 403]);
+			const pool = projectRegistryPool(env);
+			try {
+				await pool.query('UPDATE public."user" SET role=\'user\' WHERE id=$1', [global.principal.user.id]);
+				expect(await statusCodes(global.headers)).toEqual([403, 403, 403]);
+				await pool.query('UPDATE public."user" SET role=\'admin\',"directoryDisabled"=true WHERE id=$1', [global.principal.user.id]);
+				expect(await statusCodes(global.headers)).toEqual([403, 403, 403]);
+				await pool.query('UPDATE public."user" SET "directoryDisabled"=false WHERE id=$1', [global.principal.user.id]);
+				await pool.query('UPDATE public.session SET "impersonatedBy"=$1 WHERE id=$2', [alice.principal.user.id, global.principal.session.id]);
+				expect(await statusCodes(global.headers)).toEqual([403, 403, 403]);
+			} finally {
+				await pool.query('UPDATE public."user" SET role=\'admin\',"directoryDisabled"=false WHERE id=$1', [global.principal.user.id]);
+				await pool.query('UPDATE public.session SET "impersonatedBy"=NULL WHERE id=$1', [global.principal.session.id]);
+			}
+		});
+
+		it("rejects malformed or scoped workspace directory queries", async () => {
+			for (const query of ["project=", "project=tenant", "project=&project=tenant", "workspace=", "workspaceId=", "search=&search=", "accountId=", "limit=", "limit=101", "offset=-1", "offset=1e2", "search=%00", "unknown=1"]) {
+				expect((await request(new URLSearchParams(query))).status, query).toBe(400);
+			}
+		});
 	});
 });

@@ -7,6 +7,7 @@ import {
 	Check,
 	KeyRound,
 	Plus,
+	ShieldCheck,
 } from "lucide-react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
@@ -35,6 +36,7 @@ import type { CreatedApplication } from "./application-connection";
 import {
 	canManageWorkspace,
 	useConsoleWorkspaces,
+	useSelectedConsoleWorkspace,
 	workspaceProjectQueryKey,
 	workspaceProjectsPath,
 } from "./workspace-client";
@@ -50,9 +52,8 @@ export function ConsoleProjects() {
 			: undefined,
 	);
 	const workspaces = useConsoleWorkspaces();
-	const workspace = workspaces.data?.workspaces.find(
-		(item) => item.id === workspaceId,
-	);
+	const selection = useSelectedConsoleWorkspace(workspaceId, workspaces.data);
+	const workspace = selection.workspace;
 	const enabled =
 		!!workspaces.data && !!workspace && canManageWorkspace(workspace);
 	const [search, setSearch] = useState("");
@@ -123,14 +124,14 @@ export function ConsoleProjects() {
 			setSecret({ project, proxySecret: result.proxySecret });
 		});
 	};
-	if (!workspaces.data)
+	if (!workspaces.data || selection.isPending)
 		return (
 			<>
 				<PageHeading
 					title="Applications"
 					description="Choose a workspace to manage your applications."
 				/>
-				<StateMessage loading={workspaces.isPending} error={workspaces.error} />
+				<StateMessage loading={workspaces.isPending || selection.isPending} error={workspaces.error} />
 			</>
 		);
 	if (!enabled)
@@ -183,6 +184,14 @@ export function ConsoleProjects() {
 						: "Manage applications across the workspaces you administer."
 				}
 			>
+				{workspace?.protected && workspace.role === "platform-admin" && workspaces.data.platformAdmin && (
+					<Button asChild variant="outline">
+						<Link href="/admin/overview">
+							<ShieldCheck size={15} className="mr-2" aria-hidden="true" />
+							Open Platform administration
+						</Link>
+					</Button>
+				)}
 				<Button
 					type="button"
 					className="console-primary"

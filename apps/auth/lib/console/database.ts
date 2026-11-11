@@ -1,8 +1,9 @@
 import { APIError } from "better-auth";
 import type { AuthInstance } from "../api";
-import { isPlatformAdmin } from "../configuration";
+import { type AuthEnvironment, isPlatformAdmin } from "../configuration";
 import type { ControlDatabase } from "../control/types";
 import { selectedProjectAdministrator, projectInstance } from "../projects/runtime";
+import { requirePlatformDirectoryAdmin } from "../workspaces/authorization";
 
 /** Management authority always comes from the platform's current database session. */
 export async function requireConsoleAdministrator(instance: AuthInstance, headers: Headers) {
@@ -11,6 +12,15 @@ export async function requireConsoleAdministrator(instance: AuthInstance, header
 	if (!principal) throw new APIError("UNAUTHORIZED");
 	if (!principal.user.emailVerified || principal.user.banned || principal.session.impersonatedBy || (!selected && !isPlatformAdmin(principal.user, principal.session))) throw new APIError("FORBIDDEN");
 	return principal;
+}
+
+/** The global account directory uses the current platform role and root session. */
+export async function requireConsoleUserDirectoryAdministrator(instance: AuthInstance, headers: Headers, env: AuthEnvironment) {
+	if (projectInstance(instance)) {
+		await requireConsoleAdministrator(instance, headers);
+		return;
+	}
+	await requirePlatformDirectoryAdmin(instance, headers, env);
 }
 
 /** The selected native instance supplies the connection and search_path; callers cannot choose a schema. */

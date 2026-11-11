@@ -8,6 +8,15 @@ const applicationLinks = [
 	["/admin/configure", "Configure"],
 ] as const;
 
+const platformLinks = [
+	["/admin/overview", "Overview"],
+	["/admin/users", "AllAuth accounts"],
+	["/admin/platform/workspaces", "Workspace directory"],
+	["/admin/organizations", "Organizations"],
+	["/admin/audit-logs", "Logs"],
+	["/admin/configure", "Configure"],
+] as const;
+
 const applicationPaths = new Set([
 	...applicationLinks.map(([path]) => path),
 	"/admin/configure/organizations",
@@ -136,7 +145,7 @@ export function consoleNavigationGroups(input: {
 		groups.push({
 			scope: "platform",
 			label: "Platform administration",
-			links: applicationLinks,
+			links: platformLinks,
 		});
 	}
 	return groups;

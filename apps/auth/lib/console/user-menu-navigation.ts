@@ -3,6 +3,7 @@ const consolePaths = new Set([
 	"/admin/projects",
 	"/admin/overview",
 	"/admin/users",
+	"/admin/platform/workspaces",
 	"/admin/organizations",
 	"/admin/audit-logs",
 	"/admin/configure",
@@ -40,6 +41,7 @@ export function safeConsoleReturnTo(value?: string | null): string | null {
 		!consolePaths.has(target.pathname)
 	)
 		return null;
+	if (target.pathname === "/admin/platform/workspaces") return target.pathname;
 	const scope = new URLSearchParams();
 	for (const key of ["workspace", "project"] as const) {
 		const values = target.searchParams.getAll(key);

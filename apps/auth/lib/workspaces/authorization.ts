@@ -25,6 +25,13 @@ export async function storedWorkspacePrincipal(principal: ControlPrincipal, env:
 	if (!stored || principal.session.userId !== stored.id) throw new APIError("FORBIDDEN");
 	return { platformAdmin: rolesInclude(stored.role, "admin") };
 }
+/** Platform directory reads require an admitted root session and a current stored platform-admin role. */
+export async function requirePlatformDirectoryAdmin(instance: AuthInstance, headers: Headers, env: AuthEnvironment): Promise<ControlPrincipal> {
+	const principal = await requireWorkspacePrincipal(instance, headers);
+	const { platformAdmin } = await storedWorkspacePrincipal(principal, env);
+	if (!platformAdmin) throw new APIError("FORBIDDEN");
+	return principal;
+}
 /** A workspace identifier is only a lookup key; membership grants authority. */
 export async function requireWorkspaceActor(principal: ControlPrincipal, workspaceId: string, env: AuthEnvironment, options: { manage?: boolean; database?: WorkspaceDatabase; lock?: boolean } = {}): Promise<{ principal: ControlPrincipal; workspace: Workspace; role: WorkspaceRole | "platform-admin"; platformAdmin: boolean }> {
 	const database = options.database || projectRegistryPool(env);

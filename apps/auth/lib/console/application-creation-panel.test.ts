@@ -131,6 +131,7 @@ describe("persisted application creation panel", () => {
 		expect(state.invalidate.mock.calls).toEqual([
 			[{ queryKey: ["platform-projects"] }],
 			[{ queryKey: ["console-workspaces"] }],
+			[{ queryKey: ["console-workspace", workspace.id] }],
 		]);
 	});
 	it("adds only the missing environment to the existing application in the same workspace", async () => {

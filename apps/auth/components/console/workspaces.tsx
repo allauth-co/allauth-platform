@@ -33,7 +33,13 @@ import {
 	PageHeading,
 	StateMessage,
 } from "./common";
-import { canManageWorkspace, useConsoleWorkspaces } from "./workspace-client";
+import {
+	canManageWorkspace,
+	isConsoleWorkspaceId,
+	useConsoleWorkspaceDetail,
+	useConsoleWorkspaces,
+	workspacePath,
+} from "./workspace-client";
 import { DefaultWorkspaceOnboarding } from "./default-workspace-onboarding";
 import { WorkspaceBilling } from "./workspace-billing";
 import type {
@@ -49,8 +55,6 @@ const roleLabels: Record<WorkspaceRole | "platform-admin", string> = {
 	member: "Member",
 	"platform-admin": "Platform admin",
 };
-const workspacePath = (id: string) =>
-	`/api/workspaces/${encodeURIComponent(id)}`;
 const errorMessage = (error: unknown) =>
 	error instanceof Error
 		? error.message
@@ -65,12 +69,8 @@ export function ConsoleWorkspaces() {
 	);
 	const cache = useQueryClient();
 	const workspaces = useConsoleWorkspaces();
-	const detail = useQuery({
-		queryKey: ["console-workspace", workspaceId],
-		queryFn: () =>
-			managementRequest<WorkspaceDetail>(workspacePath(workspaceId!)),
-		enabled: !!workspaceId,
-	});
+	const detail = useConsoleWorkspaceDetail(workspaceId);
+	const selectedDetail = !detail.error && detail.data?.workspace.id === workspaceId ? detail.data : undefined;
 	const invitations = useQuery({
 		queryKey: ["console-workspace-invitations"],
 		queryFn: () =>
@@ -163,17 +163,17 @@ export function ConsoleWorkspaces() {
 					All workspaces
 				</Link>
 				<StateMessage
-					loading={!!workspaceId && detail.isPending}
+					loading={isConsoleWorkspaceId(workspaceId) && detail.isPending}
 					error={
-						!workspaceId
+						!isConsoleWorkspaceId(workspaceId)
 							? new Error("Choose an available workspace.")
 							: detail.error
 					}
 				/>
-				{detail.data && (search.getAll("tab").length === 1 && search.get("tab") === "billing" && canManageWorkspace(detail.data.workspace) ? <WorkspaceBilling key={detail.data.workspace.id} workspace={detail.data.workspace} checkout={search.get("checkout")} /> : (
+				{selectedDetail && (search.getAll("tab").length === 1 && search.get("tab") === "billing" && canManageWorkspace(selectedDetail.workspace) ? <WorkspaceBilling key={selectedDetail.workspace.id} workspace={selectedDetail.workspace} checkout={search.get("checkout")} /> : (
 					<WorkspaceManagement
-						key={detail.data.workspace.id}
-						data={detail.data}
+						key={selectedDetail.workspace.id}
+						data={selectedDetail}
 						tab={search.get("tab") === "settings" ? "settings" : "team"}
 						busy={busy}
 						error={error}

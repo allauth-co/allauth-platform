@@ -12,6 +12,7 @@ import {
 	projectManagementPath,
 } from "@/lib/management-client";
 import { UserOrganizationMembership } from "./user-organization-membership";
+import { PlatformWorkspaceDirectory } from "./platform-workspace-directory";
 import { supportSessionHref } from "@/lib/console/support-session";
 import type { AuthPolicy } from "@/lib/auth-policy/policy";
 import { defaultPasswordPolicy, passwordPolicyDescription, passwordPolicyError } from "@/lib/auth-policy/password";
@@ -81,6 +82,8 @@ interface UserDetail {
 const hasAdmin = (role?: string | null) =>
 	role?.split(",").some((value) => value.trim() === "admin") ?? false;
 export function ConsoleUsers({ project }: { project?: string }) {
+	const platform = project === undefined;
+	const createdLabel = platform ? "Account created" : "Joined";
 	const searchParams = useSearchParams();
 	const [search, setSearch] = useState("");
 	const [offset, setOffset] = useState(0);
@@ -163,8 +166,10 @@ export function ConsoleUsers({ project }: { project?: string }) {
 	return (
 		<>
 			<PageHeading
-				title="Users"
-				description="Explore identities, authentication methods and account access."
+				title={platform ? "AllAuth accounts" : "Users"}
+				description={platform
+					? "See who has an AllAuth account and which workspaces they can access."
+					: "Explore identities, authentication methods and account access."}
 			>
 				<Button
 					type="button"
@@ -193,7 +198,7 @@ export function ConsoleUsers({ project }: { project?: string }) {
 							["status", "Status"],
 							["role", "Role"],
 							["lastSignInAt", "Last signed in"],
-							["createdAt", "Joined"],
+							["createdAt", createdLabel],
 							["mfa", "MFA"],
 							["sessions", "Sessions"],
 						]}
@@ -263,7 +268,7 @@ export function ConsoleUsers({ project }: { project?: string }) {
 							{columns.includes("createdAt") && (
 								<th>
 									<button type="button" onClick={() => changeSort("createdAt")}>
-										Joined
+										{createdLabel}
 										{sort === "createdAt" && (
 											<ArrowDown size={12} className="inline ml-2" />
 										)}
@@ -499,6 +504,10 @@ function UserDrawer({
 }) {
 	const searchParams = useSearchParams();
 	const client = getManagementClient(project);
+	const platform = project === undefined;
+	const tabs = platform
+		? ["Profile", "Workspace access", "Organizations", "Sessions", "Activity"]
+		: ["Profile", "Organizations", "Sessions", "Activity"];
 	const [tab, setTab] = useState("Profile");
 	const query = useQuery({
 		queryKey: ["console-user", project ?? null, userId],
@@ -546,18 +555,17 @@ function UserDrawer({
 						<CopyValue value={userId} label="Copy user ID" />
 					</div>
 					<div className="console-subtabs mt-6">
-						{["Profile", "Organizations", "Sessions", "Activity"].map(
-							(value) => (
-								<button
-									type="button"
-									data-active={tab === value}
-									key={value}
-									onClick={() => setTab(value)}
-								>
-									{value}
-								</button>
-							),
-						)}
+						{tabs.map((value) => (
+							<button
+								type="button"
+								data-active={tab === value}
+								aria-pressed={tab === value}
+								key={value}
+								onClick={() => setTab(value)}
+							>
+								{value}
+							</button>
+						))}
 					</div>
 					{tab === "Profile" && (
 						<>
@@ -566,7 +574,7 @@ function UserDrawer({
 								<dd>
 									{data.user.displayUsername || data.user.username || "—"}
 								</dd>
-								<dt>Joined</dt>
+								<dt>{platform ? "Account created" : "Joined"}</dt>
 								<dd>
 									<DateText value={data.user.createdAt} />
 								</dd>
@@ -798,6 +806,9 @@ function UserDrawer({
 								</div>
 							</section>
 						</>
+					)}
+					{platform && tab === "Workspace access" && (
+						<PlatformWorkspaceDirectory accountId={userId} />
 					)}
 					{tab === "Organizations" && (
 						<>
