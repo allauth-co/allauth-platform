@@ -1,0 +1,47 @@
+---
+title: Signed server session introspection
+description: Live, bounded session checks for trusted application backends without a shared proxy-IP bottleneck.
+---
+
+An application backend's signed `GET /api/projects/:slug/auth/get-session` request uses the owning realm's native session API when both its current project proxy signature and selected realm session-cookie signature verify. Every authoritative lookup forces `disableCookieCache: true`. The cookie signature selects an admission bucket; it does not establish user identity, session validity or administrative authority. Current native security hooks, session expiry, user restrictions and revocation checks still run.
+
+## Sustained and burst admission
+
+Verified server checks have a sustained allowance of **20 checks per second per project and signed session cookie** (1,200/minute), with **120 checks of immediate burst capacity** after an idle period. Each caller consumes an admission, including callers whose native lookup is combined. This is continuous refill, not a fixed window: an initially full bucket can admit the initial 120 plus the sustained allowance over a minute. Crossing a minute boundary does not reset another burst.
+
+Continuous-refill admission uses atomic PostgreSQL updates in the realm's existing `rateLimit` table. Every service replica shares the same bucket and uses database time sampled after obtaining the counter's row lock. Adding replicas cannot multiply an allowance, and application clock differences cannot bypass it. Rejected checks do not increase debt. The `bff-session:v2:` key namespace separates this policy from the previous fixed-window counters during rolling deployments. Keys contain a SHA-256 digest, never the cookie or token; existing expired-counter cleanup remains applicable. No database migration is required.
+
+The allowance accommodates repeated layouts, page loads, API calls and prefetches without requiring client changes. It is specific to authenticated server introspection. Unsigned requests, invalid/missing cookies, and credential, password, MFA and recovery routes retain the ordinary HTTP handler and its existing protections. Forged or expired proxy signatures are rejected before introspection. Client-asserted IP headers do not select a trusted-session bucket, and no synthetic IP is substituted.
+
+## Overlap combining and live authority
+
+AllAuth groups identical requests while their individual shared admissions are pending. Every caller first passes proxy and session-cookie signature verification. Work is isolated by tenant, signed session, current native auth instance/configuration, transport secret version, URL/query and all effective headers (including origin, IP, user agent and refresh-related cookies). The already verified proxy signature/timestamp and Railway’s per-request `x-railway-request-id`/`x-request-start` metadata are excluded from equality. These metadata headers remain on the original request passed to native security hooks; they do not establish authority.
+
+The group closes **before** starting its native lookup. Every later arrival starts a fresh authority read instead of joining an earlier read that might predate revocation. Completed authentication results, including nulls and failures, are never cached. A read already in progress when a session is revoked has the ordinary in-flight request semantics; a subsequent check cannot reuse that read. Incoming query behavior is unchanged: the service continues forcing fresh session state with its existing native call.
+
+Combining is local to a service replica. Other replicas make their own live reads; they share admission through PostgreSQL, never authentication responses. This avoids distributed authentication-result caches and invalidation delays. The extra database admission still happens for every caller; combining reduces native session lookups and refresh work.
+
+Each replica admits at most 1,024 pending callers, 128 active groups and 120 pending identical checks. Excess pending work receives 429 with a one-second `Retry-After`. A group times out after ten seconds with 503. Underlying work that has not settled keeps its capacity reservation, preventing retries from creating unlimited replacement work. Buffered native responses are capped at 1 MiB. Every admitted caller receives an independent response body and headers, preserving each separate `Set-Cookie`, including refresh and cookie deletion headers.
+
+## Errors and diagnostics
+
+Rate refusal remains **HTTP 429** with `Retry-After`, `Cache-Control: no-store`, and an additive stable JSON code:
+
+```json
+{
+  "error": "Session checks are temporarily rate limited.",
+  "code": "ALLAUTH_SESSION_CHECK_RATE_LIMITED"
+}
+```
+
+Admission storage failures, native service failures and timeouts fail closed with **HTTP 503** and `ALLAUTH_SESSION_CHECK_UNAVAILABLE`. Native security denials retain their HTTP status. An absent, expired or revoked session still returns the native **200/null** result; it is never converted to success using an earlier result.
+
+Structured `allauth.session_check` logs distinguish `rate_limited`, `invalid_session`, `verification_failed` and `service_failure`, with project ID, stable code and HTTP status. They exclude cookies, credentials, session digests, IP addresses, request URLs and provider exception messages. Successful checks produce no diagnostic log. Logging failure does not change authentication.
+
+## Existing integrations and SDK improvements
+
+No SDK upgrade, new request header or SDK-version reporting is required. Existing proxy HMAC input, cookie formats, callback URLs and session response shapes remain compatible. The unchanged published 1.0.0 proxy is exercised against this service path with real native session fixtures, two independent replica coordinators and shared PostgreSQL admission. Later published SDK archives also retain their existing transport compatibility checks.
+
+Older proxy SDKs preserve upstream 429 and the JSON error body but omit upstream `Retry-After` when forwarding responses to browsers. The service sends the header correctly. SDK 1.4.4 forwards this header unchanged through the Next.js application proxy for JSON and streamed responses, including numeric delays and HTTP dates. Updating a pinned SDK and rebuilding is optional for the service fix and necessary to add header forwarding to older application proxies. Application-side overlap combining and selective prefetching remain useful traffic reductions; they are not prerequisites for this service fix. Previously published SDK archives remain unchanged; 1.4.4 has its own immutable archive and tagged public source. The SDK adds no automatic retries or completed session-result caching.
+
+Use the normal application proxy rather than disclosing a project proxy secret or provider cookie to a mobile client. Native clients receive only application-bound opaque session handles. The server/native API distinction follows [Better Auth's rate-limit contract](/docs/concepts/rate-limit): native server API calls do not pass through the browser HTTP limiter. Additional shared per-cookie admission keeps remote server checks bounded without placing every application user behind one proxy-IP counter.

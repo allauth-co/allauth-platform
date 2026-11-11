@@ -1,0 +1,55 @@
+.console-notifications-bell {
+	position: relative;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	flex: 0 0 32px;
+	width: 32px;
+	height: 32px;
+	border-radius: 7px;
+	color: var(--foreground);
+}
+.console-notifications-bell:hover, .console-notifications-bell[aria-current="page"] { background: var(--muted); }
+.console-notifications-bell:focus-visible { outline: 2px solid var(--ring); outline-offset: 3px; }
+.console-notifications-count { position: absolute; top: -2px; right: -5px; min-width: 16px; height: 16px; padding: 0 4px; border-radius: 8px; background: var(--primary); color: var(--primary-foreground); font-size: 10px; line-height: 16px; text-align: center; }
+.console-notifications { max-width: 1100px; margin: 0 auto; }
+.console-notifications-section, .console-release-highlight { margin-top: 24px; border: 1px solid var(--border); border-radius: 10px; padding: 24px; background: var(--background); }
+.console-notifications h2 { font-size: 16px; font-weight: 600; }
+.console-notifications p { margin-top: 10px; color: var(--muted-foreground); font-size: 14px; line-height: 1.7; }
+.console-notifications h3 { font-size: 15px; font-weight: 600; }
+.console-release-highlight { display: flex; gap: 16px; background: var(--muted); }
+.console-release-highlight > svg { flex-shrink: 0; margin-top: 3px; color: var(--foreground); }
+.console-notifications-title-row, .console-notifications-item-actions, .console-notifications-links { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.console-notifications-title-row { justify-content: space-between; }
+.console-notifications-links, .console-notifications-item-actions { margin-top: 16px; gap: 20px; }
+.console-notifications-links a, .console-notifications-item-actions a { display: inline-flex; align-items: center; gap: 7px; color: var(--foreground); font-size: 13px; font-weight: 500; text-decoration: underline; text-underline-offset: 3px; }
+.console-notifications-preference { display: flex; align-items: center; gap: 10px; margin-top: 16px; font-size: 14px; font-weight: 500; }
+.console-notifications-preference input { width: 16px; height: 16px; accent-color: var(--primary); }
+.console-notifications-list { list-style: none; padding: 0; margin-top: 14px; }
+.console-notifications-list > li + li { border-top: 1px solid var(--border); }
+.console-notification-item { padding: 20px 0; }
+.console-notification-item time { display: inline-block; margin-top: 6px; color: var(--muted-foreground); font-size: 12px; }
+.console-notification-item.is-unread h3 { font-weight: 650; }
+.console-notifications-error { margin: 16px 0; padding: 16px; border: 1px solid var(--destructive); border-radius: 8px; color: var(--destructive); }
+.console-notifications-error p { margin-top: 0; margin-bottom: 12px; color: inherit; }
+.console-notifications-message { padding: 12px 0; }
+.console-sdk-slug, .console-sdk-version-status { display: block; margin-top: 4px; color: var(--muted-foreground); font-size: 12px; }
+.console-sdk-upgrade { scroll-margin-top: 90px; }
+.console-sdk-upgrade pre { margin-top: 16px; padding: 16px; border-radius: 7px; background: var(--muted); overflow-x: auto; font-size: 12px; line-height: 1.8; }
+.console-sdk-upgrade details { margin-top: 20px; font-size: 13px; }
+.console-sdk-upgrade summary { cursor: pointer; }
+.console-sdk-checksum { display: block; margin-top: 8px; overflow-wrap: anywhere; font-size: 12px; }
+.allauth-releases { width: 100%; max-width: 900px; margin: 0 auto; padding: 24px; }
+.allauth-releases h1 { margin-top: 16px; font-size: clamp(28px, 5vw, 40px); font-weight: 600; letter-spacing: -0.04em; }
+.allauth-releases h2 { font-size: 21px; font-weight: 600; }
+.allauth-releases p { margin-top: 12px; color: var(--muted-foreground); line-height: 1.8; }
+.allauth-releases > section { margin-top: 32px; padding: 24px 0; border-top: 1px solid var(--border); scroll-margin-top: 80px; }
+.allauth-releases time { display: inline-block; margin-top: 10px; color: var(--muted-foreground); font-size: 13px; }
+.allauth-releases a { text-decoration: underline; text-underline-offset: 3px; }
+.allauth-releases code { overflow-wrap: anywhere; }
+@media (max-width: 640px) {
+	.console-notifications-section, .console-release-highlight { padding: 18px; }
+	.console-release-highlight { gap: 12px; }
+	.console-notifications .console-table-wrap { margin-left: -6px; margin-right: -6px; }
+	.allauth-releases { padding: 12px 0; }
+}

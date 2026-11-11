@@ -1,0 +1,72 @@
+---
+title: AllAuth signup email verification
+description: Send successful email signups to a public check-email page while preserving the final verification callback.
+---
+
+Email signup can succeed before a session exists. When email verification is
+required, the new user must follow the verification link before entering the
+authenticated app. Keep the pending email screen separate from that final
+destination:
+
+```tsx
+import { SignUp } from "@allauth/react";
+
+<SignUp checkEmailUrl="/check-email" afterSignUpUrl="/workspace" />
+```
+
+`checkEmailUrl` is an optional `SignUp` prop. After a successful email signup, the
+component checks the native session. If there is no session and email verification
+is required, it opens this local path. If a session exists, it opens
+`afterSignUpUrl` instead. Failed requests stay
+on the form and display their native error.
+
+The verification email retains `afterSignUpUrl` as its callback; it does not point
+back to `/check-email`. Google signup also keeps `afterSignUpUrl` as its final
+callback. Both navigation props must be paths within the embedding application.
+The SDK does not append an email address or credential to `checkEmailUrl`.
+
+SDK 1.3.5 reads a checked local `returnTo` from the browser query, unless an
+explicit `afterSignUpUrl` takes precedence. It carries that intent through
+sign-in links and `checkEmailUrl` while keeping the final destination in the
+verification email. External destinations, API/proxy routes, control characters
+and encoded aliases are rejected. A missing or invalid query uses the configured
+provider callback. `safeAuthReturnTo`, `resolveAuthReturnTo`, `withAuthReturnTo`
+and `useAuthReturnTo` are exported for custom local authentication pages.
+
+Create a public `/check-email` route that explains how to open the verification
+email and provides a sign-in link. Preserve any validated local return path in
+the URLs supplied by the host. Keep the signup form mounted during background
+session refreshes: replacing it on every pending session query can erase the
+successful signup state before navigation finishes.
+
+Without `checkEmailUrl`, `SignUp` displays a Check your email confirmation in its
+card and hides the signup form and Google button. Native verification and session
+policy remain enforced by the selected AllAuth environment.
+
+The public SDK configuration also supplies `signUpEnabled` and
+`emailVerificationRequired`. When registration is disabled, `SignUp` shows an
+account-creation notice and the sign-in link instead of unusable registration
+controls. When email verification is explicitly disabled, a completed signup
+without a session opens the component's `signInUrl` (or the provider's sign-in
+path), without claiming that an email was sent. Older servers that omit these
+optional flags retain the verification-first behavior. Manual capability
+configuration can supply the same boolean flags. Password registration follows
+the environment's public `passwordPolicy`, with an 8-character minimum by default.
+Length and optional character requirements are configurable per application
+environment; see [AllAuth password rules](/docs/integrations/allauth-password-policy).
+
+Hosted AllAuth pages read the same effective policy from `/api/config`. Closing
+registration hides sign-up prompts and replaces direct sign-up pages with an
+existing-account sign-in link. Disabling password authentication removes the
+password form; configured passwordless and external providers remain available.
+Hosted signup without verification or an immediate session returns to sign-in
+with its validated authentication continuation preserved.
+
+Magic links and email sign-in codes also follow the environment's
+`signUpEnabled` setting. With registration open, a new user can create an
+email-verified account by completing the link or code. Sending the email alone
+does not create the account. With registration closed, these methods continue
+to sign in existing users and cannot create new accounts. Both expire after
+five minutes and become unusable after successful verification. Hosted magic
+links send verification failures to the public `/auth-error` page so the user
+can return to sign-in and request another link.

@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "allauth": {
+      "command": "node",
+      "args": ["/absolute/path/AllAuth/apps/auth/mcp/dist/index.js"],
+      "env": {
+        "ALLAUTH_URL": "https://allauth.co",
+        "ALLAUTH_ALLOW_SENSITIVE": "false"
+      }
+    }
+  }
+}

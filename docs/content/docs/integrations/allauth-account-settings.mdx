@@ -1,0 +1,69 @@
+---
+title: Native account settings and profile photos
+description: Shared account pages, accessible dialogs and scoped native photo uploads.
+---
+
+AllAuth React SDK 1.3.4 exports `AccountSettings` for a full account page with
+Profile, Security and Organisations tabs. Set `initialSection`, optional
+`onUpdated`, `signInUrl` and the existing organisation navigation callbacks.
+It shares `UserProfile` with `UserProfileModal`; hosts supply their branding tokens.
+The dialog header, close control and navigation stay outside the scrolling main pane.
+
+The shared `AvatarUpload` accepts `name`, `image`, `onChange`, optional `disabled`
+and `onBusyChange`. The picker uses the same-origin native proxy. PNG, JPEG and
+WebP sources up to 5 MiB are decoded, resized to a maximum 512-pixel edge and
+re-encoded to no more than 128 KiB. The returned URL is a draft: existing explicit
+Save profile applies it through native `update-user`. Upload never updates the
+account directly. Advanced HTTPS image URLs remain available.
+
+`GET /api/allauth/sdk/config` optionally includes the boolean `profileImageUpload`.
+Older servers default to false. Upload controls appear only when storage is configured.
+`POST /api/allauth/sdk/avatar` accepts strict JSON `{ contentType, data }`, where
+`data` is base64 image bytes and `contentType` is `image/png`, `image/jpeg` or
+`image/webp`; it returns `{ url }`. The signed proxy retains its 256 KiB request
+limit. Native server checks require the current project's verified authoritative cookie
+session, reject impersonation and caller-supplied scope, validate image bytes and
+derive workspace/application storage on the server. No additional browser secret
+or platform authority is exposed.
+
+Browser sessions represent individual sign-ins, including other browser profiles;
+the SDK never groups or ends them automatically. Technical user-agent and IP
+information is available in a disclosure. Passkey setup uses the native options
+and verification endpoints unchanged, checks browser support and shows actionable
+cancellation, expired-challenge, recent-login and verification errors. It never
+weakens session freshness, RP ID, origin or credential verification checks.
+
+
+## Native invitation handoff
+
+`AccountSettings` accepts an optional `invitationId`. Without that prop, it reads a
+validated `?invitation=...` on the account page and opens Organisations with the
+intended invitation highlighted. A signed-out account link preserves that relative
+page in `returnTo`. SDK 1.3.4 carries a checked local return path through native
+sign-in, sign-up, recovery and MFA flows; custom authentication pages must preserve
+the checked destination themselves. Explicit component callbacks take precedence.
+Merely following the email or creating an account does not accept
+an invitation. The user explicitly chooses Accept while signed in with the
+verified email that received it; native email and project checks remain in force.
+
+After acceptance, the SDK reads fresh native membership and session, selects the
+actual organisation and loads its details before calling the host's `onSelect`
+and `onOrganizationChange(organization, "select")`. Use `onSelect` to map the native
+organisation to the host workspace. A failed host handoff can finish setup again
+without accepting twice; callbacks that already succeeded are not repeated.
+Existing native memberships show Open workspace even when the email invitation
+is no longer pending, so an owner-added member can continue without another
+invitation or an invented acceptance event. The legacy default organisation
+switcher uses the same fresh membership and handoff flow.
+
+
+The SDK exports `safeAuthReturnTo`, `resolveAuthReturnTo`, `withAuthReturnTo` and
+`useAuthReturnTo` for custom local flows. Validate untrusted destinations before
+passing them to link helpers. Query destinations are limited to 2048 characters;
+API endpoints, the configured native proxy and encoded aliases are rejected.
+The hook reads query state after hydration and follows router changes without
+writing authentication intent to browser storage. During a full-page native MFA
+challenge, `callbackUrl` is considered only with `challenge=two-factor` and no
+`returnTo`. The BFF preserves the original checked app path, query and hash;
+native TOTP/recovery verification, session gating and exact signed OAuth
+continuation handling remain unchanged.

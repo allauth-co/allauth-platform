@@ -1,0 +1,375 @@
+.account-root {
+	--primary: var(--console-accent);
+	--primary-foreground: white;
+	--ring: var(--console-accent);
+	--radius: 6px;
+	display: flex;
+	flex-direction: column;
+	min-height: 100svh;
+}
+
+.account-header-label {
+	font-size: 12px;
+	color: var(--muted-foreground);
+	white-space: nowrap;
+}
+
+.account-header-actions {
+	gap: 12px;
+	min-width: 0;
+}
+
+.account-organization-switcher {
+	max-width: 240px;
+	min-width: 0;
+	height: 34px;
+	border-radius: 6px;
+}
+
+.account-user-button {
+	width: 32px;
+	height: 32px;
+}
+
+.account-sign-in-link {
+	font-size: 12px;
+	font-weight: 550;
+	padding: 7px 12px;
+	border: 1px solid var(--border);
+	border-radius: 6px;
+	white-space: nowrap;
+}
+
+.account-header-bottom nav {
+	min-width: 0;
+}
+
+.account-main {
+	width: 100%;
+	max-width: 1240px;
+	margin: 0 auto;
+	padding: 40px 48px 64px;
+	flex: 1;
+	min-width: 0;
+}
+
+.account-main h1 {
+	font-size: 26px;
+	font-weight: 600;
+	letter-spacing: -0.65px;
+	line-height: 1.25;
+}
+
+.account-main > .space-y-8 > div:first-child > p {
+	font-size: 13px;
+	line-height: 1.6;
+}
+
+.account-page {
+	display: flex;
+	flex-direction: column;
+	gap: 28px;
+}
+
+.account-page .console-page-heading {
+	margin-bottom: 0;
+}
+
+.account-settings [data-slot="tabs-list"] {
+	width: 100%;
+	height: 46px;
+	justify-content: flex-start;
+	gap: 26px;
+	padding: 0;
+	border-radius: 0;
+	border-bottom: 1px solid var(--border);
+	background: transparent;
+	overflow-x: auto;
+	overflow-y: hidden;
+}
+
+.account-settings [data-slot="tabs-trigger"] {
+	flex: none;
+	height: 44px;
+	padding: 0;
+	border: 0;
+	border-bottom: 2px solid transparent;
+	border-radius: 0;
+	background: transparent;
+	font-size: 13px;
+	font-weight: 500;
+	gap: 7px;
+	color: var(--muted-foreground);
+	box-shadow: none;
+}
+
+.account-settings [data-slot="tabs-trigger"][data-state="active"] {
+	background: transparent;
+	border-bottom-color: var(--console-accent);
+	color: var(--foreground);
+	font-weight: 600;
+	box-shadow: none;
+}
+
+.account-settings [data-slot="tabs-trigger"] svg {
+	width: 14px;
+	height: 14px;
+}
+
+.account-settings [data-slot="tabs-content"] {
+	min-width: 0;
+}
+
+.account-main .bg-card {
+	border-radius: 9px;
+	box-shadow: none;
+}
+
+.account-main .bg-card > div:first-child {
+	padding-top: 24px;
+}
+
+.account-main h2,
+.account-main h3 {
+	font-size: 14px;
+	font-weight: 600;
+	letter-spacing: -0.15px;
+}
+
+.account-root
+	:is(
+		input:not([type="checkbox"]):not([type="radio"]),
+		textarea,
+		select,
+		[data-slot="input-group"]
+	) {
+	border-radius: 6px;
+}
+
+.account-root input,
+.account-root textarea {
+	background-color: var(--console-surface);
+}
+
+.account-root button {
+	border-radius: 6px;
+}
+
+.account-root [data-slot="switch"] {
+	border-radius: 999px;
+}
+
+.account-root [data-slot="switch"] [data-slot="switch-thumb"] {
+	border-radius: 999px;
+}
+
+.account-root [data-slot="button"][data-variant="default"] {
+	background: var(--console-accent);
+	color: white;
+}
+
+.account-root [data-slot="button"][data-variant="default"]:hover {
+	background: color-mix(in srgb, var(--console-accent) 88%, black);
+}
+
+.account-footer {
+	width: 100%;
+	max-width: 1240px;
+	margin: 0 auto;
+	padding: 24px 48px;
+	display: flex;
+	justify-content: space-between;
+	gap: 12px;
+	border-top: 1px solid var(--border);
+	color: var(--muted-foreground);
+	font-size: 11px;
+}
+
+.account-footer a:hover,
+.account-sign-in-link:hover {
+	color: var(--foreground);
+}
+
+.account-impersonation-banner {
+	border-bottom: 1px solid #f59e0b66;
+	background: #fef3c7;
+	color: #78350f;
+}
+
+.account-impersonation-content {
+	max-width: 1240px;
+	margin: 0 auto;
+	padding: 12px 48px;
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 16px;
+	font-size: 12px;
+	overflow-wrap: anywhere;
+}
+
+.account-skip-link {
+	position: fixed;
+	left: 16px;
+	top: 12px;
+	z-index: 80;
+	padding: 10px 16px;
+	border-radius: 6px;
+	background: var(--console-accent);
+	color: white;
+	transform: translateY(-200%);
+}
+
+.account-skip-link:focus {
+	transform: translateY(0);
+}
+
+.account-main-hosted {
+	display: flex;
+	flex-direction: column;
+	justify-content: center;
+	padding-top: 48px;
+	padding-bottom: 64px;
+}
+
+.hosted-auth-view {
+	width: 100%;
+	max-width: 400px;
+	margin: 0 auto;
+	display: flex;
+	flex-direction: column;
+	gap: 24px;
+}
+
+.hosted-auth-identity {
+	text-align: center;
+}
+
+.hosted-auth-symbol {
+	width: 44px;
+	height: 44px;
+	margin: 0 auto 10px;
+}
+
+.hosted-auth-identity h1 {
+	font-size: 22px;
+	letter-spacing: -0.5px;
+}
+
+.hosted-auth-identity p {
+	font-size: 12px;
+	color: var(--muted-foreground);
+	margin-top: 6px;
+}
+
+.hosted-auth-card {
+	max-width: none;
+	width: 100%;
+	border-radius: 9px;
+	background: var(--card);
+	box-shadow: none;
+}
+
+.hosted-auth-card h3 {
+	font-size: 20px;
+	letter-spacing: -0.4px;
+}
+
+.hosted-auth-card [data-slot="input-group"] input {
+	background: transparent;
+}
+
+.hosted-auth-enterprise {
+	text-align: center;
+	font-size: 12px;
+	color: var(--muted-foreground);
+}
+
+.hosted-auth-enterprise a:hover {
+	color: var(--console-accent);
+	text-decoration: underline;
+	text-underline-offset: 4px;
+}
+
+.dark .account-root :is(.bg-card, .hosted-auth-card) {
+	background: var(--card);
+}
+
+@media (max-width: 760px) {
+	.account-header-top {
+		padding: 0 20px;
+		gap: 10px;
+	}
+	.account-header-label,
+	.account-header-separator {
+		display: none;
+	}
+	.account-header-actions {
+		gap: 8px;
+	}
+	.account-organization-switcher {
+		max-width: 180px;
+	}
+	.account-header-bottom {
+		padding: 0 20px;
+	}
+	.account-main {
+		padding: 30px 20px 48px;
+	}
+	.account-footer {
+		padding: 20px;
+	}
+	.account-impersonation-content {
+		padding: 12px 20px;
+		flex-wrap: wrap;
+	}
+}
+
+@media (max-width: 480px) {
+	.account-header-top {
+		height: auto;
+		min-height: 64px;
+		padding: 14px 16px;
+		flex-wrap: wrap;
+	}
+	.account-header-actions {
+		flex-wrap: wrap;
+		justify-content: flex-end;
+	}
+	.account-organization-switcher {
+		max-width: 130px;
+	}
+	.account-root .console-logo {
+		width: 106px;
+		height: 27px;
+	}
+	.account-header-bottom {
+		padding: 0 16px;
+	}
+	.account-header-bottom nav {
+		gap: 24px;
+	}
+	.account-main {
+		padding: 28px 16px 40px;
+	}
+	.account-main h1 {
+		font-size: 24px;
+	}
+	.account-main .bg-card > div {
+		padding-left: 18px;
+		padding-right: 18px;
+	}
+	.account-settings [data-slot="tabs-list"] {
+		gap: 20px;
+	}
+	.account-footer {
+		padding: 20px 16px;
+		flex-wrap: wrap;
+	}
+	.hosted-auth-view {
+		gap: 20px;
+	}
+	.hosted-auth-identity h1 {
+		font-size: 22px;
+	}
+}

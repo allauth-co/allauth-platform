@@ -1,0 +1,29 @@
+.application-logo { display: inline-flex; align-items: center; justify-content: center; min-width: 0; }
+.application-logo img { width: auto; height: 32px; max-width: 180px; object-fit: contain; }
+.application-logo .application-logo-light { display: block; }
+.application-logo .application-logo-dark { display: none; }
+.dark .application-logo .application-logo-light { display: none; }
+.dark .application-logo .application-logo-dark { display: block; }
+.hosted-auth-identity .application-logo { margin: 0 auto 18px; }
+.hosted-auth-identity .application-logo img { height: 44px; max-width: 220px; }
+.application-brand-footer { display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 8px 20px; font-size: 12px; line-height: 1.5; }
+.application-brand-footer .application-brand-attribution { display: inline-flex; align-items: center; gap: 5px; color: var(--muted-foreground); }
+.application-brand-attribution svg { display: block; width: 56px; height: 14px; flex: none; }
+.account-root.application-branded {
+	--primary: var(--application-primary, #315bff);
+	--primary-foreground: var(--application-primary-foreground, #ffffff);
+	--console-accent: var(--application-link, #315bff);
+	--application-active-link: var(--application-link, #315bff);
+	--ring: var(--primary);
+}
+.dark .account-root.application-branded {
+	--primary: var(--application-primary-dark, #7892ff);
+	--primary-foreground: var(--application-primary-foreground-dark, #10162d);
+	--console-accent: var(--application-link-dark, #7892ff);
+	--application-active-link: var(--application-link-dark, #7892ff);
+}
+.application-branded .hosted-auth-card a:not([data-slot="button"]),
+.application-branded .hosted-auth-enterprise a,
+.application-branded .application-brand-footer a:not(.application-brand-attribution) { color: var(--application-active-link); }
+.application-branded [data-slot="button"][data-variant="link"] { color: var(--application-active-link); }
+@media (max-width: 480px) { .application-logo img { max-width: 140px; } }

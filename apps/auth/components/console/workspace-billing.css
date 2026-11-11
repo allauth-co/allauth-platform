@@ -1,0 +1,7 @@
+.workspace-billing-body p + p { margin-top: 14px; }
+.workspace-billing-body a { text-decoration: underline; text-underline-offset: 3px; }
+.workspace-billing-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 14px; margin-top: 22px; }
+.workspace-billing-facts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 24px; margin-bottom: 24px; }
+.workspace-billing-facts dt { color: var(--muted-foreground); font-size: 12px; margin-bottom: 6px; }
+.workspace-billing-facts dd { font-size: 15px; overflow-wrap: anywhere; }
+@media (max-width: 640px) { .workspace-billing-facts { grid-template-columns: 1fr; } }

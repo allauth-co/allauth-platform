@@ -1,0 +1,86 @@
+---
+title: AllAuth organization console
+description: Search organization membership and manage team rosters in an application environment.
+---
+
+The AllAuth console manages an application's end-user organizations separately
+from the workspace members who administer that application. Select the intended
+Development or Production environment before opening **Organizations**.
+
+Open an organization to manage its members, invitations, teams, custom roles and
+settings. The member directory supports search by name, email or exact user ID,
+and pages through the complete organization. Teams, roles and invitation history
+also have search and pagination. An organization's initial summary
+can contain a bounded subset; the member directory is the authoritative paged
+view. Directory-managed membership remains controlled by SCIM, and an
+organization must retain an owner.
+
+Choose **Manage members** on a team card to load its actual members. The roster supports search and pagination, and offers
+removal next to the selected person. The add-member selector searches existing
+organization members who do not already belong to that team. It shows up to 100
+matches; narrow the search to find another member. Rename saves through an
+inline form. Removing a team member clears that person's active team selection;
+it does not remove their organization membership.
+
+The add-member and invitation forms keep their role selections independent.
+Selecting an owner for an existing member does not change a later invitation's
+role. Invitations default to the member role and use the role shown in their
+own form. Assignment selectors read all role pages in requests of at most 100
+records; a failed or incomplete registry disables role changes until it reloads.
+Existing multi-role values remain visible until deliberately replaced.
+Custom roles are organization-specific and apply to native permission checks,
+member assignments, and invitations. A role assigned to members or live pending
+invitations cannot be deleted; reassign the members or cancel those invitations
+first. Editing a role's permissions takes effect on subsequent permission checks.
+User details expose the same organization role choices, with directory-managed
+memberships remaining controlled by SCIM.
+
+To change access from a person's profile, open **Users**, select the person,
+then choose **Organizations**. Each membership has its own role selector,
+including that organization's custom roles. Choosing a replacement saves through
+the same membership API used by organization details and refreshes both views.
+The organization name still opens the full organization settings.
+
+Organization roles are separate from the **User / Project administrator** account
+role and from workspace administrator access. Creating a custom role does not
+grant console access or copy it to another organization or environment. Embedded
+SDK organization settings use native permission checks for each action; viewing
+custom roles requires `ac:read`, and granting permissions remains limited to
+permissions the acting member holds. Owner and SCIM safeguards still apply.
+
+## Member directory API
+
+`GET /api/admin/organizations/{organizationId}/members` accepts:
+
+| Query | Meaning |
+| --- | --- |
+| `project` | Exact environment slug; omission selects the root platform scope |
+| `search` | Name/email substring or exact user ID, at most 128 characters |
+| `limit` | Page size from 1 to 100, default 25 |
+| `offset` | Offset from 0 to 100000, default 0 |
+| `teamId` | Optional team within the selected organization |
+| `excludeTeam` | Literal `true` lists organization members outside the selected team; requires `teamId` |
+
+The response is `{ members, total, limit, offset }`. Each member contains their
+membership ID, user ID, role, join date, name, email, image, verification/ban
+flags and directory-management status. Passwords, session tokens and private
+metadata are excluded. Search treats wildcard characters literally.
+
+The endpoint uses the selected environment's database and requires a fresh,
+verified platform/workspace administrator session. An end-user organization
+role does not grant console access. Unknown organizations and teams belonging
+to a different organization return 404; invalid pagination returns 400.
+
+The sibling `GET .../teams`, `GET .../roles`, and `GET .../invitations` endpoints
+accept the same `project`, `search`, `limit` and `offset` parameters, returning
+their resource array with `total`, `limit` and `offset`. Roles include the built-in
+roles once, followed by custom roles. Team search matches name or exact ID;
+invitation search matches email or exact invitation ID. These endpoints use the
+same administrator checks and safe, environment-scoped database connection.
+
+`GET /api/admin/users` also accepts `excludeOrganizationId` when finding an
+existing user to add. The organization must exist in the selected environment;
+membership exclusion happens before paging, so already joined users remain
+excluded even when their membership is beyond the organization's initial summary.
+This candidate query also excludes deactivated directory accounts; the general
+user directory keeps those accounts visible for administration.

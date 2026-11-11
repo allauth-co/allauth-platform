@@ -1,0 +1,113 @@
+import { createAuthMiddleware } from "@better-auth/core/api";
+import { APIError } from "@better-auth/core/error";
+import { sessionMiddleware } from "better-auth/api";
+import { STRIPE_ERROR_CODES } from "./error-codes";
+import type {
+	AuthorizeReferenceAction,
+	CustomerType,
+	StripeCtxSession,
+	StripeOptions,
+	SubscriptionOptions,
+} from "./types";
+
+export const stripeSessionMiddleware = createAuthMiddleware(
+	{
+		use: [sessionMiddleware],
+	},
+	async (ctx) => {
+		const session = ctx.context.session as StripeCtxSession;
+		return {
+			session,
+		};
+	},
+);
+
+export const referenceMiddleware = (
+	options: StripeOptions,
+	action: AuthorizeReferenceAction,
+) =>
+	createAuthMiddleware(async (ctx) => {
+		const subscriptionOptions = options.subscription as SubscriptionOptions;
+		const ctxSession = ctx.context.session as StripeCtxSession;
+		if (!ctxSession) {
+			throw APIError.from("UNAUTHORIZED", STRIPE_ERROR_CODES.UNAUTHORIZED);
+		}
+
+		const customerType: CustomerType =
+			ctx.body?.customerType || ctx.query?.customerType;
+		const explicitReferenceId: string | undefined =
+			ctx.body?.referenceId || ctx.query?.referenceId;
+
+		// Resolve once and expose on the context so the handler reads this exact id instead of re-deriving it.
+		if (customerType === "organization") {
+			if (!options.organization?.enabled) {
+				throw APIError.from(
+					"BAD_REQUEST",
+					STRIPE_ERROR_CODES.ORGANIZATION_SUBSCRIPTION_NOT_ENABLED,
+				);
+			}
+
+			// Organization subscriptions always require authorizeReference
+			if (!subscriptionOptions.authorizeReference) {
+				ctx.context.logger.error(
+					`Organization subscriptions require authorizeReference to be defined in your stripe plugin config.`,
+				);
+				throw APIError.from(
+					"BAD_REQUEST",
+					STRIPE_ERROR_CODES.AUTHORIZE_REFERENCE_REQUIRED,
+				);
+			}
+
+			const referenceId =
+				explicitReferenceId || ctxSession.session.activeOrganizationId;
+			if (!referenceId) {
+				throw APIError.from(
+					"BAD_REQUEST",
+					STRIPE_ERROR_CODES.ORGANIZATION_REFERENCE_ID_REQUIRED,
+				);
+			}
+			const isAuthorized = await subscriptionOptions.authorizeReference(
+				{
+					user: ctxSession.user,
+					session: ctxSession.session,
+					referenceId,
+					action,
+				},
+				ctx,
+			);
+			if (!isAuthorized) {
+				throw APIError.from("UNAUTHORIZED", STRIPE_ERROR_CODES.UNAUTHORIZED);
+			}
+			return { referenceId };
+		}
+
+		const referenceId = explicitReferenceId || ctxSession.user.id;
+
+		// User subscriptions - pass for own id or no explicit referenceId
+		if (!explicitReferenceId || explicitReferenceId === ctxSession.user.id) {
+			return { referenceId };
+		}
+
+		if (!subscriptionOptions.authorizeReference) {
+			ctx.context.logger.error(
+				`Passing referenceId into a subscription action isn't allowed if subscription.authorizeReference isn't defined in your stripe plugin config.`,
+			);
+			throw APIError.from(
+				"BAD_REQUEST",
+				STRIPE_ERROR_CODES.REFERENCE_ID_NOT_ALLOWED,
+			);
+		}
+		const isAuthorized = await subscriptionOptions.authorizeReference(
+			{
+				user: ctxSession.user,
+				session: ctxSession.session,
+				referenceId,
+				action,
+			},
+			ctx,
+		);
+		if (!isAuthorized) {
+			throw APIError.from("UNAUTHORIZED", STRIPE_ERROR_CODES.UNAUTHORIZED);
+		}
+		return { referenceId };
+	});

@@ -1,0 +1,15 @@
+.commercial-plans { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 20px; margin-top: 28px; }
+.commercial-plan { min-width: 0; padding: 25px; border: 1px solid var(--hp-border); border-radius: 12px; background: var(--hp-subtle); }
+.commercial-plan-featured { border-color: var(--hp-accent); }
+.public-docs .commercial-price { color: var(--hp-ink); font-size: 34px; font-weight: 650; letter-spacing: -.04em; }
+.commercial-price small { font-size: 13px; font-weight: 450; letter-spacing: 0; }
+.commercial-plan ul { padding-left: 18px; margin-block: 20px; line-height: 1.8; color: var(--hp-muted); font-size: 14px; }
+.commercial-plan li + li { margin-top: 9px; }
+.commercial-plan .homepage-button { margin-top: 8px; }
+.commercial-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 20px; margin-top: 25px; }
+.commercial-comparison { min-width: 620px; }
+.commercial-source-note { font-size: 12px; }
+.commercial-callout { padding: 22px; margin-top: 24px; background: var(--hp-subtle); border: 1px solid var(--hp-border); border-radius: 8px; }
+.homepage-footer > nav { flex-wrap: wrap; }
+@media (max-width: 980px) { .commercial-plans, .commercial-grid { grid-template-columns: 1fr; } }
+@media (max-width: 760px) { .commercial-plan { padding: 20px; } }

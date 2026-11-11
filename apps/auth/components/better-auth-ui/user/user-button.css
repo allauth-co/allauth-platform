@@ -1,0 +1,130 @@
+.allauth-user-trigger,
+.console-root .allauth-user-trigger {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	width: 32px;
+	height: 32px;
+	flex-shrink: 0;
+	padding: 0;
+	border: 0;
+	border-radius: 50%;
+	background: transparent;
+	cursor: pointer;
+}
+
+.allauth-user-trigger:focus-visible {
+	outline: 2px solid #315bff;
+	outline-offset: 4px;
+}
+
+.allauth-user-menu-panel {
+	width: 360px;
+	min-width: 0;
+	max-width: calc(100svw - 24px);
+	padding: 6px;
+	border-radius: 16px;
+	border-color: color-mix(in srgb, var(--border) 85%, transparent);
+	background: var(--popover);
+	box-shadow:
+		0 16px 48px rgb(15 23 42 / 12%),
+		0 3px 10px rgb(15 23 42 / 5%);
+}
+
+.dark .allauth-user-menu-panel {
+	box-shadow:
+		0 16px 48px rgb(0 0 0 / 32%),
+		0 3px 10px rgb(0 0 0 / 18%);
+}
+
+.allauth-user-menu-identity {
+	padding: 18px 14px;
+	font-weight: 400;
+}
+
+.allauth-user-menu-identity > div {
+	gap: 12px;
+}
+
+.allauth-user-menu-identity .grid {
+	gap: 4px;
+}
+
+.allauth-user-menu-identity .text-xs {
+	font-size: 12px;
+}
+
+.allauth-user-menu-panel [data-slot="dropdown-menu-separator"] {
+	margin: 4px 8px;
+}
+
+.allauth-user-menu-action {
+	gap: 12px;
+	min-height: 54px;
+	margin: 2px 0;
+	padding: 9px 14px;
+	border-radius: 9px;
+	cursor: pointer;
+}
+
+.allauth-user-menu-action-icon {
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	width: 32px;
+	height: 32px;
+	flex-shrink: 0;
+	border: 1px solid var(--border);
+	border-radius: 9px;
+	background: color-mix(in srgb, var(--muted) 45%, transparent);
+	color: var(--muted-foreground);
+}
+
+.allauth-user-menu-action-copy {
+	display: grid;
+	gap: 3px;
+	min-width: 0;
+}
+
+.allauth-user-menu-action-label {
+	font-size: 13px;
+	font-weight: 500;
+	line-height: 1.35;
+}
+
+.allauth-user-menu-action-description {
+	color: var(--muted-foreground);
+	font-size: 11px;
+	line-height: 1.4;
+}
+
+.allauth-user-menu-sign-out {
+	font-size: 13px;
+	font-weight: 500;
+}
+
+.allauth-user-menu-footer {
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	gap: 4px;
+	margin: 6px -6px -6px;
+	padding: 12px;
+	border-top: 1px solid var(--border);
+	border-radius: 0 0 16px 16px;
+	background: color-mix(in srgb, var(--muted) 40%, var(--popover));
+	color: var(--muted-foreground);
+	font-size: 10px;
+}
+
+.allauth-user-menu-footer svg {
+	width: 18px;
+	height: 18px;
+	margin-left: 3px;
+}
+
+.allauth-user-menu-brand {
+	color: var(--foreground);
+	font-size: 11px;
+	font-weight: 600;
+}

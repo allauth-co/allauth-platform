@@ -1,0 +1,81 @@
+import Stripe from "@allauth/stripe-client";
+import { randomUUID } from "node:crypto";
+import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { Pool } from "pg";
+import type { AuthEnvironment } from "../lib/configuration";
+import type { ControlPrincipal } from "../lib/control/types";
+import { createWorkspaceCheckout, createWorkspacePortal, readLocalWorkspaceBilling } from "../lib/billing/repository";
+import { reconcileWorkspaceBilling } from "../lib/billing/jobs";
+import { readWorkspaceEntitlements, synchronizeCommercialConfiguration } from "../lib/billing/entitlements";
+import { projectRegistryPool } from "../lib/projects/registry";
+import { createWorkspace } from "../lib/workspaces/repository";
+
+// This opt-in integration check is deliberately confined to the approved sandbox and isolated local DB.
+if (!process.argv.includes("--apply")) throw new Error("Use --apply to create and clean up disposable sandbox billing fixtures.");
+const stripePath = new URL("../../../.secrets/allauth-stripe-sandbox.json", import.meta.url);
+const databasePath = new URL("../../../.secrets/local-postgres.json", import.meta.url);
+if (!existsSync(stripePath) || !existsSync(databasePath)) throw new Error("Private sandbox and isolated database fixtures are required.");
+interface SandboxFixture { accountId: string; livemode: boolean; secretKey: string; productId: string; priceId: string; portalConfigurationId?: string }
+const fixture: SandboxFixture = JSON.parse(readFileSync(stripePath, "utf8"));
+if (fixture.livemode || !/^(sk|rk)_test_/.test(fixture.secretKey)) throw new Error("This check refuses live Stripe credentials.");
+const client = new Stripe(fixture.secretKey, { maxNetworkRetries: 1, timeout: 15_000 });
+if ((await client.accounts.retrieve(null)).id !== fixture.accountId) throw new Error("Unexpected Stripe sandbox account.");
+let price = await client.prices.retrieve(fixture.priceId);
+if (price.livemode || price.currency !== "usd" || price.unit_amount !== 999 || price.recurring?.interval !== "month" || price.recurring.interval_count !== 1 || price.product !== fixture.productId) throw new Error("The preserved sandbox offer does not match AllAuth Pro.");
+if (price.tax_behavior === "unspecified") price = await client.prices.update(price.id, { tax_behavior: "exclusive" });
+if (price.tax_behavior !== "exclusive") throw new Error("The sandbox offer must use exclusive tax behavior.");
+const portalFeatures: Stripe.BillingPortal.ConfigurationCreateParams.Features = { invoice_history: { enabled: true }, payment_method_update: { enabled: true }, subscription_cancel: { enabled: true, mode: "at_period_end" }, subscription_update: { enabled: false } };
+const portalList = await client.billingPortal.configurations.list({ limit: 100 });
+const priorPortal = portalList.data.find((configuration) => configuration.metadata?.allauthPlan === "pro-managed-v1");
+const portal = priorPortal ? await client.billingPortal.configurations.update(priorPortal.id, { features: portalFeatures, metadata: { allauthPlan: "pro-managed-v1" } }) : await client.billingPortal.configurations.create({ business_profile: { headline: "Manage your AllAuth subscription" }, features: portalFeatures, metadata: { allauthPlan: "pro-managed-v1" } });
+fixture.portalConfigurationId = portal.id;
+writeFileSync(stripePath, `${JSON.stringify(fixture, null, 2)}\n`, { mode: 0o600 });
+
+const local: { container: string; DATABASE_URL: string } = JSON.parse(readFileSync(databasePath, "utf8"));
+const url = new URL(local.DATABASE_URL);
+if (local.container !== "allauth-production-test-20261007" || url.hostname !== "127.0.0.1" || url.port !== "55445") throw new Error("Only the isolated local AllAuth test database is allowed.");
+const databaseName = `allauth_stripe_sandbox_${randomUUID().replaceAll("-", "")}`;
+const administrator = new Pool({ connectionString: local.DATABASE_URL, max: 1 });
+await administrator.query(`CREATE DATABASE "${databaseName}"`); url.pathname = `/${databaseName}`;
+const env: AuthEnvironment = { DATABASE_URL: url.toString(), BETTER_AUTH_URL: "http://localhost:3000", ALLAUTH_DEPLOYMENT_MODE: "hosted", ALLAUTH_BILLING_CHECKOUT_ENABLED: "true", ALLAUTH_BILLING_ENFORCEMENT_ENABLED: "true", ALLAUTH_STRIPE_ACCOUNT_ID: fixture.accountId, ALLAUTH_STRIPE_LIVEMODE: "false", ALLAUTH_STRIPE_PRO_PRICE_ID: fixture.priceId, ALLAUTH_STRIPE_SECRET_KEY: fixture.secretKey, ALLAUTH_STRIPE_WEBHOOK_SECRET: "whsec_local_sandbox_check", ALLAUTH_STRIPE_PORTAL_CONFIGURATION_ID: portal.id, ALLAUTH_STRIPE_AUTOMATIC_TAX_ENABLED: "false" };
+const database = projectRegistryPool(env);
+let customerId: string | null = null; let subscriptionId: string | null = null; let checkoutId: string | null = null;
+try {
+	for (const name of readdirSync(new URL("../migrations", import.meta.url)).filter((name) => name.endsWith(".sql")).sort()) await database.query(readFileSync(new URL(`../migrations/${name}`, import.meta.url), "utf8"));
+	await synchronizeCommercialConfiguration(database, env);
+	const userId = randomUUID(), sessionId = randomUUID();
+	await database.query('INSERT INTO public."user" (id,name,email,"emailVerified",role) VALUES ($1,\'Sandbox billing fixture\',$2,true,\'user\')', [userId, `allauth-sandbox-${userId}@example.com`]);
+	await database.query('INSERT INTO public.session (id,"userId",token,"expiresAt","updatedAt") VALUES ($1,$2,$3,NOW()+INTERVAL \'1 hour\',NOW())', [sessionId, userId, randomUUID()]);
+	const principal: ControlPrincipal = { user: { id: userId, name: "Sandbox billing fixture", email: `allauth-sandbox-${userId}@example.com`, emailVerified: true, role: "user" }, session: { id: sessionId, userId } };
+	const workspaceId = (await createWorkspace(principal, { name: `Disposable sandbox ${userId.slice(0, 8)}` }, env)).workspace.id;
+	await createWorkspaceCheckout(principal, workspaceId, env);
+	checkoutId = (await database.query<{ sessionId: string }>('SELECT "sessionId" FROM public."allauthBillingCheckout" WHERE "workspaceId"=$1', [workspaceId])).rows[0]!.sessionId;
+	customerId = (await readLocalWorkspaceBilling(workspaceId, env))!.stripeCustomerId!;
+	const session = await client.checkout.sessions.retrieve(checkoutId);
+	if (session.livemode || session.mode !== "subscription" || session.client_reference_id !== workspaceId || session.amount_subtotal !== 999) throw new Error("Checkout did not preserve the server-owned offer.");
+	if ((await readWorkspaceEntitlements(workspaceId, env)).plan !== "free") throw new Error("Checkout creation must not grant Pro access.");
+	await client.checkout.sessions.expire(checkoutId); checkoutId = null;
+	const method = await client.paymentMethods.attach("pm_card_visa", { customer: customerId });
+	const subscription = await client.subscriptions.create({ customer: customerId, default_payment_method: method.id, items: [{ price: fixture.priceId }], payment_behavior: "error_if_incomplete", metadata: { allauthWorkspaceId: workspaceId, allauthFixture: "commercial-billing-sandbox-check" } }, { idempotencyKey: `allauth-sandbox-check:${workspaceId}` });
+	subscriptionId = subscription.id;
+	await reconcileWorkspaceBilling(workspaceId, env);
+	const paid = await readLocalWorkspaceBilling(workspaceId, env);
+	if (paid?.stripeStatus !== "active" || !paid.paidThrough || (await readWorkspaceEntitlements(workspaceId, env)).plan !== "pro") throw new Error("The paid sandbox invoice did not grant local Pro access.");
+	const invoices = await client.invoices.list({ subscription: subscriptionId, status: "paid", limit: 1 });
+	if (invoices.data[0]?.amount_paid !== 999) throw new Error("The sandbox invoice did not confirm the expected payment.");
+	const portalSession = await createWorkspacePortal(principal, workspaceId, env);
+	if (!portalSession.url.startsWith("https://billing.stripe.com/")) throw new Error("The portal session was not created.");
+	await client.subscriptions.update(subscriptionId, { cancel_at_period_end: true });
+	await reconcileWorkspaceBilling(workspaceId, env);
+	if (!(await readLocalWorkspaceBilling(workspaceId, env))?.cancelAtPeriodEnd || (await readWorkspaceEntitlements(workspaceId, env)).plan !== "pro") throw new Error("Period-end cancellation must retain paid access.");
+	await client.subscriptions.cancel(subscriptionId); subscriptionId = null;
+	await reconcileWorkspaceBilling(workspaceId, env);
+	if ((await readWorkspaceEntitlements(workspaceId, env)).plan !== "free") throw new Error("Confirmed cancellation must remove paid access.");
+	console.info(JSON.stringify({ accountId: fixture.accountId, livemode: false, productId: fixture.productId, priceId: fixture.priceId, taxBehavior: price.tax_behavior, taxCollectionEnabled: false, portalConfigurationId: portal.id, checks: ["server-owned Checkout", "unpaid Free", "paid invoice Pro", "workspace portal", "period-end cancellation retains Pro", "immediate cancellation returns Free"], disposableSubscriptionCancelled: true }));
+} finally {
+	if (checkoutId) await client.checkout.sessions.expire(checkoutId).catch(() => undefined);
+	if (subscriptionId) await client.subscriptions.cancel(subscriptionId).catch(() => undefined);
+	if (customerId) await client.customers.del(customerId).catch(() => undefined);
+	await database.end();
+	await administrator.query(`DROP DATABASE IF EXISTS "${databaseName}" WITH (FORCE)`); await administrator.end();
+}

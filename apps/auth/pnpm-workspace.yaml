@@ -1,0 +1,39 @@
+autoInstallPeers: false
+
+packages:
+  - .
+
+allowBuilds:
+  esbuild: true
+  sharp: true
+  workerd: true
+
+overrides:
+  '@better-auth/api-key': 'link:../../packages/api-key'
+  '@better-auth/cimd': 'link:../../packages/cimd'
+  '@better-auth/core': 'link:../../packages/core'
+  '@better-auth/i18n': 'link:../../packages/i18n'
+  '@better-auth/kysely-adapter': 'link:../../packages/kysely-adapter'
+  '@better-auth/mcp': 'link:../../packages/mcp'
+  '@better-auth/oauth-provider': 'link:../../packages/oauth-provider'
+  '@better-auth/passkey': 'link:../../packages/passkey'
+  '@better-auth/scim': 'link:../../packages/scim'
+  '@better-auth/sso': 'link:../../packages/sso'
+  '@better-auth/stripe': 'link:../../packages/stripe'
+  'better-auth': 'link:../../packages/better-auth'
+  '@better-fetch/fetch': 1.3.2
+  path-to-regexp@>=8: ^8.4.0
+  fast-uri@<=3.1.3: '>=3.1.4 <4'
+  hono: '>=4.12.27 <5'
+  '@hono/node-server': '>=2.0.5 <3'
+  body-parser: '>=2.3.0 <3'
+  ip-address@<=10.1.0: ^10.2.0
+  postcss@<8.5.18: '>=8.5.18 <9'
+  sharp: '>=0.35.3 <0.36'
+  express-rate-limit: ^8.2.2
+  uuid@<11.1.1: '>=11.1.1 <12'
+  'ws@>=8 <8.20.1': '>=8.20.1 <9'
+  qs@<6.15.2: '>=6.15.2 <7'
+
+patchedDependencies:
+  '@opennextjs/aws@4.1.8': patches/@opennextjs__aws@4.1.8.patch

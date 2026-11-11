@@ -1,0 +1,58 @@
+---
+title: Environment-owned Microsoft sign-in
+description: Configure Microsoft for an exact AllAuth application environment and show it automatically in the standard SDK.
+---
+
+Google, Apple and Microsoft are part of AllAuth's standard application setup. The shared `SignIn` and `SignUp` components display the providers configured for the selected environment. Install the matching SDK; applications do not need to build their own provider buttons.
+
+Microsoft uses Better Auth's native `microsoft` provider with a confidential Microsoft Entra Web app registration. Credentials belong to the exact application environment. Platform Microsoft credentials do not enable Microsoft for other applications.
+
+## Register the application
+
+Create or select an app registration in Microsoft Entra. Match its supported account types to the audience you intend to accept:
+
+| `tenantId` | Accepted account audience |
+| --- | --- |
+| `common` (default) | Work/school and personal Microsoft accounts, when the registration supports both |
+| `organizations` | Work/school accounts |
+| `consumers` | Personal Microsoft accounts |
+| Tenant GUID | Accounts in that tenant |
+
+AllAuth accepts these aliases or a tenant GUID. Tenant domain aliases and custom authorization hosts are not accepted. The registration's supported account types must also allow the selected audience; `common` cannot broaden a restricted registration.
+
+Add the exact return URL using the registration's **Web** platform:
+
+- Application proxy: `https://<application-origin>/api/allauth/callback/microsoft`
+- Verified hosted account domain: `https://<accounts-hostname>/api/auth/callback/microsoft`
+
+Use the real selected environment's origin or verified account domain. Local Development may use an explicitly configured HTTP loopback origin. Register Production separately with HTTPS. Copy the Application (client) ID and create a client secret; store its **value** privately, not its secret identifier. Record the secret expiry and replace it before expiry.
+
+Check that permitted accounts return an `email` claim. Managed tenant users may need the optional email claim configured in Entra. Microsoft does not guarantee that this claim is a verified contact address. AllAuth preserves the native provider's unverified status and does not invent an email if the claim is absent. See Microsoft's [optional claims reference](https://learn.microsoft.com/en-us/entra/identity-platform/optional-claims-reference).
+
+## Private server configuration
+
+Set `ALLAUTH_PROJECT_MICROSOFT_PROVIDERS` on the AllAuth server to a JSON object keyed by the exact environment slugs returned by AllAuth:
+
+```json
+{
+  "example-production": {
+    "clientId": "00000000-0000-4000-8000-000000000001",
+    "clientSecret": "<private Microsoft client-secret value>",
+    "tenantId": "common"
+  }
+}
+```
+
+Each entry requires a client GUID and a nonempty secret. Omit `tenantId` to use `common`. Omit an environment entry to disable its connection. Development and Production are independent entries; credentials are never borrowed from another environment or from `MICROSOFT_CLIENT_ID` / `MICROSOFT_CLIENT_SECRET` used for AllAuth's own login.
+
+Keep this variable server-only. Never use a `NEXT_PUBLIC_` prefix, put the secret in an app's public capability overrides, or commit credentials. The runtime cache fingerprints configuration changes without returning secrets in public configuration.
+
+## SDK and identity checks
+
+The environment's `/sdk/config` advertises `microsoft: true` and `microsoftProvider: "microsoft"` only when configured. The standard SDK then renders **Continue with Microsoft** on sign-in and sign-up, retaining the same-origin return path and MFA continuation. Older servers that omit these optional fields remain compatible and do not show a Microsoft button.
+
+Login requests `openid`, `profile` and `email`; Microsoft Graph profile-photo access is disabled. Native signed state, PKCE, code exchange and token verification remain active. The AllAuth integrity plugin binds a fresh nonce to the authorization attempt and verifies the Microsoft token signature, issuer, audience and selected tenant audience before reading profile claims. Microsoft's stable provider subject identifies the account. An unverified Microsoft email is not sufficient to merge an existing account; the established account-linking verification rules still apply.
+
+Verify sign-in and sign-up using real permitted accounts after saving the registration and deploying matching server and SDK changes. Local tests with mocked provider responses do not establish live Entra consent or successful account access.
+
+References: [register an application](https://learn.microsoft.com/en-us/entra/identity-platform/quickstart-register-app), [account audiences and authority configuration](https://learn.microsoft.com/en-us/entra/identity-platform/msal-client-application-configuration), [register redirect URIs](https://learn.microsoft.com/en-us/entra/identity-platform/how-to-add-redirect-uri).

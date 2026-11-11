@@ -1,0 +1,18 @@
+diff --git a/dist/build/helper.js b/dist/build/helper.js
+index 65241819bf59b92156d762a38111e5103da19a6b..d86036494f1969df936ef2e31eeb0f1260bfe2fe 100644
+--- a/dist/build/helper.js
++++ b/dist/build/helper.js
+@@ -10,7 +10,12 @@ export function normalizeOptions(config, distDir, tempBuildDir) {
+     const appPath = path.join(process.cwd(), config.appPath || ".");
+     const buildOutputPath = path.join(process.cwd(), config.buildOutputPath || ".");
+     const outputDir = path.join(buildOutputPath, ".open-next");
+-    const { root: monorepoRoot, packager } = findPackagerAndRoot(path.join(process.cwd(), config.appPath || "."));
++    const { root: detectedRoot, packager } = findPackagerAndRoot(path.join(process.cwd(), config.appPath || "."));
++    // Nested demos can use a separate lockfile while tracing linked packages
++    // from their parent repository. Match the configured Next tracing root.
++    const monorepoRoot = config.monorepoRoot
++        ? path.resolve(process.cwd(), config.monorepoRoot)
++        : detectedRoot;
+     let appPackageJsonPath;
+     if (config.packageJsonPath) {
+         const _pkgPath = path.join(process.cwd(), config.packageJsonPath);

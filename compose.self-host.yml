@@ -1,0 +1,64 @@
+name: allauth-self-host
+services:
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: allauth
+      POSTGRES_DB: allauth
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env.self-host}
+    volumes:
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U allauth -d allauth"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+  auth:
+    image: allauth-self-host:local
+    build:
+      context: .
+      dockerfile: apps/auth/Dockerfile
+    env_file: .env.self-host
+    environment:
+      ALLAUTH_DEPLOYMENT_MODE: self-hosted
+      ALLAUTH_BILLING_CHECKOUT_ENABLED: "false"
+      ALLAUTH_BILLING_ENFORCEMENT_ENABLED: "false"
+      AUTH_RUNTIME: node
+      BETTER_AUTH_URL: https://${ALLAUTH_DOMAIN:?Set ALLAUTH_DOMAIN in .env.self-host}
+      TRUSTED_ORIGINS: https://${ALLAUTH_DOMAIN}
+      DATABASE_URL: postgresql://allauth:${POSTGRES_PASSWORD}@postgres:5432/allauth
+      RP_ID: ${ALLAUTH_DOMAIN}
+    command: ["sh", "-c", "node scripts/database.mjs migrate && exec node server.js"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${ALLAUTH_LOCAL_PORT:-3002}:3000"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+  proxy:
+    image: caddy:2-alpine
+    profiles: ["https"]
+    environment:
+      ALLAUTH_DOMAIN: ${ALLAUTH_DOMAIN}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./deploy/self-host/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      auth:
+        condition: service_healthy
+    restart: unless-stopped
+volumes:
+  postgres-data:
+  caddy-data:
+  caddy-config:

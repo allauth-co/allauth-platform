@@ -1,0 +1,32 @@
+{
+  "title": "Integrations",
+  "icon": "integrations",
+  "pages": [
+    "---Full Stack---",
+    "astro",
+    "react-router",
+    "next",
+    "nuxt",
+    "electron",
+    "svelte-kit",
+    "solid-start",
+    "tanstack",
+    "waku",
+    "---Backend---",
+    "allauth-service-directory",
+    "allauth-invitation-import",
+    "allauth-commercial-plans",
+    "hono",
+    "fastify",
+    "encore",
+    "express",
+    "elysia",
+    "nitro",
+    "nestjs",
+    "convex",
+    "---Mobile & Desktop---",
+    "expo",
+    "lynx",
+    "..."
+  ]
+}

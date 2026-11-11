@@ -1,0 +1,64 @@
+---
+title: AllAuth workspace creation
+description: Start with a default workspace, then create more workspaces with suggested unique identifiers.
+---
+
+## Your first workspace
+
+After a new platform account verifies its email and finishes signing in, entering
+Console prepares a default workspace and opens its Applications page. It uses the
+saved name, such as **Tom's workspace**, or **My workspace** when no name has been
+added. The welcome message links to Workspace settings and offers **Add your
+name** when needed. Username is optional in signup and profile editing; supplied
+usernames still need to be valid and available. Saving a profile name refreshes
+the account menu and workspace team without a manual reload.
+
+The setup action is `POST /api/workspaces/onboarding`, called only from the
+platform console after the workspace and invitation lists load. Authentication
+alone does not create a workspace: application users signing in through a tenant
+or the shared identity broker remain in their application's flow. Existing
+members, people with pending invitations, and platform administrators keep their
+current workspace flow. A person who previously created or joined a workspace
+does not receive another after leaving or deleting it.
+
+Repeated or concurrent setup requests create one workspace, owner membership and
+audit records in one transaction. They return the same still-owned default
+workspace. Setup errors offer retry and manual creation. New workspaces count
+toward the existing ownership limit; no additional privileges or settings are
+assigned.
+
+## Creating another workspace
+
+Open **Workspaces → Create workspace** and enter a name. AllAuth suggests a slug
+from the name and checks its availability. You can edit the slug; subsequent name
+changes preserve your choice. **Use suggested slug** returns to automatic naming.
+If a custom slug is taken, choose the offered available alternative or enter
+another. A creation conflict keeps the form and your entries available.
+
+Slugs use 2–48 lowercase letters, numbers or hyphens, beginning with a letter.
+`admin`, `platform`, `public`, `internal` and `allauth-platform` are reserved.
+Suggested identifiers remove accents, normalize punctuation and prefix names
+beginning with a number. Names without Latin letters or digits use `workspace`.
+Workspace names remain unchanged and can repeat. Slugs must be unique. Repeated
+suggestions receive a numeric suffix.
+
+## Workspace API
+
+`POST /api/workspaces` accepts `{ name, slug? }`. Omit `slug` to allocate an
+available identifier from the name, or provide it to request that exact slug.
+The database's unique constraint determines the final result, including
+concurrent requests. A custom slug conflict returns HTTP 409 with a readable
+message. Success returns HTTP 201 with the created `workspace` and server limits.
+
+`GET /api/workspaces/slug?slug=acme` returns
+`{ slug: "acme", available: true, suggestion: "acme" }`. A taken slug returns
+`available: false` and an available numbered `suggestion`, or `null` if the
+bounded suggestions are exhausted. The response contains no workspace names,
+owners or membership information. Availability is advisory; creation checks
+uniqueness again.
+
+Both endpoints require a current verified platform session and permission to
+create another workspace under the account's ownership limit. Anonymous,
+unverified, banned, directory-disabled, impersonated and expired sessions cannot
+check availability. Writes require the platform's same origin. Application
+end-user credentials and tenant-scoped requests cannot use these platform APIs.

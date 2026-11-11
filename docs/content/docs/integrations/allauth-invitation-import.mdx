@@ -1,0 +1,18 @@
+---
+title: Silently migrate pending organisation invitations
+description: Management-only, repeat-safe native invitation import without email delivery.
+---
+
+{/* cspell:words organisation authorise */}
+
+`POST /api/projects/<exact-slug>/auth/project-admin/import-invitations` imports pending invitations into one environment. It requires the existing verified workspace owner/admin management session and platform Origin. Directory credentials, app proxy signing and tenant roles cannot authorise it. The sensitive named management operation is `allauth_invitations_import`.
+
+Send `{ sourceInstance, dryRun, invitations }`; `dryRun` defaults to true. A batch contains 1–100 invitations and at most 1 MiB. Each row contains `sourceInvitationId`, destination `organizationId`, `email`, native `role`, destination `inviterId`, original ISO `expiresAt`, and optional ISO `createdAt`/`sourceUpdatedAt`. Keep the source instance and exact source revision stable across retries. Import only still-pending, unexpired source invitations.
+
+AllAuth checks that the destination organisation and role exist; the inviter must be a verified, active member with native invitation-create permission. An existing member or live pending invitation with the same destination email is a conflict. No migration operation elevates verification flags or creates a new inviter. The original recipient, role, inviter and expiry are retained. Native accept/reject endpoints consume the imported invitation normally; the recipient must satisfy native verified-primary-email checks. A login alias is not an invitation-recipient alias.
+
+The response includes destination project identifiers, source instance, dry-run flag, counts and safe per-row `{ sourceInvitationId, sourceUpdatedAt, invitationId?, status, nativeStatus?, reason? }`. Status is `would_create`, `created`, `existing` or `conflict`. Install application mappings only from validated applied `created`/`existing` results; validate the source revision and expected pending native state. Existing accepted/cancelled invitations are reported without reopening them. Expired, missing, conflicting or changed source rows require reconciliation.
+
+Native IDs derive from the exact project and source identity. A realm-local immutable fingerprint records provenance; identical retries return the existing invitation, while changed input returns `source_changed`. Each new invitation, provenance record and dedicated `admin.invitation-import` audit event commit atomically. Successful rows can remain committed when another row conflicts. Dry runs create no invitations, provenance, audit events or sessions.
+
+Import sends **no email**, verification or welcome message and emits no onboarding event. Resending remains a separate, explicit native invitation action. Back up and preserve the application's existing invitation-token records when mapping them to these native IDs; this operation does not rewrite application tokens or deploy acceptance handlers.

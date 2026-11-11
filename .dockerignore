@@ -1,0 +1,36 @@
+# Send only the production service and the official packages it builds.
+**
+!package.json
+!pnpm-lock.yaml
+!pnpm-workspace.yaml
+!turbo.json
+!tsconfig*.json
+!LICENSE.md
+!patches/
+!patches/**
+!packages/
+!packages/**
+!apps/
+!apps/auth/
+!apps/auth/**
+
+# Never include host dependencies, generated artifacts, or credentials.
+**/node_modules
+**/dist
+**/.next
+**/.open-next
+**/.wrangler
+**/.turbo
+**/.cache
+**/coverage
+**/test-results
+**/playwright-report
+**/*.tsbuildinfo
+**/.env*
+**/.dev.vars*
+**/.secrets
+**/certificates
+**/*.pem
+**/*.key
+**/*.log
+**/.DS_Store

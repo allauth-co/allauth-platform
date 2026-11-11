@@ -1,0 +1,4392 @@
+import { DatabaseSync } from "node:sqlite";
+import type { GenericEndpointContext } from "@better-auth/core";
+import { runWithEndpointContext } from "@better-auth/core/context";
+import { BASE_ERROR_CODES } from "@better-auth/core/error";
+import { refreshAccessToken } from "@better-auth/core/oauth2";
+import type {
+	CloudflareProfile,
+	GoogleProfile,
+	MicrosoftEntraIDProfile,
+	RailwayProfile,
+	VercelProfile,
+} from "@better-auth/core/social-providers";
+import { reddit } from "@better-auth/core/social-providers";
+import { betterFetch } from "@better-fetch/fetch";
+import { exportJWK, generateKeyPair, SignJWT } from "jose";
+import { HttpResponse, http } from "msw";
+import { setupServer } from "msw/node";
+import { OAuth2Server } from "oauth2-mock-server";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { createAuthMiddleware } from "./api";
+import { getOAuthState } from "./api/state/oauth";
+import { parseSetCookieHeader } from "./cookies";
+import { signJWT } from "./crypto";
+import { getMigrations } from "./db/get-migration";
+import { getTestInstance } from "./test-utils/test-instance";
+import { DEFAULT_SECRET } from "./utils/constants";
+
+const server = new OAuth2Server();
+const port = 8005;
+
+const mswServer = setupServer();
+let shouldUseUpdatedProfile = false;
+
+beforeAll(async () => {
+	mswServer.listen({ onUnhandledRequest: "bypass" });
+	const serverEndpoint = async () => {
+		const data: GoogleProfile = shouldUseUpdatedProfile
+			? {
+					email: "user@email.com",
+					email_verified: true,
+					name: "Updated User",
+					picture: "https://test.com/picture.png",
+					exp: 1234567890,
+					sub: "1234567890",
+					iat: 1234567890,
+					aud: "test",
+					azp: "test",
+					nbf: 1234567890,
+					iss: "test",
+					locale: "en",
+					jti: "test",
+					given_name: "Updated",
+					family_name: "User",
+				}
+			: {
+					email: "user@email.com",
+					email_verified: true,
+					name: "First Last",
+					picture: "https://lh3.googleusercontent.com/a-/AOh14GjQ4Z7Vw",
+					exp: 1234567890,
+					sub: "1234567890",
+					iat: 1234567890,
+					aud: "test",
+					azp: "test",
+					nbf: 1234567890,
+					iss: "test",
+					locale: "en",
+					jti: "test",
+					given_name: "First",
+					family_name: "Last",
+				};
+		const testIdToken = await signJWT(data, DEFAULT_SECRET);
+		return HttpResponse.json({
+			access_token: "test",
+			refresh_token: "test",
+			id_token: testIdToken,
+		});
+	};
+	mswServer.use(
+		http.post("https://oauth2.googleapis.com/token", serverEndpoint),
+		http.post("https://appleid.apple.com/auth/token", serverEndpoint),
+		http.post(`http://localhost:${port}/token`, async () => {
+			const data: GoogleProfile = {
+				email: "user@email.com",
+				email_verified: true,
+				name: "First Last",
+				picture: "https://lh3.googleusercontent.com/a-/AOh14GjQ4Z7Vw",
+				exp: 1234567890,
+				sub: "1234567890",
+				iat: 1234567890,
+				aud: "test",
+				azp: "test",
+				nbf: 1234567890,
+				iss: "test",
+				locale: "en",
+				jti: "test",
+				given_name: "First",
+				family_name: "Last",
+			};
+			const testIdToken = await signJWT(data, DEFAULT_SECRET);
+			return HttpResponse.json({
+				access_token: "new-access-token",
+				refresh_token: "new-refresh-token",
+				id_token: testIdToken,
+				token_type: "Bearer",
+				expires_in: 3600,
+			});
+		}),
+	);
+});
+
+afterEach(() => {
+	shouldUseUpdatedProfile = false;
+});
+
+afterAll(() => mswServer.close());
+
+describe("Social Providers", async (c) => {
+	const { client, cookieSetter } = await getTestInstance(
+		{
+			user: {
+				additionalFields: {
+					firstName: {
+						type: "string",
+					},
+					lastName: {
+						type: "string",
+					},
+					isOAuth: {
+						type: "boolean",
+					},
+				},
+			},
+			socialProviders: {
+				google: {
+					clientId: "test",
+					clientSecret: "test",
+					enabled: true,
+					mapProfileToUser(profile) {
+						return {
+							firstName: profile.given_name,
+							lastName: profile.family_name,
+							isOAuth: true,
+						};
+					},
+				},
+				apple: async () => ({
+					clientId: "test",
+					clientSecret: "test",
+				}),
+			},
+			advanced: {
+				disableOriginCheck: false,
+			},
+		},
+		{
+			disableTestUser: true,
+		},
+	);
+
+	beforeAll(async () => {
+		await server.issuer.keys.generate("RS256");
+		server.issuer.on;
+		await server.start(port, "localhost");
+		console.log("Issuer URL:", server.issuer.url); // -> http://localhost:${port}
+	});
+	afterAll(async () => {
+		await server.stop().catch(console.error);
+	});
+	server.service.on("beforeResponse", (tokenResponse, req) => {
+		tokenResponse.body = {
+			accessToken: "access-token",
+			refreshToken: "refresher-token",
+		};
+		tokenResponse.statusCode = 200;
+	});
+	server.service.on("beforeUserinfo", (userInfoResponse, req) => {
+		userInfoResponse.body = {
+			email: "test@localhost.com",
+			name: "OAuth2 Test",
+			sub: "oauth2",
+			picture: "https://test.com/picture.png",
+			email_verified: true,
+		};
+		userInfoResponse.statusCode = 200;
+	});
+
+	server.service.on("beforeTokenSigning", (token, req) => {
+		token.payload.email = "sso-user@localhost:8000.com";
+		token.payload.email_verified = true;
+		token.payload.name = "Test User";
+		token.payload.picture = "https://test.com/picture.png";
+	});
+
+	const headers = new Headers();
+	async function simulateOAuthFlowRefresh(
+		authUrl: string,
+		headers: Headers,
+		fetchImpl?: ((...args: any) => any) | undefined,
+	) {
+		let location: string | null = null;
+		await betterFetch(authUrl, {
+			method: "GET",
+			redirect: "manual",
+			onError(context) {
+				location = context.response.headers.get("location");
+			},
+		});
+		if (!location) throw new Error("No redirect location found");
+
+		const tokens = await refreshAccessToken({
+			refreshToken: "mock-refresh-token",
+			options: {
+				clientId: "test-client-id",
+				clientKey: "test-client-key",
+				clientSecret: "test-client-secret",
+			},
+			tokenEndpoint: `http://localhost:${port}/token`,
+		});
+		return tokens;
+	}
+
+	it("should be able to add social providers", async () => {
+		const signInRes = await client.signIn.social({
+			provider: "google",
+			callbackURL: "/callback",
+			newUserCallbackURL: "/welcome",
+		});
+		expect(signInRes.data).toMatchObject({
+			url: expect.stringContaining("google.com"),
+			redirect: true,
+		});
+	});
+
+	/**
+	 * @see https://github.com/better-auth/better-auth/issues/5441
+	 */
+	it("should forward additionalParams to the authorization URL", async () => {
+		const signInRes = await client.signIn.social({
+			provider: "google",
+			callbackURL: "/callback",
+			additionalParams: {
+				access_type: "offline",
+				hd: "example.com",
+			},
+		});
+		const url = new URL(signInRes.data!.url!);
+		expect(url.searchParams.get("access_type")).toBe("offline");
+		expect(url.searchParams.get("hd")).toBe("example.com");
+	});
+
+	it("should reject additionalParams that collide with reserved OAuth params", async () => {
+		const signInRes = await client.signIn.social({
+			provider: "google",
+			callbackURL: "/callback",
+			additionalParams: {
+				redirect_uri: "https://attacker.example/callback",
+			},
+		});
+		expect(signInRes.error?.status).toBe(400);
+	});
+
+	it("should be able to sign in with social providers", async () => {
+		const headers = new Headers();
+		const signInRes = await client.signIn.social({
+			provider: "google",
+			callbackURL: "/callback",
+			newUserCallbackURL: "/welcome",
+			fetchOptions: {
+				onSuccess: cookieSetter(headers),
+			},
+		});
+		const state = new URL(signInRes.data!.url!).searchParams.get("state") || "";
+		await client.$fetch("/callback/google", {
+			query: {
+				state,
+				code: "test",
+			},
+			headers,
+			method: "GET",
+			onError(context) {
+				expect(context.response.status).toBe(302);
+				const location = context.response.headers.get("location");
+				expect(location).toBeDefined();
+				expect(location).toContain("/welcome");
+				const cookies = parseSetCookieHeader(
+					context.response.headers.get("set-cookie") || "",
+				);
+				expect(cookies.get("better-auth.session_token")?.value).toBeDefined();
+			},
+		});
+	});
+
+	/**
+	 * A built-in social callback that arrives without a `state` parameter must
+	 * redirect to the error page using the `error` query parameter the page
+	 * reads, not a `state` parameter the page ignores.
+	 *
+	 * @see https://github.com/better-auth/better-auth/issues/9215
+	 */
+	it("redirects a built-in callback with no state to error=state_not_found", async () => {
+		await client.$fetch("/callback/google", {
+			query: {
+				code: "test",
+			},
+			method: "GET",
+			onError(context) {
+				expect(context.response.status).toBe(302);
+				const location = context.response.headers.get("location") ?? "";
+				expect(location).toContain("error=state_not_found");
+				expect(location).not.toContain("state=state_not_found");
+			},
+		});
+	});
+
+	/**
+	 * When OAuth state validation fails, the redirect must honor the per-flow
+	 * `errorCallbackURL` the caller passed at sign-in, not the default error
+	 * page. The error URL is recoverable from the parsed state even when the
+	 * state-cookie check fails, and it was already origin-validated at sign-in.
+	 *
+	 * @see https://github.com/better-auth/better-auth/issues/5467
+	 * @see https://github.com/better-auth/better-auth/issues/10022
+	 */
+	it("redirects to the per-flow errorCallbackURL when state validation fails", async () => {
+		const headers = new Headers();
+		const signInRes = await client.signIn.social({
+			provider: "google",
+			callbackURL: "/callback",
+			errorCallbackURL: "/oauth-error?source=oauth#retry",
+			fetchOptions: {
+				onSuccess: cookieSetter(headers),
+			},
+		});
+		const state = new URL(signInRes.data!.url!).searchParams.get("state") || "";
+
+		// Omit the state cookie so the signed-cookie check fails
+		// (state_security_mismatch) while the verification record still parses.
+		await client.$fetch("/callback/google", {
+			query: {
+				state,
+				code: "test",
+			},
+			method: "GET",
+			onError(context) {
+				expect(context.response.status).toBe(302);
+				const location = context.response.headers.get("location") ?? "";
+				expect(location).toContain(
+					"/oauth-error?source=oauth&error=state_mismatch#retry",
+				);
+				expect(location).not.toContain("/api/auth/error");
+			},
+		});
+	});
+
+	it("should be able to sign in with async social provider", async () => {
+		const headers = new Headers();
+		const signInRes = await client.signIn.social({
+			provider: "apple",
+			callbackURL: "/callback",
+			newUserCallbackURL: "/welcome",
+			fetchOptions: {
+				onSuccess: cookieSetter(headers),
+			},
+		});
+		const state = new URL(signInRes.data!.url!).searchParams.get("state") || "";
+		await client.$fetch("/callback/apple", {
+			query: {
+				state,
+				code: "test",
+			},
+			headers,
+			method: "GET",
+			onError(context) {
+				expect(context.response.status).toBe(302);
+				const location = context.response.headers.get("location");
+				expect(location).toBeDefined();
+				expect(location).toContain("/callback");
+				const cookies = parseSetCookieHeader(
+					context.response.headers.get("set-cookie") || "",
+				);
+				expect(cookies.get("better-auth.session_token")?.value).toBeDefined();
+			},
+		});
+	});
+
+	it("Should use callback URL if the user is already registered", async () => {
+		const headers = new Headers();
+		const signInRes = await client.signIn.social({
+			provider: "google",
+			callbackURL: "/callback",
+			newUserCallbackURL: "/welcome",
+			fetchOptions: {
+				onSuccess: cookieSetter(headers),
+			},
+		});
+		const state = new URL(signInRes.data!.url!).searchParams.get("state") || "";
+		expect(signInRes.data).toMatchObject({
+			url: expect.stringContaining("google.com"),
+			redirect: true,
+		});
+
+		await client.$fetch("/callback/google", {
+			query: {
+				state,
+				code: "test",
+			},
+			headers,
+			method: "GET",
+			onError(context) {
+				expect(context.response.status).toBe(302);
+				const location = context.response.headers.get("location");
+				expect(location).toBeDefined();
+				expect(location).toContain("/callback");
+				const cookies = parseSetCookieHeader(
+					context.response.headers.get("set-cookie") || "",
+				);
+				expect(cookies.get("better-auth.session_token")?.value).toBeDefined();
+			},
+		});
+	});
+
+	it("should be able to map profile to user", async () => {
+		const headers = new Headers();
+		const signInRes = await client.signIn.social({
+			provider: "google",
+			callbackURL: "/callback",
+			fetchOptions: {
+				onSuccess: cookieSetter(headers),
+			},
+		});
+		expect(signInRes.data).toMatchObject({
+			url: expect.stringContaining("google.com"),
+			redirect: true,
+		});
+		const state = new URL(signInRes.data!.url!).searchParams.get("state") || "";
+		await client.$fetch("/callback/google", {
+			query: {
+				state,
+				code: "test",
+			},
+			headers,
+			method: "GET",
+			onError: (c) => {
+				//TODO: fix this
+				cookieSetter(headers)(c as any);
+			},
+		});
+		const session = await client.getSession({
+			fetchOptions: {
+				headers,
+			},
+		});
+		expect(session.data?.user).toMatchObject({
+			isOAuth: true,
+			firstName: "First",
+			lastName: "Last",
+		});
+	});
+
+	it("should be protected from callback URL attacks", async () => {
+		const signInRes = await client.signIn.social(
+			{
+				provider: "google",
+				callbackURL: "https://evil.com/callback",
+			},
+			{
+				onSuccess(context) {
+					const cookies = parseSetCookieHeader(
+						context.response.headers.get("set-cookie") || "",
+					);
+					headers.set(
+						"cookie",
+						`better-auth.state=${cookies.get("better-auth.state")?.value}`,
+					);
+				},
+			},
+		);
+
+		expect(signInRes.error?.status).toBe(403);
+		expect(signInRes.error?.message).toBe("Invalid callbackURL");
+	});
+
+	it("should refresh the access token", async () => {
+		const headers = new Headers();
+		const signInRes = await client.signIn.social({
+			provider: "google",
+			callbackURL: "/callback",
+			fetchOptions: {
+				onSuccess: cookieSetter(headers),
+			},
+		});
+
+		expect(signInRes.data).toMatchObject({
+			url: expect.stringContaining("google.com"),
+			redirect: true,
+		});
+		const state = new URL(signInRes.data!.url!).searchParams.get("state") || "";
+		await client.$fetch("/callback/google", {
+			query: {
+				state,
+				code: "test",
+			},
+			headers,
+			method: "GET",
+			onError(context) {
+				expect(context.response.status).toBe(302);
+				const location = context.response.headers.get("location");
+				expect(location).toBeDefined();
+				expect(location).toContain("/callback");
+				const cookies = parseSetCookieHeader(
+					context.response.headers.get("set-cookie") || "",
+				);
+				cookieSetter(headers)(context as any);
+				expect(cookies.get("better-auth.session_token")?.value).toBeDefined();
+			},
+		});
+		const accounts = await client.listAccounts({
+			fetchOptions: { headers },
+		});
+		await client.$fetch("/refresh-token", {
+			body: {
+				accountId: accounts.data?.[0]?.id,
+			},
+			headers,
+			method: "POST",
+			onError(context) {
+				cookieSetter(headers)(context as any);
+			},
+		});
+
+		const authUrl = signInRes.data?.url;
+		if (!authUrl) throw new Error("No auth url found");
+		const mockEndpoint = authUrl.replace(
+			"https://accounts.google.com/o/oauth2/auth",
+			`http://localhost:${port}/authorize`,
+		);
+		const result = await simulateOAuthFlowRefresh(mockEndpoint, headers);
+		const { accessToken, refreshToken } = result;
+		expect({ accessToken, refreshToken }).toEqual({
+			accessToken: "new-access-token",
+			refreshToken: "new-refresh-token",
+		});
+	});
+});
+describe("Redirect URI", async () => {
+	it("should infer redirect uri", async () => {
+		const { client } = await getTestInstance({
+			basePath: "/custom/path",
+			socialProviders: {
+				google: {
+					clientId: "test",
+					clientSecret: "test",
+					enabled: true,
+				},
+			},
+		});
+
+		await client.signIn.social(
+			{
+				provider: "google",
+				callbackURL: "/callback",
+			},
+			{
+				onSuccess(context) {
+					const redirectURI = context.data.url;
+					expect(redirectURI).toContain(
+						"http%3A%2F%2Flocalhost%3A3000%2Fcustom%2Fpath%2Fcallback%2Fgoogle",
+					);
+				},
+			},
+		);
+	});
+
+	it("should respect custom redirect uri", async () => {
+		const { client } = await getTestInstance({
+			socialProviders: {
+				google: {
+					clientId: "test",
+					clientSecret: "test",
+					enabled: true,
+					redirectURI: "https://test.com/callback",
+				},
+			},
+		});
+
+		await client.signIn.social(
+			{
+				provider: "google",
+				callbackURL: "/callback",
+			},
+			{
+				onSuccess(context) {
+					const redirectURI = context.data.url;
+					expect(redirectURI).toContain(
+						"redirect_uri=https%3A%2F%2Ftest.com%2Fcallback",
+					);
+				},
+			},
+		);
+	});
+});
+
+describe("Disable implicit signup", async () => {
+	it("Should not create user when implicit sign up is disabled", async () => {
+		const { client, cookieSetter } = await getTestInstance({
+			socialProviders: {
+				google: {
+					clientId: "test",
+					clientSecret: "test",
+					enabled: true,
+					disableImplicitSignUp: true,
+				},
+			},
+		});
+		const headers = new Headers();
+		const signInRes = await client.signIn.social({
+			provider: "google",
+			callbackURL: "/callback",
+			newUserCallbackURL: "/welcome",
+			fetchOptions: {
+				onSuccess: cookieSetter(headers),
+			},
+		});
+		expect(signInRes.data).toMatchObject({
+			url: expect.stringContaining("google.com"),
+			redirect: true,
+		});
+		const state = new URL(signInRes.data!.url!).searchParams.get("state") || "";
+
+		await client.$fetch("/callback/google", {
+			query: {
+				state,
+				code: "test",
+			},
+			headers,
+			method: "GET",
+			onError(context) {
+				expect(context.response.status).toBe(302);
+				const location = context.response.headers.get("location");
+				expect(location).toBeDefined();
+				expect(location).toContain(
+					"http://localhost:3000/api/auth/error?error=signup_disabled",
+				);
+			},
+		});
+	});
+
+	it("Should create user when implicit sign up is disabled but it is requested", async () => {
+		const { client, cookieSetter } = await getTestInstance({
+			socialProviders: {
+				google: {
+					clientId: "test",
+					clientSecret: "test",
+					enabled: true,
+					disableImplicitSignUp: true,
+				},
+			},
+		});
+
+		const headers = new Headers();
+		const signInRes = await client.signIn.social({
+			provider: "google",
+			callbackURL: "/callback",
+			newUserCallbackURL: "/welcome",
+			requestSignUp: true,
+			fetchOptions: {
+				onSuccess: cookieSetter(headers),
+			},
+		});
+		expect(signInRes.data).toMatchObject({
+			url: expect.stringContaining("google.com"),
+			redirect: true,
+		});
+		const state = new URL(signInRes.data!.url!).searchParams.get("state") || "";
+
+		await client.$fetch("/callback/google", {
+			query: {
+				state,
+				code: "test",
+			},
+			headers,
+			method: "GET",
+			onError(context) {
+				expect(context.response.status).toBe(302);
+				const location = context.response.headers.get("location");
+				expect(location).toBeDefined();
+				expect(location).toContain("/welcome");
+				const cookies = parseSetCookieHeader(
+					context.response.headers.get("set-cookie") || "",
+				);
+				expect(cookies.get("better-auth.session_token")?.value).toBeDefined();
+			},
+		});
+	});
+});
+
+describe("Disable signup", async () => {
+	/**
+	 * @see https://github.com/better-auth/better-auth/issues/11480
+	 */
+	describe("ID-token sign-in", () => {
+		const googleIdTokenOptions = (email: string) => {
+			const profile: GoogleProfile = {
+				aud: "test",
+				azp: "test",
+				email,
+				email_verified: true,
+				exp: 2_000_000_000,
+				family_name: "User",
+				given_name: "Google",
+				iat: 1_900_000_000,
+				iss: "https://accounts.google.com",
+				name: "Google User",
+				picture: "https://example.com/avatar.png",
+				sub: "google-id-token-user",
+			};
+			return {
+				clientId: "test",
+				clientSecret: "test",
+				verifyIdToken: async () => true,
+				getUserInfo: async () => ({
+					user: { email, name: profile.name, emailVerified: true },
+					data: profile,
+				}),
+			};
+		};
+
+		it.each([
+			{ requestSignUp: undefined, scenario: "without requestSignUp" },
+			{ requestSignUp: true, scenario: "with requestSignUp" },
+		])("rejects ID-token sign-in for a new user $scenario", async ({
+			requestSignUp,
+		}) => {
+			const email = "new-id-token-user@example.com";
+			const { client, auth } = await getTestInstance(
+				{
+					socialProviders: {
+						google: {
+							...googleIdTokenOptions(email),
+							disableSignUp: true,
+						},
+					},
+				},
+				{ disableTestUser: true },
+			);
+
+			const response = await client.signIn.social({
+				provider: "google",
+				idToken: { token: "a.b.c" },
+				requestSignUp,
+			});
+
+			const user = await (await auth.$context).adapter.findOne({
+				model: "user",
+				where: [{ field: "email", value: email }],
+			});
+			expect(user).toBeNull();
+			expect(response.error).toMatchObject({
+				status: 401,
+				code: "OAUTH_LINK_ERROR",
+				message: "signup disabled",
+			});
+		});
+
+		it("allows an existing ID-token user to sign in when provider sign-up is disabled", async () => {
+			const email = "existing-id-token-user@example.com";
+			const { client, auth } = await getTestInstance(
+				{ socialProviders: { google: googleIdTokenOptions(email) } },
+				{ disableTestUser: true },
+			);
+			const signIn = () =>
+				client.signIn.social({
+					provider: "google",
+					idToken: { token: "a.b.c" },
+				});
+
+			const firstResponse = await signIn();
+			expect(firstResponse.error).toBeNull();
+
+			const provider = (await auth.$context).socialProviders.find(
+				(provider) => provider.id === "google",
+			);
+			expect(provider).toBeDefined();
+			provider!.options!.disableSignUp = true;
+
+			const response = await signIn();
+			expect(response.error).toBeNull();
+			expect(response.data).toMatchObject({
+				redirect: false,
+				user: { email },
+			});
+		});
+
+		it("keeps the top-level provider sign-up restriction for ID-token sign-in", async () => {
+			const { client, auth } = await getTestInstance(
+				{
+					socialProviders: {
+						google: {
+							...googleIdTokenOptions("top-level-id-token-user@example.com"),
+							disableSignUp: false,
+						},
+					},
+				},
+				{ disableTestUser: true },
+			);
+			const provider = (await auth.$context).socialProviders.find(
+				(provider) => provider.id === "google",
+			);
+			expect(provider).toBeDefined();
+			provider!.disableSignUp = true;
+
+			const response = await client.signIn.social({
+				provider: "google",
+				idToken: { token: "a.b.c" },
+			});
+			expect(response.error).toMatchObject({
+				status: 401,
+				code: "OAUTH_LINK_ERROR",
+				message: "signup disabled",
+			});
+		});
+	});
+
+	it("Should not create user when sign up is disabled", async () => {
+		const headers = new Headers();
+		const { client, cookieSetter } = await getTestInstance({
+			socialProviders: {
+				google: {
+					clientId: "test",
+					clientSecret: "test",
+					enabled: true,
+					disableSignUp: true,
+				},
+			},
+		});
+
+		const signInRes = await client.signIn.social({
+			provider: "google",
+			callbackURL: "/callback",
+			newUserCallbackURL: "/welcome",
+			fetchOptions: {
+				onSuccess: cookieSetter(headers),
+			},
+		});
+		expect(signInRes.data).toMatchObject({
+			url: expect.stringContaining("google.com"),
+			redirect: true,
+		});
+		const state = new URL(signInRes.data!.url!).searchParams.get("state") || "";
+
+		await client.$fetch("/callback/google", {
+			query: {
+				state,
+				code: "test",
+			},
+			headers,
+			method: "GET",
+			onError(context) {
+				expect(context.response.status).toBe(302);
+				const location = context.response.headers.get("location");
+				expect(location).toBeDefined();
+				expect(location).toContain(
+					"http://localhost:3000/api/auth/error?error=signup_disabled",
+				);
+			},
+		});
+	});
+});
+
+describe("signin", async () => {
+	const database = new DatabaseSync(":memory:");
+
+	beforeAll(async () => {
+		const migrations = await getMigrations({
+			database,
+		});
+		await migrations.runMigrations();
+	});
+	it("should allow user info override during sign in", async () => {
+		let state = "";
+		const headers = new Headers();
+		const { client, cookieSetter } = await getTestInstance({
+			database,
+			socialProviders: {
+				google: {
+					clientId: "test",
+					clientSecret: "test",
+					enabled: true,
+				},
+			},
+		});
+		const signInRes = await client.signIn.social({
+			provider: "google",
+			callbackURL: "/callback",
+			fetchOptions: {
+				onSuccess: cookieSetter(headers),
+			},
+		});
+		expect(signInRes.data).toMatchObject({
+			url: expect.stringContaining("google.com"),
+			redirect: true,
+		});
+		state = new URL(signInRes.data!.url!).searchParams.get("state") || "";
+
+		await client.$fetch("/callback/google", {
+			query: {
+				state,
+				code: "test",
+			},
+			headers,
+			method: "GET",
+			onError: (c) => {
+				cookieSetter(headers)(c as any);
+			},
+		});
+
+		const session = await client.getSession({
+			fetchOptions: {
+				headers,
+			},
+		});
+		expect(session.data?.user).toMatchObject({
+			name: "First Last",
+		});
+	});
+
+	it("should allow user info override during sign in", async () => {
+		shouldUseUpdatedProfile = true;
+		const headers = new Headers();
+		let state = "";
+		const { client, cookieSetter } = await getTestInstance(
+			{
+				database,
+				socialProviders: {
+					google: {
+						clientId: "test",
+						clientSecret: "test",
+						enabled: true,
+						overrideUserInfoOnSignIn: true,
+					},
+				},
+			},
+			{
+				disableTestUser: true,
+			},
+		);
+		const signInRes = await client.signIn.social({
+			provider: "google",
+			callbackURL: "/callback",
+			fetchOptions: {
+				onSuccess: cookieSetter(headers),
+			},
+		});
+		expect(signInRes.data).toMatchObject({
+			url: expect.stringContaining("google.com"),
+			redirect: true,
+		});
+		state = new URL(signInRes.data!.url!).searchParams.get("state") || "";
+
+		await client.$fetch("/callback/google", {
+			query: {
+				state,
+				code: "test",
+			},
+			headers,
+			method: "GET",
+			onError: (c) => {
+				cookieSetter(headers)(c as any);
+			},
+		});
+
+		const session = await client.getSession({
+			fetchOptions: {
+				headers,
+			},
+		});
+		expect(session.data?.user).toMatchObject({
+			name: "Updated User",
+		});
+	});
+
+	it("should allow additional data in oauth state", async () => {
+		let additionalData: Record<string, any> | null = null;
+		const headers = new Headers();
+		let state = "";
+		const { client, cookieSetter } = await getTestInstance(
+			{
+				database,
+				socialProviders: {
+					google: {
+						clientId: "test",
+						clientSecret: "test",
+						enabled: true,
+						overrideUserInfoOnSignIn: true,
+					},
+				},
+				hooks: {
+					after: createAuthMiddleware(async (ctx) => {
+						if (ctx.path === "/callback/:id") {
+							additionalData = await getOAuthState();
+						}
+					}),
+				},
+			},
+			{
+				disableTestUser: true,
+			},
+		);
+		const signInRes = await client.signIn.social({
+			provider: "google",
+			callbackURL: "/callback",
+			additionalData: {
+				invitedBy: "user-123",
+			},
+			fetchOptions: {
+				onSuccess: cookieSetter(headers),
+			},
+		});
+		expect(signInRes.data).toMatchObject({
+			url: expect.stringContaining("google.com"),
+			redirect: true,
+		});
+		state = new URL(signInRes.data!.url!).searchParams.get("state") || "";
+		expect(state).toBeTruthy();
+
+		await client.$fetch("/callback/google", {
+			query: {
+				state,
+				code: "test",
+			},
+			headers,
+			method: "GET",
+			onError: (c) => {
+				cookieSetter(headers)(c as any);
+			},
+		});
+		expect(additionalData).toEqual({
+			callbackURL: "/callback",
+			codeVerifier: expect.any(String),
+			expiresAt: expect.any(Number),
+			invitedBy: "user-123",
+			errorURL: "http://localhost:3000/api/auth/error",
+			oauthState: state,
+		});
+	});
+
+	it("should not allow overriding oauth code verifier, expiresAt, callbackURL, errorURL, newUserURL, link, requestSignUp", async () => {
+		let additionalData: Record<string, any> | null = null;
+		const headers = new Headers();
+		let state = "";
+		const { client, cookieSetter } = await getTestInstance(
+			{
+				database,
+				socialProviders: {
+					google: {
+						clientId: "test",
+						clientSecret: "test",
+						enabled: true,
+						overrideUserInfoOnSignIn: true,
+					},
+				},
+				hooks: {
+					after: createAuthMiddleware(async (ctx) => {
+						if (ctx.path === "/callback/:id") {
+							additionalData = await getOAuthState();
+						}
+					}),
+				},
+			},
+			{
+				disableTestUser: true,
+			},
+		);
+		const expiresAt = Date.now();
+		const signInRes = await client.signIn.social({
+			provider: "google",
+			callbackURL: "/callback",
+			additionalData: {
+				codeVerifier: "test-code-verifier",
+				callbackURL: "test-callback-url",
+				errorURL: "test-error-url",
+				newUserURL: "test-new-user-url",
+				link: {
+					email: "test-email",
+					userId: "test-user-id",
+				},
+				requestSignUp: true,
+				expiresAt: expiresAt,
+				serverContext: { spoofed: true },
+			},
+			fetchOptions: {
+				onSuccess: cookieSetter(headers),
+			},
+		});
+		expect(signInRes.data).toMatchObject({
+			url: expect.stringContaining("google.com"),
+			redirect: true,
+		});
+		state = new URL(signInRes.data!.url!).searchParams.get("state") || "";
+
+		await client.$fetch("/callback/google", {
+			query: {
+				state,
+				code: "test",
+			},
+			headers,
+			method: "GET",
+			onError: (c) => {
+				cookieSetter(headers)(c as any);
+			},
+		});
+		expect(additionalData!.codeVerifier).not.toBe("test-code-verifier");
+		expect(additionalData!.callbackURL).not.toBe("test-callback-url");
+		expect(additionalData!.errorURL).not.toBe("test-error-url");
+		expect(additionalData!.newUserURL).not.toBe("test-new-user-url");
+		expect(additionalData!.link).not.toBe({
+			email: "test-email",
+			userId: "test-user-id",
+		});
+		expect(additionalData!.requestSignUp).not.toBe(true);
+		expect(additionalData!.expiresAt).not.toBe(expiresAt);
+		// `serverContext` is reserved for server-set values; a client-supplied one
+		// must never survive the round-trip.
+		expect(additionalData!.serverContext).toBeUndefined();
+	});
+});
+
+describe("updateAccountOnSignIn", async () => {
+	const { client, cookieSetter, auth } = await getTestInstance({
+		account: {
+			updateAccountOnSignIn: false,
+		},
+	});
+	const ctx = await auth.$context;
+	it("should not update account on sign in", async () => {
+		const headers = new Headers();
+		const signInRes = await client.signIn.social({
+			provider: "google",
+			callbackURL: "/callback",
+			fetchOptions: {
+				onSuccess: cookieSetter(headers),
+			},
+		});
+		expect(signInRes.data).toMatchObject({
+			url: expect.stringContaining("google.com"),
+			redirect: true,
+		});
+		const state = new URL(signInRes.data!.url!).searchParams.get("state") || "";
+
+		await client.$fetch("/callback/google", {
+			query: {
+				state,
+				code: "test",
+			},
+			method: "GET",
+			headers,
+			onError(context) {
+				cookieSetter(headers)(context as any);
+			},
+		});
+		const session = await client.getSession({
+			fetchOptions: {
+				headers,
+			},
+		});
+		const userAccounts = await ctx.internalAdapter.findAccounts(
+			session.data?.user.id!,
+		);
+		await runWithEndpointContext(
+			{
+				context: ctx,
+			} as GenericEndpointContext,
+			() =>
+				ctx.internalAdapter.updateAccount(userAccounts[0]!.id, {
+					accessToken: "new-access-token",
+				}),
+		);
+
+		//re-sign in
+		const signInRes2 = await client.signIn.social({
+			provider: "google",
+			callbackURL: "/callback",
+			fetchOptions: {
+				onSuccess: cookieSetter(headers),
+			},
+		});
+		expect(signInRes2.data).toMatchObject({
+			url: expect.stringContaining("google.com"),
+			redirect: true,
+		});
+		const state2 =
+			new URL(signInRes2.data!.url!).searchParams.get("state") || "";
+
+		await client.$fetch("/callback/google", {
+			query: {
+				state: state2,
+				code: "test",
+			},
+			headers,
+			method: "GET",
+			onError(context) {
+				cookieSetter(headers)(context as any);
+			},
+		});
+		const session2 = await client.getSession({
+			fetchOptions: {
+				headers,
+			},
+		});
+		const userAccounts2 = await ctx.internalAdapter.findAccounts(
+			session2.data?.user.id!,
+		);
+		expect(userAccounts2[0]!.accessToken).toBe("new-access-token");
+	});
+});
+
+/**
+ * @see https://github.com/better-auth/better-auth/issues/4498
+ */
+describe("Google Provider — multiple client IDs", async () => {
+	const googleKeyPair = await generateKeyPair("RS256");
+	const googleJwk = await exportJWK(googleKeyPair.publicKey);
+	const googleKid = "test-google-kid";
+	googleJwk.kid = googleKid;
+	googleJwk.alg = "RS256";
+	googleJwk.use = "sig";
+
+	const webClientId = "123-web.googleusercontent.com";
+	const iosClientId = "456-ios.googleusercontent.com";
+	const androidClientId = "789-android.googleusercontent.com";
+
+	const signIdToken = (audience: string) =>
+		new SignJWT({
+			email: "mobile-user@example.com",
+			email_verified: true,
+			name: "Mobile User",
+			sub: "google-sub-999",
+		})
+			.setProtectedHeader({ alg: "RS256", kid: googleKid })
+			.setIssuedAt()
+			.setIssuer("https://accounts.google.com")
+			.setAudience(audience)
+			.setExpirationTime("1h")
+			.sign(googleKeyPair.privateKey);
+
+	beforeAll(() => {
+		mswServer.use(
+			http.get("https://www.googleapis.com/oauth2/v3/certs", async () =>
+				HttpResponse.json({ keys: [googleJwk] }),
+			),
+		);
+	});
+
+	it.each([
+		["web", webClientId],
+		["iOS", iosClientId],
+		["Android", androidClientId],
+	])("accepts an id token issued for the %s client", async (_, audience) => {
+		const idToken = await signIdToken(audience);
+		const { client } = await getTestInstance(
+			{
+				socialProviders: {
+					google: {
+						clientId: [webClientId, iosClientId, androidClientId],
+						clientSecret: "test-secret",
+					},
+				},
+			},
+			{ disableTestUser: true },
+		);
+
+		const res = await client.signIn.social({
+			provider: "google",
+			idToken: { token: idToken },
+		});
+
+		expect(res.data).toBeDefined();
+		expect(res.data!.redirect).toBe(false);
+		const data = res.data as { user: { email: string } };
+		expect(data.user.email).toBe("mobile-user@example.com");
+	});
+
+	it("rejects an id token whose audience is not configured", async () => {
+		const idToken = await signIdToken("999-unknown.googleusercontent.com");
+		const { client } = await getTestInstance(
+			{
+				socialProviders: {
+					google: {
+						clientId: [webClientId, iosClientId],
+						clientSecret: "test-secret",
+					},
+				},
+			},
+			{ disableTestUser: true },
+		);
+
+		const res = await client.signIn.social({
+			provider: "google",
+			idToken: { token: idToken },
+		});
+
+		expect(res.error?.status).toBe(401);
+	});
+
+	it("returns 401 over HTTP when a verified profile resolves an invalid account subject", async () => {
+		const idToken = await signIdToken(webClientId);
+		const { auth, client } = await getTestInstance(
+			{
+				socialProviders: {
+					google: {
+						clientId: webClientId,
+						clientSecret: "test-secret",
+					},
+				},
+			},
+			{ disableTestUser: true },
+		);
+		const context = await auth.$context;
+		const googleProvider = context.socialProviders.find(
+			(provider) => provider.id === "google",
+		);
+		expect(googleProvider).toBeDefined();
+		googleProvider!.accountSubject = () => "";
+
+		const result = await client.$fetch("/sign-in/social", {
+			method: "POST",
+			body: {
+				provider: "google",
+				idToken: { token: idToken },
+			},
+		});
+
+		expect(result.data).toBeNull();
+		expect(result.error).toMatchObject({
+			status: 401,
+			code: BASE_ERROR_CODES.FAILED_TO_GET_USER_INFO.code,
+			message: BASE_ERROR_CODES.FAILED_TO_GET_USER_INFO.message,
+		});
+	});
+
+	it("uses the first configured client id when building the authorization URL", async () => {
+		const { client } = await getTestInstance(
+			{
+				socialProviders: {
+					google: {
+						clientId: [webClientId, iosClientId, androidClientId],
+						clientSecret: "test-secret",
+					},
+				},
+			},
+			{ disableTestUser: true },
+		);
+
+		const signInRes = await client.signIn.social({
+			provider: "google",
+			callbackURL: "/callback",
+		});
+
+		expect(signInRes.data?.url).toContain(encodeURIComponent(webClientId));
+		expect(signInRes.data?.url).not.toContain(encodeURIComponent(iosClientId));
+	});
+
+	it("rejects an empty clientId array at sign-in time", async () => {
+		const { client } = await getTestInstance(
+			{
+				socialProviders: {
+					google: {
+						clientId: [],
+						clientSecret: "test-secret",
+					},
+				},
+			},
+			{ disableTestUser: true },
+		);
+
+		const res = await client.signIn.social({
+			provider: "google",
+			callbackURL: "/callback",
+		});
+
+		expect(res.error?.status).toBe(500);
+	});
+
+	it("returns 403 EMAIL_NOT_VERIFIED for an unverified id token when the provider requires verification", async () => {
+		const idToken = await new SignJWT({
+			email: "mobile-unverified@example.com",
+			email_verified: false,
+			name: "Mobile Unverified",
+			sub: "google-sub-unverified",
+		})
+			.setProtectedHeader({ alg: "RS256", kid: googleKid })
+			.setIssuedAt()
+			.setIssuer("https://accounts.google.com")
+			.setAudience(webClientId)
+			.setExpirationTime("1h")
+			.sign(googleKeyPair.privateKey);
+		const { client, auth } = await getTestInstance(
+			{
+				socialProviders: {
+					google: {
+						clientId: [webClientId, iosClientId, androidClientId],
+						clientSecret: "test-secret",
+						requireEmailVerification: true,
+					},
+				},
+				emailAndPassword: { enabled: true, requireEmailVerification: false },
+			},
+			{ disableTestUser: true },
+		);
+
+		const res = await client.signIn.social({
+			provider: "google",
+			idToken: { token: idToken },
+		});
+
+		expect(res.error?.status).toBe(403);
+		expect(res.error?.code).toBe("EMAIL_NOT_VERIFIED");
+		expect(res.data).toBeNull();
+
+		// The user is still created; only the session is withheld.
+		const ctx = await auth.$context;
+		const user = await ctx.adapter.findOne<{ emailVerified: boolean }>({
+			model: "user",
+			where: [{ field: "email", value: "mobile-unverified@example.com" }],
+		});
+		expect(user?.emailVerified).toBe(false);
+	});
+});
+
+/**
+ * The `hd` (hosted domain) authorization parameter is only a UI hint Google
+ * does not enforce, so the id_token sign-in path must check the verified `hd`
+ * claim itself. This exercises the shared verifier's `verifyClaims` hook wired
+ * by the Google provider.
+ */
+describe("Google Provider — hosted domain on id_token sign-in", async () => {
+	const googleKeyPair = await generateKeyPair("RS256");
+	const googleJwk = await exportJWK(googleKeyPair.publicKey);
+	const googleKid = "test-google-hd-kid";
+	googleJwk.kid = googleKid;
+	googleJwk.alg = "RS256";
+	googleJwk.use = "sig";
+
+	const clientId = "hd-web.googleusercontent.com";
+
+	const signIdToken = (claims: Record<string, unknown>) =>
+		new SignJWT({
+			email: "hd-user@example.com",
+			email_verified: true,
+			name: "HD User",
+			sub: "google-hd-sub",
+			...claims,
+		})
+			.setProtectedHeader({ alg: "RS256", kid: googleKid })
+			.setIssuedAt()
+			.setIssuer("https://accounts.google.com")
+			.setAudience(clientId)
+			.setExpirationTime("1h")
+			.sign(googleKeyPair.privateKey);
+
+	beforeAll(() => {
+		mswServer.use(
+			http.get("https://www.googleapis.com/oauth2/v3/certs", async () =>
+				HttpResponse.json({ keys: [googleJwk] }),
+			),
+		);
+	});
+
+	const getInstance = () =>
+		getTestInstance(
+			{
+				socialProviders: {
+					google: {
+						clientId,
+						clientSecret: "test-secret",
+						hd: "example.com",
+					},
+				},
+			},
+			{ disableTestUser: true },
+		);
+
+	it("accepts an id token whose hd claim matches the configured hosted domain", async () => {
+		const idToken = await signIdToken({ hd: "example.com" });
+		const { client } = await getInstance();
+
+		const res = await client.signIn.social({
+			provider: "google",
+			idToken: { token: idToken },
+		});
+
+		expect(res.error).toBeNull();
+		expect(res.data!.redirect).toBe(false);
+		const data = res.data as { user: { email: string } };
+		expect(data.user.email).toBe("hd-user@example.com");
+	});
+
+	it("rejects an id token whose hd claim is a different hosted domain", async () => {
+		const idToken = await signIdToken({ hd: "other.com" });
+		const { client } = await getInstance();
+
+		const res = await client.signIn.social({
+			provider: "google",
+			idToken: { token: idToken },
+		});
+
+		expect(res.error?.status).toBe(401);
+	});
+
+	it("rejects an id token with no hd claim when a hosted domain is configured", async () => {
+		const idToken = await signIdToken({});
+		const { client } = await getInstance();
+
+		const res = await client.signIn.social({
+			provider: "google",
+			idToken: { token: idToken },
+		});
+
+		expect(res.error?.status).toBe(401);
+	});
+});
+
+/**
+ * @see https://github.com/better-auth/better-auth/issues/4498
+ */
+describe("Multi-client ID support — other widened providers", () => {
+	const appleConfig = {
+		clientId: ["apple-web", "apple-ios"],
+		clientSecret: "apple-secret",
+	};
+	const facebookConfig = {
+		clientId: ["fb-web", "fb-mobile"],
+		clientSecret: "fb-secret",
+	};
+	const cognitoConfig = {
+		clientId: ["cog-web", "cog-mobile"],
+		clientSecret: "cog-secret",
+		domain: "test.auth.us-east-1.amazoncognito.com",
+		region: "us-east-1",
+		userPoolId: "us-east-1_testpool",
+	};
+
+	it.each([
+		["apple", appleConfig, "apple-web"],
+		["facebook", facebookConfig, "fb-web"],
+		["cognito", cognitoConfig, "cog-web"],
+	] as const)("%s uses the first entry of the clientId array for the auth URL", async (provider, config, firstId) => {
+		const { client } = await getTestInstance(
+			{ socialProviders: { [provider]: config } },
+			{ disableTestUser: true },
+		);
+
+		const res = await client.signIn.social({
+			provider,
+			callbackURL: "/callback",
+		});
+
+		expect(res.data?.url).toContain(firstId);
+	});
+
+	it.each([
+		["apple", { ...appleConfig, clientId: [] as string[] }],
+		["facebook", { ...facebookConfig, clientId: [] as string[] }],
+		["cognito", { ...cognitoConfig, clientId: [] as string[] }],
+	] as const)("%s rejects an empty clientId array", async (provider, config) => {
+		const { client } = await getTestInstance(
+			{ socialProviders: { [provider]: config } },
+			{ disableTestUser: true },
+		);
+
+		const res = await client.signIn.social({
+			provider,
+			callbackURL: "/callback",
+		});
+
+		expect(res.error?.status).toBe(500);
+	});
+});
+
+describe("Apple Provider", async () => {
+	it("should not use email as fallback for name when name is not provided", async () => {
+		const appleProfile = {
+			sub: "001341.example.1128",
+			email: "user@privaterelay.appleid.com",
+			email_verified: true,
+			is_private_email: true,
+			real_user_status: 2,
+			// No name field
+		};
+
+		mswServer.use(
+			http.post("https://appleid.apple.com/auth/token", async () => {
+				const idToken = await signJWT(appleProfile, DEFAULT_SECRET);
+				return HttpResponse.json({
+					access_token: "apple_access_token",
+					id_token: idToken,
+					token_type: "Bearer",
+					expires_in: 3600,
+				});
+			}),
+		);
+
+		const { client, cookieSetter } = await getTestInstance(
+			{
+				socialProviders: {
+					apple: {
+						clientId: "test-apple-client",
+						clientSecret: "test-apple-secret",
+						// Disable ID token verification for testing
+						verifyIdToken: async () => true,
+					},
+				},
+			},
+			{
+				disableTestUser: true,
+			},
+		);
+
+		const headers = new Headers();
+		const signInRes = await client.signIn.social({
+			provider: "apple",
+			callbackURL: "/callback",
+			fetchOptions: {
+				onSuccess: cookieSetter(headers),
+			},
+		});
+
+		const state = new URL(signInRes.data!.url!).searchParams.get("state") || "";
+
+		await client.$fetch("/callback/apple", {
+			query: {
+				state,
+				code: "apple_test_code",
+			},
+			headers,
+			method: "GET",
+			onError(context) {
+				cookieSetter(headers)(context as any);
+			},
+		});
+
+		const session = await client.getSession({
+			fetchOptions: {
+				headers,
+			},
+		});
+
+		// Name should NOT be the email address
+		expect(session.data?.user.name).not.toBe("user@privaterelay.appleid.com");
+		// Name should be empty string when not provided
+		expect(session.data?.user.name).toBe("");
+	});
+
+	it("should use firstName and lastName when provided in token.user", async () => {
+		const appleProfile = {
+			sub: "001341.example.1129",
+			email: "user2@privaterelay.appleid.com",
+			email_verified: true,
+			is_private_email: true,
+			real_user_status: 2,
+		};
+
+		mswServer.use(
+			http.post("https://appleid.apple.com/auth/token", async () => {
+				const idToken = await signJWT(appleProfile, DEFAULT_SECRET);
+				return HttpResponse.json({
+					access_token: "apple_access_token",
+					id_token: idToken,
+					token_type: "Bearer",
+					expires_in: 3600,
+				});
+			}),
+		);
+
+		const { client, cookieSetter } = await getTestInstance(
+			{
+				socialProviders: {
+					apple: {
+						clientId: "test-apple-client",
+						clientSecret: "test-apple-secret",
+						verifyIdToken: async () => true,
+					},
+				},
+			},
+			{
+				disableTestUser: true,
+			},
+		);
+
+		const headers = new Headers();
+		const signInRes = await client.signIn.social({
+			provider: "apple",
+			callbackURL: "/callback",
+			fetchOptions: {
+				onSuccess: cookieSetter(headers),
+			},
+		});
+
+		const state = new URL(signInRes.data!.url!).searchParams.get("state") || "";
+		const userData = JSON.stringify({
+			name: {
+				firstName: "Better",
+				lastName: "Auth",
+			},
+			email: "user2@privaterelay.appleid.com",
+		});
+
+		let redirectLocation: string | null = null;
+
+		await client.$fetch("/callback/apple", {
+			body: {
+				state,
+				code: "apple_test_code",
+				user: userData,
+			},
+			headers,
+			method: "POST",
+			onError(context) {
+				// Expecting 302 redirect
+				expect(context.response.status).toBe(302);
+				redirectLocation = context.response.headers.get("location");
+				expect(redirectLocation).toBeDefined();
+				expect(redirectLocation).toContain("/callback/apple");
+				expect(redirectLocation).toContain("user=");
+			},
+		});
+
+		const redirectUrl = new URL(redirectLocation!);
+		await client.$fetch("/callback/apple", {
+			query: Object.fromEntries(redirectUrl.searchParams),
+			headers,
+			method: "GET",
+			onError(context) {
+				cookieSetter(headers)(context as any);
+			},
+		});
+
+		const session = await client.getSession({
+			fetchOptions: {
+				headers,
+			},
+		});
+
+		expect(session.data?.user.name).toBe("Better Auth");
+	});
+
+	it("should pass user name via idToken body for Apple sign-in", async () => {
+		const appleProfile = {
+			sub: "001341.example.idtoken",
+			email: "idtoken-user@privaterelay.appleid.com",
+			email_verified: true,
+			is_private_email: true,
+			real_user_status: 2,
+			/**
+			 * Apple id_token JWT does not include the user's name.
+			 * Name is available via the `user` field in the response.
+			 * @see https://developer.apple.com/documentation/signinwithapplejs/authorizationi/id_token
+			 * @see https://developer.apple.com/documentation/signinwithapple/incorporating-sign-in-with-apple-into-other-platforms#Handle-the-response
+			 */
+		};
+
+		const idToken = await signJWT(appleProfile, DEFAULT_SECRET);
+
+		const { client } = await getTestInstance(
+			{
+				socialProviders: {
+					apple: {
+						clientId: "test-apple-client",
+						clientSecret: "test-apple-secret",
+						verifyIdToken: async () => true,
+					},
+				},
+			},
+			{
+				disableTestUser: true,
+			},
+		);
+
+		const res = await client.signIn.social({
+			provider: "apple",
+			callbackURL: "/callback",
+			idToken: {
+				token: idToken,
+				user: {
+					name: {
+						firstName: "First",
+						lastName: "Last",
+					},
+					email: "idtoken-user@privaterelay.appleid.com",
+				},
+			},
+		});
+
+		expect(res.data).toBeDefined();
+		expect(res.data!.redirect).toBe(false);
+		const data = res.data as {
+			token: string;
+			user: { email: string; name: string };
+		};
+		expect(data.token).toBeDefined();
+		expect(data.user.email).toBe("idtoken-user@privaterelay.appleid.com");
+		expect(data.user.name).toBe("First Last");
+	});
+
+	it("should result in empty name when idToken body has no user field for Apple", async () => {
+		const appleProfile = {
+			sub: "001341.example.idtoken-noname",
+			email: "noname-user@privaterelay.appleid.com",
+			email_verified: true,
+			is_private_email: true,
+			real_user_status: 2,
+		};
+
+		const idToken = await signJWT(appleProfile, DEFAULT_SECRET);
+
+		const { client } = await getTestInstance(
+			{
+				socialProviders: {
+					apple: {
+						clientId: "test-apple-client",
+						clientSecret: "test-apple-secret",
+						verifyIdToken: async () => true,
+					},
+				},
+			},
+			{
+				disableTestUser: true,
+			},
+		);
+
+		const res = await client.signIn.social({
+			provider: "apple",
+			callbackURL: "/callback",
+			idToken: {
+				token: idToken,
+			},
+		});
+
+		expect(res.data).toBeDefined();
+		expect(res.data!.redirect).toBe(false);
+		const data = res.data as {
+			token: string;
+			user: { email: string; name: string };
+		};
+		expect(data.token).toBeDefined();
+		expect(data.user.email).toBe("noname-user@privaterelay.appleid.com");
+		expect(data.user.name).toBe("");
+	});
+
+	/**
+	 * @see https://github.com/better-auth/better-auth/issues/1214
+	 */
+	it("should pass request ctx to verifyIdToken for id-token sign-in", async () => {
+		const appleProfile = {
+			sub: "001341.example.ctx-signin",
+			email: "ctx-signin@privaterelay.appleid.com",
+			email_verified: true,
+			is_private_email: true,
+			real_user_status: 2,
+		};
+		const idToken = await signJWT(appleProfile, DEFAULT_SECRET);
+		let seenPlatform: string | null | undefined;
+
+		const { client } = await getTestInstance(
+			{
+				socialProviders: {
+					apple: {
+						clientId: "test-apple-client",
+						clientSecret: "test-apple-secret",
+						verifyIdToken: async (_token, _nonce, ctx) => {
+							seenPlatform = ctx?.headers?.get("x-platform") ?? null;
+							return seenPlatform === "ios";
+						},
+					},
+				},
+			},
+			{
+				disableTestUser: true,
+			},
+		);
+
+		const rejected = await client.signIn.social({
+			provider: "apple",
+			idToken: { token: idToken },
+			fetchOptions: {
+				headers: {
+					"x-platform": "android",
+				},
+			},
+		});
+		expect(seenPlatform).toBe("android");
+		expect(rejected.error?.status).toBe(401);
+
+		const accepted = await client.signIn.social({
+			provider: "apple",
+			idToken: { token: idToken },
+			fetchOptions: {
+				headers: {
+					"x-platform": "ios",
+				},
+			},
+		});
+		expect(seenPlatform).toBe("ios");
+		expect(accepted.data).toBeDefined();
+		expect(accepted.data!.redirect).toBe(false);
+		const data = accepted.data as { user: { email: string } };
+		expect(data.user.email).toBe("ctx-signin@privaterelay.appleid.com");
+	});
+});
+
+/**
+ * @see https://github.com/better-auth/better-auth/issues/1214
+ */
+describe("verifyIdToken request ctx — account linking", async () => {
+	it("should pass request ctx to verifyIdToken for id-token account linking", async () => {
+		const googleProfile = {
+			email: "test@test.com",
+			email_verified: true,
+			name: "Ctx Link",
+			picture: "https://example.com/picture.png",
+			exp: 1234567890,
+			sub: "ctx-link-google-sub",
+			iat: 1234567890,
+			aud: "test",
+			azp: "test",
+			nbf: 1234567890,
+			iss: "test",
+			locale: "en",
+			jti: "ctx-link",
+			given_name: "Ctx",
+			family_name: "Link",
+		};
+		const idToken = await signJWT(googleProfile, DEFAULT_SECRET);
+		let seenPlatform: string | null | undefined;
+
+		const { client, signInWithTestUser } = await getTestInstance({
+			socialProviders: {
+				google: {
+					clientId: "test",
+					clientSecret: "test",
+					verifyIdToken: async (_token, _nonce, ctx) => {
+						seenPlatform = ctx?.headers?.get("x-platform") ?? null;
+						return seenPlatform === "ios";
+					},
+				},
+			},
+		});
+
+		const { runWithUser } = await signInWithTestUser();
+		await runWithUser(async (headers) => {
+			headers.set("x-platform", "android");
+			const rejected = await client.linkSocial(
+				{
+					provider: "google",
+					idToken: { token: idToken },
+				},
+				{ headers },
+			);
+			expect(seenPlatform).toBe("android");
+			expect(rejected.error?.status).toBe(401);
+
+			headers.set("x-platform", "ios");
+			const accepted = await client.linkSocial(
+				{
+					provider: "google",
+					idToken: { token: idToken },
+				},
+				{ headers },
+			);
+			expect(seenPlatform).toBe("ios");
+			expect(accepted.error).toBeNull();
+
+			const accounts = await client.listAccounts({
+				fetchOptions: { headers },
+			});
+			expect(
+				accounts.data?.some((account) => account.providerId === "google"),
+			).toBe(true);
+		});
+	});
+});
+
+describe("Vercel Provider", async () => {
+	beforeAll(async () => {
+		mswServer.use(
+			http.post(
+				"https://api.vercel.com/login/oauth/token",
+				async ({ request }) => {
+					const body = await request.text();
+					const params = new URLSearchParams(body);
+
+					// Verify PKCE is present
+					const codeVerifier = params.get("code_verifier");
+					expect(codeVerifier).not.toBeNull();
+					expect(codeVerifier).not.toBe("");
+
+					const profile: VercelProfile = {
+						sub: "vercel_user_123",
+						email: "vercel@test.com",
+						email_verified: true,
+						name: "Vercel User",
+						preferred_username: "verceluser",
+						picture: "https://vercel.com/avatar.png",
+					};
+
+					const idToken = await signJWT(profile, DEFAULT_SECRET);
+					return HttpResponse.json({
+						access_token: "vercel_access_token",
+						refresh_token: "vercel_refresh_token",
+						id_token: idToken,
+						token_type: "Bearer",
+						expires_in: 3600,
+					});
+				},
+			),
+			http.get("https://api.vercel.com/login/oauth/userinfo", async () => {
+				return HttpResponse.json({
+					sub: "vercel_user_123",
+					email: "vercel@test.com",
+					email_verified: true,
+					name: "Vercel User",
+					preferred_username: "verceluser",
+					picture: "https://vercel.com/avatar.png",
+				});
+			}),
+		);
+	});
+
+	it("should configure Vercel provider correctly", async () => {
+		const { auth } = await getTestInstance({
+			socialProviders: {
+				vercel: {
+					clientId: "vercel-test-client-id",
+					clientSecret: "vercel-test-client-secret",
+				},
+			},
+		});
+
+		const ctx = await auth.$context;
+		const vercelProvider = ctx.socialProviders.find((p) => p.id === "vercel");
+
+		expect(vercelProvider).toBeDefined();
+		expect(vercelProvider?.id).toBe("vercel");
+		expect(vercelProvider?.name).toBe("Vercel");
+	});
+
+	it("should initiate Vercel OAuth flow with PKCE", async () => {
+		const { client } = await getTestInstance({
+			socialProviders: {
+				vercel: {
+					clientId: "vercel-test-client-id",
+					clientSecret: "vercel-test-client-secret",
+				},
+			},
+		});
+
+		const signInRes = await client.signIn.social({
+			provider: "vercel",
+			callbackURL: "/dashboard",
+		});
+
+		expect(signInRes.data).toBeDefined();
+		expect(signInRes.data?.url).toContain("vercel.com/oauth/authorize");
+		expect(signInRes.data?.redirect).toBe(true);
+
+		// Verify PKCE parameters are present
+		const authUrl = new URL(signInRes.data!.url!);
+		expect(authUrl.searchParams.get("code_challenge")).not.toBeNull();
+		expect(authUrl.searchParams.get("code_challenge_method")).toBe("S256");
+	});
+
+	it("should complete Vercel OAuth flow and create user", async () => {
+		const { client, cookieSetter, auth } = await getTestInstance(
+			{
+				socialProviders: {
+					vercel: {
+						clientId: "vercel-test-client-id",
+						clientSecret: "vercel-test-client-secret",
+					},
+				},
+			},
+			{
+				disableTestUser: true,
+			},
+		);
+
+		const headers = new Headers();
+		const signInRes = await client.signIn.social({
+			provider: "vercel",
+			callbackURL: "/dashboard",
+			newUserCallbackURL: "/welcome",
+			fetchOptions: {
+				onSuccess: cookieSetter(headers),
+			},
+		});
+
+		expect(signInRes.data).toBeDefined();
+		const state = new URL(signInRes.data!.url!).searchParams.get("state") || "";
+
+		await client.$fetch("/callback/vercel", {
+			query: {
+				state,
+				code: "vercel_test_code",
+			},
+			headers,
+			method: "GET",
+			onError(context) {
+				expect(context.response.status).toBe(302);
+				const location = context.response.headers.get("location");
+				expect(location).toBeDefined();
+				expect(location).toContain("/welcome");
+
+				const cookies = parseSetCookieHeader(
+					context.response.headers.get("set-cookie") || "",
+				);
+				expect(cookies.get("better-auth.session_token")?.value).toBeDefined();
+
+				cookieSetter(headers)(context as any);
+			},
+		});
+
+		const session = await client.getSession({
+			fetchOptions: {
+				headers,
+			},
+		});
+
+		expect(session.data).toBeDefined();
+		expect(session.data?.user.email).toBe("vercel@test.com");
+		expect(session.data?.user.name).toBe("Vercel User");
+		expect(session.data?.user.image).toBe("https://vercel.com/avatar.png");
+		expect(session.data?.user.emailVerified).toBe(true);
+
+		// Verify account was created
+		const ctx = await auth.$context;
+		const accounts = await ctx.internalAdapter.findAccounts(
+			session.data?.user.id!,
+		);
+		expect(accounts).toHaveLength(1);
+		expect(accounts[0]?.providerId).toBe("vercel");
+		expect(accounts[0]?.accountId).toBe("vercel_user_123");
+	});
+
+	it("should use preferred_username as fallback for name", async () => {
+		mswServer.use(
+			http.post("https://api.vercel.com/login/oauth/token", async () => {
+				const profile: VercelProfile = {
+					sub: "vercel_user_456",
+					email: "noname@vercel.com",
+					email_verified: true,
+					preferred_username: "cooldev",
+					// No name field
+					picture: "https://vercel.com/avatar2.png",
+				};
+
+				const idToken = await signJWT(profile, DEFAULT_SECRET);
+				return HttpResponse.json({
+					access_token: "vercel_access_token_2",
+					id_token: idToken,
+					token_type: "Bearer",
+					expires_in: 3600,
+				});
+			}),
+			http.get("https://api.vercel.com/login/oauth/userinfo", async () => {
+				return HttpResponse.json({
+					sub: "vercel_user_456",
+					email: "noname@vercel.com",
+					email_verified: true,
+					preferred_username: "cooldev",
+					picture: "https://vercel.com/avatar2.png",
+				});
+			}),
+		);
+
+		const { client, cookieSetter } = await getTestInstance(
+			{
+				socialProviders: {
+					vercel: {
+						clientId: "vercel-test-client-id",
+						clientSecret: "vercel-test-client-secret",
+					},
+				},
+			},
+			{
+				disableTestUser: true,
+			},
+		);
+
+		const headers = new Headers();
+		const signInRes = await client.signIn.social({
+			provider: "vercel",
+			callbackURL: "/dashboard",
+			fetchOptions: {
+				onSuccess: cookieSetter(headers),
+			},
+		});
+
+		const state = new URL(signInRes.data!.url!).searchParams.get("state") || "";
+
+		await client.$fetch("/callback/vercel", {
+			query: { state, code: "vercel_test_code_2" },
+			headers,
+			method: "GET",
+			onError(context) {
+				cookieSetter(headers)(context as any);
+			},
+		});
+
+		const session = await client.getSession({
+			fetchOptions: { headers },
+		});
+
+		expect(session.data?.user.name).toBe("cooldev");
+	});
+
+	it("should allow additional scopes", async () => {
+		const { client } = await getTestInstance({
+			socialProviders: {
+				vercel: {
+					clientId: "vercel-test-client-id",
+					clientSecret: "vercel-test-client-secret",
+					scope: ["openid", "email", "profile", "offline_access"],
+				},
+			},
+		});
+
+		const signInRes = await client.signIn.social({
+			provider: "vercel",
+			callbackURL: "/dashboard",
+		});
+
+		expect(signInRes.data?.url).toBeDefined();
+		const authUrl = new URL(signInRes.data!.url!);
+		const scopes = authUrl.searchParams.get("scope");
+
+		expect(scopes).toContain("openid");
+		expect(scopes).toContain("email");
+		expect(scopes).toContain("profile");
+		expect(scopes).toContain("offline_access");
+	});
+
+	it("should support mapProfileToUser", async () => {
+		const { client, cookieSetter } = await getTestInstance(
+			{
+				user: {
+					additionalFields: {
+						vercelUserId: {
+							type: "string",
+						},
+					},
+				},
+				socialProviders: {
+					vercel: {
+						clientId: "vercel-test-client-id",
+						clientSecret: "vercel-test-client-secret",
+						mapProfileToUser(profile: VercelProfile) {
+							return {
+								vercelUserId: profile.sub,
+							};
+						},
+					},
+				},
+			},
+			{
+				disableTestUser: true,
+			},
+		);
+
+		const headers = new Headers();
+		const signInRes = await client.signIn.social({
+			provider: "vercel",
+			callbackURL: "/dashboard",
+			fetchOptions: {
+				onSuccess: cookieSetter(headers),
+			},
+		});
+
+		const state = new URL(signInRes.data!.url!).searchParams.get("state") || "";
+
+		await client.$fetch("/callback/vercel", {
+			query: { state, code: "vercel_test_code_3" },
+			headers,
+			method: "GET",
+			onError(context) {
+				cookieSetter(headers)(context as any);
+			},
+		});
+
+		const session = await client.getSession({
+			fetchOptions: { headers },
+		});
+
+		expect(session.data?.user).toHaveProperty("vercelUserId");
+		// The test uses the mocked userinfo which returns vercel_user_123 at this point
+		expect((session.data?.user as any).vercelUserId).toBeDefined();
+	});
+
+	it("should redirect existing Vercel users to callback URL", async () => {
+		const { client, cookieSetter } = await getTestInstance({
+			socialProviders: {
+				vercel: {
+					clientId: "vercel-test-client-id",
+					clientSecret: "vercel-test-client-secret",
+				},
+			},
+		});
+
+		const headers = new Headers();
+
+		// First sign-in (new user)
+		const signInRes1 = await client.signIn.social({
+			provider: "vercel",
+			callbackURL: "/dashboard",
+			newUserCallbackURL: "/welcome",
+			fetchOptions: {
+				onSuccess: cookieSetter(headers),
+			},
+		});
+
+		const state1 =
+			new URL(signInRes1.data!.url!).searchParams.get("state") || "";
+
+		await client.$fetch("/callback/vercel", {
+			query: { state: state1, code: "vercel_test_code_existing" },
+			headers,
+			method: "GET",
+			onError(context) {
+				expect(context.response.headers.get("location")).toContain("/welcome");
+				cookieSetter(headers)(context as any);
+			},
+		});
+
+		// Second sign-in (existing user)
+		const signInRes2 = await client.signIn.social({
+			provider: "vercel",
+			callbackURL: "/dashboard",
+			newUserCallbackURL: "/welcome",
+			fetchOptions: {
+				onSuccess: cookieSetter(headers),
+			},
+		});
+
+		const state2 =
+			new URL(signInRes2.data!.url!).searchParams.get("state") || "";
+
+		await client.$fetch("/callback/vercel", {
+			query: { state: state2, code: "vercel_test_code_existing_2" },
+			headers,
+			method: "GET",
+			onError(context) {
+				expect(context.response.status).toBe(302);
+				const location = context.response.headers.get("location");
+				expect(location).toContain("/dashboard");
+				expect(location).not.toContain("/welcome");
+			},
+		});
+	});
+});
+
+describe("Microsoft Provider", async () => {
+	const rsaKeyPair = await generateKeyPair("RS256");
+	const rsaJwk = await exportJWK(rsaKeyPair.publicKey);
+	const msKid = "test-microsoft-kid";
+	rsaJwk.kid = msKid;
+	rsaJwk.alg = "RS256";
+	rsaJwk.use = "sig";
+
+	it("should support verifyIdToken with custom function", async () => {
+		const microsoftProfile: Partial<MicrosoftEntraIDProfile> = {
+			sub: "ms-user-123",
+			iss: "https://login.microsoftonline.com/ms-tenant-123/v2.0",
+			email: "msuser@outlook.com",
+			name: "Microsoft User",
+			oid: "ms-oid-123",
+			tid: "ms-tenant-123",
+		};
+
+		mswServer.use(
+			http.post(
+				"https://login.microsoftonline.com/common/oauth2/v2.0/token",
+				async () => {
+					const idToken = await signJWT(microsoftProfile, DEFAULT_SECRET);
+					return HttpResponse.json({
+						access_token: "ms_access_token",
+						id_token: idToken,
+						token_type: "Bearer",
+						expires_in: 3600,
+					});
+				},
+			),
+			http.get("https://graph.microsoft.com/v1.0/me/photos/*", async () => {
+				return new HttpResponse(null, { status: 404 });
+			}),
+		);
+
+		const { client, cookieSetter } = await getTestInstance(
+			{
+				socialProviders: {
+					microsoft: {
+						clientId: "test-ms-client",
+						clientSecret: "test-ms-secret",
+						verifyIdToken: async () => true,
+					},
+				},
+			},
+			{
+				disableTestUser: true,
+			},
+		);
+
+		const headers = new Headers();
+		const signInRes = await client.signIn.social({
+			provider: "microsoft",
+			callbackURL: "/callback",
+			fetchOptions: {
+				onSuccess: cookieSetter(headers),
+			},
+		});
+
+		const state = new URL(signInRes.data!.url!).searchParams.get("state") || "";
+
+		await client.$fetch("/callback/microsoft", {
+			query: {
+				state,
+				code: "ms_test_code",
+			},
+			headers,
+			method: "GET",
+			onError(context) {
+				cookieSetter(headers)(context as any);
+			},
+		});
+
+		const session = await client.getSession({
+			fetchOptions: {
+				headers,
+			},
+		});
+
+		expect(session.data?.user.email).toBe("msuser@outlook.com");
+		expect(session.data?.user.name).toBe("Microsoft User");
+	});
+
+	it("should verify id token using JWKS endpoint", async () => {
+		const microsoftProfile: Partial<MicrosoftEntraIDProfile> = {
+			sub: "ms-jwks-user-456",
+			iss: "https://login.microsoftonline.com/ms-tenant-456/v2.0",
+			email: "jwksuser@outlook.com",
+			name: "JWKS User",
+			oid: "ms-oid-456",
+			tid: "ms-tenant-456",
+		};
+
+		const idToken = await new SignJWT(
+			microsoftProfile as unknown as Record<string, unknown>,
+		)
+			.setProtectedHeader({ alg: "RS256", kid: msKid })
+			.setIssuedAt()
+			.setIssuer("https://login.microsoftonline.com/ms-tenant-456/v2.0")
+			.setAudience("test-ms-client-jwks")
+			.setExpirationTime("1h")
+			.sign(rsaKeyPair.privateKey);
+
+		mswServer.use(
+			http.get(
+				"https://login.microsoftonline.com/common/discovery/v2.0/keys",
+				async () => {
+					return HttpResponse.json({
+						keys: [rsaJwk],
+					});
+				},
+			),
+			http.post(
+				"https://login.microsoftonline.com/common/oauth2/v2.0/token",
+				async () => {
+					return HttpResponse.json({
+						access_token: "ms_access_token_jwks",
+						id_token: idToken,
+						token_type: "Bearer",
+						expires_in: 3600,
+					});
+				},
+			),
+			http.get("https://graph.microsoft.com/v1.0/me/photos/*", async () => {
+				return new HttpResponse(null, { status: 404 });
+			}),
+		);
+
+		const { auth, client, cookieSetter } = await getTestInstance(
+			{
+				socialProviders: {
+					microsoft: {
+						clientId: "test-ms-client-jwks",
+						clientSecret: "test-ms-secret-jwks",
+					},
+				},
+			},
+			{
+				disableTestUser: true,
+			},
+		);
+
+		const headers = new Headers();
+		const signInRes = await client.signIn.social({
+			provider: "microsoft",
+			callbackURL: "/callback",
+			fetchOptions: {
+				onSuccess: cookieSetter(headers),
+			},
+		});
+
+		const state = new URL(signInRes.data!.url!).searchParams.get("state") || "";
+
+		await client.$fetch("/callback/microsoft", {
+			query: {
+				state,
+				code: "ms_test_code_jwks",
+			},
+			headers,
+			method: "GET",
+			onError(context) {
+				cookieSetter(headers)(context as any);
+			},
+		});
+
+		const session = await client.getSession({
+			fetchOptions: {
+				headers,
+			},
+		});
+
+		expect(session.data?.user.email).toBe("jwksuser@outlook.com");
+		expect(session.data?.user.name).toBe("JWKS User");
+		const ctx = await auth.$context;
+		const accounts = await ctx.internalAdapter.findAccounts(
+			session.data!.user.id,
+		);
+		expect(
+			accounts.find((account) => account.providerId === "microsoft")?.accountId,
+		).toBe("ms-oid-456");
+	});
+
+	it("should support id token sign in", async () => {
+		const microsoftProfile: Partial<MicrosoftEntraIDProfile> = {
+			sub: "ms-id-token-user-789",
+			email: "id-tokenuser@outlook.com",
+			name: "IdToken User",
+			oid: "ms-oid-789",
+			tid: "ms-tenant-789",
+		};
+
+		const idToken = await new SignJWT(
+			microsoftProfile as unknown as Record<string, unknown>,
+		)
+			.setProtectedHeader({ alg: "RS256", kid: msKid })
+			.setIssuedAt()
+			.setIssuer("https://login.microsoftonline.com/ms-tenant-789/v2.0")
+			.setAudience("test-ms-client-id-token")
+			.setExpirationTime("1h")
+			.sign(rsaKeyPair.privateKey);
+
+		mswServer.use(
+			http.get(
+				"https://login.microsoftonline.com/common/discovery/v2.0/keys",
+				async () => {
+					return HttpResponse.json({
+						keys: [rsaJwk],
+					});
+				},
+			),
+			http.get("https://graph.microsoft.com/v1.0/me/photos/*", async () => {
+				return new HttpResponse(null, { status: 404 });
+			}),
+		);
+
+		const { auth, client } = await getTestInstance(
+			{
+				socialProviders: {
+					microsoft: {
+						clientId: "test-ms-client-id-token",
+						clientSecret: "test-ms-secret-id-token",
+					},
+				},
+			},
+			{
+				disableTestUser: true,
+			},
+		);
+
+		const res = await client.signIn.social({
+			provider: "microsoft",
+			callbackURL: "/callback",
+			idToken: {
+				token: idToken,
+			},
+		});
+
+		expect(res.data).toBeDefined();
+		expect(res.data!.redirect).toBe(false);
+		const data = res.data as {
+			token: string;
+			user: { id: string; email: string; name: string };
+		};
+		expect(data.token).toBeDefined();
+		expect(data.user.email).toBe("id-tokenuser@outlook.com");
+		expect(data.user.name).toBe("IdToken User");
+		const ctx = await auth.$context;
+		const accounts = await ctx.internalAdapter.findAccounts(data.user.id);
+		expect(
+			accounts.find((account) => account.providerId === "microsoft")?.accountId,
+		).toBe("ms-oid-789");
+	});
+
+	it("should reject id token sign in when oid is missing", async () => {
+		const microsoftProfile: Partial<MicrosoftEntraIDProfile> = {
+			sub: "ms-missing-oid-user",
+			email: "missing-oid@outlook.com",
+			name: "Missing Oid User",
+			tid: "ms-tenant-missing-oid",
+		};
+
+		const idToken = await new SignJWT(
+			microsoftProfile as unknown as Record<string, unknown>,
+		)
+			.setProtectedHeader({ alg: "RS256", kid: msKid })
+			.setIssuedAt()
+			.setIssuer("https://login.microsoftonline.com/ms-tenant-missing-oid/v2.0")
+			.setAudience("test-ms-client-missing-oid")
+			.setExpirationTime("1h")
+			.sign(rsaKeyPair.privateKey);
+
+		mswServer.use(
+			http.get(
+				"https://login.microsoftonline.com/common/discovery/v2.0/keys",
+				async () => {
+					return HttpResponse.json({
+						keys: [rsaJwk],
+					});
+				},
+			),
+			http.get("https://graph.microsoft.com/v1.0/me/photos/*", async () => {
+				return new HttpResponse(null, { status: 404 });
+			}),
+		);
+
+		const { auth, client } = await getTestInstance(
+			{
+				socialProviders: {
+					microsoft: {
+						clientId: "test-ms-client-missing-oid",
+						clientSecret: "test-ms-secret-missing-oid",
+					},
+				},
+			},
+			{
+				disableTestUser: true,
+			},
+		);
+
+		const res = await client.signIn.social({
+			provider: "microsoft",
+			callbackURL: "/callback",
+			idToken: {
+				token: idToken,
+			},
+		});
+
+		expect(res.error?.status).toBe(401);
+		const ctx = await auth.$context;
+		const accounts = await ctx.adapter.findMany({
+			model: "account",
+			where: [{ field: "providerId", value: "microsoft" }],
+		});
+		expect(accounts).toHaveLength(0);
+	});
+
+	it("should report id_token sign-in unsupported when disableIdTokenSignIn is true", async () => {
+		const microsoftProfile: Partial<MicrosoftEntraIDProfile> = {
+			sub: "ms-disabled-user",
+			email: "disabled@outlook.com",
+			name: "Disabled User",
+		};
+
+		const idToken = await new SignJWT(
+			microsoftProfile as unknown as Record<string, unknown>,
+		)
+			.setProtectedHeader({ alg: "RS256", kid: msKid })
+			.setIssuedAt()
+			.setAudience("test-ms-client-disabled")
+			.setExpirationTime("1h")
+			.sign(rsaKeyPair.privateKey);
+
+		mswServer.use(
+			http.get(
+				"https://login.microsoftonline.com/common/discovery/v2.0/keys",
+				async () => {
+					return HttpResponse.json({
+						keys: [rsaJwk],
+					});
+				},
+			),
+		);
+
+		const { client } = await getTestInstance(
+			{
+				socialProviders: {
+					microsoft: {
+						clientId: "test-ms-client-disabled",
+						clientSecret: "test-ms-secret-disabled",
+						disableIdTokenSignIn: true,
+					},
+				},
+			},
+			{
+				disableTestUser: true,
+			},
+		);
+
+		const res = await client.signIn.social({
+			provider: "microsoft",
+			callbackURL: "/callback",
+			idToken: {
+				token: idToken,
+			},
+		});
+
+		// A disabled provider reports the id_token path as unsupported, the same as a provider
+		// that declares no idToken config, instead of the misleading "invalid id token" (401)
+		// that implies the token was verified and rejected.
+		expect(res.error?.status).toBe(404);
+		expect(res.error?.code).toBe("ID_TOKEN_NOT_SUPPORTED");
+	});
+
+	it("should verify issuer when specific tenant is configured", async () => {
+		const tenantId = "my-specific-tenant-id";
+		const microsoftProfile: Partial<MicrosoftEntraIDProfile> = {
+			sub: "ms-tenant-user",
+			email: "tenant@outlook.com",
+			name: "Tenant User",
+			oid: "ms-tenant-oid",
+			tid: tenantId,
+		};
+
+		const validToken = await new SignJWT(
+			microsoftProfile as unknown as Record<string, unknown>,
+		)
+			.setProtectedHeader({ alg: "RS256", kid: msKid })
+			.setIssuedAt()
+			.setIssuer(`https://login.microsoftonline.com/${tenantId}/v2.0`)
+			.setAudience("test-ms-client-tenant")
+			.setExpirationTime("1h")
+			.sign(rsaKeyPair.privateKey);
+
+		const wrongIssuerToken = await new SignJWT(
+			microsoftProfile as unknown as Record<string, unknown>,
+		)
+			.setProtectedHeader({ alg: "RS256", kid: msKid })
+			.setIssuedAt()
+			.setIssuer("https://login.microsoftonline.com/wrong-tenant/v2.0")
+			.setAudience("test-ms-client-tenant")
+			.setExpirationTime("1h")
+			.sign(rsaKeyPair.privateKey);
+
+		mswServer.use(
+			http.get(
+				`https://login.microsoftonline.com/${tenantId}/discovery/v2.0/keys`,
+				async () => {
+					return HttpResponse.json({ keys: [rsaJwk] });
+				},
+			),
+			http.get(
+				"https://graph.microsoft.com/v1.0/me/photos/*",
+				async () => new HttpResponse(null, { status: 404 }),
+			),
+		);
+
+		const { client } = await getTestInstance(
+			{
+				socialProviders: {
+					microsoft: {
+						clientId: "test-ms-client-tenant",
+						clientSecret: "test-ms-secret-tenant",
+						tenantId,
+					},
+				},
+			},
+			{ disableTestUser: true },
+		);
+
+		const validRes = await client.signIn.social({
+			provider: "microsoft",
+			callbackURL: "/callback",
+			idToken: { token: validToken },
+		});
+		expect(validRes.data).toBeDefined();
+		expect(validRes.data!.redirect).toBe(false);
+
+		const { client: client2 } = await getTestInstance(
+			{
+				socialProviders: {
+					microsoft: {
+						clientId: "test-ms-client-tenant",
+						clientSecret: "test-ms-secret-tenant",
+						tenantId,
+					},
+				},
+			},
+			{ disableTestUser: true },
+		);
+
+		const invalidRes = await client2.signIn.social({
+			provider: "microsoft",
+			callbackURL: "/callback",
+			idToken: { token: wrongIssuerToken },
+		});
+		expect(invalidRes.error?.status).toBe(401);
+	});
+
+	it("builds an authorization URL without clientSecret (public client)", async () => {
+		const { client } = await getTestInstance(
+			{
+				socialProviders: {
+					microsoft: {
+						clientId: "public-ms-client",
+					},
+				},
+			},
+			{ disableTestUser: true },
+		);
+
+		const res = await client.signIn.social({
+			provider: "microsoft",
+			callbackURL: "/callback",
+		});
+
+		expect(res.data?.url).toContain("public-ms-client");
+		expect(res.data?.redirect).toBe(true);
+	});
+});
+
+describe("Cloudflare Provider", () => {
+	let userInfoRequestCount = 0;
+
+	const handleUserInfoRequest = () => {
+		userInfoRequestCount += 1;
+
+		return HttpResponse.json({ sub: "cloudflare_user_123" });
+	};
+
+	beforeAll(() => {
+		mswServer.use(
+			http.post(
+				"https://dash.cloudflare.com/oauth2/token",
+				async ({ request }) => {
+					const authHeader = request.headers.get("authorization");
+					expect(authHeader).toMatch(/^Basic /);
+
+					const body = await request.text();
+					const params = new URLSearchParams(body);
+					expect(params.get("grant_type")).toBe("authorization_code");
+					expect(params.get("code")).toBeDefined();
+					expect(params.get("redirect_uri")).toBeDefined();
+					expect(params.get("code_verifier")).not.toBeNull();
+					expect(params.get("client_secret")).toBeNull();
+
+					return HttpResponse.json({
+						access_token: "cloudflare_access_token",
+						refresh_token: "cloudflare_refresh_token",
+						token_type: "Bearer",
+						expires_in: 3600,
+					});
+				},
+			),
+			http.get(
+				"https://api.cloudflare.com/client/v4/user",
+				async ({ request }) => {
+					expect(request.headers.get("authorization")).toMatch(/^Bearer /);
+					return HttpResponse.json({
+						success: true,
+						errors: [],
+						messages: [],
+						result: {
+							id: "cloudflare_user_123",
+							email: "cloudflare@test.com",
+							first_name: "Cloudflare",
+							last_name: "User",
+						} satisfies CloudflareProfile,
+					});
+				},
+			),
+			http.get(
+				"https://dash.cloudflare.com/oauth2/userinfo",
+				handleUserInfoRequest,
+			),
+		);
+	});
+
+	it("should configure Cloudflare provider correctly", async () => {
+		const { auth } = await getTestInstance({
+			socialProviders: {
+				cloudflare: {
+					clientId: "cloudflare-test-client-id",
+					clientSecret: "cloudflare-test-client-secret",
+				},
+			},
+		});
+
+		const ctx = await auth.$context;
+		const cloudflareProvider = ctx.socialProviders.find(
+			(p) => p.id === "cloudflare",
+		);
+
+		expect(cloudflareProvider).toBeDefined();
+		expect(cloudflareProvider?.id).toBe("cloudflare");
+		expect(cloudflareProvider?.name).toBe("Cloudflare");
+	});
+
+	it("should initiate Cloudflare OAuth flow with PKCE", async () => {
+		const { client } = await getTestInstance({
+			socialProviders: {
+				cloudflare: {
+					clientId: "cloudflare-test-client-id",
+					clientSecret: "cloudflare-test-client-secret",
+				},
+			},
+		});
+
+		const signInRes = await client.signIn.social({
+			provider: "cloudflare",
+			callbackURL: "/dashboard",
+		});
+
+		expect(signInRes.data).toBeDefined();
+		expect(signInRes.data?.url).toContain("dash.cloudflare.com/oauth2/auth");
+		expect(signInRes.data?.redirect).toBe(true);
+
+		const authUrl = new URL(signInRes.data!.url!);
+		expect(authUrl.searchParams.get("scope")).toContain("user-details.read");
+		expect(authUrl.searchParams.get("scope")).not.toContain("openid");
+		expect(authUrl.searchParams.get("code_challenge")).not.toBeNull();
+		expect(authUrl.searchParams.get("code_challenge_method")).toBe("S256");
+	});
+
+	it("should not send an empty scope parameter when default scopes are disabled", async () => {
+		const { client } = await getTestInstance({
+			socialProviders: {
+				cloudflare: {
+					clientId: "cloudflare-test-client-id",
+					clientSecret: "cloudflare-test-client-secret",
+					disableDefaultScope: true,
+					scope: [],
+				},
+			},
+		});
+
+		const signInRes = await client.signIn.social({
+			provider: "cloudflare",
+			callbackURL: "/dashboard",
+		});
+
+		expect(signInRes.data?.url).toBeDefined();
+		const authUrl = new URL(signInRes.data!.url!);
+		expect(authUrl.searchParams.get("scope")).toBeNull();
+	});
+
+	it("should include additional Cloudflare API scopes", async () => {
+		const { client } = await getTestInstance({
+			socialProviders: {
+				cloudflare: {
+					clientId: "cloudflare-test-client-id",
+					clientSecret: "cloudflare-test-client-secret",
+					scope: ["workers-platform.read"],
+				},
+			},
+		});
+
+		const signInRes = await client.signIn.social({
+			provider: "cloudflare",
+			callbackURL: "/dashboard",
+		});
+
+		expect(signInRes.data?.url).toBeDefined();
+		const authUrl = new URL(signInRes.data!.url!);
+		const scopes = authUrl.searchParams.get("scope");
+
+		expect(scopes).toContain("user-details.read");
+		expect(scopes).toContain("workers-platform.read");
+		expect(scopes).not.toContain("openid");
+	});
+
+	it("should complete Cloudflare OAuth flow and create user", async () => {
+		const { client, cookieSetter, auth } = await getTestInstance(
+			{
+				socialProviders: {
+					cloudflare: {
+						clientId: "cloudflare-test-client-id",
+						clientSecret: "cloudflare-test-client-secret",
+					},
+				},
+			},
+			{
+				disableTestUser: true,
+			},
+		);
+
+		const headers = new Headers();
+		const signInRes = await client.signIn.social({
+			provider: "cloudflare",
+			callbackURL: "/dashboard",
+			newUserCallbackURL: "/welcome",
+			fetchOptions: {
+				onSuccess: cookieSetter(headers),
+			},
+		});
+
+		expect(signInRes.data).toBeDefined();
+		const state = new URL(signInRes.data!.url!).searchParams.get("state") || "";
+
+		await client.$fetch("/callback/cloudflare", {
+			query: {
+				state,
+				code: "cloudflare_test_code",
+			},
+			headers,
+			method: "GET",
+			onError(context) {
+				expect(context.response.status).toBe(302);
+				const location = context.response.headers.get("location");
+				expect(location).toBeDefined();
+				expect(location).toContain("/welcome");
+
+				const cookies = parseSetCookieHeader(
+					context.response.headers.get("set-cookie") || "",
+				);
+				expect(cookies.get("better-auth.session_token")?.value).toBeDefined();
+
+				cookieSetter(headers)(context);
+			},
+		});
+
+		const session = await client.getSession({
+			fetchOptions: {
+				headers,
+			},
+		});
+
+		expect(session.data).toBeDefined();
+		expect(session.data?.user.email).toBe("cloudflare@test.com");
+		expect(session.data?.user.name).toBe("Cloudflare User");
+		// Cloudflare's /user endpoint does not expose an avatar.
+		expect(session.data?.user.image).toBeNull();
+		expect(session.data?.user.emailVerified).toBe(false);
+
+		const ctx = await auth.$context;
+		const accounts = await ctx.internalAdapter.findAccounts(
+			session.data?.user.id!,
+		);
+		expect(accounts).toHaveLength(1);
+		expect(accounts[0]?.providerId).toBe("cloudflare");
+		expect(accounts[0]?.accountId).toBe("cloudflare_user_123");
+	});
+
+	it("should support client_secret_post token authentication", async () => {
+		mswServer.use(
+			http.post(
+				"https://dash.cloudflare.com/oauth2/token",
+				async ({ request }) => {
+					expect(request.headers.get("authorization")).toBeNull();
+
+					const body = await request.text();
+					const params = new URLSearchParams(body);
+					expect(params.get("client_id")).toBe("cloudflare-post-client-id");
+					expect(params.get("client_secret")).toBe(
+						"cloudflare-post-client-secret",
+					);
+
+					return HttpResponse.json({
+						access_token: "cloudflare_post_access_token",
+						token_type: "Bearer",
+						expires_in: 3600,
+					});
+				},
+				{ once: true },
+			),
+		);
+
+		const { client, cookieSetter } = await getTestInstance(
+			{
+				socialProviders: {
+					cloudflare: {
+						clientId: "cloudflare-post-client-id",
+						clientSecret: "cloudflare-post-client-secret",
+						tokenEndpointAuthMethod: "client_secret_post",
+					},
+				},
+			},
+			{
+				disableTestUser: true,
+			},
+		);
+
+		const headers = new Headers();
+		const signInRes = await client.signIn.social({
+			provider: "cloudflare",
+			callbackURL: "/dashboard",
+			fetchOptions: {
+				onSuccess: cookieSetter(headers),
+			},
+		});
+
+		const state = new URL(signInRes.data!.url!).searchParams.get("state") || "";
+
+		await client.$fetch("/callback/cloudflare", {
+			query: { state, code: "cloudflare_post_code" },
+			headers,
+			method: "GET",
+			onError(context) {
+				cookieSetter(headers)(context);
+			},
+		});
+
+		const session = await client.getSession({
+			fetchOptions: { headers },
+		});
+
+		expect(session.data?.user.email).toBe("cloudflare@test.com");
+	});
+
+	it("should support public clients", async () => {
+		mswServer.use(
+			http.post(
+				"https://dash.cloudflare.com/oauth2/token",
+				async ({ request }) => {
+					expect(request.headers.get("authorization")).toBeNull();
+
+					const body = await request.text();
+					const params = new URLSearchParams(body);
+					expect(params.get("client_id")).toBe("cloudflare-public-client-id");
+					expect(params.get("client_secret")).toBeNull();
+
+					return HttpResponse.json({
+						access_token: "cloudflare_public_access_token",
+						token_type: "Bearer",
+						expires_in: 3600,
+					});
+				},
+				{ once: true },
+			),
+		);
+
+		const { client, cookieSetter } = await getTestInstance(
+			{
+				socialProviders: {
+					cloudflare: {
+						clientId: "cloudflare-public-client-id",
+						tokenEndpointAuthMethod: "none",
+					},
+				},
+			},
+			{
+				disableTestUser: true,
+			},
+		);
+
+		const headers = new Headers();
+		const signInRes = await client.signIn.social({
+			provider: "cloudflare",
+			callbackURL: "/dashboard",
+			fetchOptions: {
+				onSuccess: cookieSetter(headers),
+			},
+		});
+
+		const state = new URL(signInRes.data!.url!).searchParams.get("state") || "";
+
+		await client.$fetch("/callback/cloudflare", {
+			query: { state, code: "cloudflare_public_code" },
+			headers,
+			method: "GET",
+			onError(context) {
+				cookieSetter(headers)(context);
+			},
+		});
+
+		const session = await client.getSession({
+			fetchOptions: { headers },
+		});
+
+		expect(session.data?.user.email).toBe("cloudflare@test.com");
+	});
+
+	/**
+	 * Cloudflare's OIDC `userinfo` endpoint only returns the `sub` claim, so the
+	 * provider must read the profile (email, name) from the Cloudflare API
+	 * `/user` endpoint. This guards against regressing back to `userinfo`, which
+	 * cannot produce an email and breaks sign-in.
+	 * @see https://github.com/better-auth/better-auth/pull/9908
+	 */
+	it("derives the profile from the Cloudflare API /user endpoint, not the OIDC userinfo endpoint", async () => {
+		userInfoRequestCount = 0;
+		mswServer.use(
+			http.get(
+				"https://api.cloudflare.com/client/v4/user",
+				async () => {
+					return HttpResponse.json({
+						success: true,
+						errors: [],
+						messages: [],
+						result: {
+							id: "cloudflare_user_123",
+							email: "first-only@test.com",
+							first_name: "First",
+							// no last_name
+						} satisfies CloudflareProfile,
+					});
+				},
+				{ once: true },
+			),
+		);
+
+		const { client, cookieSetter } = await getTestInstance(
+			{
+				socialProviders: {
+					cloudflare: {
+						clientId: "cloudflare-test-client-id",
+						clientSecret: "cloudflare-test-client-secret",
+					},
+				},
+			},
+			{
+				disableTestUser: true,
+			},
+		);
+
+		const headers = new Headers();
+		const signInRes = await client.signIn.social({
+			provider: "cloudflare",
+			callbackURL: "/dashboard",
+			fetchOptions: {
+				onSuccess: cookieSetter(headers),
+			},
+		});
+
+		const state = new URL(signInRes.data!.url!).searchParams.get("state") || "";
+
+		await client.$fetch("/callback/cloudflare", {
+			query: { state, code: "cloudflare_user_endpoint_code" },
+			headers,
+			method: "GET",
+			onError(context) {
+				cookieSetter(headers)(context);
+			},
+		});
+
+		const session = await client.getSession({
+			fetchOptions: { headers },
+		});
+
+		expect(session.data?.user.email).toBe("first-only@test.com");
+		// Name is composed from first_name/last_name; only first_name is present.
+		expect(session.data?.user.name).toBe("First");
+		expect(userInfoRequestCount).toBe(0);
+	});
+});
+
+describe("Railway Provider", async () => {
+	beforeAll(() => {
+		mswServer.use(
+			http.post(
+				"https://backboard.railway.com/oauth/token",
+				async ({ request }) => {
+					const authHeader = request.headers.get("authorization");
+					expect(authHeader).toMatch(/^Basic /);
+
+					const body = await request.text();
+					const params = new URLSearchParams(body);
+					expect(params.get("grant_type")).toBe("authorization_code");
+					expect(params.get("code")).toBeDefined();
+					expect(params.get("redirect_uri")).toBeDefined();
+
+					// Verify PKCE code_verifier is present (Better Auth uses PKCE by default)
+					const codeVerifier = params.get("code_verifier");
+					expect(codeVerifier).not.toBeNull();
+					expect(codeVerifier).not.toBe("");
+
+					return HttpResponse.json({
+						access_token: "railway_access_token",
+						token_type: "Bearer",
+						expires_in: 3600,
+					});
+				},
+			),
+			http.get("https://backboard.railway.com/oauth/me", async () => {
+				return HttpResponse.json({
+					sub: "user_railway_123",
+					email: "railway@test.com",
+					name: "Railway User",
+					picture: "https://avatars.githubusercontent.com/u/12345",
+				} satisfies RailwayProfile);
+			}),
+		);
+	});
+
+	it("should configure Railway provider correctly", async () => {
+		const { auth } = await getTestInstance({
+			socialProviders: {
+				railway: {
+					clientId: "railway-test-client-id",
+					clientSecret: "railway-test-client-secret",
+				},
+			},
+		});
+
+		const ctx = await auth.$context;
+		const railwayProvider = ctx.socialProviders.find((p) => p.id === "railway");
+
+		expect(railwayProvider).toBeDefined();
+		expect(railwayProvider?.id).toBe("railway");
+		expect(railwayProvider?.name).toBe("Railway");
+	});
+
+	it("should initiate Railway OAuth flow with PKCE", async () => {
+		const { client } = await getTestInstance({
+			socialProviders: {
+				railway: {
+					clientId: "railway-test-client-id",
+					clientSecret: "railway-test-client-secret",
+				},
+			},
+		});
+
+		const signInRes = await client.signIn.social({
+			provider: "railway",
+			callbackURL: "/dashboard",
+		});
+
+		expect(signInRes.data).toBeDefined();
+		expect(signInRes.data?.url).toContain("backboard.railway.com/oauth/auth");
+		expect(signInRes.data?.redirect).toBe(true);
+
+		const authUrl = new URL(signInRes.data!.url!);
+		expect(authUrl.searchParams.get("scope")).toContain("openid");
+		expect(authUrl.searchParams.get("scope")).toContain("email");
+		expect(authUrl.searchParams.get("scope")).toContain("profile");
+
+		// Verify PKCE parameters are present (Better Auth uses PKCE by default)
+		expect(authUrl.searchParams.get("code_challenge")).not.toBeNull();
+		expect(authUrl.searchParams.get("code_challenge_method")).toBe("S256");
+	});
+
+	it("should complete Railway OAuth flow and create user", async () => {
+		const { client, cookieSetter, auth } = await getTestInstance(
+			{
+				socialProviders: {
+					railway: {
+						clientId: "railway-test-client-id",
+						clientSecret: "railway-test-client-secret",
+					},
+				},
+			},
+			{
+				disableTestUser: true,
+			},
+		);
+
+		const headers = new Headers();
+		const signInRes = await client.signIn.social({
+			provider: "railway",
+			callbackURL: "/dashboard",
+			newUserCallbackURL: "/welcome",
+			fetchOptions: {
+				onSuccess: cookieSetter(headers),
+			},
+		});
+
+		expect(signInRes.data).toBeDefined();
+		const state = new URL(signInRes.data!.url!).searchParams.get("state") || "";
+
+		await client.$fetch("/callback/railway", {
+			query: {
+				state,
+				code: "railway_test_code",
+			},
+			headers,
+			method: "GET",
+			onError(context) {
+				expect(context.response.status).toBe(302);
+				const location = context.response.headers.get("location");
+				expect(location).toBeDefined();
+				expect(location).toContain("/welcome");
+
+				const cookies = parseSetCookieHeader(
+					context.response.headers.get("set-cookie") || "",
+				);
+				expect(cookies.get("better-auth.session_token")?.value).toBeDefined();
+
+				cookieSetter(headers)(context as any);
+			},
+		});
+
+		const session = await client.getSession({
+			fetchOptions: {
+				headers,
+			},
+		});
+
+		expect(session.data).toBeDefined();
+		expect(session.data?.user.email).toBe("railway@test.com");
+		expect(session.data?.user.name).toBe("Railway User");
+		expect(session.data?.user.image).toBe(
+			"https://avatars.githubusercontent.com/u/12345",
+		);
+		// Railway does not provide email_verified claim, defaults to false
+		expect(session.data?.user.emailVerified).toBe(false);
+
+		const ctx = await auth.$context;
+		const accounts = await ctx.internalAdapter.findAccounts(
+			session.data?.user.id!,
+		);
+		expect(accounts).toHaveLength(1);
+		expect(accounts[0]?.providerId).toBe("railway");
+		expect(accounts[0]?.accountId).toBe("user_railway_123");
+	});
+});
+
+describe("validateUserInfo callback", async () => {
+	it("should allow sign-in when validateUserInfo returns void", async () => {
+		const { client, cookieSetter } = await getTestInstance(
+			{
+				user: {
+					validateUserInfo() {
+						// allow
+					},
+				},
+				socialProviders: {
+					google: {
+						clientId: "test",
+						clientSecret: "test",
+					},
+				},
+			},
+			{ disableTestUser: true },
+		);
+
+		const headers = new Headers();
+		const signInRes = await client.signIn.social({
+			provider: "google",
+			callbackURL: "/dashboard",
+			fetchOptions: { onSuccess: cookieSetter(headers) },
+		});
+		const state = new URL(signInRes.data!.url!).searchParams.get("state") || "";
+
+		await client.$fetch("/callback/google", {
+			query: { state, code: "test" },
+			headers,
+			method: "GET",
+			onError(context) {
+				cookieSetter(headers)(context as any);
+			},
+		});
+
+		const session = await client.getSession({ fetchOptions: { headers } });
+		expect(session.data?.user.email).toBe("user@email.com");
+	});
+
+	it("should reject redirect sign-in with source metadata and raw profile", async () => {
+		mswServer.use(
+			http.post("https://oauth2.googleapis.com/token", async () => {
+				const idToken = await signJWT(
+					{
+						email: "user@blocked.com",
+						email_verified: true,
+						name: "Blocked User",
+						picture: "https://test.com/picture.png",
+						sub: "blocked-user-id",
+						iat: 1234567890,
+						exp: 1234567890,
+						aud: "test",
+						azp: "test",
+						iss: "test",
+					},
+					DEFAULT_SECRET,
+				);
+				return HttpResponse.json({ access_token: "test", id_token: idToken });
+			}),
+		);
+
+		let capturedProfile: unknown;
+		const { client, cookieSetter } = await getTestInstance(
+			{
+				user: {
+					validateUserInfo({ user, source }) {
+						expect(source.action).toBe("create-user");
+						expect(source.method).toBe("oauth");
+						expect(source.oauth?.providerId).toBe("google");
+						capturedProfile = source.oauth?.profile;
+						if (user.email?.endsWith("@blocked.com")) {
+							return {
+								error: "domain_blocked",
+								errorDescription: "Only company emails are allowed",
+							};
+						}
+					},
+				},
+				socialProviders: {
+					google: {
+						clientId: "test",
+						clientSecret: "test",
+					},
+				},
+			},
+			{ disableTestUser: true },
+		);
+
+		const headers = new Headers();
+		const signInRes = await client.signIn.social({
+			provider: "google",
+			callbackURL: "/dashboard",
+			fetchOptions: { onSuccess: cookieSetter(headers) },
+		});
+		const state = new URL(signInRes.data!.url!).searchParams.get("state") || "";
+
+		let redirectLocation = "";
+		await client.$fetch("/callback/google", {
+			query: { state, code: "test" },
+			headers,
+			method: "GET",
+			onError(context) {
+				redirectLocation = context.response.headers.get("location") || "";
+			},
+		});
+
+		expect(redirectLocation).toContain("error=domain_blocked");
+		expect(redirectLocation).toContain(
+			"error_description=Only+company+emails+are+allowed",
+		);
+		expect((capturedProfile as Record<string, unknown>).sub).toBe(
+			"blocked-user-id",
+		);
+	});
+
+	it("should work in stateless mode (no database)", async () => {
+		const { client, cookieSetter } = await getTestInstance(
+			{
+				database: undefined,
+				user: {
+					validateUserInfo({ user, source }) {
+						expect(source.method).toBe("oauth");
+						expect(source.oauth?.providerId).toBe("google");
+						if (!user.email?.endsWith("@allowed.com")) {
+							return {
+								error: "email_not_allowed",
+								errorDescription: "Only allowed.com emails are permitted",
+							};
+						}
+					},
+				},
+				socialProviders: {
+					google: {
+						clientId: "test",
+						clientSecret: "test",
+					},
+				},
+			},
+			{ disableTestUser: true },
+		);
+
+		const headers = new Headers();
+		const signInRes = await client.signIn.social({
+			provider: "google",
+			callbackURL: "/dashboard",
+			fetchOptions: { onSuccess: cookieSetter(headers) },
+		});
+		const state = new URL(signInRes.data!.url!).searchParams.get("state") || "";
+
+		let redirectLocation = "";
+		await client.$fetch("/callback/google", {
+			query: { state, code: "test" },
+			headers,
+			method: "GET",
+			onError(context) {
+				redirectLocation = context.response.headers.get("location") || "";
+			},
+		});
+
+		expect(redirectLocation).toContain("error=email_not_allowed");
+	});
+
+	it("should reject idToken sign-in when validateUserInfo returns error", async () => {
+		const { client } = await getTestInstance(
+			{
+				user: {
+					validateUserInfo({ source }) {
+						expect(source.action).toBe("create-user");
+						expect(source.method).toBe("oauth");
+						return { error: "user_blocked" };
+					},
+				},
+				socialProviders: {
+					google: {
+						clientId: "test",
+						clientSecret: "test",
+						verifyIdToken: async () => true,
+					},
+				},
+			},
+			{ disableTestUser: true },
+		);
+
+		const idToken = await signJWT(
+			{
+				email: "blocked@email.com",
+				email_verified: true,
+				name: "Blocked User",
+				sub: "blocked-id",
+			},
+			DEFAULT_SECRET,
+		);
+
+		const res = await client.signIn.social({
+			provider: "google",
+			callbackURL: "/dashboard",
+			idToken: { token: idToken },
+		});
+
+		expect(res.error).toBeDefined();
+		expect(res.error?.status).toBe(403);
+	});
+
+	it("fires create-user on first OAuth sign-in and sign-in on the return", async () => {
+		const actions: string[] = [];
+		const { client, cookieSetter } = await getTestInstance(
+			{
+				user: {
+					validateUserInfo({ source }) {
+						actions.push(source.action);
+					},
+				},
+				socialProviders: {
+					google: {
+						clientId: "test",
+						clientSecret: "test",
+					},
+				},
+			},
+			{ disableTestUser: true },
+		);
+
+		const signInOnce = async () => {
+			const headers = new Headers();
+			const signInRes = await client.signIn.social({
+				provider: "google",
+				callbackURL: "/dashboard",
+				fetchOptions: { onSuccess: cookieSetter(headers) },
+			});
+			const state =
+				new URL(signInRes.data!.url!).searchParams.get("state") || "";
+			await client.$fetch("/callback/google", {
+				query: { state, code: "test" },
+				headers,
+				method: "GET",
+				onError(context) {
+					cookieSetter(headers)(context as any);
+				},
+			});
+		};
+
+		await signInOnce(); // first time: the user is created
+		await signInOnce(); // same identity returns
+
+		expect(actions).toEqual(["create-user", "sign-in"]);
+	});
+
+	// The OAuth-specific security case: a returning user whose provider identity
+	// moved out of policy must be rejected, and the hook must see the fresh
+	// mapped provider user, not the stored row.
+	it("re-validates a returning OAuth user against the fresh provider identity", async () => {
+		const tokenFor = (identity: {
+			email: string;
+			name: string;
+			emailVerified: boolean;
+		}) =>
+			http.post("https://oauth2.googleapis.com/token", async () => {
+				const idToken = await signJWT(
+					{
+						email: identity.email,
+						email_verified: identity.emailVerified,
+						name: identity.name,
+						picture: "https://test.com/picture.png",
+						sub: "mover-sub",
+						iat: 1234567890,
+						exp: 1234567890,
+						aud: "test",
+						azp: "test",
+						iss: "test",
+					},
+					DEFAULT_SECRET,
+				);
+				return HttpResponse.json({ access_token: "test", id_token: idToken });
+			});
+
+		let emailSeenOnSignIn: string | undefined;
+		let emailVerifiedSeenOnSignIn: boolean | undefined;
+		let nameSeenOnSignIn: string | undefined;
+		let idSeenOnSignIn: string | undefined;
+		const { client, cookieSetter } = await getTestInstance(
+			{
+				user: {
+					validateUserInfo({ user, source }) {
+						if (source.action !== "sign-in") {
+							return;
+						}
+						emailSeenOnSignIn = user.email as string;
+						emailVerifiedSeenOnSignIn = user.emailVerified as boolean;
+						nameSeenOnSignIn = user.name as string;
+						idSeenOnSignIn = user.id as string;
+						if (user.email?.endsWith("@blocked.com")) {
+							return {
+								error: "domain_revoked",
+								errorDescription: "Your account is no longer allowed",
+							};
+						}
+					},
+				},
+				socialProviders: {
+					google: {
+						clientId: "test",
+						clientSecret: "test",
+					},
+				},
+			},
+			{ disableTestUser: true },
+		);
+
+		const signIn = async () => {
+			const headers = new Headers();
+			const signInRes = await client.signIn.social({
+				provider: "google",
+				callbackURL: "/dashboard",
+				fetchOptions: { onSuccess: cookieSetter(headers) },
+			});
+			const state =
+				new URL(signInRes.data!.url!).searchParams.get("state") || "";
+			let redirectLocation = "";
+			await client.$fetch("/callback/google", {
+				query: { state, code: "test" },
+				headers,
+				method: "GET",
+				onError(context) {
+					redirectLocation = context.response.headers.get("location") || "";
+					cookieSetter(headers)(context as any);
+				},
+			});
+			return { headers, redirectLocation };
+		};
+
+		// First sign-in on an allowed domain provisions the user.
+		mswServer.use(
+			tokenFor({
+				email: "mover@allowed.com",
+				name: "Allowed Mover",
+				emailVerified: true,
+			}),
+		);
+		const first = await signIn();
+		const session = await client.getSession({
+			fetchOptions: { headers: first.headers },
+		});
+		expect(session.data?.user.email).toBe("mover@allowed.com");
+		expect(session.data?.user.name).toBe("Allowed Mover");
+
+		// The provider now asserts a disallowed identity for the same account.
+		mswServer.use(
+			tokenFor({
+				email: "mover@blocked.com",
+				name: "Blocked Mover",
+				emailVerified: false,
+			}),
+		);
+		const second = await signIn();
+
+		// The hook saw the fresh provider identity, not the stored allowed one,
+		// while keeping the Better Auth user id instead of the provider account id.
+		expect(emailSeenOnSignIn).toBe("mover@blocked.com");
+		expect(nameSeenOnSignIn).toBe("Blocked Mover");
+		expect(emailVerifiedSeenOnSignIn).toBe(false);
+		expect(idSeenOnSignIn).toBe(session.data?.user.id);
+		expect(second.redirectLocation).toContain("error=domain_revoked");
+	});
+
+	it("re-validates a returning OAuth user on the id-token (API) surface", async () => {
+		const { client } = await getTestInstance(
+			{
+				user: {
+					validateUserInfo({ user, source }) {
+						if (
+							source.action === "sign-in" &&
+							user.email?.endsWith("@blocked.com")
+						) {
+							return { error: "domain_revoked" };
+						}
+					},
+				},
+				socialProviders: {
+					google: {
+						clientId: "test",
+						clientSecret: "test",
+						verifyIdToken: async () => true,
+					},
+				},
+			},
+			{ disableTestUser: true },
+		);
+
+		const idTokenFor = (email: string) =>
+			signJWT(
+				{
+					email,
+					email_verified: true,
+					name: "Mover",
+					sub: "idtoken-mover",
+				},
+				DEFAULT_SECRET,
+			);
+
+		// First id-token sign-in on an allowed domain provisions the user.
+		const created = await client.signIn.social({
+			provider: "google",
+			callbackURL: "/dashboard",
+			idToken: { token: await idTokenFor("mover@allowed.com") },
+		});
+		expect(created.error).toBeNull();
+
+		// Same account (sub), provider now asserts a disallowed email.
+		const blocked = await client.signIn.social({
+			provider: "google",
+			callbackURL: "/dashboard",
+			idToken: { token: await idTokenFor("mover@blocked.com") },
+		});
+		expect(blocked.error?.status).toBe(403);
+		expect(blocked.error?.code).toBe("domain_revoked");
+	});
+
+	// An implicit link of a new provider to an existing user on sign-in reports
+	// `link-account` (not `sign-in`), and a rejection persists no account row,
+	// because the gate runs before the account write.
+	it("reports link-account for an implicit link and persists no orphaned link when rejected", async () => {
+		// Self-contained token handler so this test does not depend on a prior
+		// test's mswServer.use override leaking through.
+		mswServer.use(
+			http.post("https://oauth2.googleapis.com/token", async () => {
+				const idToken = await signJWT(
+					{
+						email: "implicit-link@example.com",
+						email_verified: true,
+						name: "Implicit Link",
+						picture: "https://test.com/picture.png",
+						sub: "implicit-link-sub",
+						iat: 1234567890,
+						exp: 1234567890,
+						aud: "test",
+						azp: "test",
+						iss: "test",
+					},
+					DEFAULT_SECRET,
+				);
+				return HttpResponse.json({ access_token: "test", id_token: idToken });
+			}),
+		);
+
+		let seenAction: string | undefined;
+		const { client, cookieSetter } = await getTestInstance(
+			{
+				emailAndPassword: { enabled: true },
+				account: {
+					accountLinking: {
+						trustedProviders: ["google"],
+						requireLocalEmailVerified: false,
+					},
+				},
+				user: {
+					validateUserInfo({ source }) {
+						if (source.action === "link-account") {
+							seenAction = source.action;
+							return { error: "linking_blocked" };
+						}
+					},
+				},
+				socialProviders: {
+					google: {
+						clientId: "test",
+						clientSecret: "test",
+					},
+				},
+			},
+			{ disableTestUser: true },
+		);
+
+		// An existing user owning the email the provider will assert.
+		await client.signUp.email({
+			email: "implicit-link@example.com",
+			password: "password",
+			name: "Existing User",
+		});
+
+		// OAuth sign-in for that email with no linked google account: an implicit
+		// link, which the gate rejects.
+		const headers = new Headers();
+		const signInRes = await client.signIn.social({
+			provider: "google",
+			callbackURL: "/dashboard",
+			fetchOptions: { onSuccess: cookieSetter(headers) },
+		});
+		const state = new URL(signInRes.data!.url!).searchParams.get("state") || "";
+		let redirectLocation = "";
+		await client.$fetch("/callback/google", {
+			query: { state, code: "test" },
+			headers,
+			method: "GET",
+			onError(context) {
+				redirectLocation = context.response.headers.get("location") || "";
+			},
+		});
+
+		expect(seenAction).toBe("link-account");
+		expect(redirectLocation).toContain("error=linking_blocked");
+
+		// No google account was persisted for the rejected implicit link.
+		const signedIn = new Headers();
+		await client.signIn.email(
+			{ email: "implicit-link@example.com", password: "password" },
+			{ onSuccess: cookieSetter(signedIn) },
+		);
+		const accounts = await client.listAccounts({
+			fetchOptions: { headers: signedIn },
+		});
+		const providers = (accounts.data || []).map((a) => a.providerId);
+		expect(providers).toContain("credential");
+		expect(providers).not.toContain("google");
+	});
+});
+
+/**
+ * Regression tests for the Reddit provider profile mapping. Reddit's `identity`
+ * scope does not return an email; previously the provider mapped the shared
+ * `oauth_client_id` (which identifies the OAuth app, not the user) to
+ * `user.email` and `has_verified_email` to `emailVerified`, collapsing every
+ * Reddit user of the same app onto one "verified" email and enabling implicit
+ * account linking/takeover.
+ */
+describe("Reddit Provider — profile email mapping", async () => {
+	const profile = {
+		id: "reddit-user-123",
+		name: "reddit_user",
+		icon_img: "https://example.com/avatar.png?x=1",
+		has_verified_email: true,
+		oauth_client_id: "shared-reddit-oauth-client-id",
+		verified: true,
+	};
+
+	beforeAll(() => {
+		mswServer.use(
+			http.get("https://oauth.reddit.com/api/v1/me", async () =>
+				HttpResponse.json(profile),
+			),
+		);
+	});
+
+	it("never uses oauth_client_id as the email and falls back to a unique per-user email", async () => {
+		const provider = reddit({
+			clientId: "reddit-client-id",
+			clientSecret: "reddit-client-secret",
+		});
+
+		const result = await provider.getUserInfo({
+			accessToken: "reddit-access-token",
+		} as any);
+
+		// Without a mapped email the provider derives a unique, per-user
+		// placeholder email from the Reddit user id rather than falling back to
+		// the shared oauth_client_id, so users can never collide on one address.
+		// The non-routable `.invalid` domain keeps it from matching a real mailbox.
+		expect(result?.user.email).toBe(
+			"reddit-user-123@reddit.placeholder.invalid",
+		);
+		expect(result?.user.email).not.toBe(profile.oauth_client_id);
+		expect(result?.user.emailVerified).toBe(false);
+	});
+
+	it("uses the email supplied by mapProfileToUser and ignores oauth_client_id", async () => {
+		const provider = reddit({
+			clientId: "reddit-client-id",
+			clientSecret: "reddit-client-secret",
+			mapProfileToUser: (p) => ({
+				email: `${p.name}@example.com`,
+			}),
+		});
+
+		const result = await provider.getUserInfo({
+			accessToken: "reddit-access-token",
+		} as any);
+
+		expect(result?.user.email).toBe("reddit_user@example.com");
+		expect(result?.user.email).not.toBe(profile.oauth_client_id);
+		// The synthetic "verified email" flag must not be applied to the mapped
+		// email unless the integrator opts in.
+		expect(result?.user.emailVerified).toBe(false);
+	});
+});
+
+/**
+ * `account.scope` is the user's accumulated grant set: linkSocial unions
+ * new scopes; re-auth and refresh-token responses never narrow the stored
+ * set, regardless of what the provider echoes.
+ *
+ * @see https://github.com/better-auth/better-auth/pull/3013
+ */
+describe("account.scope path-dependent semantics", async () => {
+	const { client, cookieSetter, auth } = await getTestInstance(
+		{
+			socialProviders: {
+				google: {
+					clientId: "test",
+					clientSecret: "test",
+				},
+			},
+		},
+		{ disableTestUser: true },
+	);
+	const ctx = await auth.$context;
+
+	const buildIdToken = (sub: string) =>
+		signJWT(
+			{
+				email: `${sub}@email.com`,
+				email_verified: true,
+				name: "Scope User",
+				picture: "https://test.com/picture.png",
+				exp: 1234567890,
+				sub,
+				iat: 1234567890,
+				aud: "test",
+				azp: "test",
+				nbf: 1234567890,
+				iss: "test",
+				locale: "en",
+				jti: "test",
+				given_name: "Scope",
+				family_name: "User",
+			} satisfies GoogleProfile,
+			DEFAULT_SECRET,
+		);
+
+	function mockGoogleTokenResponse(
+		idToken: string,
+		responseScope: string | undefined,
+	) {
+		mswServer.use(
+			http.post("https://oauth2.googleapis.com/token", () =>
+				HttpResponse.json({
+					access_token: "test-access-token",
+					refresh_token: "test-refresh-token",
+					id_token: idToken,
+					token_type: "Bearer",
+					expires_in: 3600,
+					...(responseScope !== undefined ? { scope: responseScope } : {}),
+				}),
+			),
+		);
+	}
+
+	async function completeSignIn(headers: Headers) {
+		const signInRes = await client.signIn.social({
+			provider: "google",
+			callbackURL: "/callback",
+			fetchOptions: { onSuccess: cookieSetter(headers) },
+		});
+		const state = new URL(signInRes.data!.url!).searchParams.get("state") || "";
+		await client.$fetch("/callback/google", {
+			query: { state, code: "test" },
+			method: "GET",
+			headers,
+			onError(c) {
+				cookieSetter(headers)(c as any);
+			},
+		});
+	}
+
+	it("preserves stored scope on sign-in re-authentication when token claim is narrower", async () => {
+		const headers = new Headers();
+		const idToken = await buildIdToken("scope-reauth-sub");
+
+		// Initial sign-in with full granted scope set.
+		mockGoogleTokenResponse(
+			idToken,
+			"openid email profile https://www.googleapis.com/auth/drive.readonly",
+		);
+		await completeSignIn(headers);
+
+		const session = await client.getSession({ fetchOptions: { headers } });
+		const userId = session.data!.user.id;
+		const initial = await ctx.internalAdapter.findAccounts(userId);
+		expect(initial[0]!.scope).toContain(
+			"https://www.googleapis.com/auth/drive.readonly",
+		);
+
+		// Re-sign-in echoing only a subset.
+		mockGoogleTokenResponse(idToken, "openid email");
+		await completeSignIn(headers);
+
+		const after = await ctx.internalAdapter.findAccounts(userId);
+		expect(after[0]!.scope).toContain(
+			"https://www.googleapis.com/auth/drive.readonly",
+		);
+	});
+
+	it("unions stored scope with newly granted scopes on linkSocial incremental authorization", async () => {
+		const headers = new Headers();
+		const idToken = await buildIdToken("scope-link-sub");
+
+		mockGoogleTokenResponse(idToken, "openid email profile");
+		await completeSignIn(headers);
+
+		const session = await client.getSession({ fetchOptions: { headers } });
+		const userId = session.data!.user.id;
+		const initial = await ctx.internalAdapter.findAccounts(userId);
+		expect(initial[0]!.scope?.split(",").sort()).toEqual([
+			"email",
+			"openid",
+			"profile",
+		]);
+
+		// linkSocial requesting a new scope; provider echoes only that scope.
+		mockGoogleTokenResponse(
+			idToken,
+			"https://www.googleapis.com/auth/drive.readonly",
+		);
+		const linkRes = await client.linkSocial(
+			{
+				provider: "google",
+				callbackURL: "/callback",
+				scopes: ["https://www.googleapis.com/auth/drive.readonly"],
+			},
+			{ headers, onSuccess: cookieSetter(headers) },
+		);
+		if (!linkRes.data || !("url" in linkRes.data) || !linkRes.data.url) {
+			throw new Error(
+				`linkSocial did not return an authorization URL: ${JSON.stringify(linkRes)}`,
+			);
+		}
+		const linkState = new URL(linkRes.data.url).searchParams.get("state") || "";
+		await client.$fetch("/callback/google", {
+			query: { state: linkState, code: "test" },
+			method: "GET",
+			headers,
+			onError(c) {
+				cookieSetter(headers)(c as any);
+			},
+		});
+
+		const after = await ctx.internalAdapter.findAccounts(userId);
+		const merged = after[0]!.scope?.split(",") ?? [];
+		expect(merged).toContain("openid");
+		expect(merged).toContain("email");
+		expect(merged).toContain("profile");
+		expect(merged).toContain("https://www.googleapis.com/auth/drive.readonly");
+	});
+
+	it("preserves stored scope on /refresh-token when the refresh response is narrower", async () => {
+		const headers = new Headers();
+		const idToken = await buildIdToken("scope-refresh-sub");
+
+		mockGoogleTokenResponse(
+			idToken,
+			"openid email profile https://www.googleapis.com/auth/drive.readonly",
+		);
+		await completeSignIn(headers);
+
+		const session = await client.getSession({ fetchOptions: { headers } });
+		const userId = session.data!.user.id;
+		const accounts = await ctx.internalAdapter.findAccounts(userId);
+		expect(accounts[0]!.scope).toContain(
+			"https://www.googleapis.com/auth/drive.readonly",
+		);
+
+		// Refresh response narrower than stored (RFC 6749 Section 1.5).
+		mswServer.use(
+			http.post("https://oauth2.googleapis.com/token", () =>
+				HttpResponse.json({
+					access_token: "refreshed-access-token",
+					refresh_token: "refreshed-refresh-token",
+					token_type: "Bearer",
+					expires_in: 3600,
+					scope: "openid email",
+				}),
+			),
+		);
+		const refresh = await client.$fetch<{ scope?: string }>("/refresh-token", {
+			body: {
+				accountId: accounts[0]!.id,
+			},
+			headers,
+			method: "POST",
+			onError(c) {
+				cookieSetter(headers)(c as any);
+			},
+		});
+		expect(refresh.data?.scope).toContain(
+			"https://www.googleapis.com/auth/drive.readonly",
+		);
+
+		const after = await ctx.internalAdapter.findAccounts(userId);
+		expect(after[0]!.scope).toContain(
+			"https://www.googleapis.com/auth/drive.readonly",
+		);
+	});
+
+	it("does not write stale account cookie scope on /refresh-token", async () => {
+		const headers = new Headers();
+		const idToken = await buildIdToken("scope-refresh-cookie-sub");
+
+		mockGoogleTokenResponse(idToken, "openid email");
+		await completeSignIn(headers);
+
+		const session = await client.getSession({ fetchOptions: { headers } });
+		const userId = session.data!.user.id;
+		const accounts = await ctx.internalAdapter.findAccounts(userId);
+		const accumulatedScope =
+			"openid,email,profile,https://www.googleapis.com/auth/drive.readonly";
+		await ctx.internalAdapter.updateAccount(accounts[0]!.id, {
+			scope: accumulatedScope,
+		});
+
+		// The account cookie still has the original narrower scope. Refresh must
+		// not write that stale cookie scope back over the stored accumulated grant.
+		mswServer.use(
+			http.post("https://oauth2.googleapis.com/token", () =>
+				HttpResponse.json({
+					access_token: "cookie-refreshed-access-token",
+					refresh_token: "cookie-refreshed-refresh-token",
+					token_type: "Bearer",
+					expires_in: 3600,
+					scope: "openid email",
+				}),
+			),
+		);
+		const refresh = await client.$fetch<{ scope?: string }>("/refresh-token", {
+			body: {
+				accountId: accounts[0]!.id,
+			},
+			headers,
+			method: "POST",
+			onError(c) {
+				cookieSetter(headers)(c as any);
+			},
+		});
+
+		expect(refresh.data?.scope).toBe(accumulatedScope);
+		const after = await ctx.internalAdapter.findAccounts(userId);
+		expect(after[0]!.scope).toBe(accumulatedScope);
+	});
+});
+
+/**
+ * @see https://github.com/better-auth/better-auth/issues/9326
+ */
+describe("Google Provider - includeGrantedScopes", async () => {
+	it("includes `include_granted_scopes=true` in the authorization URL by default", async () => {
+		const { client } = await getTestInstance(
+			{
+				socialProviders: {
+					google: {
+						clientId: "test",
+						clientSecret: "test",
+					},
+				},
+			},
+			{ disableTestUser: true },
+		);
+
+		const signInRes = await client.signIn.social({
+			provider: "google",
+			callbackURL: "/callback",
+		});
+
+		const authUrl = new URL(signInRes.data!.url!);
+		expect(authUrl.searchParams.get("include_granted_scopes")).toBe("true");
+	});
+
+	it("includes `include_granted_scopes=true` when explicitly enabled", async () => {
+		const { client } = await getTestInstance(
+			{
+				socialProviders: {
+					google: {
+						clientId: "test",
+						clientSecret: "test",
+						includeGrantedScopes: true,
+					},
+				},
+			},
+			{ disableTestUser: true },
+		);
+
+		const signInRes = await client.signIn.social({
+			provider: "google",
+			callbackURL: "/callback",
+		});
+
+		const authUrl = new URL(signInRes.data!.url!);
+		expect(authUrl.searchParams.get("include_granted_scopes")).toBe("true");
+	});
+
+	it("lets additionalParams disable `include_granted_scopes` for a single flow", async () => {
+		const { client } = await getTestInstance(
+			{
+				socialProviders: {
+					google: {
+						clientId: "test",
+						clientSecret: "test",
+					},
+				},
+			},
+			{ disableTestUser: true },
+		);
+
+		const signInRes = await client.signIn.social({
+			provider: "google",
+			callbackURL: "/callback",
+			additionalParams: {
+				include_granted_scopes: "false",
+			},
+		});
+
+		const authUrl = new URL(signInRes.data!.url!);
+		expect(authUrl.searchParams.get("include_granted_scopes")).toBe("false");
+	});
+
+	it("omits `include_granted_scopes` from the authorization URL when disabled", async () => {
+		const { client } = await getTestInstance(
+			{
+				socialProviders: {
+					google: {
+						clientId: "test",
+						clientSecret: "test",
+						includeGrantedScopes: false,
+					},
+				},
+			},
+			{ disableTestUser: true },
+		);
+
+		const signInRes = await client.signIn.social({
+			provider: "google",
+			callbackURL: "/callback",
+			scopes: ["https://www.googleapis.com/auth/drive.file"],
+		});
+
+		const authUrl = new URL(signInRes.data!.url!);
+		expect(authUrl.searchParams.has("include_granted_scopes")).toBe(false);
+		expect(authUrl.searchParams.get("scope")).toContain("openid");
+		expect(authUrl.searchParams.get("scope")).toContain(
+			"https://www.googleapis.com/auth/drive.file",
+		);
+	});
+
+	it("lets additionalParams re-enable `include_granted_scopes` for a single flow", async () => {
+		const { client } = await getTestInstance(
+			{
+				socialProviders: {
+					google: {
+						clientId: "test",
+						clientSecret: "test",
+						includeGrantedScopes: false,
+					},
+				},
+			},
+			{ disableTestUser: true },
+		);
+
+		const signInRes = await client.signIn.social({
+			provider: "google",
+			callbackURL: "/callback",
+			additionalParams: {
+				include_granted_scopes: "true",
+			},
+		});
+
+		const authUrl = new URL(signInRes.data!.url!);
+		expect(authUrl.searchParams.get("include_granted_scopes")).toBe("true");
+	});
+});

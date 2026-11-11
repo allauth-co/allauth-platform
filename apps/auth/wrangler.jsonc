@@ -1,0 +1,51 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "allauth-worker-preview",
+  "main": ".open-next/worker.js",
+  "compatibility_date": "2026-10-07",
+  "compatibility_flags": [
+    "nodejs_compat",
+    "global_fetch_strictly_public"
+  ],
+  "workers_dev": false,
+  "preview_urls": false,
+  "assets": {
+    "directory": ".open-next/assets",
+    "binding": "ASSETS"
+  },
+  "services": [
+    {
+      "binding": "WORKER_SELF_REFERENCE",
+      "service": "allauth-worker-preview"
+    }
+  ],
+  "vars": {
+    "BETTER_AUTH_URL": "https://auth.example.com",
+    "TRUSTED_ORIGINS": "https://auth.example.com",
+    "EMAIL_FROM": "security@auth.example.com",
+    "AUTH_APP_NAME": "AllAuth",
+    "NODE_ENV": "production",
+    "RP_ID": "auth.example.com",
+    "RP_NAME": "AllAuth",
+    "SESSION_COOKIE_NAME": "allauth",
+    "ADMIN_EMAIL": "admin@example.com"
+  },
+  "send_email": [
+    {
+      "name": "EMAIL",
+      "allowed_sender_addresses": [
+        "security@example.com"
+      ]
+    }
+  ],
+  "limits": {
+    "cpu_ms": 1000
+  },
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1,
+    "logs": {
+      "invocation_logs": false
+    }
+  }
+}

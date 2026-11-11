@@ -1,0 +1,114 @@
+---
+title: AllAuth release notifications
+description: Receive SDK and platform release notices in the AllAuth dashboard and by email without sharing your application's source code.
+---
+
+## Release notices
+
+Open **Notifications** in AllAuth to see SDK and hosted-platform releases,
+compatibility guidance, public release notes, and SDK archive downloads with
+SHA-256 checksums. These notices
+are available to verified platform accounts even when AllAuth cannot access the
+application's repository. Existing published archives remain unchanged; AllAuth
+does not replace packages or deploy customer applications automatically.
+
+The public release archive also backfills notes reconstructed from retained SDK
+packages. Historical entries are explicitly marked as historical, use unknown
+dates when the original publication date cannot be verified, and link to the
+exact source tag and download checksum. They do not create unread notifications
+or retrospective email jobs. A dated platform entry is shown only when a
+verified service release record supports it.
+
+Use the public [SDK downloads](https://allauth.co/sdk) and
+[installation and upgrade guide](https://allauth.co/sdk/quickstart) for package
+setup. The [release archive](https://allauth.co/releases) gives each SDK and
+platform entry a permanent `/releases/{slug}` page. Follow the
+[RSS feed](https://allauth.co/releases/feed.xml),
+[JSON feed](https://allauth.co/releases/feed.json), or the
+[SDK source repository and tagged releases](https://github.com/thegarty/allauth-sdk).
+An SDK source link selects the exact version tag and `packages/react` tree.
+Platform notes do not imply that the private hosted-service source is public.
+
+## Publication pathway
+
+Each new SDK or platform release needs public notes and a supported publication
+date. SDK publication also requires a new versioned archive, its SHA-256 checksum,
+and the matching public source tag and release assets. Existing SDK archives stay
+immutable. Platform releases publish their own notes and source-version record;
+they do not require repackaging an unchanged SDK.
+
+The release workflow verifies source/archive parity, immutable download metadata,
+legacy proxy compatibility and the real-client request budget before publishing.
+Only new entries explicitly marked for announcement enter the account inbox and
+email pipeline. Historical backfills remain public with `announce: false`, even
+if an original publication date is recovered later.
+
+
+SDK 1.4.3 fixes unnecessary organisation refreshes after permission and slug
+checks and reduces permission requests for fully authorised organisation
+managers. This update preserves existing authentication and organisation APIs.
+Review the release notes, update the application's pinned SDK dependency, and
+rebuild and deploy through your normal release process when ready. Older SDKs do
+not need to provide a version header to keep working.
+
+## Reported SDK versions
+
+The dashboard lists only environments that your platform account may manage.
+A recent signed application-proxy request can supply an advisory SDK version.
+Versions are observations, not a scan of your repository or proof that every
+instance runs that version. An older SDK that does not report its version is
+shown as unknown. Version reports never grant access or affect authentication.
+
+## Email preferences and delivery
+
+SDK and platform release email is enabled by default for verified workspace
+owners and admins. The existing `releaseEmails` preference controls both kinds.
+Emails cover releases published after the account was created; new accounts can
+read earlier releases in their inbox without receiving a backlog of old email.
+Ordinary application end users and workspace members do not receive these
+platform update emails. Change **Release email alerts** in Notifications to opt
+out; dashboard notices remain available. Notifications and their read state
+belong to the current platform account.
+
+Release emails use AllAuth's platform branding and existing configured email
+transport. A durable outbox has one row per release and account. Bounded workers
+use leases, retry failures with backoff, and check current account eligibility,
+workspace membership and email preferences before each attempt. Provider
+acceptance is recorded separately from inbox delivery. Transport interruptions
+can leave acceptance uncertain and cause a retry; the outbox is not a guarantee
+of exactly-once inbox delivery.
+
+## Platform API
+
+`GET /api/admin/notifications?limit=25&offset=0` returns `notifications`,
+`unreadCount`, `preferences`, `sdk` and `pagination`. `limit` is 1–100 and `offset`
+is 0–100000. An unknown observed SDK version has `version`, `lastSeenAt` and
+`updateAvailable` set to `null`.
+
+The notification union is additive:
+
+- `kind: "sdk-release"` retains its existing `release` fields: `version`,
+  `compatibility`, `summary`, `upgradeUrl`, `changelogUrl`, `downloadUrl` and
+  `sha256`.
+- `kind: "platform-release"` has
+  `release: { compatibility: "platform-update", summary, changelogUrl }`.
+  It contains no SDK version, package download or checksum claim.
+
+Both kinds have the same account-scoped `id`, `title`, `body`, `createdAt` and
+`readAt` fields and use the same read-state and preference endpoints. A new
+platform announcement does not change `sdk.latestVersion` or imply that the
+recipient must upgrade a pinned SDK package. Clients should branch on `kind`
+when displaying package-specific fields.
+
+
+`POST /api/admin/notifications` accepts either
+`{ "action": "mark-read", "ids": ["sdk-1.4.3"] }` or
+`{ "action": "mark-all-read" }`. Only published, explicitly announced notification IDs are accepted.
+
+`PATCH /api/admin/notifications` accepts `{ "releaseEmails": false }` or
+`{ "releaseEmails": true }`. Both write endpoints return `{ "ok": true }`.
+
+These endpoints require a fresh, verified native platform session. Bearer
+credentials, tenant-scoped requests, impersonated sessions and disabled accounts
+cannot use them. Writes require the platform's same origin. A caller cannot
+supply another account's identifier to read notifications or change preferences.

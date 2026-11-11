@@ -1,0 +1,73 @@
+---
+title: Owned profile photos and erasure
+description: A project-scoped, fail-closed lifecycle for newly uploaded profile-photo drafts.
+---
+
+The compatible runtime and private storage are deployed. The genuine disposable Development lifecycle and pending-erasure retry have completed, and fresh Production and Development SDK readbacks now return both `profileImageUpload: true` and `profileImageOwnershipAndDeletion: true`. Physical native photo-picker acceptance remains separate and is not established here. Keep native photo selection hidden whenever either owning-service capability is false. Name changes, manual HTTPS image URLs and removing a profile image remain independent controls.
+
+## Contract and boundaries
+
+`POST /sdk/avatar` still prepares a draft and returns `{url}`. It does not save the user's image. The selected realm supplies the fresh authenticated user ID; caller-supplied ownership fields are rejected. Newly owned objects use:
+
+```text
+/avatars/<workspace UUID>/<application UUID>/<project UUID>/<asset UUID>.<png|jpg|webp>
+```
+
+Owned objects use a separate private `OWNED_AVATARS` R2 binding, never the existing branding bucket. The controlled Worker returns `private, no-store` for image GET/HEAD and all new-namespace responses, starting with the first upload. It does not redirect to an R2 URL. The bucket must have neither an enabled `r2.dev` endpoint nor a public custom domain; verify those control-plane settings before enabling the private-storage configuration. Review cache rules so they cannot override this namespace's no-store responses.
+
+The existing `/branding/...` protocol and caching stay unchanged for branding and applications that have not opted in. Legacy branding URLs and manually supplied external URLs have no demonstrated user ownership or erasure path. This change does not assign ownership to them or delete them. Erasing an owned origin object does not recall downloaded copies, screenshots or independently retained copies.
+
+## Durable drafts and deletion
+
+Migration `013-owned-user-avatars.sql` adds per-realm ownership, lifecycle and user-state tables plus image/insert, image/update and user/delete triggers. It edits no previous migration and backfills no asset. The existing checksum/advisory migration runner includes it for public and existing tenant schemas; newly provisioned realms receive it too.
+
+A committed ownership intent precedes every body write. The second upload transaction locks the current user and exact asset record, so account deletion cannot race an untracked upload. Only the current user's draft in that same realm can become a saved owned image. Initial account creation cannot borrow an owned-avatar URL; the INSERT guard recognizes the reserved namespace even before lifecycle setup. Realm create/update hooks use the actual URL parser to reject fragment, case, whitespace, protocol-relative, backslash and dot-segment aliases; a saved owned URL must be the exact canonical draft URL. Replacing/removing the image queues prior owned records. Unselected drafts expire after 24 hours; unfinished drafts are bounded at ten per user. No worker lists or guesses object ownership from storage keys.
+
+The signed, method/path/body/time-bound avatar protocol is separate from branding. A successful DELETE replaces image bytes with an opaque zero-byte tombstone. Its GET/HEAD becomes 404. Immutable conditional PUT cannot overwrite the marker, including a delayed PUT that began before deletion. This relies on R2's [atomic conditional-write semantics](https://developers.cloudflare.com/r2/reference/consistency/) and its [Workers conditional PUT contract](https://developers.cloudflare.com/r2/api/workers/workers-api-reference/). Tombstones retain opaque application/object keys, not image bytes or a user ID.
+
+Normal self-deletion preflights owned erasure before credentials or sessions are removed. Project-administrator deletion preflights before revocation, and a final internal-adapter guard covers other internal user-deletion calls. The guard is installed only after Better Auth's context resolves: plugin initialisation rebuilds that adapter, so installing there would be ineffective. A user database hook alone is too late because the internal adapter removes accounts/sessions before deleting the user.
+
+If owned images/drafts remain unacknowledged, deletion returns fixed HTTP503 with `Profile photo erasure is pending. Retry account deletion shortly.` The user remains, credentials remain available for retry, and further owned uploads/saves are blocked by durable deleting state. The bounded synchronous pass handles up to three objects; larger or failed jobs remain durable for the scheduled worker and deletion can be retried. User-table deletion has an additional SQL-trigger fallback that queues all remaining owned records and retains jobs after the owner FK becomes null. A privileged raw database deletion is asynchronous fallback, not proof that the normal endpoint completed erasure.
+
+The configured email-confirmation token is one-use and is consumed before this erasure preflight. An HTTP503 response does not make that token reusable: request a fresh genuine confirmation link for the retry and satisfy the current fresh-session requirement. A `Verification email sent` response acknowledges only the confirmation request, not account deletion.
+
+## Configuration and worker
+
+The native capability defaults false. It requires all of the following:
+
+- The exact immutable project UUID is listed in comma-separated `ALLAUTH_OWNED_AVATAR_PROJECT_IDS`.
+- `ALLAUTH_AVATAR_CLEANUP_ENABLED=true` is configured on the service and scheduled worker.
+- The service has an exact HTTPS `ALLAUTH_ASSET_ORIGIN` and a separate server-only `ALLAUTH_AVATAR_SECRET` of at least 32 characters.
+- The asset Worker has that same secret, a separate private `OWNED_AVATARS` binding, and `OWNED_AVATAR_PRIVATE_STORAGE=true` after the bucket's public endpoints/domains have been verified disabled.
+- Migration 013, all three enabled realm triggers, the exact asset origin and protocol version match.
+- A cleanup heartbeat is no older than five minutes and has no unresolved failed jobs.
+
+The production image includes a compiled, self-contained Node 22 runner and dependency permission notices at `scripts/avatar-cleanup/`. It needs no runtime pnpm, tsx, source files or host `node_modules`. The image's normal `node server.js` command is unchanged. A one-shot cleanup command, from the image working directory `/app/apps/auth`, is:
+
+```sh
+node scripts/avatar-cleanup/avatar-cleanup.mjs
+```
+
+The launcher refuses arguments or missing exact `ALLAUTH_AVATAR_CLEANUP_ENABLED=true` before loading any database/provider implementation. It reads the registry's validated realm scopes, takes an advisory single-worker lock and emits fixed count-only results. Each realm pass processes at most 25 registered objects with durable retries/backoff. A 50-second pass deadline cancels transport and database work, including the current per-object loop; pending database connection acquisition has a separate 1.5-second bound. Query/statement/lock waits are bounded at four/three/two seconds. Pool and checked-out-client error events are contained without logging pg's attached client/config, and cancellation discards connections rather than recycling them. Cancellation detected before the heartbeat write prevents that write; cancellation after PostgreSQL commits cannot undo a valid completed heartbeat. For a large fleet, schedule explicit reviewed shards/cursors before relying on every realm's heartbeat; an unvisited/stale realm fails closed.
+
+For a dedicated always-on background service, explicitly set `ALLAUTH_AVATAR_CLEANUP_CONTINUOUS=true` and use the same command. It runs serial passes separated by a cancellable 60-second wait. SIGTERM/SIGINT cancels the current pass or idle wait, discards database connections and exits; an ordinary failed pass also exits for supervised restart. This flag defaults off. Do not run the continuous mode as a cron job. [Railway cron jobs have a minimum five-minute frequency and may drift](https://docs.railway.com/guides/cron-workers-queues), which cannot reliably sustain this capability's five-minute freshness bound. Keep one selected cleanup service with restart-on-failure, no public domain/port and the same reviewed immutable source as the web service. A shared image digest is preferable; when builds are separate, verify the compiled cleanup artifact hashes on both actual deployments and record that distinction.
+
+Before a healthy heartbeat, a signed lifecycle handshake verifies actual bucket PUT/HEAD/DELETE/HEAD using an empty non-user probe. It returns no secret, owner or object URL. Pending failed jobs cannot be hidden by a later empty poll. The worker never performs a branding DELETE. Completed asset rows drop their user linkage. Continue running cleanup when opting out so existing jobs can drain; do not drop a realm/schema before owned jobs have acknowledged erasure.
+
+## Guarded rollout and rollback
+
+1. Independently review the additive SQL, runtime guard, new protocol and worker diff. Rehearse migration and rollback against a disposable local copy with no provider access.
+2. For a new environment, prepare the exact private bucket/binding and new secret actions for authorised service setup. Use resources and credentials owned by your deployment; do not reuse a hosted environment's settings.
+3. Deploy the compatible Worker with private storage verified and cache rules checked. Keep project opt-in absent.
+4. Apply the existing migration runner to its intended database after backup/rehearsal; verify 013 checksum and all three enabled triggers in every selected realm. Do not replay old migrations.
+5. Start the server-only scheduled cleanup command and verify its scoped, fresh heartbeat. Use only fictional, explicitly owned fixture uploads to verify draft/save/replacement/abandonment, failed-delete retry, user deletion and 404/no-store after tombstoning.
+6. Set only the intended immutable project IDs; read back both SDK booleans and verify native/backend gate behavior. Public release remains held until these actual receipts exist.
+7. Roll back by clearing project opt-in first. Keep the compatible Worker, migration and cleanup process until every registered job drains; removing code or a schema early would discard the erasure path. Legacy unowned URLs remain a separately recorded gap.
+
+## Configure your own environment
+
+Provision your own private owned-avatar bucket and binding. Keep project selection empty and `OWNED_AVATAR_PRIVATE_STORAGE=false` until public-access and cache checks pass. Configure the same independent server-only avatar secret on your asset Worker, app and cleanup service. Start cleanup with scoped heartbeat checks, then opt in only the reviewed immutable project IDs. Keep the compatible Worker, migrations, tombstones and cleanup process until all registered jobs drain; clearing an opt-in is not an erasure operation.
+
+## Source verification
+
+The focused candidate suite includes mock Worker transport, delayed-PUT/tombstone concurrency, malformed signatures and no-store responses, exact SDK capability validation, real isolated PostgreSQL ownership/draft/replacement/delete/race/rollback checks, and mounted Better Auth deletion cases proving pending cleanup cannot report successful deletion or discard the retry credential. These checks use synthetic objects and a guarded local database only. They are not deployment, private-bucket configuration or live erasure evidence.

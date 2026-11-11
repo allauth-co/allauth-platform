@@ -1,0 +1,13 @@
+.next
+node_modules
+.source
+.env
+.DS_Store
+next-env.d.ts
+
+# Build-time sync targets (populated by scripts/sync-versions.ts)
+content/_generated/**
+!content/_generated/**/
+!content/_generated/**/.gitkeep
+.docs-sync-tmp/
+.vercel

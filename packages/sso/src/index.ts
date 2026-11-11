@@ -1,0 +1,461 @@
+import type { BetterAuthPlugin } from "better-auth";
+import { createAuthMiddleware, getSessionFromCtx } from "better-auth/api";
+import { XMLValidator } from "fast-xml-parser";
+import { SAML_SESSION_BY_ID_PREFIX } from "./constants";
+import { assignOrganizationByDomain } from "./linking";
+import {
+	requestDomainVerification,
+	verifyDomain,
+} from "./routes/domain-verification";
+import {
+	deleteSSOProvider,
+	getSSOProvider,
+	listSSOProviders,
+	updateSSOProvider,
+} from "./routes/providers";
+import {
+	acsEndpoint,
+	callbackSSO,
+	callbackSSOShared,
+	initiateSLO,
+	registerSSOProvider,
+	signInSSO,
+	sloEndpoint,
+	spMetadata,
+} from "./routes/sso";
+import { saml } from "./samlify";
+
+export {
+	DEFAULT_CLOCK_SKEW_MS,
+	DEFAULT_MAX_SAML_METADATA_SIZE,
+	DEFAULT_MAX_SAML_RESPONSE_SIZE,
+} from "./constants";
+export {
+	deriveSAMLIdentityProviderEntityID,
+	deriveSAMLServiceProviderPolicy,
+	type SAMLServiceProviderPolicy,
+} from "./routes/helpers";
+export {
+	type AlgorithmValidationOptions,
+	DataEncryptionAlgorithm,
+	type DeprecatedAlgorithmBehavior,
+	DigestAlgorithm,
+	KeyEncryptionAlgorithm,
+	SignatureAlgorithm,
+} from "./saml";
+export {
+	type SAMLConditions,
+	type TimestampValidationOptions,
+	validateSAMLTimestamp,
+} from "./saml/timestamp";
+
+import type {
+	InferSSOProvider,
+	OIDCConfig,
+	SAMLConfig,
+	SAMLIdentityProviderMetadata,
+	SSOOIDCUserResolutionInput,
+	SSOOptions,
+	SSOProvider,
+	SSOProviderMutationGuardContext,
+	SSOProviderMutationGuardInput,
+	SSOProviderReference,
+	SSOProviderSchema,
+	SSOProviderUserProfile,
+	SSOSAMLUserResolutionInput,
+	SSOUserResolution,
+	SSOUserResolutionContext,
+	SSOUserResolutionInput,
+} from "./types";
+import { PACKAGE_VERSION } from "./version";
+
+export type {
+	OIDCConfig,
+	SAMLConfig,
+	SAMLIdentityProviderMetadata,
+	SSOOIDCUserResolutionInput,
+	SSOOptions,
+	SSOProvider,
+	SSOProviderMutationGuardContext,
+	SSOProviderMutationGuardInput,
+	SSOProviderReference,
+	SSOProviderUserProfile,
+	SSOSAMLUserResolutionInput,
+	SSOUserResolution,
+	SSOUserResolutionContext,
+	SSOUserResolutionInput,
+};
+
+declare module "@better-auth/core" {
+	interface BetterAuthPluginRegistry<AuthOptions, Options> {
+		sso: {
+			creator: typeof sso;
+		};
+	}
+}
+
+export {
+	computeDiscoveryUrl,
+	type DiscoverOIDCConfigParams,
+	DiscoveryError,
+	type DiscoveryErrorCode,
+	discoverOIDCConfig,
+	fetchDiscoveryDocument,
+	type HydratedOIDCConfig,
+	needsRuntimeDiscovery,
+	normalizeDiscoveryUrls,
+	normalizeUrl,
+	type OIDCDiscoveryDocument,
+	REQUIRED_DISCOVERY_FIELDS,
+	type RequiredDiscoveryField,
+	selectTokenEndpointAuthMethod,
+	validateDiscoveryDocument,
+	validateDiscoveryUrl,
+} from "./oidc";
+
+const fastValidator = {
+	async validate(xml: string) {
+		const isValid = XMLValidator.validate(xml, {
+			allowBooleanAttributes: true,
+		});
+		if (isValid === true) return "SUCCESS_VALIDATE_XML";
+		throw "ERR_INVALID_XML";
+	},
+};
+
+saml.setSchemaValidator(fastValidator);
+
+type DomainVerificationEndpoints = {
+	requestDomainVerification: ReturnType<typeof requestDomainVerification>;
+	verifyDomain: ReturnType<typeof verifyDomain>;
+};
+
+type SSOEndpoints<O extends SSOOptions> = {
+	spMetadata: ReturnType<typeof spMetadata>;
+	registerSSOProvider: ReturnType<typeof registerSSOProvider<O>>;
+	signInSSO: ReturnType<typeof signInSSO>;
+	callbackSSO: ReturnType<typeof callbackSSO>;
+	callbackSSOShared: ReturnType<typeof callbackSSOShared>;
+	acsEndpoint: ReturnType<typeof acsEndpoint>;
+	sloEndpoint: ReturnType<typeof sloEndpoint>;
+	initiateSLO: ReturnType<typeof initiateSLO>;
+	listSSOProviders: ReturnType<typeof listSSOProviders>;
+	getSSOProvider: ReturnType<typeof getSSOProvider>;
+	updateSSOProvider: ReturnType<typeof updateSSOProvider>;
+	deleteSSOProvider: ReturnType<typeof deleteSSOProvider>;
+};
+
+export type SSOPlugin<O extends SSOOptions> = {
+	id: "sso";
+	version: string;
+	endpoints: SSOEndpoints<O> &
+		(O extends { domainVerification: { enabled: true } }
+			? DomainVerificationEndpoints
+			: {});
+	schema: SSOProviderSchema<O>;
+	$Infer: {
+		SSOProvider: InferSSOProvider<O>;
+	};
+	options: NoInfer<O>;
+};
+
+/**
+ * SAML endpoint paths that should skip origin check validation.
+ * These endpoints receive POST requests from external Identity Providers,
+ * which won't have a matching Origin header.
+ */
+const SAML_SKIP_ORIGIN_CHECK_PATHS = [
+	"/sso/saml2/sp/acs", // SAML ACS endpoint (prefix matches /sp/acs/:providerId)
+	"/sso/saml2/sp/slo", // SAML SLO endpoint (prefix matches /sp/slo/:providerId)
+];
+
+const SSO_PROVIDER_BUILT_IN_FIELD_KEYS = [
+	"id",
+	"issuer",
+	"oidcConfig",
+	"samlConfig",
+	"userId",
+	"providerId",
+	"organizationId",
+	"domain",
+	"domainVerified",
+] as const;
+
+const SSO_PROVIDER_RESPONSE_FIELD_KEYS = [
+	"type",
+	"spMetadataUrl",
+	"redirectURI",
+	"domainVerificationToken",
+] as const;
+
+const SSO_PROVIDER_BUILT_IN_FIELD_KEY_SET = new Set<string>(
+	SSO_PROVIDER_BUILT_IN_FIELD_KEYS,
+);
+
+const SSO_PROVIDER_RESPONSE_FIELD_KEY_SET = new Set<string>(
+	SSO_PROVIDER_RESPONSE_FIELD_KEYS,
+);
+
+type SSOProviderBuiltInFieldKey =
+	(typeof SSO_PROVIDER_BUILT_IN_FIELD_KEYS)[number];
+
+function getSSOProviderBuiltInFieldName(
+	options: SSOOptions | undefined,
+	key: SSOProviderBuiltInFieldKey,
+) {
+	const fieldNames = options?.fields as
+		| Partial<Record<SSOProviderBuiltInFieldKey, string>>
+		| undefined;
+	const schemaFieldNames = options?.schema?.ssoProvider?.fields as
+		| Partial<Record<SSOProviderBuiltInFieldKey, string>>
+		| undefined;
+	return fieldNames?.[key] ?? schemaFieldNames?.[key] ?? key;
+}
+
+function assertNoAdditionalFieldCollisions(options?: SSOOptions) {
+	const additionalFields = options?.schema?.ssoProvider?.additionalFields ?? {};
+	const builtInFieldNames = new Set(
+		SSO_PROVIDER_BUILT_IN_FIELD_KEYS.map((key) =>
+			getSSOProviderBuiltInFieldName(options, key),
+		),
+	);
+	for (const [key, field] of Object.entries(additionalFields)) {
+		if (SSO_PROVIDER_BUILT_IN_FIELD_KEY_SET.has(key)) {
+			throw new Error(
+				`ssoProvider additional field "${key}" conflicts with a built-in field`,
+			);
+		}
+		if (SSO_PROVIDER_RESPONSE_FIELD_KEY_SET.has(key)) {
+			throw new Error(
+				`ssoProvider additional field "${key}" conflicts with a returned provider field`,
+			);
+		}
+		const fieldName = field.fieldName ?? key;
+		if (builtInFieldNames.has(fieldName)) {
+			throw new Error(
+				`ssoProvider additional field "${key}" maps to built-in field "${fieldName}"`,
+			);
+		}
+	}
+}
+
+export function sso<
+	O extends SSOOptions & {
+		domainVerification?: { enabled: true };
+	},
+>(
+	options?: O | undefined,
+): {
+	id: "sso";
+	version: string;
+	endpoints: SSOEndpoints<O> & DomainVerificationEndpoints;
+	schema: SSOProviderSchema<O>;
+	$Infer: {
+		SSOProvider: InferSSOProvider<O>;
+	};
+	options: NoInfer<O>;
+};
+export function sso<O extends SSOOptions>(
+	options?: O | undefined,
+): {
+	id: "sso";
+	version: string;
+	endpoints: SSOEndpoints<O>;
+	schema: SSOProviderSchema<O>;
+	$Infer: {
+		SSOProvider: InferSSOProvider<O>;
+	};
+	options: NoInfer<O>;
+};
+
+export function sso<O extends SSOOptions>(
+	options?: O | undefined,
+): BetterAuthPlugin {
+	assertNoAdditionalFieldCollisions(options);
+	const optionsWithStore = options as O;
+
+	let endpoints = {
+		spMetadata: spMetadata(optionsWithStore),
+		registerSSOProvider: registerSSOProvider(optionsWithStore),
+		signInSSO: signInSSO(optionsWithStore),
+		callbackSSO: callbackSSO(optionsWithStore),
+		callbackSSOShared: callbackSSOShared(optionsWithStore),
+		acsEndpoint: acsEndpoint(optionsWithStore),
+		sloEndpoint: sloEndpoint(optionsWithStore),
+		initiateSLO: initiateSLO(optionsWithStore),
+		listSSOProviders: listSSOProviders(optionsWithStore),
+		getSSOProvider: getSSOProvider(optionsWithStore),
+		updateSSOProvider: updateSSOProvider(optionsWithStore),
+		deleteSSOProvider: deleteSSOProvider(optionsWithStore),
+	};
+
+	if (options?.domainVerification?.enabled) {
+		const domainVerificationEndpoints = {
+			requestDomainVerification: requestDomainVerification(optionsWithStore),
+			verifyDomain: verifyDomain(optionsWithStore),
+		};
+
+		endpoints = {
+			...endpoints,
+			...domainVerificationEndpoints,
+		};
+	}
+
+	return {
+		id: "sso",
+		version: PACKAGE_VERSION,
+		init(ctx) {
+			const existing = ctx.skipOriginCheck;
+			if (existing === true) {
+				return {};
+			}
+			const existingPaths = Array.isArray(existing) ? existing : [];
+			return {
+				context: {
+					skipOriginCheck: [...existingPaths, ...SAML_SKIP_ORIGIN_CHECK_PATHS],
+				},
+			};
+		},
+		endpoints,
+		hooks: {
+			before: [
+				{
+					matcher(context) {
+						return context.path === "/sign-out";
+					},
+					handler: createAuthMiddleware(async (ctx) => {
+						if (!options?.saml?.enableSingleLogout) {
+							return;
+						}
+						const session = await getSessionFromCtx(ctx);
+						if (!session?.session?.id) {
+							return;
+						}
+						const sessionLookupKey = `${SAML_SESSION_BY_ID_PREFIX}${session.session.id}`;
+						const sessionLookup =
+							await ctx.context.internalAdapter.findVerificationValue(
+								sessionLookupKey,
+							);
+						if (sessionLookup?.value) {
+							await ctx.context.internalAdapter
+								.deleteVerificationByIdentifier(sessionLookup.value)
+								.catch(() => {});
+							await ctx.context.internalAdapter
+								.deleteVerificationByIdentifier(sessionLookupKey)
+								.catch(() => {});
+						}
+					}),
+				},
+			],
+			after: [
+				{
+					matcher(context) {
+						return context.path?.startsWith("/callback/") ?? false;
+					},
+					handler: createAuthMiddleware(async (ctx) => {
+						const newSession = ctx.context.newSession;
+						if (!newSession?.user) {
+							return;
+						}
+
+						if (!ctx.context.hasPlugin("organization")) {
+							return;
+						}
+
+						await assignOrganizationByDomain(ctx, {
+							user: newSession.user,
+							provisioningOptions: options?.organizationProvisioning,
+							domainVerification: options?.domainVerification,
+						});
+					}),
+				},
+			],
+		},
+		schema: {
+			ssoProvider: {
+				modelName:
+					options?.modelName ??
+					options?.schema?.ssoProvider?.modelName ??
+					"ssoProvider",
+				fields: {
+					issuer: {
+						type: "string",
+						required: true,
+						fieldName:
+							options?.fields?.issuer ??
+							options?.schema?.ssoProvider?.fields?.issuer ??
+							"issuer",
+					},
+					oidcConfig: {
+						type: "string",
+						required: false,
+						fieldName:
+							options?.fields?.oidcConfig ??
+							options?.schema?.ssoProvider?.fields?.oidcConfig ??
+							"oidcConfig",
+					},
+					samlConfig: {
+						type: "string",
+						required: false,
+						fieldName:
+							options?.fields?.samlConfig ??
+							options?.schema?.ssoProvider?.fields?.samlConfig ??
+							"samlConfig",
+					},
+					userId: {
+						type: "string",
+						references: {
+							model: "user",
+							field: "id",
+						},
+						fieldName:
+							options?.fields?.userId ??
+							options?.schema?.ssoProvider?.fields?.userId ??
+							"userId",
+					},
+					providerId: {
+						type: "string",
+						required: true,
+						unique: true,
+						fieldName:
+							options?.fields?.providerId ??
+							options?.schema?.ssoProvider?.fields?.providerId ??
+							"providerId",
+					},
+					organizationId: {
+						type: "string",
+						required: false,
+						fieldName:
+							options?.fields?.organizationId ??
+							options?.schema?.ssoProvider?.fields?.organizationId ??
+							"organizationId",
+					},
+					domain: {
+						type: "string",
+						required: true,
+						fieldName:
+							options?.fields?.domain ??
+							options?.schema?.ssoProvider?.fields?.domain ??
+							"domain",
+					},
+					...(options?.domainVerification?.enabled
+						? {
+								domainVerified: {
+									type: "boolean",
+									required: false,
+									fieldName:
+										options?.schema?.ssoProvider?.fields?.domainVerified ??
+										"domainVerified",
+								},
+							}
+						: {}),
+					...(options?.schema?.ssoProvider?.additionalFields ?? {}),
+				},
+			},
+		} as unknown as SSOProviderSchema<O>,
+		$Infer: {
+			SSOProvider: {} as InferSSOProvider<O>,
+		},
+		options: options as NoInfer<O>,
+	} satisfies BetterAuthPlugin;
+}

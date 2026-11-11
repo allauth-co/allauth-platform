@@ -1,0 +1,106 @@
+---
+title: AllAuth MCP and agent skills
+description: Connect Codex, Claude, and other MCP clients to the hosted AllAuth management APIs.
+---
+
+The hosted AllAuth application includes a local stdio MCP server and a portable
+`allauth` agent skill in `apps/auth/mcp/`. These expose the application's
+management operations through the same authenticated APIs used by its console.
+The signed-in account retains its existing workspace and project permissions.
+
+Organization details are bounded summaries. For complete collections, use
+`allauth_organization_members_list`, `allauth_organization_teams_list`,
+`allauth_organization_roles_list` and `allauth_organization_invitations_list`.
+These read-only tools accept an exact environment `project`, `organizationId`,
+optional `search`, `limit` (1–100) and `offset`; follow the returned pagination
+metadata. Member reads also accept `teamId` and `excludeTeam` to inspect a roster
+or find organization members available for that team. The users list accepts
+`excludeOrganizationId` to find prospective organization members. These tools
+require the matching organization collection routes on the deployed service.
+
+This integration belongs to the hosted AllAuth application. Better Auth's
+`@better-auth/mcp` package provides separate authentication functionality; it
+does not install this management server.
+
+## Build and authenticate
+
+From the AllAuth repository:
+
+```sh
+pnpm --dir apps/auth/mcp install --frozen-lockfile
+pnpm --dir apps/auth/mcp build
+pnpm --dir apps/auth/mcp run login --url https://allauth.co
+pnpm --dir apps/auth/mcp run doctor
+```
+
+Default login prints a device approval URL and user code. Open that URL, sign
+in with the Google-connected AllAuth account that manages the target workspace,
+and approve AllAuth MCP once. The CLI does not open the browser automatically
+or require an AllAuth password for a Google-only account. If AllAuth requires
+MFA, return to the terminal for its hidden TOTP or one-use recovery-code prompt;
+this can be required even after browser MFA. Keep codes in the local prompt.
+The CLI then verifies workspace access, saves a private signed session, and
+performs management operations without the browser until that session expires.
+
+If terminal MFA fails or is cancelled, start a new `login` and approve the new
+device code. The prior device grant has been consumed and cannot be redeemed
+again; a partial MFA challenge is never saved as a management session.
+
+Device login requires the accompanying AllAuth server integration to be
+deployed; a local package build does not establish production availability.
+If the signed management session is absent, the CLI saves nothing. It never
+substitutes a device access token for a management cookie or bearer token.
+
+For an existing AllAuth password credential, use the terminal-only alternative:
+
+```sh
+pnpm --dir apps/auth/mcp run login --method password --url https://allauth.co
+```
+
+That method supports TOTP or one-use recovery codes. A Google password cannot
+sign in a Google-only AllAuth account through the password method. Keep all
+authentication secrets in the local flow. An application API key does not
+authorize these management operations. Use `pnpm run login` for the package
+script; `pnpm login` is the separate registry-login command.
+
+## Connect an agent
+
+Register the built stdio executable with an absolute path:
+
+```sh
+codex mcp add allauth -- node /absolute/path/AllAuth/apps/auth/mcp/dist/index.js
+```
+
+For Claude Code:
+
+```sh
+claude mcp add --scope user --transport stdio allauth -- node /absolute/path/AllAuth/apps/auth/mcp/dist/index.js
+```
+
+Copy `apps/auth/mcp/skills/allauth/` to `~/.agents/skills/allauth/` for Codex or
+`~/.claude/skills/allauth/` for Claude Code. The skill and MCP server are separate:
+installing the skill does not authenticate the account or expose tools.
+
+The package's `INSTALL.md` contains complete configuration for Codex, Claude
+Code, Claude Desktop, other stdio clients, and private credential sources.
+`ALLAUTH_URL` selects the service origin; `ALLAUTH_READ_ONLY=true` hides and blocks
+writes. `ALLAUTH_ALLOW_SENSITIVE=true` enables tools that can return integration
+secrets. The service enforces its own authorization in every mode.
+
+## Select the environment
+
+Ask the agent to list accessible workspaces and projects, then identify the
+exact application environment. Development and Production have separate users,
+organizations, sessions, credentials, and settings. Workspace team access is
+separate from an application's end-user organizations.
+
+The server uses the existing API contracts. Errors, required roles, unavailable
+capabilities, pagination, delivery status, and verification requirements retain
+their service meanings. A completed request does not establish email delivery,
+domain verification, or an authentication outcome unless the API confirms it.
+
+This package supplies a local MCP process. The service origin is not a remote
+MCP endpoint and cannot be entered as a claude.ai/Cowork remote connector.
+
+See the official [Codex MCP guide](https://learn.chatgpt.com/docs/extend/mcp) and
+[Claude Code MCP guide](https://code.claude.com/docs/en/mcp) for client options.

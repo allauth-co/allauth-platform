@@ -1,0 +1,4 @@
+interface:
+  display_name: "AllAuth"
+  short_description: "Manage AllAuth accounts and workspaces with MCP"
+  default_prompt: "Use $allauth to inspect my workspaces and manage the selected AllAuth application."

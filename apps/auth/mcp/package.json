@@ -1,0 +1,42 @@
+{
+  "name": "@allauth/mcp",
+  "version": "0.1.1",
+  "description": "AllAuth management tools and agent skills for local MCP clients",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "packageManager": "pnpm@11.1.1",
+  "engines": {
+    "node": ">=22.14.0"
+  },
+  "bin": {
+    "allauth-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "skills",
+    "examples",
+    "INSTALL.md",
+    "README.md",
+    "LICENSE.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "start": "node dist/index.js",
+    "login": "node dist/index.js login",
+    "logout": "node dist/index.js logout",
+    "doctor": "node dist/index.js doctor",
+    "prepack": "pnpm build"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.29.0",
+    "zod": "4.5.4"
+  },
+  "devDependencies": {
+    "@types/node": "25.9.4",
+    "typescript": "6.0.3",
+    "vite": "8.2.0",
+    "vitest": "5.0.0"
+  }
+}

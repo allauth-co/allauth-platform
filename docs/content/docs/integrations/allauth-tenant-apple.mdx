@@ -1,0 +1,51 @@
+---
+title: Environment-owned Sign in with Apple
+description: Configure a direct Apple provider for one exact AllAuth application environment.
+---
+
+AllAuth uses Better Auth's native `apple` provider. Apple is advertised to the embedded SDK and hosted sign-in UI only when the selected environment has its own server configuration. There is no platform credential fallback, shared Apple broker, or public signing material.
+
+Apple is part of the standard AllAuth setup alongside Google and Microsoft. New applications use the shared SDK's `SignIn` and `SignUp` components without a manually maintained provider list. Include Apple Services ID registration, HTTPS callbacks and private-relay email checks when preparing each new environment. Existing applications must install the matching SDK to receive the Apple button and callback support.
+
+## Server configuration
+
+Set the server-only `ALLAUTH_PROJECT_APPLE_PROVIDERS` variable to a JSON object keyed by the **exact environment slug** returned by AllAuth. Development and Production remain separate entries. Never prefix this variable with `NEXT_PUBLIC_` or copy it into a mobile bundle.
+
+Each entry contains:
+
+| Field | Meaning |
+| --- | --- |
+| `clientId` | Apple Services ID for the browser flow |
+| `teamId` | Ten-character Apple Developer Team ID |
+| `keyId` | Ten-character Sign in with Apple key ID |
+| `privateKey` | PKCS8 `.p8` PEM with real newline characters after JSON decoding |
+| `appBundleIdentifier` | Optional native bundle audience; the browser Services ID remains the primary client ID |
+
+Supply the real registered identifiers and signing material through the deployment's private environment settings. The application does not generate or assume a Services ID. Omit an environment entry to disable its Apple provider.
+
+AllAuth generates an ES256 client-secret JWT with a seven-day expiry. Apple-enabled native instances refresh at least daily, and the credential fingerprint also changes when the environment's key or identifiers change. The private key never enters a public configuration response, SDK capability, or browser.
+
+## Apple Developer setup and callbacks
+
+Associate the Services ID with a Sign in with Apple-enabled primary App ID. Register the exact HTTPS domain and return URL in Apple Developer:
+
+- Application proxy: `https://<application-origin>/api/allauth/callback/apple`
+- Verified hosted account domain: `https://<accounts-hostname>/api/auth/callback/apple`
+
+Use the selected environment's actual app origin or verified hosted account domain. Apple does not accept `localhost` or non-HTTPS return URLs. An Apple configuration on a local HTTP application origin is rejected rather than silently using another callback.
+
+Apple returns a top-level `application/x-www-form-urlencoded` POST. The SDK proxy permits this only at `callback/apple`, from the exact Apple origin, with an existing selected-project OAuth state cookie and an unambiguous state value. All other POST origin checks remain in place. The native POST-to-GET continuation stays on the application's callback route, retaining the app's scoped cookies.
+
+Only the OAuth `state`/`oauth_state` cookies use `SameSite=None; Secure; HttpOnly` in Apple-enabled environments. Session cookie settings remain unchanged. Native signed state, PKCE, code exchange and token validation remain active. The Apple integrity plugin verifies the token signature, issuer, configured audience and fresh state-bound nonce before reading the profile.
+
+## Private email and account continuity
+
+Treat Apple's verified subject as the stable provider identity. A private relay address is not evidence that the user owns another real email address; AllAuth does not infer or merge those identities. Existing account-linking verification rules remain in force.
+
+Apple may omit email after first consent. AllAuth recovers the stored email only by finding the same verified Apple subject in the selected realm's account table. A new Apple subject without an email does not receive an invented address or match another user's account.
+
+Accept both `privaterelay.appleid.com` and `private.icloud.com` relay addresses. To send to them, register the actual outbound email sources and authenticate mail as required by Apple's Private Email Relay service. Configuration does not prove delivery.
+
+The SDK exposes `apple: true` and `appleProvider: "apple"`, and renders Continue with Apple on sign-in and sign-up while preserving the app's return path. Older AllAuth servers that omit these optional fields continue to work.
+
+References: [Apple environment configuration](https://developer.apple.com/documentation/signinwithapple/configuring-your-environment-for-sign-in-with-apple), [authorization form POST](https://developer.apple.com/documentation/signinwithapplerestapi/request-an-authorization-to-the-sign-in-with-apple-server.), [private relay setup](https://developer.apple.com/help/account/capabilities/configure-private-email-relay-service/), [new relay domain](https://developer.apple.com/news/?id=1ptvdtcm).

@@ -1,0 +1,101 @@
+---
+title: AllAuth commercial plans
+description: Workspace billing, hosted feature limits and unrestricted self-hosting.
+---
+
+AllAuth's managed service bills a developer workspace, which owns applications
+and their development/production environments. A workspace is separate from an
+application's customer organisations. Existing application and console-team
+quotas still apply.
+
+| | Hosted Free | Hosted Pro | Self-hosted |
+|---|---|---|---|
+| Monthly software/service price | $0 | US$9.99 per workspace, plus applicable tax | No software fee |
+| AllAuth attribution on supported surfaces | Required | Removable | Removable |
+| Members per customer organisation | 20 | Unlimited under fair use | Unlimited |
+| Monthly impersonations | 5 | Unlimited under fair use | Unlimited |
+
+There is no annual plan, trial or automatic usage-overage billing at launch.
+Provider configuration and usage charges, infrastructure costs and applicable
+third-party licences are separate. The supported authentication capabilities
+are available on both hosted plans; installing a provider integration does not
+configure it.
+
+## Enforcement
+
+The organisation creator counts as a member. Pending invitations do not reserve
+seats; accepting an invitation enforces the current limit. The same limit
+applies to console/API additions and SSO/SCIM provisioning. Concurrent additions
+cannot exceed the limit.
+
+Five monthly impersonation starts are shared across every application and
+environment in the workspace. Committed impersonated sessions count once;
+failed transactions and repeated insertion of the same session do not consume
+another start. Usage resets on the first day of each UTC calendar month and
+does not reset on plan changes. Counting begins when hosted enforcement launches.
+Stopping and revoking existing support sessions never requires payment.
+
+Downgrades preserve existing members, users and ordinary sessions. Free applies
+to new restricted actions and effective attribution. Saved branding preferences
+remain available when the workspace upgrades again. Cancelling retains Pro
+through the paid period; failed renewals receive one seven-day recovery window
+anchored to the failed renewal. Authentication does not call Stripe.
+
+## Workspace billing API
+
+These platform endpoints use a current verified, non-impersonated platform
+browser session. Tenant roles, application API keys and bearer tokens do not
+authorize billing. Workspace owners and platform administrators can manage
+billing; workspace administrators can inspect it.
+
+- `GET /api/workspaces/:workspaceId/billing`: current plan, subscription and
+  cancellation/grace state, local entitlements, UTC usage and checkout readiness.
+- `POST /api/workspaces/:workspaceId/billing/checkout`: returns `{ url }` for the
+  server-configured US$9.99 monthly workspace subscription.
+- `POST /api/workspaces/:workspaceId/billing/portal`: returns `{ url }` for the
+  workspace's Stripe Customer Portal.
+
+Mutations require the platform's exact browser Origin. Client-supplied customer,
+subscription, price, quantity and arbitrary return URLs are not accepted. The
+Checkout return page does not grant access: confirmed invoice payment does.
+The server verifies and durably records Stripe events at
+`POST /api/billing/stripe/webhook`; worker retries and reconciliation refresh
+current Stripe state rather than trusting webhook delivery order.
+
+Billing follows a workspace through changes of owner. Cancel any chargeable
+subscription and expire open Checkout sessions before deleting an empty
+workspace. Historical Stripe mappings are retained for delayed events.
+
+## Operator setup and rollout
+
+`ALLAUTH_DEPLOYMENT_MODE=hosted` is the safe default. Explicit
+`ALLAUTH_DEPLOYMENT_MODE=self-hosted` enables all product features without Stripe.
+Missing billing credentials never turn a hosted deployment into self-hosting.
+
+Start managed rollout with `ALLAUTH_BILLING_CHECKOUT_ENABLED=false` and
+`ALLAUTH_BILLING_ENFORCEMENT_ENABLED=false`. Set the server-only
+`ALLAUTH_STRIPE_ACCOUNT_ID`, `ALLAUTH_STRIPE_LIVEMODE`,
+`ALLAUTH_STRIPE_PRO_PRICE_ID`, `ALLAUTH_STRIPE_SECRET_KEY`,
+`ALLAUTH_STRIPE_WEBHOOK_SECRET` and optional
+`ALLAUTH_STRIPE_PORTAL_CONFIGURATION_ID` for the selected environment.
+
+Run `pnpm --dir apps/auth billing:setup` to inspect the sandbox offer, and
+`pnpm --dir apps/auth billing:sandbox-check -- --apply` for the explicitly
+configured isolated sandbox fixture. Setup refuses live resource creation.
+`pnpm --dir apps/auth billing:reconcile` repairs local subscription projections;
+live reconciliation requires its explicit live-mode argument.
+
+Automatic tax remains disabled until the account's registrations and product
+classification are confirmed. Enable `ALLAUTH_STRIPE_AUTOMATIC_TAX_ENABLED`
+only after that verification; the integration also checks active registrations.
+Tax configuration must be verified separately in live mode.
+
+Changing deployment mode or enforcement flags also requires
+`pnpm --dir apps/auth db:migrate` to synchronise the database guard policy.
+Apply migrations before starting the matching service. Enable checkout and Free
+enforcement together only after live billing is ready. Disabling enforcement
+for rollback preserves existing usage and billing records; it does not cancel
+subscriptions. The protected internal platform workspace is exempt.
+
+AllAuth-owned code is MIT-licensed. The public source release, self-hosting guide
+and managed-service terms are maintained separately from immutable SDK archives.

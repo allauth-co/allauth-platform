@@ -1,0 +1,31 @@
+---
+title: Scoped application backend directory
+description: Read one environment's identities and memberships without a workspace session or write authority.
+---
+
+{/* cspell:words organisation organisations authorisation */}
+
+Application backends can opt into `directory:read` using a separate, project-bound credential. No credential exists by default. A proxy HMAC, ordinary native API key, OAuth token or application-user role does not grant this directory authority.
+
+A current verified workspace owner/admin issues the credential through `POST /api/admin/projects/<exact-slug>/backend-credentials` with `{ "name": "Application workers", "expiresInDays": 90 }`. The lifetime is 1–90 days. The response returns `{ credential, key }` once; store `key` only in the application's private server environment. `GET` lists safe credential metadata. `DELETE .../backend-credentials/<credential-id>` revokes immediately. Issue a replacement and install it before revoking an older key; existing credentials are never overwritten. The named management tools are `allauth_backend_credentials_list`, `allauth_backend_credential_create` (sensitive), and `allauth_backend_credential_revoke`.
+
+The registry retains a SHA-256 key hash, exact project, fixed scope, version, expiry and revocation state. Every request rechecks current database expiry/revocation. This credential creates no user session and cannot mutate users, organisations, roles, invitations, authentication settings or support sessions. Never install an administrator's workspace cookie in an application.
+
+Send `allauth-backend-key: <private-key>` directly from the server to the exact environment's authentication base:
+
+| GET path                           | Filters                                    | Safe collection                                                                   |
+| ---------------------------------- | ------------------------------------------ | --------------------------------------------------------------------------------- |
+| `/service-directory/users`         | Optional `userId`                          | `users`: ID, name, primary email, verification/restriction flags, image and dates |
+| `/service-directory/organizations` | Optional `organizationId`                  | `organizations`: ID, name, slug, logo and creation date                           |
+| `/service-directory/members`       | At least one of `userId`, `organizationId` | `members`: ID, user/organisation IDs, native role and join date                   |
+| `/service-directory/roles`         | Required `organizationId`                  | `roles`: built-in/custom role names and native permission definitions             |
+
+Every response includes the exact `project` slug, immutable `projectId`, `environment`, collection, `total`, `limit` and `offset`. Pages accept `limit` 1–100 (default 25) and `offset` 0–100000. A user-only members query pages that user's complete memberships across the selected environment without querying each organisation. Missing exact user/organisation filters return an empty collection; members/roles requests naming an unknown organisation return 404. Responses are `no-store`. Passwords, sessions, account tokens and private metadata are excluded. These endpoints are never exposed by the browser SDK proxy.
+
+Validate destination identifiers and complete pagination before changing an application's local projection. Use these reads after compact identity webhooks and for periodic reconciliation. Unavailable or incomplete reads must not be interpreted as deletions. Authentication/access checks fail closed while authoritative restrictions or membership cannot be checked. A machine integration authenticates to the application using its own credential; the application uses this separate backend credential to check that integration's mapped user and current memberships.
+
+## Shared backend admission
+
+A valid current project-bound credential enters only these four fixed GET paths through native server reads. Its independent PostgreSQL token bucket admits 20 reads per second with 120 immediate burst credits, shared across replicas and isolated by project and a credential digest. No completed authorisation or directory result is cached. Missing, invalid, expired or revoked credentials retain the ordinary HTTP handler and its IP admission; sign-in, password, MFA and all other browser limits remain unchanged. Cookies, bearer sessions and proxy assertions are not forwarded into a directory read.
+
+Refusal returns HTTP 429, `Retry-After`, `no-store` and `ALLAUTH_DIRECTORY_RATE_LIMITED`. Credential-storage/admission/native failures fail closed with HTTP 503 and `ALLAUTH_DIRECTORY_UNAVAILABLE`. Read complete pages before projection; a temporary refusal is not evidence of a user or membership deletion. These initial admission settings are a bound on work, not a production throughput guarantee.

@@ -1,0 +1,22 @@
+{
+  "name": "@better-auth-test/fixtures-cloudflare",
+  "private": true,
+  "dependencies": {
+    "@better-auth/core": "workspace:*",
+    "@better-auth/sso": "workspace:*",
+    "better-auth": "workspace:*",
+    "hono": "^4.13.7"
+  },
+  "devDependencies": {
+    "vitest": "catalog:vitest",
+    "wrangler": "4.123.0"
+  },
+  "scripts": {
+    "check": "wrangler types --check --env-interface CloudflareBindings && tsc && wrangler build",
+    "e2e:smoke": "pnpm run check && vitest run",
+    "dev": "wrangler dev",
+    "cf-typegen": "wrangler types --env-interface CloudflareBindings",
+    "typecheck:consumer": "tsc --noEmit --project tsconfig.json",
+    "typecheck:skip-lib-check-false": "tsc --noEmit --project tsconfig.skip-lib-check-false.json"
+  }
+}

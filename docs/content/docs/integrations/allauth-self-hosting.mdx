@@ -1,0 +1,12 @@
+---
+title: Self-host AllAuth
+description: Run the complete AllAuth platform on your own infrastructure and connect an application to your instance.
+---
+
+AllAuth runs in explicit self-hosted mode with Node.js and PostgreSQL. All features are enabled without Stripe or a hosted subscription. You operate the service and pay infrastructure and provider costs.
+
+The repository’s [self-hosting guide](../../../SELF_HOSTING.md) covers Compose with HTTPS, initial administrator creation, email, OAuth callbacks, backups, recovery and upgrades. The complete MIT-licensed source is in the [platform repository](https://github.com/thegarty/allauth-platform).
+
+Keep your application’s signed same-origin proxy and set `allauthURL` on `createAllAuthProxy` to your instance’s HTTPS origin. Its console setup guide supplies the project slug, proxy secret, application origin and provider callbacks. Keep credentials server-side.
+
+Self-hosting includes attribution removal and no monthly organization-member or impersonation quotas. Authorization, security protections and auditing remain active. Optional email, storage, custom-domain routing, SSO and SCIM need their matching provider configuration. SMS delivery is not provisioned by the deployment stack.

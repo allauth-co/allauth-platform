@@ -1,0 +1,27 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "allauth-brand-assets",
+  "main": "workers/brand-assets.ts",
+  "compatibility_date": "2026-10-07",
+  "workers_dev": false,
+  "preview_urls": false,
+  "r2_buckets": [
+    {
+      "binding": "BRAND_ASSETS",
+      "bucket_name": "my-allauth-brand-assets"
+    },
+    {
+      "binding": "OWNED_AVATARS",
+      "bucket_name": "my-allauth-owned-avatars"
+    }
+  ],
+  "vars": {
+    "OWNED_AVATAR_PRIVATE_STORAGE": "false"
+  },
+  "observability": {
+    "enabled": true,
+    "logs": {
+      "invocation_logs": false
+    }
+  }
+}

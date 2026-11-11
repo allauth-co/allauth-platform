@@ -1,0 +1,72 @@
+{
+  "name": "@better-auth/scim",
+  "version": "1.7.7",
+  "description": "SCIM plugin for Better Auth",
+  "type": "module",
+  "license": "MIT",
+  "homepage": "https://www.better-auth.com/docs/plugins/scim",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/better-auth/better-auth.git",
+    "directory": "packages/scim"
+  },
+  "author": "Jonathan Samines",
+  "keywords": [
+    "auth",
+    "scim",
+    "typescript",
+    "better-auth"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsdown",
+    "dev": "tsdown --watch",
+    "lint:package": "publint run --strict --pack false",
+    "lint:types": "attw --profile esm-only --pack .",
+    "typecheck": "tsc --project tsconfig.json",
+    "test": "vitest",
+    "coverage": "vitest run --coverage --coverage.provider=istanbul"
+  },
+  "files": [
+    "dist"
+  ],
+  "main": "./dist/index.mjs",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.mts",
+  "exports": {
+    ".": {
+      "dev-source": "./src/index.ts",
+      "types": "./dist/index.d.mts",
+      "default": "./dist/index.mjs"
+    }
+  },
+  "typesVersions": {
+    "*": {
+      "*": [
+        "./dist/index.d.mts"
+      ]
+    }
+  },
+  "dependencies": {
+    "@noble/hashes": "^2.2.0",
+    "zod": "catalog:"
+  },
+  "devDependencies": {
+    "@better-auth/core": "workspace:*",
+    "@better-auth/kysely-adapter": "workspace:*",
+    "@better-auth/sso": "workspace:*",
+    "@better-auth/test-utils": "workspace:*",
+    "kysely": "catalog:",
+    "oauth2-mock-server": "^9.0.0",
+    "tsdown": "catalog:"
+  },
+  "peerDependencies": {
+    "@better-auth/core": "workspace:^",
+    "@better-auth/utils": "catalog:peer",
+    "better-auth": "workspace:^",
+    "better-call": "catalog:"
+  }
+}

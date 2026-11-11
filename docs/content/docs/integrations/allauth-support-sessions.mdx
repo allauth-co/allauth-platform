@@ -1,0 +1,116 @@
+---
+title: AllAuth support impersonation
+description: Start, inspect and end environment-scoped support sessions in the console and connected applications.
+---
+
+{/* cspell:words authorisation */}
+
+Open a selected application's **Users** directory and choose **Impersonate user**
+from a user's details. Workspace owners and administrators can manage their
+environment; platform administrators can manage all authorized environments.
+Administrator and banned user accounts cannot be impersonated.
+
+The console retains the selected workspace, environment and user. A support
+banner displays the actual target email and session expiry across that
+environment's console pages. **End support session** ends only that project's
+support session. The administrator's platform session remains signed in.
+The banner refreshes its status without extending the 15-minute support lifetime.
+If the session expires just before it is ended, the console checks the current
+session and completes the action once no live impersonation remains.
+
+## Connected application support
+
+The local SDK 1.4.0 candidate adds an explicit connected-app integration. Deploy
+the matching service and adopt the checked SDK archive before enabling it.
+Existing applications remain disabled until configured.
+
+Enable the handoff on the app's server proxy:
+
+```ts title="app/api/allauth/[...all]/route.ts"
+import { createAllAuthProxy } from "@allauth/react/next";
+
+const handler = createAllAuthProxy({
+	project: process.env.ALLAUTH_PROJECT!,
+	proxySecret: process.env.ALLAUTH_PROXY_SECRET!,
+	appOrigin: process.env.APP_ORIGIN!,
+	supportAccess: {
+		enabled: true,
+		basePath: "/api/allauth",
+		afterStartUrl: "/",
+	},
+});
+export { handler as GET, handler as POST };
+```
+
+Enable the persistent banner in the app's shared layout:
+
+```tsx
+<AllAuthProvider supportAccess basePath="/api/allauth">
+	{children}
+</AllAuthProvider>
+```
+
+The optional `AllAuthUIProvider` also accepts `supportAccess`. Keep the provider
+mounted across application navigation. The banner identifies both the target
+and acting administrator, shows expiry and provides **End support session**.
+
+In the selected environment's **User & authentication → Support access**, enter
+`https://your-app.example/api/allauth/support/callback`, enable connected support
+and save. The origin must already be registered for that application; the path
+must exactly match the server proxy mount. HTTPS is required except for local
+loopback development. Query strings, fragments and embedded credentials are
+rejected. The configuration API exposes this as optional
+`policy.supportAccess: { enabled, callbackUrl }`; omitting it disables handoff.
+
+For local handoff testing, use distinct hostnames for the service and app, for
+example `http://localhost:3002` and `http://127.0.0.1:3004`, and register the app's
+exact origin. Cookies are shared across ports on the same hostname. Two
+`localhost` ports therefore share the native session cookie and cannot model
+the separate app sign-in that this handoff preserves.
+
+Start impersonation from Users, then select **Open connected app** in the console
+banner. A two-minute launch ticket, browser-bound state, PKCE and a one-use
+exchange code bind the handoff to the current administrator, target, environment,
+callback and server integration key. Session credentials never appear in URLs
+or JavaScript responses. The app's original sign-in remains unchanged until
+the exchange succeeds, and the support session keeps its original expiry.
+
+Ending support from either domain revokes the same native support session.
+On the app, ending support restores its prior sign-in only if that session is
+still valid. A newer sign-in in another tab is preserved. Expired, banned or
+revoked sessions are not restored. The encrypted restoration state is available
+for up to 20 minutes, never outlives a browser-session-only original sign-in,
+and cannot survive integration-key rotation. After that window, sign in again
+normally. If support expires or is ended in the console, the app banner offers
+cleanup and restoration.
+
+Fresh native requests revalidate the connected support actor's platform session,
+workspace authority, target eligibility and registration. Removing access or
+disabling the integration revokes connected support. Disabling registration does
+not prevent the existing session from being explicitly ended.
+
+Support sessions preserve the acting administrator. Sensitive authentication
+changes, factor enrollment, account linking and account deletion remain blocked.
+Native impersonated JWT access tokens and ID tokens include actor claims;
+applications must preserve these claims and enforce their own sensitive-action
+restrictions. Offline refresh access is unavailable during impersonation.
+
+## Application-initiated support in a separate window
+
+An application may separately opt into backend-delegated support. This does not grant its users workspace or native administrator roles. Keep the normal application as canonical origin, register a separate HTTPS support hostname and origin, and set the single support callback to that origin's `/api/allauth/support/callback`. Cookies remain host-only, so ordinary administration tabs stay signed in independently.
+
+The complete support policy can additionally contain `applicationInitiated: { enabled: true, authorizeUrl: "https://app.example/api/admin/impersonation/authorize", returnUrl: "https://app.example/admin" }`. The authorisation path is fixed, both destinations must belong to the canonical application origin, and the support callback must use a different registered hostname. Another port on the primary hostname does not isolate cookies. Omitting this object keeps application delegation disabled. Preserve the complete versioned policy when updating it.
+
+After checking the current application's superuser role, target/context eligibility and required reason, its backend calls signed `POST /sdk/support/application/launch` with the original ordinary native actor cookie and `{ actorSessionId, targetUserId, reason, applicationAuditId, context: { kind: "user" | "company" | "practice", id } }`. The response supplies only a two-minute opaque `url` and `expiresAt`; no target session is issued yet. These endpoints are server-only and excluded from the browser SDK proxy.
+
+Open that URL in the separate window. Existing SDK `/support/start` creates browser state/PKCE, then AllAuth redirects an application ticket to the configured main-app authorisation endpoint. That backend must recheck the same original actor session and current app permissions, then call signed `POST /sdk/support/application/authorize` with `{ launch, state, codeChallenge }` and the original actor cookie. AllAuth consumes the ticket and creates a native target session lasting at most 15 minutes and never beyond the original actor session. Redirect the returned `url` to the support callback; existing one-use state/PKCE exchange issues only support-origin cookies. A stolen launch ticket cannot complete authorisation without the original main-app actor session. Session credentials never cross origins or appear in URLs.
+
+On the support server proxy, use `supportAccess: { enabled: true, applicationReturnUrl: "https://app.example/admin" }` with the exact policy return destination. SDK 1.4.5 preserves the native application's safe actor binding and validates this return URL. Keep the provider mounted with `supportAccess`. Native support status adds `actorKind: "application"`, `actorSessionId`, `applicationAuditId`, `context` and `applicationReturnURL`; retain them when resolving application access.
+
+AllAuth rechecks the original native actor session, restrictions, target, support registration and integration-key version. Application-issued support sessions also require signed transport from their registered support origin. **The application must check its current superuser role and scoped target eligibility before every business request and every native proxy read/write**; AllAuth cannot read application-owned roles. Keep status/end cleanup available after app permission loss. On an isolated support surface, disable ordinary authentication/admin flows and restrict native writes to the explicit support-stop operation. The generic SDK proxy retains its existing endpoints for other integrations; it does not impose host-specific application policy.
+
+End revokes the same native support session and clears/restores only the support hostname's cookies. The SDK returns the exact configured main-app administration URL; a script-opened support window may close after successful cleanup and offer that link when closing is unavailable. The original main-app session is never copied into the support hostname or replaced by this flow. Existing console-initiated support remains compatible and uses its original authority checks.
+
+The native authorisation response also returns safe `sessionId`; persist it beside the application audit row before redirecting. A main-app administrator can abort that exact issuance using server-only signed `POST /sdk/support/application/revoke` with `{ sessionId, applicationAuditId }` and the same original ordinary actor cookie. The native actor/session/audit binding must match; the directory key grants no revoke authority. Cleanup remains available for an existing binding after support registration is disabled. A 24-hour credential-free receipt permits idempotent cleanup of already-ended sessions; it never authenticates a user or extends native support lifetime.
+
+If both cleanup receipts have expired, a freshly verified signed request from the configured main application with a live ordinary actor can acknowledge an exact native session ID only when that session no longer exists. The response adds `alreadyEnded: true` and performs no session mutation. An existing session still requires the complete stored actor/session/audit binding; absent-session acknowledgement requires current application delegation to remain enabled.

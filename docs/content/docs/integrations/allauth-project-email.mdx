@@ -1,0 +1,41 @@
+---
+title: AllAuth project email providers
+description: Select a private transactional email transport for one hosted AllAuth project.
+---
+
+Hosted AllAuth projects can use a project-specific Resend sender while the
+platform and other projects continue using the existing Cloudflare transport.
+This setting belongs to the AllAuth server. It does not change the Better Auth
+organization plugin API or require a browser SDK change.
+
+For exact project slug `exampleapp-production`, configure:
+
+```dotenv
+ALLAUTH_PROJECT_EXAMPLEAPP_PRODUCTION_EMAIL_PROVIDER=resend
+ALLAUTH_PROJECT_EXAMPLEAPP_PRODUCTION_EMAIL_FROM=security@exampleapp.example
+ALLAUTH_PROJECT_EXAMPLEAPP_PRODUCTION_EMAIL_FROM_NAME=ExampleApp
+ALLAUTH_PROJECT_EXAMPLEAPP_PRODUCTION_RESEND_API_KEY=<server-only sending key>
+```
+
+The prefix is the exact project slug uppercased, replacing hyphens with
+underscores. Each development and production realm is configured separately.
+No global `RESEND_API_KEY` automatically changes existing senders.
+
+Verify the sender domain with Resend using its returned DNS records, and use a
+sending-only API key restricted to that domain. Keep all credentials in the
+AllAuth service's private environment. Restart the service after changes.
+
+The selected transport serves the existing verification, recovery, security and
+native organization-invitation callbacks. A missing or invalid scoped sender/key
+fails without falling back to another application's email identity. Provider
+acceptance is checked but does not establish inbox delivery. Existing templates,
+branding and application callback URLs are retained.
+
+The Security console reports new-device emails as available only when that
+environment's selected email transport is configured. Without it, the notification
+control is unavailable and coverage shows **Not active**. Device recognition and
+its audit events continue, and the saved notification preference is preserved.
+Configuring a sender establishes availability; it does not prove inbox delivery.
+
+See the [Resend send API](https://resend.com/docs/api-reference/emails/send-email)
+and [domain setup](https://resend.com/docs/api-reference/domains/create-domain).

@@ -1,0 +1,930 @@
+import { DatabaseSync } from "node:sqlite";
+import type { BetterAuthOptions } from "@better-auth/core";
+import { CamelCasePlugin, Kysely, PostgresDialect } from "kysely";
+import { Pool } from "pg";
+import {
+	afterAll,
+	afterEach,
+	beforeAll,
+	beforeEach,
+	describe,
+	expect,
+	it,
+} from "vitest";
+import { betterAuth } from "../auth/full";
+import { getMigrations } from "./get-migration";
+
+const CONNECTION_STRING = "postgres://user:password@localhost:5433/better_auth";
+// Check if PostgreSQL is available
+let isPostgresAvailable = false;
+try {
+	const testPool = new Pool({
+		connectionString: CONNECTION_STRING,
+		connectionTimeoutMillis: 2000,
+	});
+	await testPool.query("SELECT 1");
+	await testPool.end();
+	isPostgresAvailable = true;
+} catch {
+	// PostgreSQL not available, tests will be skipped
+	isPostgresAvailable = false;
+}
+
+describe.runIf(isPostgresAvailable)(
+	"PostgreSQL Schema Detection in Migrations",
+	() => {
+		const customSchema = "auth_test";
+
+		// Create two separate connection pools
+		const publicPool = new Pool({
+			connectionString: CONNECTION_STRING,
+		});
+
+		const customSchemaPool = new Pool({
+			connectionString: `${CONNECTION_STRING}?options=-c search_path=${customSchema}`,
+		});
+
+		beforeAll(async () => {
+			// Setup: Create custom schema and a table in public schema
+			await publicPool.query(`DROP SCHEMA IF EXISTS ${customSchema} CASCADE`);
+			await publicPool.query(`CREATE SCHEMA ${customSchema}`);
+			await publicPool.query(
+				`DROP TABLE IF EXISTS public.user CASCADE; DROP TABLE IF EXISTS public.session CASCADE; DROP TABLE IF EXISTS public.account CASCADE; DROP TABLE IF EXISTS public.verification CASCADE;`,
+			);
+			// Create a conflicting table in the public schema
+			await publicPool.query(`
+			CREATE TABLE public.user (
+				id SERIAL PRIMARY KEY,
+				email VARCHAR(255) NOT NULL,
+				name VARCHAR(255)
+			);
+		`);
+		});
+
+		afterAll(async () => {
+			// Cleanup
+			await publicPool.query(`DROP SCHEMA IF EXISTS ${customSchema} CASCADE`);
+			await publicPool.query(`DROP TABLE IF EXISTS public.user CASCADE`);
+			await publicPool.end();
+			await customSchemaPool.end();
+		});
+
+		it("should detect custom schema from search_path", async () => {
+			// Use Pool with search_path option
+			const config: BetterAuthOptions = {
+				database: customSchemaPool,
+				emailAndPassword: {
+					enabled: true,
+				},
+			};
+
+			const { toBeCreated, toBeAdded } = await getMigrations(config);
+
+			// With custom schema, should detect no existing tables in that schema
+			// Therefore all tables should be in toBeCreated
+			const userTableCreated = toBeCreated.find((t) => t.table === "user");
+			const userTableToBeAdded = toBeAdded.find((t) => t.table === "user");
+
+			expect(userTableCreated).toBeDefined();
+			expect(userTableToBeAdded).toBeUndefined();
+
+			// The user table should have all fields (not just missing ones)
+			expect(userTableCreated?.fields).toHaveProperty("email");
+			expect(userTableCreated?.fields).toHaveProperty("name");
+			expect(userTableCreated?.fields).toHaveProperty("emailVerified");
+		});
+
+		/**
+		 * @see https://github.com/better-auth/better-auth/issues/7926
+		 */
+		it("should detect custom schema with CamelCasePlugin enabled", async () => {
+			const executedSql: string[] = [];
+			const customSchemaKysely = new Kysely({
+				dialect: new PostgresDialect({ pool: customSchemaPool }),
+				log(event) {
+					if (event.level === "query") executedSql.push(event.query.sql);
+				},
+				plugins: [new CamelCasePlugin()],
+			});
+
+			// Create a user table in the custom schema so it should be detected as existing
+			await customSchemaPool.query(`
+				CREATE TABLE IF NOT EXISTS ${customSchema}.user (
+					id TEXT PRIMARY KEY NOT NULL,
+					email TEXT NOT NULL,
+					name TEXT NOT NULL,
+					"emailVerified" BOOLEAN NOT NULL,
+					image TEXT,
+					"createdAt" TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP NOT NULL,
+					"updatedAt" TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP NOT NULL
+				);
+			`);
+
+			try {
+				const config: BetterAuthOptions = {
+					database: {
+						db: customSchemaKysely,
+						type: "postgres",
+					},
+					emailAndPassword: {
+						enabled: true,
+					},
+				};
+
+				const { toBeCreated, toBeAdded } = await getMigrations(config);
+
+				// user table exists in custom schema, so it should NOT be in toBeCreated
+				const userTableCreated = toBeCreated.find((t) => t.table === "user");
+				const userTableToBeAdded = toBeAdded.find((t) => t.table === "user");
+
+				expect(userTableCreated).toBeUndefined();
+				expect(userTableToBeAdded).toBeUndefined();
+
+				// Other tables should still need to be created
+				const sessionTable = toBeCreated.find((t) => t.table === "session");
+				expect(sessionTable).toBeDefined();
+				expect(executedSql).not.toContainEqual(
+					expect.stringContaining("information_schema.tables"),
+				);
+			} finally {
+				// Cleanup: drop the user table so subsequent tests are not affected
+				await customSchemaPool.query(
+					`DROP TABLE IF EXISTS ${customSchema}.user CASCADE`,
+				);
+			}
+		});
+
+		it("should not be affected by tables in public schema when using custom schema", async () => {
+			// Even though there's a 'user' table in public schema,
+			// when we use custom schema, migrations should create a new user table
+			const config: BetterAuthOptions = {
+				database: customSchemaPool,
+				emailAndPassword: {
+					enabled: true,
+				},
+			};
+
+			const { toBeCreated } = await getMigrations(config);
+
+			// Should want to create user table (because it doesn't exist in custom schema)
+			const userTable = toBeCreated.find((t) => t.table === "user");
+			expect(userTable).toBeDefined();
+
+			// Verify the table in public schema still exists and is not affected
+			const publicTableCheck = await publicPool.query(
+				`SELECT table_name FROM information_schema.tables
+			 WHERE table_schema = 'public' AND table_name = 'user'`,
+			);
+			expect(publicTableCheck.rows.length).toBe(1);
+		});
+
+		it("should only inspect tables in public schema when using default connection", async () => {
+			await publicPool.query(`DROP TABLE IF EXISTS public.user CASCADE`);
+			await publicPool.query(`
+			CREATE TABLE public.user (
+				id TEXT PRIMARY KEY NOT NULL,
+				email TEXT NOT NULL,
+				name TEXT NOT NULL,
+				"emailVerified" BOOLEAN NOT NULL,
+				image TEXT,
+				"createdAt" TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP NOT NULL,
+				"updatedAt" TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP NOT NULL
+			);
+		`);
+
+			const config: BetterAuthOptions = {
+				database: publicPool,
+				emailAndPassword: {
+					enabled: true,
+				},
+			};
+
+			const { toBeCreated, toBeAdded } = await getMigrations(config);
+
+			// Should detect existing user table in public schema
+			const userTable = toBeCreated.find((t) => t.table === "user");
+			expect(userTable).toBeUndefined();
+
+			// Should not need to add fields if table structure matches
+			const userFieldsToAdd = toBeAdded.find((t) => t.table === "user");
+			expect(userFieldsToAdd).toBeUndefined();
+
+			// Session, account, verification tables should need to be created
+			const sessionTable = toBeCreated.find((t) => t.table === "session");
+			expect(sessionTable).toBeDefined();
+		});
+
+		it("should create tables in custom schema when running migrations", async () => {
+			// Clean the custom schema
+			await customSchemaPool.query(
+				`DROP SCHEMA IF EXISTS ${customSchema} CASCADE`,
+			);
+			await customSchemaPool.query(`CREATE SCHEMA ${customSchema}`);
+
+			const config: BetterAuthOptions = {
+				database: customSchemaPool,
+				emailAndPassword: {
+					enabled: true,
+				},
+			};
+
+			const { runMigrations } = await getMigrations(config);
+			await runMigrations();
+
+			// Verify tables were created in custom schema
+			const tablesInCustomSchema = await customSchemaPool.query(
+				`SELECT table_name FROM information_schema.tables
+			 WHERE table_schema = $1 AND table_type = 'BASE TABLE'`,
+				[customSchema],
+			);
+
+			const tableNames = tablesInCustomSchema.rows.map(
+				(r: { table_name: string }) => r.table_name,
+			);
+
+			expect(tableNames).toContain("user");
+			expect(tableNames).toContain("session");
+			expect(tableNames).toContain("account");
+			expect(tableNames).toContain("verification");
+		});
+	},
+);
+
+describe.runIf(isPostgresAvailable)(
+	"PostgreSQL Schema Detection in Migrations",
+	() => {
+		const pool = new Pool({
+			connectionString: CONNECTION_STRING,
+		});
+		const schema = "uuid_test";
+
+		const schemaPool = new Pool({
+			connectionString: `${CONNECTION_STRING}?options=-c search_path=${schema}`,
+		});
+
+		beforeAll(async () => {
+			await pool.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
+			await schemaPool.query(`CREATE SCHEMA ${schema}`);
+		});
+
+		afterAll(async () => {
+			await schemaPool.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
+			await pool.end();
+			await schemaPool.end();
+		});
+
+		it("should use uuid for id when `advanced.database.generateId` is set to 'uuid'", async () => {
+			const config: BetterAuthOptions = {
+				database: schemaPool,
+				emailAndPassword: {
+					enabled: true,
+				},
+				advanced: {
+					database: {
+						generateId: "uuid",
+					},
+				},
+			};
+			const { runMigrations, compileMigrations } = await getMigrations(config);
+			await runMigrations();
+			await compileMigrations();
+			const auth = betterAuth(config);
+
+			const user = await auth.api.signUpEmail({
+				body: {
+					email: "test@test.com",
+					password: "test123456",
+					name: "test user",
+				},
+			});
+			const uuidRegex =
+				/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+			expect(user.user.id).toMatch(uuidRegex);
+
+			// run migrations again to ensure no migrations are needed & no errors are thrown
+			const { compileMigrations: round2Migrations } =
+				await getMigrations(config);
+			const secondRoundOfMigrations = await round2Migrations();
+			expect(secondRoundOfMigrations).toEqual(";");
+		});
+	},
+);
+
+describe.runIf(isPostgresAvailable)(
+	"PostgreSQL Identity Column Generation",
+	() => {
+		const pool = new Pool({
+			connectionString: CONNECTION_STRING,
+		});
+		const schema = "identity_test";
+
+		const schemaPool = new Pool({
+			connectionString: `${CONNECTION_STRING}?options=-c search_path=${schema}`,
+		});
+
+		beforeAll(async () => {
+			await pool.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
+			await schemaPool.query(`CREATE SCHEMA ${schema}`);
+		});
+
+		afterAll(async () => {
+			await schemaPool.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
+			await pool.end();
+			await schemaPool.end();
+		});
+
+		it("should use GENERATED ALWAYS AS IDENTITY instead of SERIAL when `advanced.database.generateId` is set to 'serial'", async () => {
+			const config: BetterAuthOptions = {
+				database: schemaPool,
+				emailAndPassword: {
+					enabled: true,
+				},
+				advanced: {
+					database: {
+						generateId: "serial",
+					},
+				},
+			};
+
+			const { compileMigrations } = await getMigrations(config);
+			const migrations = await compileMigrations();
+
+			expect(migrations).toContain("GENERATED BY DEFAULT AS IDENTITY");
+			expect(migrations).not.toContain("SERIAL");
+
+			const userTableMatch = migrations.match(/create table.*?"user".*?\(/is);
+			expect(userTableMatch).toBeDefined();
+
+			const idColumnMatch = migrations.match(
+				/"id"\s+integer\s+GENERATED\s+BY\s+DEFAULT\s+AS\s+IDENTITY/gi,
+			);
+			expect(idColumnMatch).toBeDefined();
+			expect(idColumnMatch?.length).toBeGreaterThan(0);
+		});
+	},
+);
+
+describe.runIf(isPostgresAvailable)("PostgreSQL Column Additions", () => {
+	const pool = new Pool({
+		connectionString: CONNECTION_STRING,
+	});
+	const schema = "column_test";
+
+	const schemaPool = new Pool({
+		connectionString: `${CONNECTION_STRING}?options=-c search_path=${schema}`,
+	});
+
+	afterAll(async () => {
+		await schemaPool.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
+		await pool.end();
+		await schemaPool.end();
+	});
+	beforeAll(async () => {
+		await pool.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
+		await schemaPool.query(`CREATE SCHEMA ${schema}`);
+	});
+
+	it("should update default tables with plugin schema fields", async () => {
+		const config: BetterAuthOptions = {
+			database: schemaPool,
+			emailAndPassword: {
+				enabled: true,
+			},
+		};
+
+		// Run the initial migration
+		const migration = await getMigrations(config);
+		await migration.runMigrations();
+
+		// Change the config to add a plugin schema
+		config.plugins = [
+			{
+				id: "test",
+				schema: {
+					user: {
+						fields: {
+							role: {
+								type: "string",
+							},
+						},
+					},
+					session: {
+						fields: {
+							impersonatedBy: {
+								type: "string",
+							},
+						},
+					},
+				},
+			},
+		];
+		const { toBeAdded, toBeCreated } = await getMigrations(config);
+		expect(toBeCreated.length).toBe(0);
+		expect(toBeAdded.length).toBe(2);
+		expect(toBeAdded).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					table: "user",
+					fields: expect.objectContaining({
+						role: expect.objectContaining({ type: "string" }),
+					}),
+				}),
+				expect.objectContaining({
+					table: "session",
+					fields: expect.objectContaining({
+						impersonatedBy: expect.objectContaining({ type: "string" }),
+					}),
+				}),
+			]),
+		);
+	});
+
+	/**
+	 * @see https://github.com/better-auth/better-auth/issues/8536
+	 */
+	it("should generate valid PostgreSQL CREATE INDEX syntax for indexed columns added to existing tables", async () => {
+		const config: BetterAuthOptions = {
+			database: schemaPool,
+			emailAndPassword: {
+				enabled: true,
+			},
+		};
+
+		const initial = await getMigrations(config);
+		await initial.runMigrations();
+
+		config.plugins = [
+			{
+				id: "test-index",
+				schema: {
+					user: {
+						fields: {
+							externalId: {
+								type: "string",
+								index: true,
+								required: false,
+							},
+						},
+					},
+				},
+			},
+		];
+
+		const { compileMigrations } = await getMigrations(config);
+		const sql = (await compileMigrations()).toLowerCase();
+
+		expect(sql).toContain("create index");
+		expect(sql).not.toContain("add index");
+	});
+});
+
+/**
+ * @see https://github.com/better-auth/better-auth/issues/8536
+ */
+describe("index generation for columns added to existing tables", () => {
+	it("should use CREATE INDEX when adding indexed columns to existing SQLite tables", async () => {
+		const config: BetterAuthOptions = {
+			database: new DatabaseSync(":memory:"),
+			emailAndPassword: {
+				enabled: true,
+			},
+		};
+
+		const initial = await getMigrations(config);
+		await initial.runMigrations();
+
+		config.plugins = [
+			{
+				id: "test-index",
+				schema: {
+					user: {
+						fields: {
+							externalId: {
+								type: "string",
+								index: true,
+								required: false,
+							},
+						},
+					},
+				},
+			},
+		];
+
+		const { compileMigrations } = await getMigrations(config);
+		const sql = (await compileMigrations()).toLowerCase();
+
+		expect(sql).toContain("create index");
+		expect(sql).not.toContain("add index");
+	});
+
+	/**
+	 * @see https://github.com/better-auth/better-auth/issues/10356
+	 */
+	it("should enforce unique indexed fields on new tables without a duplicate index", async () => {
+		const db = new DatabaseSync(":memory:");
+		const config: BetterAuthOptions = {
+			database: db,
+			emailAndPassword: {
+				enabled: true,
+			},
+			plugins: [
+				{
+					id: "test-unique-index",
+					schema: {
+						uniqueTable: {
+							fields: {
+								slug: {
+									type: "string",
+									index: true,
+									unique: true,
+									required: true,
+								},
+							},
+						},
+					},
+				},
+			],
+		};
+
+		const { compileMigrations, runMigrations } = await getMigrations(config);
+		const sql = (await compileMigrations()).toLowerCase();
+
+		expect(sql).toMatch(
+			/create table "uniquetable"[^;]*"slug" text not null unique/s,
+		);
+		expect(sql).not.toContain("uniquetable_slug_uidx");
+
+		await runMigrations();
+		db.exec(
+			`INSERT INTO "uniqueTable" ("id", "slug") VALUES ('first', 'shared')`,
+		);
+		expect(() =>
+			db.exec(
+				`INSERT INTO "uniqueTable" ("id", "slug") VALUES ('second', 'shared')`,
+			),
+		).toThrow();
+	});
+
+	/**
+	 * @see https://github.com/better-auth/better-auth/issues/9689
+	 */
+	it("should execute runMigrations without error when adding indexed columns to existing tables", async () => {
+		const config: BetterAuthOptions = {
+			database: new DatabaseSync(":memory:"),
+			emailAndPassword: {
+				enabled: true,
+			},
+		};
+
+		const initial = await getMigrations(config);
+		await initial.runMigrations();
+
+		config.plugins = [
+			{
+				id: "test-index",
+				schema: {
+					user: {
+						fields: {
+							externalId: {
+								type: "string",
+								index: true,
+								required: false,
+							},
+						},
+					},
+				},
+			},
+		];
+
+		const { runMigrations } = await getMigrations(config);
+		await expect(runMigrations()).resolves.not.toThrow();
+	});
+
+	/**
+	 * @see https://github.com/better-auth/better-auth/issues/9689
+	 */
+	it("should execute runMigrations when adding a new table with indexed columns to an existing database", async () => {
+		const config: BetterAuthOptions = {
+			database: new DatabaseSync(":memory:"),
+			emailAndPassword: {
+				enabled: true,
+			},
+		};
+
+		const initial = await getMigrations(config);
+		await initial.runMigrations();
+
+		config.plugins = [
+			{
+				id: "test-new-table",
+				schema: {
+					apikey: {
+						fields: {
+							configId: {
+								type: "string",
+								required: true,
+								index: true,
+							},
+							referenceId: {
+								type: "string",
+								required: true,
+								index: true,
+							},
+							key: {
+								type: "string",
+								required: true,
+								index: true,
+							},
+							createdAt: {
+								type: "date",
+								required: true,
+							},
+							updatedAt: {
+								type: "date",
+								required: true,
+							},
+						},
+					},
+				},
+			},
+		];
+
+		const { runMigrations } = await getMigrations(config);
+		await expect(runMigrations()).resolves.not.toThrow();
+	});
+
+	/**
+	 * @see https://github.com/better-auth/better-auth/issues/9689
+	 */
+	it("should execute runMigrations when upgrading an existing table with new indexed columns (simulates 1.4.x -> latest)", async () => {
+		const db = new DatabaseSync(":memory:");
+
+		const baseConfig: BetterAuthOptions = {
+			database: db,
+			emailAndPassword: {
+				enabled: true,
+			},
+			plugins: [
+				{
+					id: "old-apikey",
+					schema: {
+						apikey: {
+							fields: {
+								key: {
+									type: "string",
+									required: true,
+								},
+								userId: {
+									type: "string",
+									required: true,
+								},
+								createdAt: {
+									type: "date",
+									required: true,
+								},
+								updatedAt: {
+									type: "date",
+									required: true,
+								},
+							},
+						},
+					},
+				},
+			],
+		};
+
+		const initial = await getMigrations(baseConfig);
+		await initial.runMigrations();
+
+		const upgradedConfig: BetterAuthOptions = {
+			database: db,
+			emailAndPassword: {
+				enabled: true,
+			},
+			plugins: [
+				{
+					id: "new-apikey",
+					schema: {
+						apikey: {
+							fields: {
+								configId: {
+									type: "string",
+									required: true,
+									index: true,
+								},
+								referenceId: {
+									type: "string",
+									required: true,
+									index: true,
+								},
+								key: {
+									type: "string",
+									required: true,
+									index: true,
+								},
+								userId: {
+									type: "string",
+									required: true,
+								},
+								createdAt: {
+									type: "date",
+									required: true,
+								},
+								updatedAt: {
+									type: "date",
+									required: true,
+								},
+							},
+						},
+					},
+				},
+			],
+		};
+
+		const { runMigrations, toBeAdded } = await getMigrations(upgradedConfig);
+		expect(toBeAdded.length).toBeGreaterThan(0);
+		const apikeyAdded = toBeAdded.find((t) => t.table === "apikey");
+		expect(apikeyAdded).toBeDefined();
+		expect(apikeyAdded!.fields).toHaveProperty("configId");
+		expect(apikeyAdded!.fields).toHaveProperty("referenceId");
+
+		await expect(runMigrations()).resolves.not.toThrow();
+	});
+
+	/**
+	 * @see https://github.com/better-auth/better-auth/issues/10306
+	 */
+	it("should not detect migration changes for SQLite bigint fields on subsequent runs", async () => {
+		const config: BetterAuthOptions = {
+			database: new DatabaseSync(":memory:"),
+			rateLimit: {
+				storage: "database",
+			},
+		};
+
+		const initial = await getMigrations(config);
+		await initial.runMigrations();
+
+		const second = await getMigrations(config);
+		const { toBeCreated, toBeAdded } = second;
+
+		expect(toBeCreated.length).toBe(0);
+		expect(toBeAdded.length).toBe(0);
+
+		const sql = await second.compileMigrations();
+		expect(sql).toBe(";");
+	});
+
+	/**
+	 * @see https://github.com/better-auth/better-auth/issues/10025
+	 */
+	it("should add table indexes to existing device authorization columns", async () => {
+		const db = new DatabaseSync(":memory:");
+		const baseConfig: BetterAuthOptions = {
+			database: db,
+			plugins: [
+				{
+					id: "old-device-code",
+					schema: {
+						deviceCode: {
+							fields: {
+								deviceCode: {
+									type: "string",
+									required: true,
+								},
+								userCode: {
+									type: "string",
+									required: true,
+								},
+							},
+						},
+					},
+				},
+			],
+		};
+
+		const initial = await getMigrations(baseConfig);
+		await initial.runMigrations();
+
+		const upgradedConfig: BetterAuthOptions = {
+			...baseConfig,
+			plugins: [
+				{
+					id: "new-device-code",
+					schema: {
+						deviceCode: {
+							fields: {
+								deviceCode: {
+									type: "string",
+									required: true,
+								},
+								userCode: {
+									type: "string",
+									required: true,
+								},
+							},
+							indexes: [
+								{ fields: ["deviceCode"], unique: true },
+								{ fields: ["userCode"], unique: true },
+							],
+						},
+					},
+				},
+			],
+		};
+
+		const migration = await getMigrations(upgradedConfig);
+		const sql = await migration.compileMigrations();
+
+		expect(migration.toBeAdded).toEqual([]);
+		expect(sql).toContain('create unique index "deviceCode_deviceCode_uidx"');
+		expect(sql).toContain('create unique index "deviceCode_userCode_uidx"');
+
+		await migration.runMigrations();
+
+		const repeated = await getMigrations(upgradedConfig);
+		await expect(repeated.compileMigrations()).resolves.toBe(";");
+	});
+});
+
+describe.runIf(isPostgresAvailable)("PostgreSQL configured schema name", () => {
+	const schema = "schema_name_test";
+	const pool = new Pool({ connectionString: CONNECTION_STRING });
+	const config: BetterAuthOptions = {
+		database: {
+			dialect: new PostgresDialect({ pool }),
+			schemaName: schema,
+			type: "postgres",
+		},
+		emailAndPassword: { enabled: true },
+	};
+
+	beforeEach(async () => {
+		await pool.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
+	});
+
+	afterEach(async () => {
+		await pool.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
+	});
+
+	afterAll(async () => {
+		await pool.end();
+	});
+
+	it("creates the schema and its tables, and leaves the public schema alone", async () => {
+		const publicTablesBefore = await pool.query<{ table_name: string }>(
+			`SELECT table_name FROM information_schema.tables
+				 WHERE table_schema = 'public' AND table_name IN ('user', 'session', 'account', 'verification')
+				 ORDER BY table_name`,
+		);
+		const { compileMigrations, runMigrations } = await getMigrations(config);
+		const migrations = await compileMigrations();
+		expect(migrations).toContain(`create schema if not exists "${schema}"`);
+		expect(migrations).toContain(`create table "${schema}"."user"`);
+
+		await runMigrations();
+
+		const tables = await pool.query<{ table_name: string }>(
+			`SELECT table_name FROM information_schema.tables
+				 WHERE table_schema = $1 AND table_type = 'BASE TABLE'`,
+			[schema],
+		);
+		const tableNames = tables.rows.map((row) => row.table_name);
+		expect(tableNames).toEqual(
+			expect.arrayContaining(["user", "session", "account", "verification"]),
+		);
+
+		const publicTables = await pool.query<{ table_name: string }>(
+			`SELECT table_name FROM information_schema.tables
+				 WHERE table_schema = 'public' AND table_name IN ('user', 'session', 'account', 'verification')
+				 ORDER BY table_name`,
+		);
+		expect(publicTables.rows).toEqual(publicTablesBefore.rows);
+	});
+
+	it("reads and writes through the configured schema at runtime", async () => {
+		await (await getMigrations(config)).runMigrations();
+		const auth = betterAuth(config);
+
+		const signUp = await auth.api.signUpEmail({
+			body: {
+				email: "schema-name@test.com",
+				password: "test123456",
+				name: "schema name user",
+			},
+		});
+
+		const users = await pool.query<{ id: string }>(
+			`SELECT id FROM ${schema}."user" WHERE email = $1`,
+			["schema-name@test.com"],
+		);
+		expect(users.rows.map((row) => row.id)).toEqual([signUp.user.id]);
+	});
+
+	it("plans no further changes once the schema is migrated", async () => {
+		await (await getMigrations(config)).runMigrations();
+		const { compileMigrations } = await getMigrations(config);
+
+		expect(await compileMigrations()).toEqual(";");
+	});
+});

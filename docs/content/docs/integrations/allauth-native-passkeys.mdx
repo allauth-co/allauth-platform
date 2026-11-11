@@ -1,0 +1,33 @@
+---
+title: Environment-owned native passkeys
+description: Bind native passkey verification to an exact project, HTTPS RP and reviewed app signing identities.
+---
+
+Native passkeys are disabled unless the selected application environment has a complete server-owned policy. No localhost RP, client-provided origin, wildcard or platform-wide native origin fallback is used. Existing web-only projects retain their current passkey configuration.
+
+## Server policy
+
+Set `ALLAUTH_PROJECT_NATIVE_PASSKEYS` on the AllAuth server to a JSON object keyed by the exact environment slug. Each selected entry has these fields:
+
+| Field | Required meaning |
+| --- | --- |
+| `enabled` | Explicit `true` after identity/configuration review |
+| `projectId` | The selected environment's immutable project UUID |
+| `environment` | Exactly `development` or `production`, matching the project |
+| `rpOrigin` | Exact canonical HTTPS origin, matching that realm's primary/public origin |
+| `ios` | Optional `{teamId,bundleId}` with the approved Apple Team ID and bundle identifier |
+| `android` | Array of approved `{packageName,certificateSha256}` entries; fingerprints contain 32 colon-separated hex bytes |
+
+At least one native platform must be declared. Missing, invalid or mismatched configuration disables native capability. Unknown policy fields are rejected. Do not put this setting in client configuration or accept a client request that changes it. Signing fingerprints are public identity metadata, but edits remain server-owner operations and require deliberate review.
+
+The verifier's RP ID remains the selected canonical realm hostname. Its expected-origin array contains that HTTPS origin and only Android origins derived from the selected policy's approved certificate digests. The digest's raw 32 bytes are base64url encoded without padding after `android:apk-key-hash:`. Generic HTTP trusted origins and signed proxy validation are unchanged. Configuration cache keys incorporate only the selected policy, so changes cannot silently authorize another environment.
+
+## Association and verification
+
+The RP host must serve its iOS AASA `webcredentials.apps` entry and Android asset-links `delegate_permission/common.get_login_creds` entry. iOS builds require matching Associated Domains entitlements/provisioning. Android production fingerprints must match the installed Play App Signing certificate, including reviewed rotation certificates when applicable. An upload or development certificate is not automatically the Play-installed app's identity.
+
+Configured native realms require discoverable credentials and user verification in the generated options. Both cryptographic verifiers require the signed UV flag; changing a client option does not bypass this check. Existing one-use, purpose-tagged challenges and tenant-scoped credential storage remain authoritative.
+
+The selected SDK config advertises only `nativePasskeys:{enabled,ios,android,rpId?}`. Disabled capability contains three false flags and no RP ID. Enrollment must additionally require the current verified account and a recent session, with challenge cookies retained privately by the application server. Authentication should use a short-lived PKCE-bound application flow rather than returning provider cookies to a native client.
+
+Source tests cover real P-256 self-attestation and signed assertions, approved web/iOS and Android origins, wrong certificate origins, missing UV, wrong RP/challenge/signature, replay, tenant isolation and selected-policy cache invalidation. Native build and physical-device association/ceremony checks remain necessary before enabling a live policy.

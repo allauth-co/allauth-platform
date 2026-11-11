@@ -1,0 +1,20 @@
+---
+title: Project application origins
+description: Versioned canonical application origins and broker callback reconciliation per environment.
+---
+
+Use `allauth_project_origins_get` to read one exact project slug. The response includes its immutable project ID, environment, version, primary origin, complete allowed origin list, provider callback URLs and broker reconciliation status. Credentials and tenant schema names are excluded.
+
+Use `allauth_project_origins_update` with the same project ID, environment and current version, plus the complete `primaryOrigin` and `origins` list. Include the primary origin exactly once. Retain every localhost origin that is still required explicitly; omission removes its proxy trust and registered broker callback. This named control also exists as `GET` and `PATCH /api/admin/projects/:slug/origins` on the AllAuth platform. A verified, active platform session and current workspace owner/admin authority are required. Writes require an exact platform Origin header. Tenant-only roles or bearer credentials grant no authority.
+
+Origin strings must be exact HTTPS origins without paths, trailing slash, credentials, query, fragment or wildcard. HTTP is limited to explicit loopback addresses in Development. Production requires HTTPS for every registered origin. The AllAuth platform's own origin cannot be registered as an application origin. An incorrect immutable ID/environment is rejected; a stale version returns409 and requires a new read.
+
+Registry updates and their audit/reconciliation intent are one transaction. The selected environment's existing broker is then reconciled through its native administrative lifecycle. Its callbacks include the explicitly registered BFF origins and fully verified hosted origins. Per-project serialization prevents an earlier request from overwriting a later callback set. Transport secrets are preserved. A provider or success-audit failure returns202 with `broker.status: "pending"`; settings have been saved but completion has not been established. Read again and repeat the identical current versioned update to retry. Reconciliation is request-driven, with durable intent; no background retry worker is claimed. A successful retry returns200 with `broker.status: "reconciled"`.
+
+Changing the primary origin rebuilds origin-sensitive authentication instances and changes canonical email links, provider callbacks, and the passkey relying party. External Google/Apple redirect registrations require separate review. Broker reconciliation does not configure those external consoles or verify delivery/ceremonies. Existing localhost passkeys are not portable to a new HTTPS relying party.
+
+Retaining localhost in the allowed origins and broker callback list preserves explicit trust. The current authentication runtime still chooses canonical provider callbacks from `primaryOrigin`; browser OAuth initiated on localhost can therefore redirect to the HTTPS application and lack its localhost state cookie. Until request-bound callback routing is separately implemented and reviewed, use the HTTPS application surface for browser Google/Apple/broker QA after changing the primary origin. Local native/email testing remains separate. This limitation must not be reported as fully verified localhost OAuth compatibility.
+
+Broker reconciliation sends its server-owned project/workspace metadata to the native callback validator. Its explicit loopback allowance is enabled only for a Development registry row with registered HTTP loopback origins. Production does not receive that allowance, and no caller-supplied metadata changes this decision.
+
+No database migration is needed for this control. Version tokens include the immutable target, origin set and monotonic stored revision. Immutable events retain pending/reconciled status. Native passkey policy remains separately disabled unless its exact project ID, environment, HTTPS RP and signing identities are configured and verified.

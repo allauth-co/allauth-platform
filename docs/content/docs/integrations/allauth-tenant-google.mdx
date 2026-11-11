@@ -1,0 +1,49 @@
+---
+title: Tenant-specific Google sign-in
+description: Configure a separate Google OAuth client for each AllAuth application environment.
+---
+
+Application environments can use their own Google OAuth credentials. Direct Google sign-in goes from the application to Google and back to the selected environment, without the shared AllAuth broker's extra consent screen. Google can still show its normal account selection and consent screens.
+
+## Configure an environment
+
+1. Select the workspace, application and exact Development or Production environment in the AllAuth console.
+2. Open **User & authentication → Social connections → Google**.
+3. Create a Google OAuth **Web application** client, or choose a client dedicated to that environment. Add the exact callback URLs displayed by AllAuth to Google's authorized redirect URIs.
+4. Save the client ID and client secret, then enable direct Google sign-in. Development and Production credentials are independent.
+5. Reload the application's sign-in page and test Google login, account linking, MFA and the final application destination.
+
+The secret is encrypted at rest and is never returned by settings reads. Leaving the secret blank preserves the saved value. Disabling direct Google retains its credentials and restores the shared broker when that broker is available. Existing broker account links remain available.
+
+For an application using the standard same-origin proxy, the Google callback is the application's canonical origin plus `/api/allauth/callback/google`. For example, NativeApp local development uses `http://localhost:5100/api/allauth/callback/google`. A hosted AllAuth account domain uses that domain's native authentication callback URL instead. Use the URLs returned for your selected environment rather than constructing a Production address from a Development name.
+
+## Management API
+
+`GET /api/admin/projects/{environment-slug}/providers/google` returns safe configuration, the current version, the effective provider and callback URLs. Workspace authorization is checked against the selected environment. It does not return the client secret.
+
+`PATCH` accepts the current version and the complete Google settings:
+
+```json
+{
+  "version": 0,
+  "google": {
+    "enabled": true,
+    "clientId": "your-environment-client-id.apps.googleusercontent.com",
+    "clientSecret": "your-new-private-secret"
+  }
+}
+```
+
+Omit `clientSecret` or submit an empty field to preserve an existing secret. An enabled direct provider requires both a client ID and a saved or newly supplied secret. Version conflicts require a fresh read and reconciliation. Treat the request secret as private: do not place it in logs, client bundles, source control or support screenshots.
+
+## Application clients
+
+The public `/sdk/config` response adds `googleProvider`:
+
+- `"google"`: use the selected environment's direct Google provider.
+- `"allauth"`: use the shared AllAuth broker.
+- `null`: Google sign-in is unavailable.
+
+The `google` boolean remains available. Updated `@allauth/react` sign-in and registration components select the advertised provider automatically. Older SDKs continue to use the shared broker until upgraded. Custom clients should pass the exact non-null provider to `signIn.social`, preserving their existing callback destination and MFA handling.
+
+Provider changes do not grant application administrator access, migrate another environment's users or bypass email verification. Back up and test existing accounts before changing a production environment's sign-in methods.

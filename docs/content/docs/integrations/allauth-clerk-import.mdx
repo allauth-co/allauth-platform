@@ -1,0 +1,50 @@
+---
+title: Import Clerk identities into hosted AllAuth
+description: A scoped, repeat-safe administrator import with dry runs and compatible bcrypt verification.
+---
+
+Hosted AllAuth provides `POST /api/projects/<exact-environment-slug>/auth/project-admin/import-clerk-users`.
+It requires a current verified workspace owner/admin or platform administrator and a same-origin AllAuth management request. Tenant administrator roles, browser application proxy credentials and browser-supplied user IDs cannot authorize it. The destination is the selected environment's native user store; the body cannot select a different project.
+
+The named MCP operation is `allauth_users_import_clerk`. It uses the same management API and authority. Hash-bearing input requires `ALLAUTH_ALLOW_SENSITIVE=true`; read-only mode always excludes the operation. Keep exported password hashes and private metadata in restricted local files and out of conversation transcripts, logs and source control. Never scrape or copy management cookies into migration scripts.
+
+Use the file runner to keep hash-bearing batches out of chat and tool arguments:
+
+```sh
+ALLAUTH_ALLOW_SENSITIVE=true allauth-mcp import-clerk \
+  --project communityapp-development \
+  --input /absolute/private/batch-0001.json \
+  --out /absolute/private/dry-run-0001.json
+```
+
+After inspecting the dry-run result, repeat with a fresh `--out` path and `--apply` to import. The command uses the existing private management login and the named operation's schema/API route. `--apply` alone enables writes; a batch file's `dryRun: false` cannot enable them. `ALLAUTH_READ_ONLY=true` blocks this privileged POST operation, including dry runs. An optional `--url` selects the exact configured AllAuth origin.
+
+Input must be an owned regular file with private permissions (`chmod 600`); symbolic input files are refused. Canonical input and output paths must be outside Git checkouts, including symlinked directories. The runner reserves a new exclusive `0600` output before contacting AllAuth, refuses overwrites, validates destination/source/revision bindings and saves only whitelisted IDs, timestamps, counts and status codes. Standard output contains only summary counts and the dry-run flag. A failed or unverified remote outcome leaves a private `complete: false` marker; inspect the environment before retrying with a new result path.
+
+## Request and results
+
+Send `{ sourceInstance, dryRun, users }`, with 1–100 users and at most 1 MiB per batch. `sourceInstance` is the stable Clerk instance identifier and must remain the same across retries. `dryRun` defaults to `true`.
+
+Each user has required `sourceUserId`, primary `email`, `emailVerified` and `name`. Optional fields are `image` (HTTPS profile image URL), `createdAt`/`updatedAt` (ISO timestamps), `passwordHash` together with `passwordHasher: "bcrypt"`, `socialAccounts: [{ provider: "google" | "apple", subject }]`, `banned`, `locked`, `twoFactorEnabled`, `publicMetadata` and `privateMetadata`.
+
+Use Clerk's authoritative API record for verification/restriction/MFA flags and linked provider subjects. For Google and Apple, `subject` is Clerk's external account `provider_user_id`, representing the provider's original `sub`; it is never the Clerk external-account row ID, `identification_id` or email address. Keep the existing provider application/client configuration where its subject namespace requires it. Verify Google and Apple sign-in against imported fixtures before production cutover.
+
+The result is `{ project, projectId, sourceInstance, dryRun, created, existing, conflicts, users }`. Validate the exact destination environment slug and source instance before installing application identity mappings; refuse dry-run output for live mappings. Each result row contains `sourceUserId`, `sourceUpdatedAt` (normalized ISO timestamp, or `null` when omitted), an optional destination `userId`, and `status: "would_create" | "created" | "existing" | "conflict"`. Compare `sourceUpdatedAt` against the exact source inventory revision; successful older results must not authorize a newer snapshot. Keep the corresponding prepared manifest and password-export capture boundary. Conflict rows include only a safe reason code. Emails, password digests, metadata and provider subjects are never echoed.
+
+Import creates ordinary user-role identities, preserves the supplied verified-email flag and original timestamps, and maps either source `banned` or `locked` to a restricted AllAuth account. Original restriction flags remain in server-owned private provenance. The operation emits a dedicated `admin.clerk-import` audit event; it sends no welcome, verification or password-reset email and creates no login session. No `user.created` onboarding event is emitted.
+
+## Repeat safety and conflicts
+
+Destination IDs derive from the exact project, source instance and source user ID. Private server-owned provenance records a canonical source fingerprint. Retrying identical data returns `existing` and never resets a password or restores a removed provider account. Changed source data returns `source_changed` and requires explicit reconciliation; a later Clerk export must not silently replace a password already changed in AllAuth.
+
+Existing same-email identities are refused as `email_conflict`; provider subjects already owned in that environment are refused as `provider_conflict`. The importer never links by email. Duplicate source IDs in a batch are invalid. Source provenance conflicts, unsupported MFA and transactional write conflicts are reported separately. Reconcile every conflict before enabling the new sign-in path. Each created user, credential/provider records and audit event commit in one transaction; a failed row leaves none of those records behind. Other successful rows can remain committed, so retries must use the returned statuses.
+
+Dry runs do not write users, accounts, events or sessions. Their proposed IDs are stable. A dry run is a current check, not a reservation against later concurrent signups. Run the final reconciliation with destination signup held off until imported identities are verified and the application's identity mappings are installed.
+
+## Credentials and rollout
+
+Supported imported hashes are bcrypt `$2a$`, `$2b$` and `$2y$` with work factors 4–14. Unknown algorithms, malformed encodings and excessive work factors fail validation before writes. Existing native scrypt credentials continue to work; newly created or reset passwords still use native scrypt. Imported bcrypt remains compatible until a password replacement writes scrypt. Password verification preserves bcrypt's original byte and normalization behavior.
+
+Users with source MFA enabled are refused as `mfa_unsupported`; the importer cannot claim to preserve Clerk's authenticator enrollment or recovery codes. Passkey credentials and active Clerk sessions are not imported. Plan and validate their user transition separately. Direct Google and Apple credentials must be configured for the selected AllAuth environment.
+
+Preserve application-owned user IDs and data relations, and store an explicit Clerk-to-AllAuth identity map. Test import, sign-in, recovery, source restrictions, role enforcement, realtime connections and mobile flows in Development before any production user import. This API does not deploy application changes, import users automatically, disable Clerk or guarantee session continuity.

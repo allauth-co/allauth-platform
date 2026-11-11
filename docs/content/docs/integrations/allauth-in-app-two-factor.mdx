@@ -1,0 +1,67 @@
+---
+title: AllAuth in-app two-factor verification
+description: Optional application-side verification for shared AllAuth sign-in, preserving hosted MFA for existing integrations.
+---
+
+AllAuth's shared sign-in can require a second factor on the central account even when the application account has no second factor of its own. The optional in-app broker challenge lets an application collect the authenticator or backup code on its own sign-in screen. AllAuth remains responsible for checking it.
+
+This capability requires SDK 1.4.6 or newer and the matching AllAuth service release. Existing SDK archives and integrations retain the hosted `/two-factor` screen. An older service ignores the optional capability and continues using hosted verification.
+
+## Enable in a Next.js application
+
+Keep the standard `/api/allauth/[...all]` same-origin proxy and the registered `/api/allauth/callback/allauth` callback. Add the optional server configuration only after the application renders the matching portable SDK `SignIn` component:
+
+```ts
+import { createAllAuthProxy } from "@allauth/react/next";
+
+const handler = createAllAuthProxy({
+  project: process.env.ALLAUTH_PROJECT!,
+  proxySecret: process.env.ALLAUTH_PROXY_SECRET!,
+  appOrigin: process.env.APP_ORIGIN!,
+  brokerTwoFactor: { signInUrl: "/sign-in" },
+});
+
+export { handler as GET, handler as POST };
+```
+
+```tsx
+"use client";
+
+import { AllAuthProvider, SignIn } from "@allauth/react";
+import "@allauth/react/styles.css";
+
+export default function SignInPage() {
+  return (
+    <AllAuthProvider signInUrl="/sign-in" afterSignInUrl="/workspace">
+      <SignIn />
+    </AllAuthProvider>
+  );
+}
+```
+
+`signInUrl` must be a local public page without a query or fragment. Keep `/api/allauth/broker-two-factor/accept` and `/api/allauth/broker-two-factor/verify` reachable through the proxy. Neither the sign-in page nor these routes may require an authenticated application session.
+
+Do not enable this option for an older SDK, a custom form which does not handle the broker challenge, a custom proxy base path, or the optional Better Auth UI registry wrapper. These integrations can continue using hosted MFA. Hosted application portals, unrelated OAuth clients and direct application-owned Google providers retain their existing flows.
+
+## Sign-in behaviour
+
+1. The proxy adds an optional capability and the hash of a new browser secret to the OAuth authorization request. The secret remains in an application-origin HttpOnly cookie.
+2. After the primary factor, AllAuth's native MFA deletes the provisional session and creates its usual pending challenge. For a signed opted-in request from a registered application broker, AllAuth stores an encrypted handoff with a five-minute expiry and redirects to the fixed application accept route.
+For JSON-based primary sign-ins, the hosted `/two-factor` entry first verifies the native signed, unexpired pending cookie and the signed authorization query on the server. An opted-in registered broker continues to the same app handoff; absent, forged, expired or unsupported context retains the hosted screen.
+
+3. The accept route requires the initiating application's browser cookie, moves the opaque ticket into another HttpOnly cookie, and redirects to the configured sign-in page with `challenge=broker-two-factor`. The ticket does not remain in the page URL.
+4. `SignIn` shows the app's existing branding and accepts an authenticator or backup code. Its same-origin POST uses the signed application proxy. AllAuth checks the current registered broker, exact application origin and browser secret before invoking native factor verification.
+5. Successful verification consumes both the native challenge and its handoff. The application receives only an opaque one-use completion URL, valid for one minute.
+6. A brief top-level redirect to AllAuth checks the original platform browser's pending cookie, consumes the completion receipt, resumes native OAuth and restores the native cookies on the AllAuth origin. OAuth state and PKCE remain authoritative at the application's normal callback. Required consent remains part of native OAuth and may still display its hosted screen.
+
+An invalid code stays on the app screen. An expired or spent challenge must start sign-in again. The restart link opens the configured local sign-in page. Removing `brokerTwoFactor` restores hosted MFA for subsequent sign-ins.
+
+## Security and compatibility
+
+Central session and pending-factor cookies never enter the application or its JavaScript. Handoffs and receipts use random 256-bit values, hashed storage identifiers, encrypted server-side payloads and bounded expiry. The native atomic challenge-consumption rule, per-challenge attempt budget, account lockout and rate limiting still apply. An application cannot select a different broker, change the return origin, bypass consent or create a login before native MFA succeeds.
+
+The host application handles the entered code, as it does for embedded password entry; enable this capability only in application code you trust. Authenticator secrets remain on AllAuth.
+
+The app transport authenticates the request using the existing server-only project proxy signature. Browser verification POSTs require the application's exact origin and reject cross-site requests. Cookie forwarding remains limited to that application's prefix. Completion additionally requires the original AllAuth browser cookie, and the receipt can be consumed once. Response headers disable caching and referrer forwarding on handoff/completion redirects.
+
+This feature uses the existing verification table and requires no database migration. It does not require SDK-version reporting and does not change existing cookies, signatures or endpoint contracts. New integrations explicitly opt in; existing integrations continue authenticating without an upgrade.

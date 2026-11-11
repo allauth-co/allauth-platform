@@ -1,0 +1,95 @@
+{
+  "name": "@better-auth/sso",
+  "version": "1.7.7",
+  "description": "SSO plugin for Better Auth",
+  "type": "module",
+  "license": "MIT",
+  "homepage": "https://www.better-auth.com/docs/plugins/sso",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/better-auth/better-auth.git",
+    "directory": "packages/sso"
+  },
+  "author": "Bereket Engida",
+  "keywords": [
+    "sso",
+    "auth",
+    "saml",
+    "oauth",
+    "oidc",
+    "openid",
+    "openid connect",
+    "single sign on",
+    "typescript",
+    "better-auth"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsdown",
+    "dev": "tsdown --watch",
+    "lint:package": "publint run --strict --pack false",
+    "lint:types": "attw --profile esm-only --pack .",
+    "typecheck": "tsc --project tsconfig.json",
+    "test": "vitest",
+    "coverage": "vitest run --coverage --coverage.provider=istanbul"
+  },
+  "files": [
+    "dist"
+  ],
+  "main": "./dist/index.mjs",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.mts",
+  "exports": {
+    ".": {
+      "dev-source": "./src/index.ts",
+      "types": "./dist/index.d.mts",
+      "default": "./dist/index.mjs"
+    },
+    "./client": {
+      "dev-source": "./src/client.ts",
+      "types": "./dist/client.d.mts",
+      "default": "./dist/client.mjs"
+    }
+  },
+  "typesVersions": {
+    "*": {
+      "*": [
+        "./dist/index.d.mts"
+      ],
+      "client": [
+        "./dist/client.d.mts"
+      ]
+    }
+  },
+  "dependencies": {
+    "@xmldom/xmldom": "^0.9.12",
+    "fast-xml-parser": "^5.8.0",
+    "jose": "^6.2.3",
+    "samlify": "^2.13.1",
+    "tldts": "^7.4.3",
+    "zod": "catalog:"
+  },
+  "devDependencies": {
+    "@better-auth/core": "workspace:*",
+    "@better-auth/kysely-adapter": "workspace:*",
+    "@types/body-parser": "^1.19.6",
+    "@types/express": "^5.0.6",
+    "better-auth": "workspace:*",
+    "better-call": "catalog:",
+    "body-parser": "^2.3.0",
+    "express": "^5.2.1",
+    "kysely": "catalog:",
+    "oauth2-mock-server": "^9.0.0",
+    "tsdown": "catalog:"
+  },
+  "peerDependencies": {
+    "@better-auth/core": "workspace:^",
+    "@better-auth/utils": "catalog:peer",
+    "@better-fetch/fetch": "catalog:",
+    "better-auth": "workspace:^",
+    "better-call": "catalog:"
+  }
+}

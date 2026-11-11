@@ -1,0 +1,309 @@
+.allauth [hidden] { display: none !important; }
+/* Opt-in native account and organization chrome. Legacy cards retain their appearance. */
+.allauth-header-menu{position:relative;display:inline-flex;align-items:center;max-width:100%}
+.allauth button.allauth-header-trigger{display:inline-flex;align-items:center;gap:.6rem;min-height:2.4rem;padding:.25rem .45rem;border:1px solid transparent;background:transparent;color:var(--allauth-foreground);font-weight:500;border-radius:.55rem}
+.allauth button.allauth-header-trigger:hover,.allauth button.allauth-header-trigger[aria-expanded=true]{background:var(--allauth-footer-background);border-color:var(--allauth-border)}
+.allauth-active-org-name{max-width:12rem;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+.allauth-avatar{display:inline-flex;align-items:center;justify-content:center;flex:none;width:2rem;height:2rem;border-radius:50%;overflow:hidden;background:var(--allauth-avatar-background,#f4d5ca);color:var(--allauth-avatar-foreground,#5c3227);font-size:.75rem;font-weight:650;line-height:1;vertical-align:middle}
+.allauth-avatar img{width:100%;height:100%;object-fit:cover}
+.allauth-avatar-square{border-radius:.4rem;background:var(--allauth-footer-background);border:1px solid var(--allauth-border)}
+.allauth-header-popover{position:absolute;top:calc(100% + .6rem);right:0;z-index:100;width:min(23rem,calc(100vw - 2rem));background:var(--allauth-background);color:var(--allauth-foreground);border:1px solid var(--allauth-border);border-radius:.85rem;box-shadow:0 14px 36px #17171724;overflow:hidden;padding:.35rem 0}
+.allauth-organization-menu .allauth-header-popover{left:0;right:auto}
+.allauth-header-popover [role=menuitem]{display:flex;align-items:center;gap:.75rem;min-height:3.2rem;padding:.75rem 1rem;width:100%;text-align:left;border:0;border-radius:0;background:transparent;color:inherit;text-decoration:none;font-size:.875rem;font-weight:450}
+.allauth-header-popover [role=menuitem]:hover,.allauth-header-popover [role=menuitem]:focus-visible{background:var(--allauth-footer-background)}
+.allauth-header-popover .allauth-menu-identity{padding:.85rem 1rem;border-bottom:1px solid var(--allauth-border);display:flex;flex-direction:column;gap:.2rem}
+.allauth-menu-identity strong{font-size:.9rem;font-weight:550}.allauth-menu-identity span,.allauth-org-menu-row small{color:var(--allauth-muted);font-size:.8rem}
+.allauth-menu-heading{padding:.55rem 1rem .25rem;color:var(--allauth-muted);font-size:.7rem;text-transform:uppercase;letter-spacing:.06em}
+.allauth-org-menu-row{border-bottom:1px solid var(--allauth-border)}.allauth-org-menu-row [role=menuitem]>span:nth-child(2){display:flex;flex:1;min-width:0;flex-direction:column;align-items:flex-start;gap:.15rem}.allauth-org-menu-row strong{font-weight:550;overflow-wrap:anywhere}.allauth-header-popover .allauth-error{margin:.4rem .75rem}
+/* Modal chrome occupies its own rows. Only the main pane scrolls. */
+.allauth-modal-backdrop {
+  --allauth-accent: var(--allauth-modal-accent, #c64b36);
+  --allauth-accent-hover: #a83a29;
+  --allauth-accent-foreground: #fff;
+  position: fixed;
+  inset: 0;
+  z-index: 2147483000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1.5rem;
+  background: #15151570;
+  isolation: isolate;
+}
+.allauth-modal {
+  display: flex;
+  flex-direction: column;
+  width: min(34rem, 100%);
+  max-height: calc(100dvh - 3rem);
+  min-width: 0;
+  overflow: hidden;
+  background: var(--allauth-background);
+  border: 1px solid var(--allauth-border);
+  border-radius: .85rem;
+  box-shadow: 0 22px 90px #0003;
+  color: var(--allauth-foreground);
+}
+.allauth-modal-with-nav { width: min(56rem, 100%); height: min(44rem, calc(100dvh - 3rem)); }
+.allauth-modal-header {
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 44px;
+  flex: none;
+  align-items: center;
+  gap: 1rem;
+  min-height: 73px;
+  padding: .875rem 1.25rem .875rem 1.5rem;
+  border-bottom: 1px solid var(--allauth-border);
+  background: var(--allauth-background);
+}
+.allauth .allauth-modal-header h2 { max-width: none; margin: 0; font-size: 1.125rem; font-weight: 650; line-height: 1.4; }
+.allauth .allauth-modal-header button.allauth-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  height: 44px;
+  min-width: 44px;
+  min-height: 44px;
+  padding: 0;
+  border: 0;
+  border-radius: .5rem;
+  background: transparent;
+  color: var(--allauth-muted);
+  font-size: 1.5rem;
+  font-weight: 400;
+  line-height: 1;
+}
+.allauth .allauth-modal-header button.allauth-close:hover { background: var(--allauth-footer-background); color: var(--allauth-foreground); }
+.allauth-modal-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+.allauth-modal-has-sidebar { grid-template-columns: 12rem minmax(0, 1fr); }
+.allauth-modal-sidebar {
+  min-width: 0;
+  min-height: 0;
+  padding: 1.25rem .75rem;
+  overflow: hidden;
+  border-right: 1px solid var(--allauth-border);
+  background: var(--allauth-panel-background, #f8f6f4);
+}
+.allauth-modal-sidebar-content { display: flex; flex-direction: column; gap: 1rem; min-width: 0; }
+.allauth-modal-sidebar-content > p { margin: 0; padding: 0 .75rem; color: var(--allauth-muted); font-size: .75rem; line-height: 1.6; }
+.allauth-modal-sidebar nav { display: flex; flex-direction: column; gap: .375rem; }
+.allauth-modal-sidebar nav button {
+  display: flex;
+  align-items: center;
+  gap: .625rem;
+  min-height: 42px;
+  padding: .625rem .75rem;
+  border: 0;
+  border-radius: .45rem;
+  background: transparent;
+  color: var(--allauth-muted);
+  font-size: .8125rem;
+  font-weight: 500;
+  line-height: 1.4;
+  text-align: left;
+}
+.allauth-modal-sidebar nav button svg { width: 1rem; height: 1rem; flex: none; }
+.allauth-modal-sidebar nav button[aria-current=page] { background: var(--allauth-selected-background, #f2e3dc); color: var(--allauth-accent); }
+.allauth-modal-main {
+  min-width: 0;
+  min-height: 0;
+  padding: 1.5rem 1.75rem 1.75rem;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+.allauth-modal-main-content { min-width: 0; max-width: 100%; }
+.allauth-modal .allauth { --allauth-background: inherit; --allauth-foreground: inherit; --allauth-muted: inherit; --allauth-border: inherit; --allauth-accent: inherit; --allauth-accent-foreground: inherit; --allauth-footer-background: inherit; }
+.allauth-profile-embedded { max-width: none; padding: 0; border: 0; background: transparent; }
+.allauth .allauth-profile-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 1rem; padding: 0 0 1.25rem; }
+.allauth-profile-heading > div { min-width: 0; }
+.allauth .allauth-profile-heading h2,
+.allauth-profile-embedded > .allauth-stack > h2 { margin: 0; font-size: 1.125rem; font-weight: 650; line-height: 1.4; }
+.allauth .allauth-profile-heading p { margin-top: .375rem; font-size: .8125rem; line-height: 1.6; }
+.allauth-profile-section { display: flex; flex-direction: column; gap: .875rem; margin-top: 1.25rem; padding-top: 1.25rem; border-top: 1px solid var(--allauth-border); }
+.allauth-profile-section:first-child { margin-top: 0; }
+.allauth .allauth-profile-section h3 { font-size: .875rem; font-weight: 600; }
+.allauth .allauth-profile-section p { font-size: .8125rem; line-height: 1.6; }
+.allauth-profile-row { display: grid; grid-template-columns: minmax(6rem, .7fr) minmax(0, 1.4fr) auto; align-items: center; gap: 1rem; padding: 1.25rem 0; border-bottom: 1px solid var(--allauth-border); font-size: .8125rem; }
+.allauth-profile-row > span:first-child { font-weight: 500; }
+.allauth-profile-row > div { min-width: 0; }
+.allauth-profile-identity { display: flex; align-items: center; gap: .875rem; min-width: 0; }
+.allauth-profile-identity .allauth-avatar { width: 2.75rem; height: 2.75rem; }
+.allauth-profile-identity strong { overflow-wrap: anywhere; font-weight: 500; }
+.allauth button.allauth-text-button { min-height: 2rem; padding: .25rem 0; border: 0; background: transparent; color: var(--allauth-accent); font-size: .8125rem; font-weight: 500; text-align: left; }
+.allauth-badge,
+.allauth-role-badge { display: inline-flex; flex: none; align-items: center; align-self: flex-start; max-width: 100%; padding: .2rem .5rem; border: 1px solid var(--allauth-border); border-radius: .35rem; background: var(--allauth-footer-background); color: var(--allauth-muted); font-size: .6875rem; line-height: 1.4; white-space: nowrap; }
+.allauth-profile-edit { padding: 1rem; border: 1px solid var(--allauth-border); border-radius: .6rem; background: var(--allauth-footer-background); }
+.allauth-profile-edit button,
+.allauth-security-form > button,
+.allauth-organization-profile form > button { align-self: flex-start; }
+.allauth button.allauth-compact-button { display: inline-flex; align-self: flex-start; align-items: center; justify-content: center; gap: .5rem; min-height: 36px; width: auto; padding: .45rem .75rem; font-size: .75rem; font-weight: 550; line-height: 1.4; }
+.allauth-danger-zone { padding-top: 1.25rem; border-top: 1px solid var(--allauth-border); }
+.allauth-danger-zone > button { align-self: flex-start; }
+.allauth-organization-profile .allauth-profile-row { grid-template-columns: auto minmax(0, 1fr); justify-content: start; }
+.allauth-organization-logo,
+.allauth-organization-avatar { width: 3rem; height: 3rem; flex: none; border-radius: .5rem; object-fit: contain; }
+.allauth-organization-avatar { display: inline-flex; align-items: center; justify-content: center; background: var(--allauth-footer-background); font-size: 1rem; }
+.allauth-members-scroll { min-width: 0; max-width: 100%; overflow-x: auto; overscroll-behavior-x: contain; }
+.allauth-members-table { width: 100%; border-collapse: collapse; font-size: .8125rem; }
+.allauth-members-table th,
+.allauth-members-table td { padding: .75rem .5rem; border-bottom: 1px solid var(--allauth-border); text-align: left; vertical-align: middle; overflow-wrap: anywhere; }
+.allauth-members-table th { color: var(--allauth-muted); font-size: .6875rem; font-weight: 500; }
+.allauth-members-table td:first-child { padding-left: 0; }
+.allauth-members-table th:first-child { padding-left: 0; }
+.allauth-members-table td:last-child,
+.allauth-members-table th:last-child { padding-right: 0; }
+.allauth-member-identity strong,
+.allauth-member-identity small { display: block; }
+.allauth-member-identity strong { font-size: .8125rem; font-weight: 550; }
+.allauth-member-identity small { margin-top: .25rem; color: var(--allauth-muted); font-size: .75rem; }
+.allauth-last-owner { display: block; margin-top: .35rem; color: var(--allauth-muted); font-size: .6875rem; }
+.allauth-members-table .allauth-row { justify-content: flex-start; gap: .375rem; }
+.allauth .allauth-members-table select { min-width: 6.5rem; width: auto; min-height: 36px; padding: .4rem .5rem; font-size: .75rem; }
+.allauth-member-invite { display: grid; grid-template-columns: minmax(0, 1fr) minmax(7rem, .45fr) auto; gap: .75rem; align-items: end; }
+.allauth-member-invite .allauth-field { min-width: 0; }
+.allauth-member-invite .allauth-field input,
+.allauth-member-invite .allauth-field select { min-width: 0; min-height: 40px; font-size: .8125rem; }
+.allauth .allauth-member-invite > button { min-height: 40px; align-self: end; }
+.allauth-invitation-list { display: flex; flex-direction: column; gap: .625rem; max-width: 100%; margin: 0; padding: 0; list-style: none; }
+.allauth-invitation-item { display: flex; align-items: center; justify-content: space-between; gap: .75rem; padding: .75rem 0; border-bottom: 1px solid var(--allauth-border); }
+.allauth-invitation-target { padding: .875rem; border: 1px solid color-mix(in srgb, var(--allauth-accent) 35%, var(--allauth-border)); border-radius: .6rem; background: color-mix(in srgb, var(--allauth-accent) 5%, var(--allauth-background)); }
+.allauth-invitation-identity { display: flex; flex: 1; flex-direction: column; gap: .375rem; min-width: 0; }
+.allauth-invitation-identity strong { overflow-wrap: anywhere; font-size: .8125rem; font-weight: 550; }
+.allauth-invitation-meta { display: flex; align-items: center; gap: .5rem; color: var(--allauth-muted); font-size: .6875rem; }
+.allauth-security-detail { border: 1px solid var(--allauth-border); border-radius: .6rem; background: var(--allauth-background); }
+.allauth .allauth-security-detail > summary { padding: .875rem 1rem; color: var(--allauth-foreground); font-size: .8125rem; font-weight: 550; line-height: 1.5; }
+.allauth .allauth-security-detail > :not(summary) { margin: 0; padding: 0 1rem 1rem; }
+.allauth .allauth-security-detail > .allauth-profile-section { border: 0; }
+.allauth .allauth-security-detail > form { margin-top: 0; }
+.allauth-security-form { min-width: 0; }
+.allauth-passkey-row { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: .75rem; }
+.allauth .allauth-sessions > .allauth-row > button { min-height: 34px; padding: .375rem .625rem; font-size: .75rem; }
+.allauth-device-list { display: flex; flex-direction: column; gap: .75rem; margin: 0; padding: 0; list-style: none; }
+.allauth .allauth-device-list > li { padding: 1rem; border: 1px solid var(--allauth-border); border-radius: .6rem; }
+.allauth-device-identity { display: flex; align-items: flex-start; justify-content: space-between; gap: .75rem; }
+.allauth-device-identity > div { min-width: 0; }
+.allauth-device-identity strong { display: block; font-size: .8125rem; font-weight: 550; }
+.allauth-device-identity p { margin-top: .375rem; color: var(--allauth-muted); font-size: .75rem; line-height: 1.6; }
+.allauth .allauth-device-details > summary { padding: .75rem 0 0; color: var(--allauth-muted); font-size: .6875rem; font-weight: 500; }
+.allauth .allauth-device-details p { margin-top: .375rem; overflow-wrap: anywhere; font-size: .6875rem; }
+.allauth-account-settings { width: 100%; min-width: 0; }
+.allauth-account-tabs { display: flex; gap: .5rem; min-width: 0; margin-bottom: 1.5rem; border-bottom: 1px solid var(--allauth-border); overflow-x: auto; overflow-y: hidden; }
+.allauth .allauth-account-tabs > button { flex: none; min-height: 44px; margin-bottom: -1px; padding: .75rem 1rem; border: 0; border-bottom: 2px solid transparent; border-radius: 0; background: transparent; color: var(--allauth-muted); font-size: .875rem; font-weight: 500; }
+.allauth .allauth-account-tabs > button:focus-visible { outline-offset: -3px; }
+.allauth .allauth-account-tabs > button[aria-selected=true] { border-bottom-color: var(--allauth-accent); color: var(--allauth-accent); }
+.allauth-account-panel { min-width: 0; padding: 1.5rem; border: 1px solid var(--allauth-border); border-radius: .75rem; background: var(--allauth-background); }
+.allauth-account-organizations { min-width: 0; }
+.allauth-account-organizations .allauth-header-trigger { border-color: var(--allauth-border); }
+.allauth-avatar-upload { display: flex; align-items: flex-start; gap: 1rem; min-width: 0; }
+.allauth-avatar-upload > .allauth-avatar { width: 4rem; height: 4rem; font-size: 1.125rem; }
+.allauth-avatar-upload-actions { display: flex; flex: 1; flex-direction: column; align-items: flex-start; gap: .625rem; min-width: 0; }
+.allauth .allauth-avatar-upload input[type=file] { max-width: 100%; min-width: 0; min-height: 0; padding: .5rem; font-size: .75rem; }
+.allauth-avatar-upload p { color: var(--allauth-muted); font-size: .75rem; line-height: 1.6; }
+.allauth-avatar-advanced { max-width: 100%; }
+.allauth .allauth-avatar-advanced > summary { padding: .5rem 0; color: var(--allauth-muted); font-size: .75rem; font-weight: 500; }
+/* The native account dialog is a shared SDK surface; organization dialogs keep their chrome. */
+.allauth-profile-identity-row { grid-template-columns: minmax(0, 1fr) auto; }
+.allauth-profile-identity > div { display: flex; flex-direction: column; gap: .25rem; min-width: 0; }
+.allauth-profile-label { color: var(--allauth-muted); font-size: .8125rem; font-weight: 450; }
+.allauth-profile-email-row { grid-template-columns: minmax(6rem, .7fr) minmax(0, 1.4fr); }
+.allauth-profile-email-value { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem .75rem; overflow-wrap: anywhere; }
+.allauth-verified-badge,
+.allauth-connected-status { display: inline-flex; flex: none; align-items: center; justify-content: center; gap: .375rem; padding: .3rem .625rem; border: 0; border-radius: .5rem; background: var(--allauth-success-background, #e6f5ed); color: var(--allauth-success-foreground, #116447); font-size: .75rem; font-weight: 450; line-height: 1.4; white-space: nowrap; }
+.allauth-verified-badge svg,
+.allauth-connected-status svg { flex: none; }
+.allauth-connected-list { gap: 0; }
+.allauth-connected-provider { display: inline-flex; align-items: center; gap: .875rem; min-width: 0; }
+.allauth-provider-icon { display: inline-flex; flex: none; align-items: center; justify-content: center; width: 2.5rem; height: 2.5rem; border: 1px solid var(--allauth-border); border-radius: 50%; background: #fff; color: #17212d; }
+.allauth-provider-icon img { display: block; width: 1.5rem; height: 1.5rem; object-fit: contain; }
+.allauth-provider-apple { border-color: transparent; }
+.allauth-provider-apple img { width: 1.75rem; height: 1.75rem; }
+.allauth-account-dialog-backdrop { --allauth-accent: var(--allauth-modal-accent, #171717); --allauth-selected-background: color-mix(in srgb, var(--allauth-foreground) 8%, var(--allauth-background)); background: #15203059; backdrop-filter: blur(3px); -webkit-backdrop-filter: blur(3px); }
+.allauth-account-dialog-backdrop .allauth-modal { position: relative; width: min(66.25rem, 100%); height: min(41.25rem, calc(100dvh - 3rem)); border-radius: .875rem; box-shadow: 0 24px 96px #10182833; }
+.allauth-account-dialog-backdrop .allauth-modal-has-sidebar { grid-template-columns: 17.5rem minmax(0, 1fr); }
+.allauth-account-dialog-backdrop .allauth-modal-sidebar { padding: 3rem 2.25rem; background: var(--allauth-background); }
+.allauth-account-dialog-backdrop .allauth-modal-sidebar-content { gap: 1.5rem; }
+.allauth-account-dialog-backdrop .allauth-account-dialog-title { font-size: 1.375rem; font-weight: 650; letter-spacing: -.035em; line-height: 1.35; }
+.allauth-account-dialog-backdrop .allauth-modal-sidebar nav { gap: .375rem; }
+.allauth-account-dialog-backdrop .allauth-modal-sidebar nav button { min-height: 48px; gap: .875rem; padding: .75rem .875rem; border-radius: .625rem; color: var(--allauth-foreground); font-size: .9375rem; font-weight: 450; }
+.allauth-account-dialog-backdrop .allauth-modal-sidebar nav button svg { width: 1.25rem; height: 1.25rem; stroke-width: 1.6; }
+.allauth-account-dialog-backdrop .allauth-modal-sidebar nav button[aria-current=page] { background: var(--allauth-selected-background); color: var(--allauth-foreground); }
+.allauth-account-dialog-backdrop .allauth-modal-sidebar nav button:hover { background: var(--allauth-footer-background); }
+.allauth-account-dialog-backdrop .allauth-modal-main { padding: 3rem; }
+.allauth-account-dialog-backdrop .allauth-profile-embedded > .allauth-stack { gap: 0; }
+.allauth-account-dialog-backdrop .allauth-profile-embedded > .allauth-stack > h2 { padding: 0 2rem 1.25rem 0; border-bottom: 1px solid var(--allauth-border); font-size: 1.75rem; font-weight: 550; letter-spacing: -.04em; line-height: 1.3; }
+.allauth-account-dialog-backdrop .allauth-profile-row { padding: 1.5rem 0; gap: 1rem; font-size: 1rem; }
+.allauth-account-dialog-backdrop .allauth-profile-identity-row { grid-template-columns: minmax(0, 1fr) auto; }
+.allauth-account-dialog-backdrop .allauth-profile-identity { gap: 1.25rem; }
+.allauth-account-dialog-backdrop .allauth-profile-identity .allauth-avatar { width: 5rem; height: 5rem; font-size: 1.25rem; }
+.allauth-account-dialog-backdrop .allauth-profile-identity strong { font-size: 1.125rem; font-weight: 500; line-height: 1.4; }
+.allauth-account-dialog-backdrop .allauth-profile-label { color: var(--allauth-muted); font-size: .875rem; font-weight: 450; }
+.allauth-account-dialog-backdrop .allauth-profile-email-row { display: flex; flex-direction: column; align-items: flex-start; gap: .5rem; }
+.allauth-account-dialog-backdrop .allauth-profile-email-value { gap: .5rem .875rem; font-size: 1rem; }
+.allauth-account-dialog-backdrop .allauth-profile-summary .allauth-verified-badge { padding: .375rem .625rem; font-size: .75rem; }
+.allauth-account-dialog-backdrop button.allauth-text-button { min-height: 42px; padding: .625rem .875rem; border: 1px solid var(--allauth-border); border-radius: .5rem; background: var(--allauth-background); color: var(--allauth-foreground); font-size: .8125rem; font-weight: 500; text-align: center; white-space: nowrap; }
+.allauth-account-dialog-backdrop button.allauth-text-button:hover { background: var(--allauth-footer-background); }
+.allauth-account-dialog-backdrop .allauth-connected-accounts { margin-top: 0; padding-top: 1.5rem; border: 0; gap: .625rem; }
+.allauth-account-dialog-backdrop .allauth-connected-accounts h3 { font-size: .9375rem; font-weight: 500; }
+.allauth-account-dialog-backdrop .allauth-connected-list > li { min-height: 68px; padding: .75rem 0; font-size: .875rem; }
+.allauth-account-dialog-backdrop .allauth-connected-status { padding: .375rem .625rem; }
+.allauth-account-dialog-backdrop .allauth-profile-edit { margin-top: 1.25rem; padding: 1.25rem; }
+.allauth-account-dialog-backdrop .allauth-profile-embedded > .allauth-stack > .allauth-security-detail { margin-top: 1.25rem; }
+.allauth-account-dialog-backdrop .allauth-profile-embedded > .allauth-stack > .allauth-stack { margin-top: 1rem; }
+.allauth-account-dialog-backdrop .allauth-notice,
+.allauth-account-dialog-backdrop .allauth-error { margin-top: 1rem; }
+.allauth-account-dialog-backdrop button.allauth-account-dialog-close { position: absolute; top: .875rem; right: .875rem; display: inline-flex; align-items: center; justify-content: center; width: 44px; height: 44px; min-width: 44px; min-height: 44px; padding: 0; border: 0; border-radius: .5rem; background: transparent; color: var(--allauth-muted); }
+.allauth-account-dialog-backdrop button.allauth-account-dialog-close:hover { background: var(--allauth-footer-background); color: var(--allauth-foreground); }
+@media (max-width: 680px) {
+  .allauth-modal-backdrop { padding: .75rem; }
+  .allauth-modal,
+  .allauth-modal-with-nav { max-height: calc(100dvh - 1.5rem); }
+  .allauth-modal-with-nav { height: calc(100dvh - 1.5rem); }
+  .allauth-modal-header { min-height: 69px; gap: .5rem; padding: .75rem .875rem .75rem 1rem; }
+  .allauth-modal-has-sidebar { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); }
+  .allauth-modal-sidebar { padding: .5rem .625rem; border-right: 0; border-bottom: 1px solid var(--allauth-border); }
+  .allauth-modal-sidebar-content { gap: 0; }
+  .allauth-modal-sidebar-content > p { display: none; }
+  .allauth-modal-sidebar nav { flex-direction: row; gap: .375rem; }
+  .allauth-modal-sidebar nav button { flex: 1; justify-content: center; min-height: 42px; padding: .625rem .75rem; white-space: nowrap; }
+  .allauth-modal-main { padding: 1.25rem 1rem 1.5rem; }
+  .allauth-profile-row { grid-template-columns: minmax(0, 1fr); gap: .625rem; padding: 1rem 0; }
+  .allauth-profile-identity .allauth-avatar { width: 2.5rem; height: 2.5rem; }
+  .allauth .allauth-profile-heading { gap: .75rem; padding-bottom: 1rem; }
+  .allauth-member-invite { grid-template-columns: minmax(0, 1fr); align-items: start; }
+  .allauth .allauth-member-invite > button { justify-self: start; }
+  .allauth-invitation-item { flex-wrap: wrap; }
+  .allauth-invitation-item > button { margin-left: auto; }
+  .allauth-device-identity { flex-wrap: wrap; }
+  .allauth-active-org-name { max-width: 8rem; }
+  .allauth-account-tabs { gap: .125rem; margin-bottom: 1rem; }
+  .allauth .allauth-account-tabs > button { padding: .625rem .875rem; font-size: .8125rem; }
+  .allauth-account-panel { padding: 1.25rem 1rem; }
+  .allauth-avatar-upload { flex-wrap: wrap; }
+  .allauth-avatar-upload-actions { flex-basis: 12rem; }
+  .allauth-account-dialog-backdrop .allauth-modal { height: calc(100dvh - 1.5rem); border-radius: .75rem; }
+  .allauth-account-dialog-backdrop .allauth-modal-has-sidebar { grid-template-columns: minmax(0, 1fr); }
+  .allauth-account-dialog-backdrop .allauth-modal-sidebar { padding: 1.25rem 1.25rem .875rem; }
+  .allauth-account-dialog-backdrop .allauth-modal-sidebar-content { gap: 1rem; }
+  .allauth-account-dialog-backdrop .allauth-account-dialog-title { padding-right: 2.75rem; font-size: 1.25rem; }
+  .allauth-account-dialog-backdrop .allauth-modal-sidebar nav button { justify-content: center; min-height: 44px; padding: .625rem .75rem; font-size: .875rem; }
+  .allauth-account-dialog-backdrop .allauth-modal-main { padding: 1.5rem 1.25rem 2rem; }
+  .allauth-account-dialog-backdrop .allauth-profile-embedded > .allauth-stack > h2 { padding-right: 0; font-size: 1.5rem; }
+  .allauth-account-dialog-backdrop .allauth-profile-identity-row { display: flex; flex-wrap: wrap; }
+  .allauth-account-dialog-backdrop .allauth-profile-identity { flex: 1 1 11rem; gap: .875rem; }
+  .allauth-account-dialog-backdrop .allauth-profile-identity .allauth-avatar { width: 3.5rem; height: 3.5rem; }
+  .allauth-account-dialog-backdrop .allauth-profile-identity strong { font-size: 1.0625rem; }
+  .allauth-account-dialog-backdrop .allauth-profile-row { padding: 1.25rem 0; }
+  .allauth-account-dialog-backdrop .allauth-connected-provider { gap: .625rem; }
+  .allauth-account-dialog-backdrop .allauth-connected-status { font-size: .6875rem; }
+  .allauth-account-dialog-backdrop button.allauth-account-dialog-close { top: .75rem; right: .75rem; }
+}

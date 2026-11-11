@@ -1,0 +1,781 @@
+import type {
+	Awaitable,
+	DBTransactionAdapter,
+	OAuth2Tokens,
+	User,
+} from "better-auth";
+import type {
+	DBFieldAttribute,
+	FieldAttributeToObject,
+	InferAdditionalFieldsFromPluginOptions,
+	RemoveFieldsWithReturnedFalse,
+} from "better-auth/db";
+import type { AlgorithmValidationOptions } from "./saml/algorithms";
+
+export interface OIDCMapping {
+	email?: string | undefined;
+	emailVerified?: string | undefined;
+	name?: string | undefined;
+	image?: string | undefined;
+	extraFields?: Record<string, string> | undefined;
+}
+
+export interface SAMLMapping {
+	email?: string | undefined;
+	emailVerified?: string | undefined;
+	name?: string | undefined;
+	firstName?: string | undefined;
+	lastName?: string | undefined;
+	extraFields?: Record<string, string> | undefined;
+}
+
+export interface OIDCConfig {
+	issuer: string;
+	pkce: boolean;
+	clientId: string;
+	/** Required for client_secret_basic/client_secret_post. Optional for private_key_jwt. */
+	clientSecret?: string;
+	authorizationEndpoint?: string | undefined;
+	discoveryEndpoint: string;
+	userInfoEndpoint?: string | undefined;
+	scopes?: string[] | undefined;
+	overrideUserInfo?: boolean | undefined;
+	tokenEndpoint?: string | undefined;
+	tokenEndpointAuthentication?:
+		| ("client_secret_post" | "client_secret_basic" | "private_key_jwt")
+		| undefined;
+	/** Key ID for private_key_jwt key resolution */
+	privateKeyId?: string | undefined;
+	/** Signing algorithm for private_key_jwt. @default "RS256" */
+	privateKeyAlgorithm?: string | undefined;
+	jwksEndpoint?: string | undefined;
+	mapping?: OIDCMapping | undefined;
+	/**
+	 * Accept callbacks from OIDC providers that initiate the OAuth flow
+	 * without sending a `state` parameter. When enabled, stateless callbacks
+	 * restart the OAuth flow server-side with a fresh `state` and PKCE
+	 * verifier. See the SSO docs for details.
+	 *
+	 * @default false
+	 */
+	allowIdpInitiated?: boolean | undefined;
+}
+
+interface SAMLIdentityProviderMetadataBase {
+	/**
+	 * IdP signing certificate(s). Pass a single PEM string or an array for
+	 * rolling rotation. Takes precedence over the top-level `cert` when both
+	 * are set. Omit when `metadata` XML is supplied.
+	 */
+	cert?: string | string[] | undefined;
+	privateKey?: string | undefined;
+	privateKeyPass?: string | undefined;
+	isAssertionEncrypted?: boolean | undefined;
+	encPrivateKey?: string | undefined;
+	encPrivateKeyPass?: string | undefined;
+	singleSignOnService?:
+		| Array<{
+				Binding: string;
+				Location: string;
+		  }>
+		| undefined;
+	singleLogoutService?:
+		| Array<{
+				Binding: string;
+				Location: string;
+		  }>
+		| undefined;
+}
+
+/**
+ * The trusted identity-provider authority for a SAML connection.
+ *
+ * Metadata XML carries the IdP entity ID. Manual configurations must declare
+ * `entityID` explicitly so the service provider's issuer is never mistaken
+ * for the identity provider's authority.
+ */
+export type SAMLIdentityProviderMetadata = SAMLIdentityProviderMetadataBase &
+	(
+		| {
+				metadata: string;
+				entityID?: string | undefined;
+		  }
+		| {
+				metadata?: undefined;
+				entityID: string;
+		  }
+	);
+
+export interface SAMLConfig {
+	/**
+	 * SP Entity ID. Used as the `entityID` in SP metadata when
+	 * `spMetadata.entityID` is not set. Also used as the expected
+	 * audience for SAML assertion validation when `audience` is not set.
+	 */
+	issuer: string;
+	/**
+	 * IdP SSO URL. Used as the redirect destination when
+	 * `idpMetadata.metadata` is not provided. Ignored when
+	 * IdP metadata XML is set (the SSO URL is extracted from the XML).
+	 */
+	entryPoint: string;
+	/**
+	 * IdP signing certificate(s). Used to verify SAML response signatures when
+	 * `idpMetadata.metadata` is not provided. Ignored when IdP metadata XML is
+	 * set (the certificate is extracted from the XML). When both this and
+	 * `idpMetadata.cert` are set, `idpMetadata.cert` takes precedence. Pass an
+	 * array of PEM strings for rolling rotation; responses signed by any
+	 * listed cert are accepted.
+	 */
+	cert?: string | string[];
+	audience?: string | undefined;
+	/**
+	 * Provider-level post-auth redirect URL for IdP-initiated or fallback SAML
+	 * flows when no RelayState callback URL is available.
+	 */
+	callbackUrl?: string | undefined;
+	/**
+	 * Fallback absolute URL or same-origin relative path for IdP-initiated SAML
+	 * responses when RelayState has no safe callback, including error redirects.
+	 */
+	idpInitiatedCallbackUrl?: string | undefined;
+	idpMetadata: SAMLIdentityProviderMetadata;
+	/**
+	 * SP metadata configuration. All fields are optional; when omitted,
+	 * SP metadata is auto-generated from `issuer`, `wantAssertionsSigned`,
+	 * `authnRequestsSigned`, and `identifierFormat`.
+	 */
+	spMetadata?: {
+		metadata?: string | undefined;
+		entityID?: string | undefined;
+		binding?: string | undefined;
+		privateKey?: string | undefined;
+		privateKeyPass?: string | undefined;
+		isAssertionEncrypted?: boolean | undefined;
+		encPrivateKey?: string | undefined;
+		encPrivateKeyPass?: string | undefined;
+	};
+	/**
+	 * Request and require signed assertions from the IdP. When true, generated
+	 * SP metadata advertises `WantAssertionsSigned="true"` and the ACS rejects
+	 * unsigned assertions. Custom SP metadata supplies the effective policy and
+	 * accepts the XML Schema boolean forms `true`, `false`, `1`, and `0`.
+	 */
+	wantAssertionsSigned?: boolean | undefined;
+	authnRequestsSigned?: boolean | undefined;
+	signatureAlgorithm?: string | undefined;
+	digestAlgorithm?: string | undefined;
+	identifierFormat?: string | undefined;
+	privateKey?: string | undefined;
+	mapping?: SAMLMapping | undefined;
+}
+
+/** Stored AuthnRequest record for InResponseTo validation */
+export interface AuthnRequestRecord {
+	id: string;
+	providerId: string;
+	providerReference: SSOProviderReference;
+	createdAt: number;
+	expiresAt: number;
+}
+
+/** Session data stored during SAML login for Single Logout */
+export interface SAMLSessionRecord {
+	/** Session row id, used to key the by-id lookup index. */
+	sessionId: string;
+	/** Session token, used to revoke the session during Single Logout. */
+	sessionToken: string;
+	providerId: string;
+	nameID: string;
+	sessionIndex?: string;
+}
+
+/**
+ * Parsed SAML login response extract from samlify.
+ *
+ * samlify's extractor nests multi-attribute XML elements as objects:
+ * - `response` (Response/@ID, @IssueInstant, @Destination, @InResponseTo)
+ * - `sessionIndex` (AuthnStatement/@AuthnInstant, @SessionNotOnOrAfter, @SessionIndex)
+ * - `conditions` (Conditions/@NotBefore, @NotOnOrAfter)
+ *
+ * Single-value elements remain as strings: `nameID`, `audience`.
+ */
+export interface SAMLAssertionExtract {
+	nameID?: string;
+	/**
+	 * From `<AuthnStatement>` — samlify extracts all 3 attributes as an object.
+	 * To get the SessionIndex string, read `sessionIndex.sessionIndex`.
+	 */
+	sessionIndex?: {
+		authnInstant?: string;
+		sessionNotOnOrAfter?: string;
+		sessionIndex?: string;
+	};
+	conditions?: {
+		notBefore?: string;
+		notOnOrAfter?: string;
+	};
+	response?: {
+		id?: string;
+		issueInstant?: string;
+		destination?: string;
+		inResponseTo?: string;
+	};
+	/** Single string or array when multiple `<Audience>` elements are present. */
+	audience?: string | string[];
+}
+
+type BaseSSOProvider = {
+	issuer: string;
+	oidcConfig?: OIDCConfig | undefined;
+	samlConfig?: SAMLConfig | undefined;
+	userId: string;
+	providerId: string;
+	organizationId?: string | undefined;
+	domain: string;
+};
+
+type SSOProviderAdditionalFields<
+	O extends SSOOptions,
+	IsClientSide extends boolean,
+> = O["schema"] extends {
+	ssoProvider?: {
+		additionalFields: infer Field extends Record<string, DBFieldAttribute>;
+	};
+}
+	? IsClientSide extends true
+		? FieldAttributeToObject<RemoveFieldsWithReturnedFalse<Field>>
+		: FieldAttributeToObject<Field>
+	: {};
+
+export type SSOProviderAdditionalFieldsInput<
+	O extends SSOOptions,
+	IsClientSide extends boolean = true,
+> = InferAdditionalFieldsFromPluginOptions<"ssoProvider", O, IsClientSide>;
+
+export type InferSSOProvider<
+	O extends SSOOptions,
+	IsClientSide extends boolean = true,
+> = (O["domainVerification"] extends { enabled: true }
+	? {
+			domainVerified: boolean;
+		} & BaseSSOProvider
+	: BaseSSOProvider) &
+	SSOProviderAdditionalFields<O, IsClientSide>;
+
+export type SSOProvider<O extends SSOOptions> =
+	O["domainVerification"] extends { enabled: true }
+		? {
+				domainVerified: boolean;
+			} & BaseSSOProvider &
+				SSOProviderAdditionalFields<O, false>
+		: BaseSSOProvider & SSOProviderAdditionalFields<O, false>;
+
+export type SSOProviderSchema<O extends SSOOptions> = {
+	ssoProvider: {
+		modelName: string;
+		fields: Record<string, DBFieldAttribute> &
+			(O["schema"] extends {
+				ssoProvider?: {
+					additionalFields: infer Field extends Record<
+						string,
+						DBFieldAttribute
+					>;
+				};
+			}
+				? Field
+				: {});
+	};
+};
+
+/** Decision returned by an SSO user resolver. */
+export type SSOUserResolution =
+	| { action: "continue" }
+	| {
+			action: "link";
+			userId: string;
+			profile: "preserve" | "update";
+	  }
+	| { action: "reject"; code: string; message?: string | undefined };
+
+/** Normalized provider attributes available to an SSO user resolver. */
+export type SSOProviderUserProfile = {
+	email: string;
+	emailVerified: boolean;
+	name: string;
+	image?: string | null | undefined;
+} & Record<string, unknown>;
+
+/**
+ * Opaque reference to the SSO provider configuration accepted for the current
+ * authentication flow.
+ *
+ * This reference is a transient authentication fence. Applications must not
+ * persist it as a tenant or user binding.
+ */
+export interface SSOProviderReference {
+	providerId: string;
+	source: { type: "configured" } | { type: "persisted"; recordId: string };
+	authenticationConfigurationFingerprint: string;
+}
+
+interface BaseSSOUserResolutionInput {
+	providerId: string;
+	accountKey: {
+		issuer: string;
+		accountId: string;
+	};
+	providerUser: SSOProviderUserProfile;
+	providerReference: SSOProviderReference;
+}
+
+/** OIDC identity and profile data available to an application's SSO resolver. */
+export interface SSOOIDCUserResolutionInput extends BaseSSOUserResolutionInput {
+	protocol: "oidc";
+	/** Raw claims from UserInfo, or the verified ID Token when UserInfo is absent. */
+	providerClaims: Record<string, unknown>;
+	/** Claims from the cryptographically verified ID Token. */
+	verifiedIdTokenClaims: Record<string, unknown>;
+}
+
+/** SAML identity and assertion data available to an application's SSO resolver. */
+export interface SSOSAMLUserResolutionInput extends BaseSSOUserResolutionInput {
+	protocol: "saml";
+	/**
+	 * Attributes from the verified assertion. Multi-valued attributes remain
+	 * arrays and all scalar values remain strings.
+	 */
+	providerAttributes: Record<string, string | readonly string[]>;
+}
+
+/** Verified SSO identity and provider data available to an application resolver. */
+export type SSOUserResolutionInput =
+	| SSOOIDCUserResolutionInput
+	| SSOSAMLUserResolutionInput;
+
+/** Transaction-bound capabilities available while resolving an SSO user. */
+export interface SSOUserResolutionContext {
+	database: DBTransactionAdapter;
+}
+
+interface BaseSSOProviderMutationGuardInput {
+	provider: {
+		id: string;
+		providerId: string;
+		organizationId: string | null;
+	};
+	/**
+	 * Opaque reference to the exact locked provider configuration.
+	 *
+	 * This value is transient and must not be persisted as a tenant binding.
+	 */
+	providerReference: SSOProviderReference;
+}
+
+/** Mutation attempted against one exact persisted SSO provider row. */
+export type SSOProviderMutationGuardInput =
+	| (BaseSSOProviderMutationGuardInput & {
+			action: "update";
+			/**
+			 * True when the validated proposal changes provider identity,
+			 * routing, or verification policy used to authenticate accounts.
+			 */
+			isAuthenticationBoundaryChange: boolean;
+	  })
+	| (BaseSSOProviderMutationGuardInput & {
+			action: "delete";
+	  });
+
+/** Transaction-bound context for guarding a persisted provider mutation. */
+export interface SSOProviderMutationGuardContext {
+	database: DBTransactionAdapter;
+}
+
+export interface SSOOptions {
+	/**
+	 * Resolve a verified provider identity to a Better Auth user.
+	 *
+	 * For OIDC, `accountKey` is derived from the validated ID Token. For SAML,
+	 * it contains the verified IdP entity ID and signed NameID. Profile fields,
+	 * raw OIDC claims, and SAML assertion attributes are protocol-accepted
+	 * provider data and may require application-level validation.
+	 *
+	 * The callback runs on every SSO sign-in inside the same native database
+	 * transaction as account finalization and session creation.
+	 */
+	resolveUser?:
+		| ((
+				input: SSOUserResolutionInput,
+				context: SSOUserResolutionContext,
+		  ) => Awaitable<SSOUserResolution>)
+		| undefined;
+	/**
+	 * Guards updates and deletion of an exact persisted SSO provider.
+	 *
+	 * The callback runs after the provider row is locked and before any provider
+	 * or linked Account mutation. Update inputs disclose only whether the
+	 * validated proposal changes the authentication boundary; proposed secrets
+	 * and configuration values are never exposed. Throw to reject the mutation.
+	 * Better Auth converts callback failures into a stable conflict response.
+	 */
+	guardProviderMutation?:
+		| ((
+				input: SSOProviderMutationGuardInput,
+				context: SSOProviderMutationGuardContext,
+		  ) => Awaitable<void>)
+		| undefined;
+	/**
+	 * custom function to provision a user when they sign in with an SSO provider.
+	 */
+	provisionUser?:
+		| ((data: {
+				/**
+				 * The user object from the database
+				 */
+				user: User & Record<string, any>;
+				/**
+				 * The user info object from the provider
+				 */
+				userInfo: Record<string, any>;
+				/**
+				 * The OAuth2 tokens from the provider
+				 */
+				token?: OAuth2Tokens;
+				/**
+				 * The SSO provider
+				 */
+				provider: SSOProvider<SSOOptions>;
+		  }) => Awaitable<void>)
+		| undefined;
+	/**
+	 * If true, the `provisionUser` callback will be called on every login,
+	 * not just when a new user is registered. This is useful when you need
+	 * to sync upstream identity provider profile changes on each sign-in.
+	 *
+	 * The `provisionUser` callback should be idempotent when this is enabled.
+	 *
+	 * @default false
+	 */
+	provisionUserOnEveryLogin?: boolean;
+	/**
+	 * Organization provisioning options
+	 */
+	organizationProvisioning?:
+		| {
+				disabled?: boolean;
+				defaultRole?: "member" | "admin";
+				getRole?: (data: {
+					/**
+					 * The user object from the database
+					 */
+					user: User & Record<string, any>;
+					/**
+					 * The user info object from the provider
+					 */
+					userInfo: Record<string, any>;
+					/**
+					 * The OAuth2 tokens from the provider
+					 */
+					token?: OAuth2Tokens;
+					/**
+					 * The SSO provider
+					 */
+					provider: SSOProvider<SSOOptions>;
+				}) => Promise<"member" | "admin">;
+		  }
+		| undefined;
+	/**
+	 * Default SSO provider configurations for testing.
+	 * These will take the precedence over the database providers.
+	 */
+	defaultSSO?:
+		| Array<{
+				/**
+				 * The domain to match for this default provider.
+				 * This is only used to match incoming requests to this default provider.
+				 */
+				domain: string;
+				/**
+				 * The provider ID to use
+				 */
+				providerId: string;
+				/**
+				 * SAML configuration
+				 */
+				samlConfig?: SAMLConfig;
+				/**
+				 * OIDC configuration
+				 */
+				oidcConfig?: OIDCConfig;
+				/**
+				 * Private key for `private_key_jwt` authentication.
+				 * Only used with defaultSSO — not stored in DB.
+				 */
+				privateKey?: {
+					privateKeyJwk?: JsonWebKey;
+					privateKeyPem?: string;
+				};
+		  }>
+		| undefined;
+	/**
+	 * Override user info with the provider info.
+	 * @default false
+	 */
+	defaultOverrideUserInfo?: boolean | undefined;
+	/**
+	 * Disable implicit sign up for new users. When set to true for the provider,
+	 * sign-in need to be called with with requestSignUp as true to create new users.
+	 */
+	disableImplicitSignUp?: boolean | undefined;
+	/**
+	 * The model name for the SSO provider table. Defaults to "ssoProvider".
+	 */
+	modelName?: string;
+	/**
+	 * Map fields
+	 *
+	 * @example
+	 * ```ts
+	 * {
+	 *  samlConfig: "saml_config"
+	 * }
+	 * ```
+	 */
+	fields?: {
+		issuer?: string | undefined;
+		oidcConfig?: string | undefined;
+		samlConfig?: string | undefined;
+		userId?: string | undefined;
+		providerId?: string | undefined;
+		organizationId?: string | undefined;
+		domain?: string | undefined;
+	};
+	/**
+	 * The schema for the SSO plugin.
+	 */
+	schema?:
+		| {
+				ssoProvider?: {
+					modelName?: string | undefined;
+					fields?: {
+						issuer?: string | undefined;
+						oidcConfig?: string | undefined;
+						samlConfig?: string | undefined;
+						userId?: string | undefined;
+						providerId?: string | undefined;
+						organizationId?: string | undefined;
+						domain?: string | undefined;
+						domainVerified?: string | undefined;
+					};
+					additionalFields?: {
+						[key in string]: DBFieldAttribute;
+					};
+				};
+		  }
+		| undefined;
+	/**
+	 * Configure the maximum number of SSO providers a user can register.
+	 * You can also pass a function that returns a number.
+	 * Set to 0 to disable SSO provider registration.
+	 *
+	 * @example
+	 * ```ts
+	 * providersLimit: async (user) => {
+	 *   const plan = await getUserPlan(user);
+	 *   return plan.name === "pro" ? 10 : 1;
+	 * }
+	 * ```
+	 * @default 10
+	 */
+	providersLimit?: (number | ((user: User) => Awaitable<number>)) | undefined;
+	/**
+	 * Trust the email verified flag from the provider.
+	 *
+	 * ⚠️ Use this with caution — it can lead to account takeover if misused. Only enable it if users **cannot freely register new providers**. You can
+	 * prevent that by using `disabledPaths` or other safeguards to block provider registration from the client.
+	 *
+	 * If you want to allow account linking for specific trusted providers, enable the `accountLinking` option in your auth config and specify those
+	 * providers in the `trustedProviders` list.
+	 *
+	 * @default false
+	 *
+	 * @deprecated This option is discouraged for new projects. Relying on provider-level `email_verified` is a weaker
+	 * trust signal compared to using `trustedProviders` in `accountLinking` or enabling `domainVerification` for SSO.
+	 * Existing configurations will continue to work, but new integrations should use explicit trust mechanisms.
+	 * This option may be removed in a future major version.
+	 */
+	trustEmailVerified?: boolean | undefined;
+	/**
+	 * Enable domain verification on SSO providers
+	 *
+	 * When this option is enabled, new SSO providers will require the associated domain to be verified by the owner
+	 * prior to allowing sign-ins.
+	 */
+	domainVerification?: {
+		/**
+		 * Enables or disables the domain verification feature
+		 */
+		enabled?: boolean;
+		/**
+		 * Prefix used to generate the domain verification token.
+		 * An underscore is automatically prepended to follow DNS
+		 * infrastructure subdomain conventions (RFC 8552), so do
+		 * not include a leading underscore.
+		 *
+		 * @default "better-auth-token"
+		 */
+		tokenPrefix?: string;
+	};
+	/**
+	 * A shared redirect URI used by all OIDC providers instead of
+	 * per-provider callback URLs. Can be a path or a full URL.
+	 */
+	redirectURI?: string;
+	/**
+	 * Callback to resolve private key material for private_key_jwt authentication.
+	 * Called during token exchange when a provider uses tokenEndpointAuthentication: "private_key_jwt".
+	 * Keeps private keys out of the database — supports HSM/KMS/Vault integration.
+	 */
+	resolvePrivateKey?: (params: {
+		providerId: string;
+		keyId?: string;
+		issuer: string;
+	}) => Promise<{
+		privateKeyJwk?: JsonWebKey;
+		privateKeyPem?: string;
+		kid?: string;
+		algorithm?: string;
+	}>;
+	/**
+	 * SAML security options for AuthnRequest/InResponseTo validation.
+	 * This prevents unsolicited responses, replay attacks, and cross-provider injection.
+	 */
+	saml?: {
+		/**
+		 * Enable InResponseTo validation for SP-initiated SAML flows.
+		 * When enabled, AuthnRequest IDs are tracked and validated against SAML responses.
+		 *
+		 * Storage behavior:
+		 * - Uses `secondaryStorage` (e.g., Redis) if configured in your auth options
+		 * - Falls back to the verification table in the database otherwise
+		 *
+		 * This works correctly in serverless environments without any additional configuration.
+		 *
+		 * @default true
+		 */
+		enableInResponseToValidation?: boolean;
+		/**
+		 * Allow IdP-initiated SSO (unsolicited SAML responses).
+		 * When true, responses without InResponseTo are accepted.
+		 * When false, all responses must correlate to a stored AuthnRequest.
+		 *
+		 * IdP-initiated SSO is a known attack vector — the SAML2Int
+		 * interoperability profile recommends against it. Only enable
+		 * this if your IdP requires it and you understand the risks.
+		 *
+		 * Only applies when InResponseTo validation is enabled.
+		 *
+		 * @default false
+		 */
+		allowIdpInitiated?: boolean;
+		/**
+		 * TTL for AuthnRequest records in milliseconds.
+		 * Requests older than this will be rejected.
+		 *
+		 * Only applies when InResponseTo validation is enabled.
+		 *
+		 * @default 300000 (5 minutes)
+		 */
+		requestTTL?: number;
+		/**
+		 * Clock skew tolerance for SAML assertion timestamp validation in milliseconds.
+		 * Allows for minor time differences between IdP and SP servers.
+		 *
+		 * Defaults to 300000 (5 minutes) to accommodate:
+		 * - Network latency and processing time
+		 * - Clock synchronization differences (NTP drift)
+		 * - Distributed systems across timezones
+		 *
+		 * For stricter security, reduce to 1-2 minutes (60000-120000).
+		 * For highly distributed systems, increase up to 10 minutes (600000).
+		 *
+		 * @default 300000 (5 minutes)
+		 */
+		clockSkew?: number;
+		/**
+		 * Require timestamp conditions (NotBefore/NotOnOrAfter) in SAML assertions.
+		 * When enabled, assertions without timestamp conditions will be rejected.
+		 *
+		 * When disabled (default), assertions without timestamps are accepted
+		 * but a warning is logged.
+		 *
+		 * **SAML Spec Notes:**
+		 * - SAML 2.0 Core: Timestamps are OPTIONAL
+		 * - SAML2Int (enterprise profile): Timestamps are REQUIRED
+		 *
+		 * **Recommendation:** Enable for enterprise/production deployments
+		 * where your IdP follows SAML2Int (Okta, Azure AD, OneLogin, etc.)
+		 *
+		 * @default false
+		 */
+		requireTimestamps?: boolean;
+		/**
+		 * Algorithm validation options for SAML responses.
+		 *
+		 * Controls behavior when deprecated algorithms (SHA-1, RSA1_5, 3DES)
+		 * are detected in SAML responses.
+		 *
+		 * @example
+		 * ```ts
+		 * algorithms: {
+		 *   onDeprecated: "reject" // Reject deprecated algorithms
+		 * }
+		 * ```
+		 */
+		algorithms?: AlgorithmValidationOptions;
+		/**
+		 * Maximum allowed size for SAML responses in bytes.
+		 *
+		 * @default 262144 (256KB)
+		 */
+		maxResponseSize?: number;
+		/**
+		 * Maximum allowed size for IdP or SP metadata XML in bytes.
+		 *
+		 * @default 102400 (100KB)
+		 */
+		maxMetadataSize?: number;
+		/**
+		 * Enable SAML Single Logout
+		 * @default false
+		 */
+		enableSingleLogout?: boolean;
+		/**
+		 * TTL for LogoutRequest records in milliseconds
+		 * @default 300000 (5 minutes)
+		 */
+		logoutRequestTTL?: number;
+		/**
+		 * Require signed LogoutRequests from IdP
+		 * @default false
+		 */
+		wantLogoutRequestSigned?: boolean;
+		/**
+		 * Require signed LogoutResponses from IdP
+		 * @default false
+		 */
+		wantLogoutResponseSigned?: boolean;
+		/**
+		 * Global fallback absolute URL or same-origin relative path for
+		 * IdP-initiated SAML responses when the provider has no safe callback.
+		 */
+		idpInitiatedCallbackUrl?: string | undefined;
+	};
+}
+
+export interface Member {
+	id: string;
+	userId: string;
+	organizationId: string;
+	role: string;
+}

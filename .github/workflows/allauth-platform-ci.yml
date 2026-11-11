@@ -1,0 +1,76 @@
+name: AllAuth platform
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: allauth-platform-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: allauth
+          POSTGRES_DB: allauth
+          POSTGRES_PASSWORD: allauth-ci-only
+        ports: ["55445:5432"]
+        options: >-
+          --health-cmd "pg_isready -U allauth -d allauth"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      LEFTHOOK: "0"
+      NEXT_TELEMETRY_DISABLED: "1"
+      TURBO_TELEMETRY_DISABLED: "1"
+      AUTH_RUNTIME: node
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+      - name: Install and build native packages
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+          pnpm --dir apps/auth install --frozen-lockfile
+      - name: Typecheck
+        run: |
+          pnpm typecheck
+          pnpm --dir apps/auth typecheck
+      - name: Configure isolated test database
+        run: |
+          node --input-type=module <<'JS'
+          import { mkdirSync, writeFileSync } from 'node:fs';
+          mkdirSync('.secrets', { recursive: true });
+          // Historical marker used by the tests' isolated-fixture allowlist.
+          writeFileSync('.secrets/local-postgres.json', JSON.stringify({ container: 'allauth-production-test-20261007', DATABASE_URL: 'postgresql://allauth:allauth-ci-only@127.0.0.1:55445/allauth' }), { mode: 0o600 });
+          JS
+      - name: Test billing, entitlements, self-hosting and public pages
+        run: >-
+          pnpm exec vitest run --root apps/auth --config vitest.config.ts
+          lib/billing/state.test.ts lib/billing/webhook.test.ts
+          lib/billing/billing.pg.test.ts lib/billing/entitlements.test.ts lib/billing/entitlements.pg.test.ts
+          lib/ops/initialize-admin.pg.test.ts lib/self-host-email.test.ts
+          lib/commercial/public-pages.test.ts lib/console/workspace-billing-render.test.ts
+          lib/console/workspace-navigation.test.ts lib/console/user-menu-navigation.test.ts
+          lib/console/compact-shell.test.ts lib/homepage.test.ts lib/public-sdk.test.ts
+      - name: Verify SDK and build service
+        run: |
+          pnpm exec node --test apps/auth/scripts/public-source-policy.test.mjs
+          pnpm --dir apps/auth check:sdk
+          pnpm --dir apps/auth verify:sdk-artifact
+          pnpm --dir apps/auth build

@@ -1,0 +1,10 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "allauth-domain-gateway",
+  "main": "workers/domain-gateway.ts",
+  "compatibility_date": "2026-10-07",
+  "workers_dev": false,
+  "vars": {
+    "ALLAUTH_ORIGIN": "https://your-service.up.railway.app"
+  }
+}
