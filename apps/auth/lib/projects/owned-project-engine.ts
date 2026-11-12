@@ -1779,6 +1779,7 @@ export function createOwnedProjectEngine(
 			signingSecret: options.signingSecret,
 			rp: options.passkeys,
 			readBody: requestBody,
+			auditContext: browserEventContext,
 			writeCookie,
 			async readSession(request, fresh) {
 				const current = await currentSession(request.headers);

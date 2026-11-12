@@ -19,13 +19,13 @@ import type {
 	ControlWebhookDelivery,
 	ControlWebhookEndpoint,
 } from "../control/webhook-contract";
-import type { ControlWebhookEnvelope } from "../control/webhooks";
 import {
 	webhookDeliveryInput,
 	webhookEndpointInput,
 	webhookEventTypes,
 	webhookSignature,
 } from "../control/webhook-contract";
+import type { ControlWebhookEnvelope } from "../control/webhooks";
 import {
 	createControlWebhooks,
 	deliverPendingWebhooks,

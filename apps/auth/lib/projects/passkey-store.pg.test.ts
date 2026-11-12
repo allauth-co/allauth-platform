@@ -2,11 +2,17 @@ import { createHash, generateKeyPairSync, randomBytes, randomUUID, sign } from "
 import { existsSync, readFileSync } from "node:fs";
 import { passkey } from "@better-auth/passkey";
 import { isoCBOR } from "@simplewebauthn/server/helpers";
+import { symmetricEncrypt } from "better-auth/crypto";
 import { getTestInstance } from "better-auth/test";
 import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { postgresDatabase } from "../auth";
 import { defaultAuthPolicy } from "../auth-policy/policy";
+import { allauthControl } from "../control";
+import { newWebhookSigningSecret, webhookSignature } from "../control/webhook-contract";
+import type { ControlWebhookEnvelope } from "../control/webhooks";
+import { deliverPendingWebhooks } from "../control/webhooks";
+import { featureBoundaries } from "../features/server";
 import { createOwnedProjectEngine } from "./owned-project-engine";
 import { readLegacySessionCookie } from "./legacy-session-cookie";
 import { projectPasskeyStore } from "./passkey-store";
@@ -23,6 +29,7 @@ const primary = checkedProjectSchema(`allauth_project_${randomUUID().replaceAll(
 const other = checkedProjectSchema(`allauth_project_${randomUUID().replaceAll("-", "")}`);
 const ownerEmail = "owner@passkey-storage.fixture.example";
 const foreignEmail = "other@passkey-storage.fixture.example";
+const fixtureSecret = "synthetic-passkey-storage-fixture-signing-secret";
 const publicKey = new Uint8Array([0xfb, 0xff, 0x04, 0x00, 0x99]);
 const hash = (value: string | Uint8Array) => createHash("sha256").update(value).digest();
 
@@ -79,13 +86,18 @@ function virtualCredential() {
 	};
 }
 
-function legacyFixture(database: ReturnType<typeof postgresDatabase>) {
+function legacyFixture(database: ReturnType<typeof postgresDatabase>, audit = false) {
 	return getTestInstance({
 		database,
 		baseURL: origin,
-		advanced: { cookiePrefix: `allauth_project_${projectSlug}` },
+		secret: fixtureSecret,
+		advanced: { cookiePrefix: `allauth_project_${projectSlug}`, ipAddress: { ipAddressHeaders: ["x-real-ip"] } },
+		...(audit ? { rateLimit: { enabled: true, storage: "database", max: 100, window: 60 } } : {}),
 		logger: { disabled: true },
-		plugins: [passkey({ rpID: rpId, origin, requireUserVerification: true })],
+		plugins: [
+			passkey({ rpID: rpId, origin, requireUserVerification: true }),
+			...(audit ? [allauthControl({ database: database.db, secret: fixtureSecret, baseURL: origin, ipHeader: "x-real-ip", requireTrustedIP: true }), featureBoundaries()] : []),
+		],
 	}, { disableTestUser: true });
 }
 
@@ -211,7 +223,7 @@ describe.skipIf(!existsSync(fixturePath))("project passkey PostgreSQL interopera
 			url.port !== "55445"
 		) throw new Error("Passkey interoperability requires the isolated PostgreSQL fixture.");
 		pool = new Pool({ connectionString: fixture.DATABASE_URL, max: 4 });
-		const migrations = ["001-initial-auth.sql", "002-control-plane.sql", "005-free-plugins.sql"].map((name) =>
+		const migrations = ["001-initial-auth.sql", "002-control-plane.sql", "004-webhooks.sql", "005-free-plugins.sql", "006-analytics.sql"].map((name) =>
 			readFileSync(new URL(`../../migrations/${name}`, import.meta.url), "utf8"));
 
 		for (const schema of [primary, other]) {
@@ -269,7 +281,226 @@ describe.skipIf(!existsSync(fixturePath))("project passkey PostgreSQL interopera
 		}
 	});
 
-	it("reads the exact native row format and preserves owner-scoped rename and delete", async () => {
+	it("matches signed native passkey registration, rename and deletion events", async () => {
+			if (!pool || !nativeDatabase)
+				throw new Error("Missing PostgreSQL fixture.");
+			const database = nativeDatabase.db;
+			const audited = await legacyFixture(nativeDatabase, true);
+			const browser = {
+				ipAddress: "192.0.2.65",
+				userAgent: "Synthetic passkey audit browser",
+			};
+			const candidate = createOwnedProjectEngine({
+				database: pool,
+				project: { slug: projectSlug, schemaName: primary },
+				baseURL: origin,
+				basePath: "/api/auth",
+				trustedOrigins: [],
+				signingSecret: fixtureSecret,
+				policy: defaultAuthPolicy,
+				trustedIP: (request) => request.headers.get("x-real-ip"),
+				passkeys: {
+					id: rpId,
+					name: "Passkey fixture",
+					origins: [origin],
+					requireUserVerification: true,
+				},
+			});
+			const endpoint = "https://passkey-webhook.fixture.example/receive";
+			const endpointId = randomUUID();
+			const signingKey = newWebhookSigningSecret();
+			await pool.query(
+				`INSERT INTO "${primary}"."allauthWebhookEndpoint" (id,url,"eventTypes","encryptedSecret") VALUES ($1,$2,'["passkey.*"]',$3)`,
+				[
+					endpointId,
+					endpoint,
+					await symmetricEncrypt({ key: fixtureSecret, data: signingKey }),
+				],
+			);
+			const cookie = headers.get("cookie")!;
+			const absent = "synthetic-missing-passkey";
+			const label = "Synthetic passkey label";
+			async function exercise(
+				dispatch: (request: Request) => Promise<Response>,
+				checkRollback = false,
+			) {
+				function send(operation: string, body?: object, session = cookie) {
+					return dispatch(
+						new Request(`${origin}/api/auth/passkey/${operation}`, {
+							method: body ? "POST" : "GET",
+							headers: {
+								origin,
+								cookie: session,
+								"x-real-ip": browser.ipAddress,
+								"user-agent": browser.userAgent,
+								...(body ? { "content-type": "application/json" } : {}),
+							},
+							body: body ? JSON.stringify(body) : undefined,
+						}),
+					);
+				}
+				const options = await send("generate-register-options");
+				expect(options.status).toBe(200);
+				const { challenge } = (await options.json()) as { challenge: string };
+				const proof = virtualCredential();
+				const response = proof.registration(challenge);
+				const request = { response, name: label };
+				expect((await send("verify-registration", request)).status).toBe(400);
+				const challengeCookie = options.headers
+					.getSetCookie()
+					.map((value) => value.split(";", 1)[0])
+					.join("; ");
+				const registered = await send(
+					"verify-registration",
+					request,
+					`${cookie}; ${challengeCookie}`,
+				);
+				expect(registered.status).toBe(200);
+				const { id } = (await registered.json()) as StoredProjectPasskey;
+				if (checkRollback) {
+					if (!pool) throw new Error("Missing PostgreSQL fixture.");
+					await pool.query(
+						`ALTER TABLE "${primary}"."allauthEvent" ADD CONSTRAINT test_passkey_event_failure CHECK (type<>'passkey.updated') NOT VALID`,
+					);
+					try {
+						await expect(
+							send("update-passkey", { id, name: "Rolled back passkey name" }),
+						).rejects.toThrow(/test_passkey_event_failure/);
+					} finally {
+						await pool.query(
+							`ALTER TABLE "${primary}"."allauthEvent" DROP CONSTRAINT test_passkey_event_failure`,
+						);
+					}
+					expect(
+						(await store.listForUser(ownerId)).find((row) => row.id === id)
+							?.name,
+					).toBe(label);
+				}
+				expect(
+					(await send("update-passkey", { id: absent, name: label })).status,
+				).toBe(404);
+				expect((await send("update-passkey", { id, name: label })).status).toBe(
+					200,
+				);
+				expect((await send("delete-passkey", { id }, "")).status).toBe(401);
+				expect((await send("delete-passkey", { id })).status).toBe(200);
+				expect((await send("delete-passkey", { id: absent })).status).toBe(404);
+				const delivered: Array<{
+					body: string;
+					headers: Record<string, string>;
+				}> = [];
+				expect(
+					await deliverPendingWebhooks({
+						database,
+						secret: fixtureSecret,
+						resolver: async () => [{ address: "93.184.216.34", family: 4 }],
+						now: () => new Date(Date.now() + 1_000),
+						maxDeliveries: 20,
+						transport: async ({ destination, body, headers }) => {
+							if (destination.url.href === endpoint)
+								delivered.push({ body, headers });
+							return 204;
+						},
+					}),
+				).toMatchObject({
+					claimed: delivered.length,
+					delivered: delivered.length,
+				});
+				const events = [];
+				for (const { body, headers } of delivered) {
+					expect(headers["webhook-signature"]).toBe(
+						await webhookSignature(
+							signingKey,
+							headers["webhook-id"],
+							headers["webhook-timestamp"],
+							body,
+						),
+					);
+					const envelope = JSON.parse(body) as ControlWebhookEnvelope;
+					expect(envelope.data.event).toMatchObject({
+						id: envelope.id,
+						type: envelope.type,
+						createdAt: envelope.timestamp,
+					});
+					expect(envelope.data.user).toBeUndefined();
+					for (const privateValue of [
+						proof.id,
+						label,
+						response.response.attestationObject,
+						cookie,
+						signingKey,
+					])
+						expect(body).not.toContain(privateValue);
+					const {
+						id: _id,
+						createdAt: _time,
+						targetId,
+						...event
+					} = envelope.data.event;
+					events.push({
+						...event,
+						...(targetId
+							? { targetId: targetId === id ? "credential-row" : targetId }
+							: {}),
+					});
+				}
+				return events.sort((a, b) =>
+					JSON.stringify(a).localeCompare(JSON.stringify(b)),
+				);
+			}
+			try {
+				const expected = await exercise((request) =>
+					audited.auth.handler(request),
+				);
+				expect(
+					expected.map(({ type, outcome }) => `${type}:${outcome}`).sort(),
+				).toEqual([
+					"passkey.deleted:failure",
+					"passkey.deleted:failure",
+					"passkey.deleted:success",
+					"passkey.registered:failure",
+					"passkey.registered:success",
+					"passkey.updated:failure",
+					"passkey.updated:success",
+				]);
+				expect(
+					await exercise((request) => candidate.dispatch(request), true),
+				).toEqual(expected);
+				const admissionIP = "192.0.2.66";
+				await pool.query(
+					`INSERT INTO "${primary}"."rateLimit" (id,key,count,"lastRequest") VALUES ($1,$2,99,$3)`,
+					[randomUUID(), `${admissionIP}|/passkey/delete-passkey`, Date.now()],
+				);
+				const repeat = () =>
+					new Request(`${origin}/api/auth/passkey/delete-passkey`, {
+						method: "POST",
+						headers: {
+							origin,
+							"x-real-ip": admissionIP,
+							"content-type": "application/json",
+						},
+						body: JSON.stringify({ id: absent }),
+					});
+				expect((await audited.auth.handler(repeat())).status).toBe(401);
+				const limit = await candidate.dispatch(repeat());
+				expect(limit.status).toBe(429);
+				expect(Number(limit.headers.get("X-Retry-After"))).toBeGreaterThan(0);
+				const {
+					rows: [queued],
+				} = await pool.query<{ total: number }>(
+					`SELECT count(*)::integer AS total FROM "${primary}"."allauthWebhookDelivery" WHERE "endpointId"=$1 AND status='pending'`,
+					[endpointId],
+				);
+				expect(queued?.total).toBe(1);
+			} finally {
+				await pool.query(
+					`DELETE FROM "${primary}"."allauthWebhookEndpoint" WHERE id=$1`,
+					[endpointId],
+				);
+			}
+		});
+
+		it("reads the exact native row format and preserves owner-scoped rename and delete", async () => {
 		const adapter = (await legacy.auth.$context).adapter;
 		const created = await adapter.create<Omit<StoredProjectPasskey, "id">, StoredProjectPasskey>({
 			model: "passkey",
