@@ -7,6 +7,7 @@ import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { defaultAuthPolicy } from "../auth-policy/policy";
 import { clerkCompatiblePasswords } from "../clerk-password";
+import { allauthControl } from "../control";
 import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
 import type { CompleteOwnedEmailVerification } from "./owned-email-verification";
 import { createOwnedRecoveryHttp } from "./owned-recovery-http";
@@ -35,10 +36,13 @@ async function legacyFixture(
 			basePath,
 			secret: signingSecret,
 			database: { db, type: "postgres" },
+			trustedOrigins: [appOrigin],
+			plugins: [allauthControl({ ipHeader: "x-real-ip" })],
 			emailAndPassword: {
 				enabled: true,
 				autoSignIn: false,
 				password: clerkCompatiblePasswords,
+				async sendResetPassword() {},
 			},
 			emailVerification: {
 				autoSignInAfterVerification: false,
@@ -159,6 +163,12 @@ describe.skipIf(!existsSync(fixturePath))(
 				trustedOrigins: [appOrigin],
 				resetCallbackURLs: [resetCallback],
 				verificationCallbackURLs: [verifyCallback],
+				auditContext(request) {
+					return {
+						ipAddress: request.headers.get("x-real-ip") ?? undefined,
+						userAgent: request.headers.get("user-agent") ?? undefined,
+					};
+				},
 				email: {
 					environment: {
 						EMAIL_FROM: "no-reply@recovery-fixture.example",
@@ -258,6 +268,59 @@ describe.skipIf(!existsSync(fixturePath))(
 			await expect(
 				native.auth.api.signInEmail({ body: { email, password: newPassword } }),
 			).resolves.toMatchObject({ user: { id: user.id } });
+		});
+
+		it("records uniform native password request audit outcomes for known and unknown addresses", async () => {
+			const addresses = [
+				"request-event@recovery-fixture.example",
+				"missing-request-event@recovery-fixture.example",
+			];
+			await seed(addresses[0]);
+			const events = async () =>
+				(
+					await database.query(
+						`SELECT id, type, outcome, "actorId", "userId", "targetId", metadata,
+					 "ipAddress", "userAgent" FROM "${schema}"."allauthEvent"
+					 WHERE type='user.password-reset-requested' ORDER BY "createdAt", id`,
+					)
+				).rows;
+			const before = new Set((await events()).map((event) => event.id));
+			const headers = {
+				origin: appOrigin,
+				"user-agent": "synthetic-recovery-client",
+				"x-real-ip": "192.0.2.38",
+			};
+			for (const email of addresses) {
+				const nativeResponse = await native.auth.api.requestPasswordReset({
+					body: { email, redirectTo: resetCallback },
+					headers,
+					asResponse: true,
+				});
+				expect(nativeResponse.status).toBe(200);
+			}
+			const nativeEvents = (await events()).filter(
+				(event) => !before.has(event.id),
+			);
+			expect(nativeEvents).toHaveLength(2);
+			for (const event of nativeEvents) before.add(event.id);
+
+			const recovery = fixture();
+			for (const email of addresses) {
+				const pending = post("/request-password-reset", {
+					email,
+					redirectTo: resetCallback,
+				});
+				for (const [name, value] of Object.entries(headers))
+					pending.headers.set(name, value);
+				expect((await recovery.handler(pending))?.status).toBe(200);
+			}
+			await recovery.flush();
+			const ownedEvents = (await events()).filter(
+				(event) => !before.has(event.id),
+			);
+			expect(ownedEvents.map(({ id, ...event }) => event)).toEqual(
+				nativeEvents.map(({ id, ...event }) => event),
+			);
 		});
 
 		it("blocks unapproved origins and callback paths before queuing, and applies admission", async () => {

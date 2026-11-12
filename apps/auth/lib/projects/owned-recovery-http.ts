@@ -4,6 +4,7 @@ import * as z from "zod";
 import type { AuthPolicy } from "../auth-policy/policy";
 import { authPolicySchema } from "../auth-policy/policy";
 import type { ApplicationBranding } from "../branding/types";
+import type { ControlEventInput } from "../control/types";
 import { authenticationEmail } from "../email/authentication";
 import type { EmailEnvironment } from "../email/send";
 import { emailConfigured, sendAuthEmail } from "../email/send";
@@ -53,6 +54,9 @@ export interface RecoveryHttpOptions {
 	resetCallbackURLs: readonly string[];
 	verificationCallbackURLs: readonly string[];
 	callbackPolicy?: OwnedEmailCallbackPolicy;
+	auditContext?(
+		request: Request,
+	): Pick<ControlEventInput, "ipAddress" | "userAgent">;
 	email: { environment: EmailEnvironment; branding?: ApplicationBranding };
 	checkPasswordSafety: Parameters<
 		typeof createOwnedPasswordReset
@@ -297,14 +301,6 @@ export function createOwnedRecoveryHttp(options: RecoveryHttpOptions) {
 				VALUES ($1, $2, $3, statement_timestamp() + interval '1 hour')`,
 				[randomUUID(), `reset-password:${token}`, user.id],
 			);
-			await store.record(
-				client,
-				"user.password-reset-requested",
-				"success",
-				"/request-password-reset",
-				user.id,
-				user.id,
-			);
 			return { user, link: emailURL(`/reset-password/${token}`, destination) };
 		});
 		if (!message) return;
@@ -391,6 +387,16 @@ export function createOwnedRecoveryHttp(options: RecoveryHttpOptions) {
 				503,
 				"EMAIL_DELIVERY_UNAVAILABLE",
 				"Authentication email is unavailable.",
+			);
+		}
+		if (isReset) {
+			await store.transaction((client) =>
+				store.recordEvent(client, {
+					type: "user.password-reset-requested",
+					outcome: "success",
+					...options.auditContext?.(request),
+					metadata: { path: "/request-password-reset" },
+				}),
 			);
 		}
 		return json(

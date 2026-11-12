@@ -269,6 +269,7 @@ interface OwnedProjectEngineOptions {
 		| "baseURL"
 		| "basePath"
 		| "trustedOrigins"
+		| "auditContext"
 		| "completeVerification"
 	>;
 	/** Only an already authenticated ingress may supply the client IP. */
@@ -1790,6 +1791,7 @@ export function createOwnedProjectEngine(
 			baseURL: origin,
 			basePath: options.basePath,
 			trustedOrigins: options.trustedOrigins,
+			auditContext: browserEventContext,
 			async admit(request, operation, email) {
 				if (
 					operation === "request-password-reset" ||
