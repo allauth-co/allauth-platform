@@ -50,7 +50,18 @@ export function productionTwoFactor(origin: string, challengePath = "/two-factor
 							const continuation = applicationMfaCallback(location, origin, ctx.context.options.basePath);
 							if (continuation) target = appendQueryParams(target, new URLSearchParams({ callbackUrl: continuation }));
 						} else if (callback.origin === origin && (/^\/(account|organizations|accept-invitation|device)(\/|$)/.test(callback.pathname) || (["/admin/workspaces", "/console"].includes(callback.pathname) && !callback.hash))) {
-							target = appendQueryParams(target, new URLSearchParams({ callbackUrl: `${callback.pathname}${callback.search}` }));
+							const hostedAccountFragment =
+								ctx.path === "/magic-link/verify" &&
+								browserChallenge.origin === origin &&
+								browserChallenge.pathname === "/two-factor" &&
+								ctx.context.options.advanced?.cookiePrefix?.startsWith("allauth_project_") &&
+								/^\/account(?:\/|$)/.test(callback.pathname) &&
+								callback.hash !== "";
+							const preserved = hostedAccountFragment
+								? applicationMfaCallback(location, origin, ctx.context.options.basePath)
+								: undefined;
+							const continuation = preserved ?? `${callback.pathname}${callback.search}`;
+							target = appendQueryParams(target, new URLSearchParams({ callbackUrl: continuation }));
 						}
 					}
 					throw ctx.redirect(target);

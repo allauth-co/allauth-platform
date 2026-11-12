@@ -1,12 +1,13 @@
 import { authOrigin } from "@/lib/configuration";
 import { edgeHeaders } from "@/lib/domains/edge";
+import { hostedSdkMagicLinkRequests } from "@/lib/domains/hosted-magic-link-requests";
+import { hostedScimConsoleRequest } from "@/lib/domains/hosted-scim-console";
 import { hostedSdkEndpoint } from "@/lib/domains/hosted-sdk-policy";
-import { hostedSdkTransportEnabled } from "@/lib/domains/hosted-sdk-selection";
 import {
 	hostedSdkFailure,
 	hostedSdkResponse,
 } from "@/lib/domains/hosted-sdk-response";
-import { hostedScimConsoleRequest } from "@/lib/domains/hosted-scim-console";
+import { hostedSdkTransportEnabled } from "@/lib/domains/hosted-sdk-selection";
 import { withPortalAuthEngine } from "@/lib/domains/hosting";
 import { isProjectWriterUnavailable } from "@/lib/projects/project-engine-unavailable";
 import { scimConsoleRoute } from "@/lib/scim-management";
@@ -97,6 +98,8 @@ async function handle(request: Request) {
 			body: bound.body,
 			duplex: "half",
 		} as RequestInit);
+		if (endpoint === "sign-in/magic-link")
+			hostedSdkMagicLinkRequests.add(nativeRequest);
 		return hostedSdkResponse(
 			await engine.dispatch(nativeRequest),
 			endpoint,

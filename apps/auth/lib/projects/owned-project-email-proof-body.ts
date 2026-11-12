@@ -12,6 +12,7 @@ export function readSharedProjectEmailOtpBody(request: Request) {
 /** Read bounded JSON or form proof fields without collapsing duplicates. */
 export async function readProjectEmailProofBody(
 	request: Pick<Request, "headers" | "body">,
+	maximumBytes = 8192,
 ): Promise<unknown> {
 	const mime = request.headers
 		.get("content-type")
@@ -35,7 +36,7 @@ export async function readProjectEmailProofBody(
 			const { done, value } = await reader.read();
 			if (done) break;
 			length += value.byteLength;
-			if (length > 8192) {
+			if (length > maximumBytes) {
 				void reader.cancel().catch(() => {});
 				return undefined;
 			}

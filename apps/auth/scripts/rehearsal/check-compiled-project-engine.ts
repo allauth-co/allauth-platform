@@ -10,7 +10,10 @@ import { createLocalJWKSet, jwtVerify } from "jose";
 import { defaultAuthPolicy } from "../../lib/auth-policy/policy";
 import { clerkCompatiblePasswords } from "../../lib/clerk-password";
 import { signEdgeRequest } from "../../lib/domains/edge";
+import { hostedMagicLinkCallbacks } from "../../lib/domains/hosted-sdk-policy";
 import { projectEmailAliasVariable } from "../../lib/project-email-alias-config";
+import { signProjectIssuerQuery } from "../../lib/projects/owned-project-issuer-authorization-query";
+import { projectSecret } from "../../lib/projects/project-secret";
 import { platformWorkspaceId } from "../../lib/workspaces/types";
 import {
 	developmentAgentReplayBridgeIdsSetting,
@@ -313,6 +316,7 @@ async function startConnectedApplication(realm: Realm, cookie: string) {
 	});
 	assert.ok(grant.keyId);
 	return {
+		queryString,
 		async rotate() {
 			const updated = await exchange({ grant_type: "refresh_token", refresh_token: grant.refresh });
 			assert.equal(updated.keyId, grant.keyId, "The project issuer retains the signing key.");
@@ -330,6 +334,7 @@ async function startConfiguredWebhook(realm: Realm, cookie: string) {
 		...defaultAuthPolicy,
 		mfaMode: "optional" as const,
 		requireEmailVerification: false,
+		signUpEnabled: false,
 	};
 	const policy = JSON.stringify(fixturePolicy).replaceAll("'", "''");
 	await query(source, `
@@ -595,7 +600,7 @@ try {
 					await docker(
 						"exec",
 						database,
-						"pg_isready",
+						"pg_isready", // cspell:ignore isready
 						"-h",
 						"127.0.0.1",
 						"-d",
@@ -887,6 +892,36 @@ try {
 			200,
 			"The selected realm uses the first-party hosted API.",
 		);
+		if (!railway && connected) {
+			const authorization = new URLSearchParams(connected.queryString);
+			authorization.set("state", `${"signed-application-state".repeat(171)}+one&two`);
+			const secret = projectSecret({ ALLAUTH_AUTH_SECRET: authSecret }, owned.id);
+			const destination = `/oauth2/continue?${signProjectIssuerQuery(authorization, secret)}`;
+			const body = {
+				email: "unregistered@project-engine-rehearsal.invalid",
+				...hostedMagicLinkCallbacks(destination, `https://${host}`),
+			};
+			assert.ok(Buffer.byteLength(JSON.stringify(body)) > 8192);
+			expectStatus(
+				await request("/api/auth/hosted-ui/sign-in/magic-link", {
+					host,
+					body,
+					accept: "application/json",
+				}),
+				200,
+				"The compiled hosted route accepts the long signed browser continuation.",
+			);
+			expectStatus(
+				await request("/api/auth/sign-in/magic-link", { host, body }),
+				400,
+				"The standard project route retains the existing request limit.",
+			);
+			const schema = `allauth_project_${owned.id.replaceAll("-", "")}`;
+			assert.equal(
+				await query(restored, `SELECT count(*) FROM "${schema}"."verification" WHERE identifier LIKE 'magic-link:%'`),
+				"0",
+			);
+		}
 	} else {
 		await start(rehearsalImage, restored, selected);
 	}

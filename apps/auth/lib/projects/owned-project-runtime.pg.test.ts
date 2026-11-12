@@ -8,7 +8,8 @@ import {
 } from "node:crypto";
 import { once } from "node:events";
 import { existsSync, readFileSync } from "node:fs";
-import { get as httpGet, type IncomingMessage } from "node:http";
+import type { IncomingMessage } from "node:http";
+import { get as httpGet } from "node:http";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { symmetricDecrypt, symmetricEncrypt } from "better-auth/crypto";
@@ -51,7 +52,7 @@ import { signEdgeRequest } from "../domains/edge";
 import { googleProviderRepository } from "../project-providers/repository";
 import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
 import { platformWorkspaceId } from "../workspaces/types";
-import { openLegacyMfaRecord } from "./legacy-mfa-record";
+import { openLegacyMfaRecord, sealLegacyMfaRecord } from "./legacy-mfa-record";
 import { readLegacyProjectKeyring } from "./legacy-project-keyring";
 import { signProjectIssuerQuery } from "./owned-project-issuer-authorization-query";
 import { projectOpenApiPath } from "./owned-project-openapi";
@@ -486,7 +487,7 @@ async function openProcess(
 
 const oauthVerifier = "runtime-restart-fixture-project-issuer-proof-verifier";
 
-function fixtureAuthorizationQuery(state = randomUUID()) {
+function fixtureAuthorizationQuery(state: string = randomUUID()) {
 	return new URLSearchParams({
 		response_type: "code",
 		client_id: oauthClientId,
@@ -6044,20 +6045,35 @@ describe.skipIf(!existsSync(fixture))(
 					EMAIL_FROM: "magic-links@runtime.fixture.example",
 				};
 				service = await openProcess(databaseURL, alpha, true, alpha.slug, undefined, undefined, rollout);
-				async function issue(host: string, destination: string, email: string, standard = false) {
+				function form(
+					host: string,
+					destination: string,
+					email: string,
+					standard = false,
+				) {
 					const origin = `https://${host}`;
 					const error = new URL("/auth-error", origin);
 					if (!standard) error.searchParams.set("callbackUrl", destination);
+					return {
+						email,
+						callbackURL: new URL(destination, origin).href,
+						errorCallbackURL: error.href.replaceAll("%", "%25"),
+					};
+				}
+				async function issue(
+					host: string,
+					destination: string,
+					email: string,
+					standard = false,
+					clientIP?: string,
+				) {
 					const previous = service!.mail.length;
 					const path = standard ? "/api/auth/sign-in/magic-link" : "/api/auth/hosted-ui/sign-in/magic-link";
 					const response = await service!.request(path, {
 						host,
+						clientIP,
 						accept: "application/json",
-						body: {
-							email,
-							callbackURL: new URL(destination, origin).href,
-							errorCallbackURL: error.href.replaceAll("%", "%25"),
-						},
+						body: form(host, destination, email, standard),
 					});
 					expect(response.status, await response.clone().text()).toBe(200);
 					return vi.waitFor(() => {
@@ -6065,7 +6081,7 @@ describe.skipIf(!existsSync(fixture))(
 						const link = mail?.text.match(/https:\/\/[^\s<>\]]+\/magic-link\/verify\?[^\s<>\]]+/)?.[0];
 						expect(link).toBeDefined();
 						const url = new URL(link!);
-						expect(url.origin).toBe(origin);
+						expect(url.origin).toBe(`https://${host}`);
 						return url;
 					});
 				}
@@ -6095,6 +6111,108 @@ describe.skipIf(!existsSync(fixture))(
 				const continued = await service.request(authorization.pathname + authorization.search, { host: customHost });
 				expect(continued.status).toBe(302);
 				expect(continued.headers.get("location")).toBe(`https://${customHost}${signedDestination}`);
+				const longState = `${"signed-application-state".repeat(171)}+one&two`;
+				const longDestination = `/oauth2/continue?${signProjectIssuerQuery(
+					fixtureAuthorizationQuery(longState),
+					versionedSigningSecret,
+				)}`;
+				const longBody = form(customHost, longDestination, credentials.project.email);
+				expect(longBody.callbackURL.length).toBeGreaterThan(2048);
+				expect(longBody.errorCallbackURL.length).toBeGreaterThan(2048);
+				expect(Buffer.byteLength(JSON.stringify(longBody))).toBeGreaterThan(8192);
+				const direct = await service.request(
+					`/api/projects/${alpha.slug}/auth/sign-in/magic-link`,
+					{ body: longBody },
+				);
+				expect(direct.status).toBe(400);
+				expect(await direct.json()).toMatchObject({ code: "INVALID_BODY" });
+				const standardLong = await service.request("/api/auth/sign-in/magic-link", {
+					host: customHost,
+					body: longBody,
+				});
+				expect(standardLong.status).toBe(400);
+				const oversized = `/oauth2/continue?${signProjectIssuerQuery(
+					fixtureAuthorizationQuery("a".repeat(8100)),
+					versionedSigningSecret,
+				)}`;
+				const oversizedBody = form(customHost, oversized, credentials.project.email);
+				const verificationCount = async () =>
+					(await database!.query<{ count: string }>(
+						`SELECT count(*) FROM "${alpha.schemaName}"."verification" WHERE identifier LIKE 'magic-link:%'`,
+					)).rows[0]!.count;
+				const beforeOversized = await verificationCount();
+				const oversizedResponse = await service.request("/api/auth/hosted-ui/sign-in/magic-link", {
+					host: customHost,
+					accept: "application/json",
+					clientIP: "192.0.2.80",
+					body: oversizedBody,
+				});
+				expect(oversizedResponse.status).toBe(403);
+				expect(await verificationCount()).toBe(beforeOversized);
+				const tampered = new URL(longBody.callbackURL);
+				tampered.searchParams.set("state", `${longState}-modified`);
+				const tamperedResponse = await service.request("/api/auth/hosted-ui/sign-in/magic-link", {
+					host: customHost,
+					accept: "application/json",
+					clientIP: "192.0.2.81",
+					body: form(customHost, tampered.pathname + tampered.search, credentials.project.email),
+				});
+				expect(tamperedResponse.status).toBe(403);
+				expect(await verificationCount()).toBe(beforeOversized);
+				const long = await issue(customHost, longDestination, credentials.project.email, false, "192.0.2.82");
+				const continuedLong = await service.request(long.pathname + long.search, {
+					host: customHost,
+					clientIP: "192.0.2.82",
+				});
+				expect(continuedLong.status).toBe(302);
+				expect(continuedLong.headers.get("location")).toBe(longBody.callbackURL);
+				expect(cookie(continuedLong)).toContain(".session_token=");
+				const pendingLong = await issue(customHost, longDestination, credentials.realmAdmin.email, false, "192.0.2.83");
+				const recoveryCode = "test0-12345";
+				const { encryptionKeys } = readLegacyProjectKeyring(
+					projectSecret(childEnvironment(), alpha.id),
+					versionedEncryption,
+				);
+				await database.query(
+					`INSERT INTO "${alpha.schemaName}"."twoFactor" (id,secret,"backupCodes","userId",verified)
+					 VALUES ($1,$2,$3,$4,TRUE)`,
+					[
+						randomUUID(),
+						sealLegacyMfaRecord("isolated-runtime-totp-secret", encryptionKeys),
+						sealLegacyMfaRecord(JSON.stringify([recoveryCode]), encryptionKeys),
+						credentials.project.id,
+					],
+				);
+				await database.query(
+					`UPDATE "${alpha.schemaName}"."user" SET "twoFactorEnabled"=TRUE WHERE id=$1`,
+					[credentials.project.id],
+				);
+				const mfaTransport = { host: customHost, clientIP: "192.0.2.84" };
+				const mfaLink = await issue(
+					customHost,
+					longDestination,
+					credentials.project.email,
+					false,
+					mfaTransport.clientIP,
+				);
+				const challenge = await service.request(mfaLink.pathname + mfaLink.search, mfaTransport);
+				expect(challenge.status).toBe(302);
+				expect(challenge.headers.get("location")).toBe(
+					`https://${customHost}/two-factor?${new URLSearchParams({ callbackUrl: longDestination })}`,
+				);
+				expect(cookie(challenge)).toContain(".two_factor=");
+				expect(cookie(challenge)).not.toContain(".session_token=");
+				const completedMfa = await service.request(
+					"/api/auth/hosted-ui/two-factor/verify-backup-code",
+					{
+						...mfaTransport,
+						accept: "application/json",
+						cookie: cookie(challenge),
+						body: { code: recoveryCode },
+					},
+				);
+				expect(completedMfa.status, await completedMfa.clone().text()).toBe(200);
+				expect(cookie(completedMfa)).toContain(".session_token=");
 				await service.stop();
 				service = undefined;
 				service = await openProcess(databaseURL, alpha, false, alpha.slug, undefined, undefined, rollout);
@@ -6102,6 +6220,13 @@ describe.skipIf(!existsSync(fixture))(
 				expect(rolledBack.status).toBe(302);
 				expect(rolledBack.headers.get("location")).toBe(`https://${customHost}${customDestination}`);
 				expect(cookie(rolledBack)).toContain(".session_token=");
+				const continuedAfterRollback = await service.request(
+					pendingLong.pathname + pendingLong.search,
+					{ host: customHost, clientIP: "192.0.2.83" },
+				);
+				expect(continuedAfterRollback.status).toBe(302);
+				expect(continuedAfterRollback.headers.get("location")).toBe(longBody.callbackURL);
+				expect(cookie(continuedAfterRollback)).toContain(".session_token=");
 			} finally {
 				try {
 					await service?.stop();

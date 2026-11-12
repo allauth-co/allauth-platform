@@ -4,15 +4,19 @@ import type { AuthPolicy } from "../auth-policy/policy";
 import { authPolicySchema } from "../auth-policy/policy";
 import { validAvatarPath } from "../avatars/protocol";
 import type { ApplicationBranding } from "../branding/types";
+import { hostedSdkMagicLinkRequests } from "../domains/hosted-magic-link-requests";
 import { hostedMagicLinkCallbacks } from "../domains/hosted-sdk-policy";
 import { authenticationEmail } from "../email/authentication";
 import type { EmailEnvironment } from "../email/send";
 import { emailConfigured, sendAuthEmail } from "../email/send";
-import type { OwnedEmailCallbackPolicy } from "./owned-project-email-callback";
 import type { OwnedProjectEmailAliases } from "./owned-project-email-aliases";
+import type { OwnedEmailCallbackPolicy } from "./owned-project-email-callback";
 import { scheduleOwnedEmailDelivery } from "./owned-project-email-delivery";
 import type { ProjectEmailOtpVerificationOperation } from "./owned-project-email-otp-verification";
-import { readProjectEmailProofBody, readSharedProjectEmailOtpBody } from "./owned-project-email-proof-body";
+import {
+	readProjectEmailProofBody,
+	readSharedProjectEmailOtpBody,
+} from "./owned-project-email-proof-body";
 import type { CompleteProjectEmailSignIn } from "./owned-project-email-sign-in-store";
 import { createProjectEmailSignInStore } from "./owned-project-email-sign-in-store";
 import type { Project } from "./registry";
@@ -20,13 +24,24 @@ import type { SessionCheckAdmission } from "./session-introspection-admission";
 import { projectOrigin, projectSlug } from "./validation";
 
 const email = z.email().max(320);
-const callback = z.string().max(2048).optional();
+const maximumCallbackLength = 2048;
+const maximumHostedProofBytes = 32_768;
+const maximumHostedVerificationURLLength = 16_384;
+const callback = z.string().max(maximumCallbackLength).optional();
 const magicInput = z.object({
 	email,
 	name: z.string().max(256).optional(),
 	callbackURL: callback,
 	newUserCallbackURL: callback,
 	errorCallbackURL: callback,
+});
+const hostedMagicCallback = z
+	.string()
+	.max(maximumHostedVerificationURLLength)
+	.optional();
+const hostedMagicInput = magicInput.extend({
+	callbackURL: hostedMagicCallback,
+	errorCallbackURL: hostedMagicCallback,
 });
 type MagicCallbackInput = Pick<
 	z.infer<typeof magicInput>,
@@ -117,10 +132,14 @@ function unsupported() {
 	);
 }
 
-function normalizeURL(value: string, origin: string) {
+function normalizeURL(
+	value: string,
+	origin: string,
+	maximumLength = maximumCallbackLength,
+) {
 	if (
 		!value ||
-		value.length > 2048 ||
+		value.length > maximumLength ||
 		value.startsWith("//") ||
 		/[\\\u0000-\u0020\u007f]/.test(value)
 	)
@@ -177,6 +196,26 @@ export function createOwnedProjectEmailSignIn(
 	if (!approved.length)
 		throw new Error("An explicit project magic link callback is required.");
 	const policy = authPolicySchema.parse(options.policy);
+
+	function allowsExtendedMagicMfaRedirect(target: URL, callback: string) {
+		if (
+			options.basePath !== "/api/auth" ||
+			!options.hostedCallbackPolicy ||
+			target.origin !== linkOrigin ||
+			target.pathname !== "/two-factor" ||
+			target.searchParams.size !== 1
+		)
+			return false;
+		const continuation = new URL(callback);
+		return (
+			continuation.pathname === "/oauth2/continue" &&
+			target.searchParams.get("callbackUrl") ===
+				`${continuation.pathname}?${continuation.searchParams}` &&
+			options.hostedCallbackPolicy(continuation, "hosted-magic-link", "consume")
+				?.url.href === continuation.href
+		);
+	}
+
 	const store = createProjectEmailSignInStore({
 		...options,
 		schemaName: options.project.schemaName,
@@ -185,8 +224,20 @@ export function createOwnedProjectEmailSignIn(
 			const response = await options.completeSignIn(input);
 			const location = response.headers.get("location");
 			if (location) {
-				const target = normalizeURL(location, linkOrigin);
+				const extended = location.length > maximumCallbackLength;
+				const target = normalizeURL(
+					location,
+					linkOrigin,
+					extended ? maximumHostedVerificationURLLength : maximumCallbackLength,
+				);
 				if (!target || !origins.has(target.origin)) return forbidden();
+				if (
+					extended &&
+					(input.path !== "/magic-link/verify" ||
+						!input.callbackURL ||
+						!allowsExtendedMagicMfaRedirect(target, input.callbackURL))
+				)
+					return forbidden();
 			}
 			return response;
 		},
@@ -214,27 +265,45 @@ export function createOwnedProjectEmailSignIn(
 			!input.callbackURL ||
 			!input.errorCallbackURL ||
 			input.newUserCallbackURL !== undefined ||
+			input.callbackURL.length > maximumHostedVerificationURLLength ||
+			input.errorCallbackURL.length > maximumHostedVerificationURLLength ||
 			input.callbackURL.startsWith("//") ||
 			/[\\\u0000-\u0020\u007f]/.test(input.callbackURL)
 		)
 			return null;
 		try {
 			const target = new URL(input.callbackURL, origin);
-			const checked = options.hostedCallbackPolicy(target, "verification", phase);
-			if (!checked) return null;
+			const extended =
+				target.href.length > maximumCallbackLength ||
+				input.callbackURL.length > maximumCallbackLength ||
+				input.errorCallbackURL.length > maximumCallbackLength;
+			if (extended && target.pathname !== "/oauth2/continue") return null;
 			const error = normalizeURL(
 				decodeURIComponent(input.errorCallbackURL),
 				origin,
+				extended ? maximumHostedVerificationURLLength : maximumCallbackLength,
 			);
 			if (error?.origin !== origin || error.pathname !== "/auth-error")
 				return null;
 			// The standard form uses a bare error URL. The hosted form carries the
 			// same checked destination in both callback fields.
 			const wire = error.search
-				? hostedMagicLinkCallbacks(`${target.pathname}${target.search}${target.hash}`, origin)
+				? hostedMagicLinkCallbacks(
+						`${target.pathname}${target.search}${target.hash}`,
+						origin,
+					)
 				: { callbackURL: target.href, errorCallbackURL: error.href };
-			if (error.search && input.errorCallbackURL !== wire.errorCallbackURL)
+			if (
+				(error.search && input.errorCallbackURL !== wire.errorCallbackURL) ||
+				(extended && (!error.search || input.callbackURL !== wire.callbackURL))
+			)
 				return null;
+			const checked = options.hostedCallbackPolicy(
+				target,
+				extended ? "hosted-magic-link" : "verification",
+				phase,
+			);
+			if (!checked) return null;
 			if (checked.expiredContinuation && error.search)
 				error.searchParams.set("callbackUrl", checked.url.pathname);
 			return { destination: checked.url, created: checked.url, error, wire };
@@ -319,18 +388,37 @@ export function createOwnedProjectEmailSignIn(
 		return options.emailAliases ? options.emailAliases.resolve(address) : { email: address };
 	}
 
-	async function proofBody(request: Request) {
-		const raw = await readProjectEmailProofBody(request);
+	async function proofBody(request: Request, maximumBytes?: number) {
+		const raw = await readProjectEmailProofBody(request, maximumBytes);
 		return options.emailAliases?.normalizeInput(raw) ?? raw;
 	}
 
 	async function sendMagic(request: Request, caller: string) {
-		const parsed = magicInput.safeParse(await proofBody(request));
+		const hostedForm =
+			options.basePath === "/api/auth" &&
+			options.hostedCallbackPolicy &&
+			hostedSdkMagicLinkRequests.has(request);
+		const parsed = (hostedForm ? hostedMagicInput : magicInput).safeParse(
+			await proofBody(
+				request,
+				hostedForm ? maximumHostedProofBytes : undefined,
+			),
+		);
 		if (!parsed.success)
 			return failure(400, "INVALID_BODY", "Supply a valid email address.");
 		const body = parsed.data;
 		const callbacks = magicCallbacks(body, caller, "issue");
 		if (!callbacks) return forbidden();
+		const url = new URL(`${linkPath}/magic-link/verify`, linkOrigin);
+		// Check the encoded email URL before creating the 32-character challenge.
+		url.searchParams.set("token", "a".repeat(32));
+		url.searchParams.set("callbackURL", callbacks.wire.callbackURL);
+		if (body.newUserCallbackURL)
+			url.searchParams.set("newUserCallbackURL", callbacks.created.href);
+		if (body.errorCallbackURL)
+			url.searchParams.set("errorCallbackURL", callbacks.wire.errorCallbackURL);
+		if (hostedForm && url.href.length > maximumHostedVerificationURLLength)
+			return forbidden();
 		const identity = await resolveEmail(body.email);
 		if (!identity) return invalidAlias();
 		const limited = await admission(request, "sign-in/magic-link", identity.email);
@@ -338,13 +426,7 @@ export function createOwnedProjectEmailSignIn(
 		const scheduled = await schedule("sign-in/magic-link", async () => {
 			const token = await store.issueMagic({ ...identity, name: body.name });
 			if (!token) return null;
-			const url = new URL(`${linkPath}/magic-link/verify`, linkOrigin);
 			url.searchParams.set("token", token);
-			url.searchParams.set("callbackURL", callbacks.wire.callbackURL);
-			if (body.newUserCallbackURL)
-				url.searchParams.set("newUserCallbackURL", callbacks.created.href);
-			if (body.errorCallbackURL)
-				url.searchParams.set("errorCallbackURL", callbacks.wire.errorCallbackURL);
 			return () =>
 				sendAuthEmail(options.email.environment, {
 					to: identity.email,

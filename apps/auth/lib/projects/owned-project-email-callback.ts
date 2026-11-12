@@ -5,7 +5,7 @@ import {
 } from "./owned-project-issuer-authorization-query";
 import { projectOrigin } from "./validation";
 
-type CallbackFlow = "verification" | "password-reset";
+type CallbackFlow = "verification" | "password-reset" | "hosted-magic-link";
 type CallbackPhase = "issue" | "consume";
 
 export type OwnedEmailCallbackPolicy = (
@@ -27,12 +27,13 @@ export function createOwnedProjectEmailCallbackPolicy(options: {
 	const authPath = new URL(options.publicLinkBaseURL).pathname;
 	const account = `${origin}/account`;
 
-	function local(target: URL, phase: CallbackPhase) {
+	function local(target: URL, phase: CallbackPhase, hostedMagic = false) {
 		if (
 			target.origin !== origin ||
 			target.username ||
 			target.password ||
-			target.href.length > 2048 ||
+			(target.href.length > 2048 &&
+				(!hostedMagic || target.pathname !== "/oauth2/continue")) ||
 			target.searchParams.has("token") ||
 			target.searchParams.has("error")
 		)
@@ -67,6 +68,7 @@ export function createOwnedProjectEmailCallbackPolicy(options: {
 
 	return (target, flow, phase) => {
 		if (flow === "verification") return local(target, phase);
+		if (flow === "hosted-magic-link") return local(target, phase, true);
 		if (
 			target.origin !== origin ||
 			target.username ||
