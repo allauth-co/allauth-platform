@@ -293,6 +293,17 @@ describe.skipIf(!existsSync(fixturePath))("isolated PostgreSQL owned project eng
 				expect(JSON.parse(replacementBody)).toEqual(JSON.parse(originalBody));
 				return JSON.parse(replacementBody) as Record<string, unknown>;
 			};
+			for (const [path, method, body] of [
+				["/admin/oauth2/create-client", "POST", { client_name: "Fixture application" }],
+				["/admin/oauth2/update-client", "PATCH", { client_id: "fixture", update: {} }],
+			] as const) {
+				const input = () => new Request(request(path, body, { cookie: active.cookie }), { method });
+				const nativeResponse = await native.handler(input());
+				const ownedResponse = await candidate.dispatch(input());
+				expect(nativeResponse.status).toBe(404);
+				expect(ownedResponse.status).toBe(404);
+				expect(await ownedResponse.text()).toBe(await nativeResponse.text());
+			}
 			const target = `/admin/get-user?id=${member}`;
 			const result = await compare(target, undefined, active.cookie);
 			expect(result).toMatchObject({

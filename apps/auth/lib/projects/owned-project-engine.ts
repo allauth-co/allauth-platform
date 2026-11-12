@@ -2698,6 +2698,9 @@ export function createOwnedProjectEngine(
 		)
 			return forbidden();
 		const path = url.pathname.slice(options.basePath.length);
+		// These management methods are internal calls on the shared platform broker.
+		if (path === "/admin/oauth2/create-client" || path === "/admin/oauth2/update-client")
+			return new Response(null, { status: 404 });
 		if (
 			options.openApi &&
 			(path === projectOpenApiPath || path === "/reference")
