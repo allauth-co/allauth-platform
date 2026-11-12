@@ -1597,7 +1597,7 @@ describe.skipIf(!existsSync(fixturePath))(
 				kid: "linked-profile-key",
 				alg: "RS256",
 			};
-			const sign = (name: string) =>
+			const sign = (name: string, kid = jwk.kid) =>
 				new SignJWT({
 					name,
 					email: "provider-profile@fixture.example",
@@ -1605,7 +1605,7 @@ describe.skipIf(!existsSync(fixturePath))(
 					username: "fixture-link",
 					fixtureSecret: "never-return-raw-claims",
 				})
-					.setProtectedHeader({ alg: "RS256", kid: jwk.kid })
+					.setProtectedHeader({ alg: "RS256", kid })
 					.setIssuer("accounts.google.com")
 					.setAudience(google.clientId)
 					.setSubject(account.accountId)
@@ -1629,6 +1629,7 @@ describe.skipIf(!existsSync(fixturePath))(
 					oldRefresh,
 				],
 			);
+			let keyPublicationDelayed = false;
 			const fetch = vi.fn(
 				async (input: URL | RequestInfo, init?: RequestInit) => {
 					const request = new Request(input, init);
@@ -1638,14 +1639,24 @@ describe.skipIf(!existsSync(fixturePath))(
 					expect(request.redirect).toBe("error");
 					const params = new URLSearchParams(await request.text());
 					expect(params.get("grant_type")).toBe("refresh_token");
-					expect(params.get("refresh_token")).toBe("fixture-old-refresh-grant");
+					expect(params.get("refresh_token")).toBe(
+						keyPublicationDelayed
+							? "fixture-rotated-refresh"
+							: "fixture-old-refresh-grant",
+					);
 					expect(params.get("client_id")).toBe(google.clientId);
 					return Response.json({
 						token_type: "Bearer",
-						access_token: "fixture-rotated-access",
-						refresh_token: "fixture-rotated-refresh",
+						access_token: keyPublicationDelayed
+							? "fixture-replacement-access"
+							: "fixture-rotated-access",
+						refresh_token: keyPublicationDelayed
+							? "fixture-replacement-refresh"
+							: "fixture-rotated-refresh",
 						expires_in: 600,
-						id_token: await sign("Rotated linked profile"),
+						id_token: keyPublicationDelayed
+							? await sign("Unverified new profile", "unpublished-key")
+							: await sign("Rotated linked profile"),
 					});
 				},
 			);
@@ -1746,6 +1757,38 @@ describe.skipIf(!existsSync(fixturePath))(
 				expect(await (await native.handler(request)).json()).toMatchObject({
 					user: { name: "Rotated linked profile" },
 					account: { id: account.id },
+				});
+				keyPublicationDelayed = true;
+				await database.query(
+					`UPDATE "${schema}"."account" SET "accessTokenExpiresAt"=now()-interval '1 second' WHERE id=$1`,
+					[account.id],
+				);
+				const usable = await candidate.accountInfo(request);
+				expect(usable.status).toBe(200);
+				expect(await usable.json()).toMatchObject({
+					user: { name: "Rotated linked profile" },
+				});
+				const replacement = await database.query<{
+					accessToken: string;
+					refreshToken: string;
+				}>(
+					`SELECT "accessToken","refreshToken" FROM "${schema}"."account" WHERE id=$1`,
+					[account.id],
+				);
+				expect(
+					await symmetricDecrypt({
+						key,
+						data: replacement.rows[0]!.accessToken,
+					}),
+				).toBe("fixture-replacement-access");
+				expect(
+					await symmetricDecrypt({
+						key,
+						data: replacement.rows[0]!.refreshToken,
+					}),
+				).toBe("fixture-replacement-refresh");
+				expect(await (await native.handler(request)).json()).toMatchObject({
+					user: { name: "Rotated linked profile" },
 				});
 			} finally {
 				externalNetwork = undefined;

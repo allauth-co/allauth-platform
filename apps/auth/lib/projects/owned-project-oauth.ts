@@ -989,7 +989,6 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 	}
 
 	async function refreshLinkedAccount(
-		request: Request,
 		provider: ProjectOAuthProvider,
 		config: Credentials | AppleCredentials,
 		as: oauth.AuthorizationServer,
@@ -1018,7 +1017,7 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 			refreshToken,
 			{
 				[oauth.customFetch]: providerNetwork,
-				signal: AbortSignal.any([request.signal, AbortSignal.timeout(7000)]),
+				signal: AbortSignal.timeout(7000),
 				...(provider === "microsoft" && {
 					additionalParameters: { scope: "openid profile email" },
 				}),
@@ -1050,18 +1049,21 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 			(tokens.refresh_token?.length ?? 0) > 32768
 		)
 			throw new Error("Invalid linked provider token response.");
-		if (tokens.id_token)
-			linkedProviderProfile(
-				account,
+		let idToken = account.idToken;
+		if (tokens.id_token) {
+			// A temporary signing-key failure must not lose a refresh grant the provider has already rotated.
+			const identity = await linkedIdentityToken(
 				provider,
-				await linkedIdentityToken(
-					provider,
-					as,
-					tokens.id_token,
-					clientId,
-					false,
-				),
-			);
+				as,
+				tokens.id_token,
+				clientId,
+				false,
+			).catch(() => undefined);
+			if (identity) {
+				linkedProviderProfile(account, provider, identity);
+				idToken = tokens.id_token;
+			}
+		}
 		return {
 			accessToken: sealLegacyMfaRecord(tokens.access_token, tokenKeys),
 			accessTokenExpiresAt: boundedExpiry(tokens.expires_in) ?? null,
@@ -1071,7 +1073,7 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 			refreshTokenExpiresAt:
 				boundedExpiry(tokens.refresh_token_expires_in) ??
 				account.refreshTokenExpiresAt,
-			idToken: tokens.id_token ?? account.idToken,
+			idToken,
 		};
 	}
 
@@ -1121,13 +1123,7 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 							current.accountId !== account.accountId
 						)
 							throw new Error("Linked provider account changed.");
-						return refreshLinkedAccount(
-							request,
-							provider.data,
-							config,
-							as,
-							current,
-						);
+						return refreshLinkedAccount(provider.data, config, as, current);
 					},
 				);
 				if (refreshed.status === "rejected") return rejectedResponse(refreshed);
