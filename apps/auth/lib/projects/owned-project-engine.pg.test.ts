@@ -13,7 +13,8 @@ import type { Statements } from "better-auth/plugins/access";
 import { defaultRoles, defaultStatements } from "better-auth/plugins/organization/access";
 import { getTestInstance } from "better-auth/test";
 import { hash } from "bcryptjs";
-import { createLocalJWKSet, type JSONWebKeySet, jwtVerify } from "jose";
+import type { JSONWebKeySet } from "jose";
+import { createLocalJWKSet, jwtVerify } from "jose";
 import { Kysely, PostgresDialect } from "kysely";
 import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
@@ -1087,7 +1088,7 @@ describe.skipIf(!existsSync(fixturePath))("isolated PostgreSQL owned project eng
 	it.each([false, true])("authenticates an existing credential (imported bcrypt %s), withholds tokens and records the session", async (bcrypt) => {
 		const email = `case-${bcrypt}@fixture.example`;
 		const userId = await seed(email, { bcrypt });
-		const owner = engine();
+		const owner = engine(schema, bcrypt ? "203.0.113.216" : "203.0.113.215");
 		const signedIn = await owner.dispatch(request("/sign-in/email", { email: email.toUpperCase(), password }));
 		expect(signedIn.status).toBe(200);
 		const signInValue: unknown = await signedIn.json();
@@ -1121,8 +1122,9 @@ describe.skipIf(!existsSync(fixturePath))("isolated PostgreSQL owned project eng
 			["mfa@fixture.example", password, 501], ["unverified@fixture.example", password, 403],
 			["banned@fixture.example", password, 403], ["mfa@fixture.example", "wrong-password", 401],
 		] as const;
-		for (const [email, attempt, status] of attempts) {
-			const result = await owner.dispatch(request("/sign-in/email", { email, password: attempt }));
+		for (const [index, [email, attempt, status]] of attempts.entries()) {
+			const caller = engine(schema, `203.0.113.${217 + index}`);
+			const result = await caller.dispatch(request("/sign-in/email", { email, password: attempt }));
 			expect(result.status).toBe(status);
 			expect(result.headers.getSetCookie()).toEqual([]);
 		}

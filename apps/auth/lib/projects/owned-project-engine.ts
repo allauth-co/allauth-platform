@@ -1347,6 +1347,16 @@ export function createOwnedProjectEngine(
 				? "Invalid email or password"
 				: "Invalid username or password";
 		if (!trustedRequest(request.headers, true)) return forbidden();
+		const ip = security.trustedIP(request);
+		if (ip) {
+			const limited = await store.transaction((client) =>
+				admitOwnedProjectNativeRoute(client, ip, path, {
+					max: 3,
+					windowMs: 10_000,
+				}),
+			);
+			if (limited) return limited;
+		}
 		if (!policy.emailAndPasswordEnabled)
 			return failure(
 				400,
@@ -1383,7 +1393,6 @@ export function createOwnedProjectEngine(
 		)
 			return securityBlocked();
 
-		const ip = security.trustedIP(request);
 		if (!ip) return forbidden();
 		const bucket = createHmac("sha256", options.signingSecret)
 			.update(`owned-password:v1\0${ip}`)
@@ -3597,6 +3606,13 @@ export function createOwnedProjectEngine(
 		}
 		if (emailChange && path === "/change-email" && request.method === "POST") {
 			if (!trustedRequest(request.headers, true)) return forbidden();
+			const limited = await store.transaction((client) =>
+				admitOwnedProjectNativeRoute(client, options.trustedIP(request), path, {
+					max: 3,
+					windowMs: 10_000,
+				}),
+			);
+			if (limited) return limited;
 			const denied = await factorAdmission(request, "change-email");
 			if (denied) return denied;
 			return emailChange.start(request, await requestBody(request));

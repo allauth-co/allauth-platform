@@ -1416,6 +1416,164 @@ describe.skipIf(!existsSync(fixture))(
 			}
 		});
 
+		it("preserves the native password sign-in admission bucket and signed security decisions across writers", async () => {
+			const realm = `"${alpha.schemaName}"`;
+			const path = "/sign-in/email";
+			const incorrectPassword = "Synthetic-incorrect-password-7!";
+			const spoofedAddress = "198.51.100.21";
+			const subscription = await endpoint("legacy", "security-credentials", [
+				"security.*",
+			]);
+			const stock = installedNative();
+			const candidate = createOwnedProjectEngine({
+				database,
+				project: alpha,
+				baseURL: origin,
+				basePath: alpha.path,
+				signingSecret: alpha.secret,
+				policy: defaultAuthPolicy,
+				trustedOrigins: [],
+				trustedIP: (input) => input.headers.get("x-real-ip"),
+				security: { requireTrustedIP: true },
+			});
+			const previousPolicy = (
+				await database.query<{ policy: unknown; updatedAt: Date }>(
+					`SELECT policy,"updatedAt" FROM ${realm}."allauthSecurityPolicy" WHERE id='default'`,
+				)
+			).rows[0];
+			const ruleIds: string[] = [];
+			const rates: string[] = [];
+			async function policy(mode: "enforce" | "monitor") {
+				await database.query(
+					`INSERT INTO ${realm}."allauthSecurityPolicy" (id,policy,"updatedAt") VALUES ('default',$1,now())
+					 ON CONFLICT (id) DO UPDATE SET policy=EXCLUDED.policy,"updatedAt"=EXCLUDED."updatedAt"`,
+					[{ ...defaultSecurityPolicy, mode }],
+				);
+			}
+			async function blockAddress(ip: string) {
+				const id = randomUUID();
+				ruleIds.push(id);
+				await database.query(
+					`INSERT INTO ${realm}."allauthSecurityRule" (id,type,value,reason) VALUES ($1,'ip',$2,'Synthetic credential policy')`,
+					[id, ip],
+				);
+				return id;
+			}
+			const attempt = (dispatch: typeof stock.handler, ip: string) => {
+				const incoming = request(`${alpha.path}${path}`, {
+					email: eventEmail,
+					password: incorrectPassword,
+				});
+				incoming.headers.set("x-real-ip", ip);
+				incoming.headers.set("x-forwarded-for", spoofedAddress);
+				return dispatch(incoming);
+			};
+			const observe = () =>
+				signedEvents(subscription, [
+					eventEmail,
+					incorrectPassword,
+					spoofedAddress,
+				]);
+			const failed = (ipAddress: string) => ({
+				event: {
+					type: "security.sign-in-failed",
+					outcome: "failure",
+					ipAddress,
+					userAgent: "webhook-management-fixture",
+					metadata: { method: "email", path },
+				},
+			});
+			const blocked = (
+				ipAddress: string,
+				ruleId: string,
+				monitor: boolean,
+			) => ({
+				event: {
+					type: "security.blocked",
+					outcome: monitor ? "success" : "blocked",
+					ipAddress,
+					userAgent: "webhook-management-fixture",
+					metadata: {
+						signal: "explicit-rule",
+						monitor,
+						ruleId,
+						ruleType: "ip",
+					},
+				},
+			});
+			try {
+				await policy("enforce");
+				for (const [first, second, ip] of [
+					[stock.handler, candidate.dispatch, "192.0.2.230"],
+					[candidate.dispatch, stock.handler, "192.0.2.231"],
+				] as const) {
+					const key = `${ip}|${path}`;
+					rates.push(key);
+					await database.query(
+						`INSERT INTO ${realm}."rateLimit" (id,"key",count,"lastRequest") VALUES ($1,$2,2,$3)`,
+						[randomUUID(), key, Date.now()],
+					);
+					expect((await attempt(first, ip)).status).toBe(401);
+					expect(await observe()).toEqual([failed(ip)]);
+					await blockAddress(ip);
+					const limited = await attempt(second, ip);
+					expect(limited.status).toBe(429);
+					expect(await limited.json()).toEqual({
+						message: "Too many requests. Please try again later.",
+					});
+					expect(await observe()).toEqual([]);
+					const { rows } = await database.query<{ count: number }>(
+						`SELECT count FROM ${realm}."rateLimit" WHERE "key"=$1`,
+						[key],
+					);
+					expect(rows[0]?.count).toBe(3);
+				}
+				for (const [dispatch, ip] of [
+					[stock.handler, "192.0.2.232"],
+					[candidate.dispatch, "192.0.2.233"],
+				] as const) {
+					rates.push(`${ip}|${path}`);
+					const ruleId = await blockAddress(ip);
+					await policy("monitor");
+					expect((await attempt(dispatch, ip)).status).toBe(401);
+					const observed = await observe();
+					expect(observed).toHaveLength(2);
+					expect(observed).toEqual(
+						expect.arrayContaining([blocked(ip, ruleId, true), failed(ip)]),
+					);
+					await policy("enforce");
+					const denied = await attempt(dispatch, ip);
+					expect(denied.status).toBe(429);
+					expect(await denied.json()).toMatchObject({
+						code: "ALLAUTH_SECURITY_BLOCKED",
+					});
+					expect(await observe()).toEqual([blocked(ip, ruleId, false)]);
+				}
+			} finally {
+				await database.query(
+					`DELETE FROM ${realm}."allauthWebhookEndpoint" WHERE id=$1`,
+					[subscription.endpoint.id],
+				);
+				await database.query(
+					`DELETE FROM ${realm}."allauthSecurityRule" WHERE id=ANY($1::text[])`,
+					[ruleIds],
+				);
+				await database.query(
+					`DELETE FROM ${realm}."rateLimit" WHERE "key"=ANY($1::text[])`,
+					[rates],
+				);
+				if (previousPolicy)
+					await database.query(
+						`UPDATE ${realm}."allauthSecurityPolicy" SET policy=$1,"updatedAt"=$2 WHERE id='default'`,
+						[previousPolicy.policy, previousPolicy.updatedAt],
+					);
+				else
+					await database.query(
+						`DELETE FROM ${realm}."allauthSecurityPolicy" WHERE id='default'`,
+					);
+			}
+		});
+
 		it("signs out users linked to installed SIWE and exact realm SSO providers", async () => {
 			const installed = installedNative();
 			const realm = `"${alpha.schemaName}"`;

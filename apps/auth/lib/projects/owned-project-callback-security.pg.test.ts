@@ -545,6 +545,167 @@ describe.skipIf(!existsSync(fixturePath))(
 			}
 		});
 
+		it("delivers unattributed user events for rejected email change requests", async () => {
+			const path = "/change-email";
+			const address = "192.0.2.187";
+			const rateKey = `${address}|${path}`;
+			const target = randomUUID();
+			const existingEmail = "email-change-signed-target@fixture.example";
+			const unusedEmail = "email-change-signed-unregistered@fixture.example";
+			const endpoint = randomUUID();
+			const subscription = newWebhookSigningSecret();
+			const recipient = "https://email-change-hook.fixture.example/events";
+			const nativeEngine = native(nativeDatabase);
+			const defer = vi.fn();
+			const candidate = createOwnedProjectEngine({
+				database,
+				project: { schemaName: schema, slug },
+				baseURL: origin,
+				basePath,
+				trustedOrigins: [],
+				signingSecret: secret,
+				trustedIP: (request) => request.headers.get("x-real-ip"),
+				policy: defaultAuthPolicy,
+				accountLinks: {
+					publicLinkBaseURL: `${origin}${basePath}`,
+					emailChange: true,
+					defer,
+					deliver: async () => {},
+				},
+			});
+			await database.query(
+				`INSERT INTO ${scope}."user" (id,name,email,"emailVerified") VALUES ($1,'Synthetic email change target',$2,true)`,
+				[target, existingEmail],
+			);
+			await database.query(
+				`INSERT INTO ${scope}."allauthWebhookEndpoint" (id,url,"eventTypes","encryptedSecret") VALUES ($1,$2,'["user.*"]',$3)`,
+				[
+					endpoint,
+					recipient,
+					await symmetricEncrypt({ key: secret, data: subscription }),
+				],
+			);
+			const request = (newEmail: string) =>
+				new Request(`${origin}${basePath}${path}`, {
+					method: "POST",
+					headers: {
+						origin,
+						"content-type": "application/json",
+						"x-real-ip": address,
+						"user-agent": rawUserAgent,
+					},
+					body: JSON.stringify({ newEmail }),
+				});
+			const expected = {
+				type: "user.email-change-requested",
+				outcome: "failure",
+				ipAddress: address,
+				userAgent,
+				metadata: { path, errorCode: "UNAUTHORIZED" },
+			};
+			async function exercise(dispatch: Dispatch) {
+				for (const email of [existingEmail, unusedEmail, existingEmail]) {
+					const response = await dispatch(request(email));
+					expect(response.status).toBe(401);
+					expect(await response.json()).toEqual({
+						code: "UNAUTHORIZED",
+						message: "Unauthorized",
+					});
+					expect(response.headers.getSetCookie()).toEqual([]);
+				}
+				const events = new Set<string>();
+				const worker = await deliverPendingWebhooks({
+					database: nativeDatabase,
+					secret,
+					now: () => new Date(Date.now() + 2_000),
+					resolver: async () => [{ address: "93.184.216.34", family: 4 }],
+					async transport({ destination, body, headers }) {
+						expect(destination.url.href).toBe(recipient);
+						const signature = createHmac(
+							"sha256",
+							Buffer.from(subscription.slice(6), "base64"),
+						)
+							.update(
+								`${headers["webhook-id"]}.${headers["webhook-timestamp"]}.${body}`,
+							)
+							.digest("base64");
+						expect(headers["webhook-signature"]).toBe(`v1,${signature}`);
+						expect(body).not.toContain(existingEmail);
+						expect(body).not.toContain(unusedEmail);
+						expect(body).not.toContain(target);
+						const envelope = JSON.parse(body) as ControlWebhookEnvelope;
+						const { id, createdAt } = envelope.data.event;
+						expect(envelope).toEqual({
+							id,
+							type: expected.type,
+							timestamp: createdAt,
+							data: { event: { id, createdAt, ...expected } },
+						});
+						events.add(id);
+						return 204;
+					},
+				});
+				expect(worker).toEqual({
+					claimed: 3,
+					delivered: 3,
+					retried: 0,
+					failed: 0,
+				});
+				expect(events.size).toBe(3);
+				const countAudits = async () =>
+					(
+						await database.query(
+							`SELECT count(*)::int AS events FROM ${scope}."allauthEvent" WHERE type=$1 AND "ipAddress"=$2`,
+							[expected.type, address],
+						)
+					).rows[0]?.events;
+				const audits = await countAudits();
+				const limited = await dispatch(request(unusedEmail));
+				expect(limited.status).toBe(429);
+				expect(await limited.json()).toEqual({
+					message: "Too many requests. Please try again later.",
+				});
+				expect(await countAudits()).toBe(audits);
+				expect(
+					(
+						await database.query(
+							`SELECT id FROM ${scope}."allauthWebhookDelivery" WHERE "endpointId"=$1 AND status<>'delivered'`,
+							[endpoint],
+						)
+					).rows,
+				).toEqual([]);
+			}
+			try {
+				await exercise(nativeEngine.handler);
+				await database.query(
+					`DELETE FROM ${scope}."rateLimit" WHERE "key"=$1`,
+					[rateKey],
+				);
+				await exercise(candidate.dispatch);
+				expect(
+					(
+						await database.query(
+							`SELECT id,email,"emailVerified" FROM ${scope}."user" WHERE id=$1 OR email=$2`,
+							[target, unusedEmail],
+						)
+					).rows,
+				).toEqual([{ id: target, email: existingEmail, emailVerified: true }]);
+				expect(defer).not.toHaveBeenCalled();
+			} finally {
+				await database.query(
+					`DELETE FROM ${scope}."allauthWebhookEndpoint" WHERE id=$1`,
+					[endpoint],
+				);
+				await database.query(`DELETE FROM ${scope}."user" WHERE id=$1`, [
+					target,
+				]);
+				await database.query(
+					`DELETE FROM ${scope}."rateLimit" WHERE "key"=$1`,
+					[rateKey],
+				);
+			}
+		});
+
 		it("preserves native profile and stored-account domain denials after verifying a Google callback", async () => {
 			const endpoint = randomUUID();
 			const signingSecret = newWebhookSigningSecret();

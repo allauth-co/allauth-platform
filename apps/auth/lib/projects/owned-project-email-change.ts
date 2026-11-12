@@ -163,7 +163,19 @@ export function createOwnedProjectEmailChange(
 		const newEmail = parsed.data.newEmail.toLowerCase();
 		const result = await store.transaction(async (client) => {
 			const current = await options.authority(client, request);
-			if (!current || current.impersonatedBy || current.eligible === false)
+			const audit = {
+				type: "user.email-change-requested",
+				...options.auditContext?.(request),
+			};
+			if (!current) {
+				await store.recordEvent(client, {
+					...audit,
+					outcome: "failure",
+					metadata: { path: "/change-email", errorCode: "UNAUTHORIZED" },
+				});
+				return accountLinkError(401, "UNAUTHORIZED", "Unauthorized");
+			}
+			if (current.impersonatedBy || current.eligible === false)
 				return accountLinkError(401, "UNAUTHORIZED", "Unauthorized");
 			const user = await store.lockUser(client, current.userId);
 			if (
@@ -177,15 +189,14 @@ export function createOwnedProjectEmailChange(
 					"DELETION_PENDING",
 					"Account deletion is already being processed.",
 				);
-			const audit = {
-				type: "user.email-change-requested",
+			const attributed = {
+				...audit,
 				actorId: user.id,
 				userId: user.id,
-				...options.auditContext?.(request),
 			};
 			if (newEmail === user.email) {
 				await store.recordEvent(client, {
-					...audit,
+					...attributed,
 					outcome: "failure",
 					metadata: {
 						path: "/change-email",
@@ -195,7 +206,7 @@ export function createOwnedProjectEmailChange(
 				return accountLinkError(400, "BAD_REQUEST", "Email is the same");
 			}
 			await store.recordEvent(client, {
-				...audit,
+				...attributed,
 				outcome: "success",
 				metadata: { path: "/change-email" },
 			});
