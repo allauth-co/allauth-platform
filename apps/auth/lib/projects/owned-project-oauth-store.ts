@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { Pool, PoolClient } from "pg";
 import * as z from "zod";
+import { reservedProjectEmailError } from "../project-email-alias-config";
 import type { LegacyMfaKeys } from "./legacy-mfa-record";
 import { sealLegacyMfaRecord } from "./legacy-mfa-record";
 import type { ProjectUser } from "./owned-project-engine-store";
@@ -51,7 +52,8 @@ type Binding =
 				| "LINKING_NOT_ALLOWED"
 				| "LINKING_DIFFERENT_EMAILS_NOT_ALLOWED"
 				| "USER_EMAIL_NOT_FOUND"
-				| "SIGN_UP_DISABLED";
+				| "SIGN_UP_DISABLED"
+				| typeof reservedProjectEmailError.code;
 	  }
 	| null;
 
@@ -75,6 +77,7 @@ export function createProjectOAuthStore(
 	database: Pool,
 	schemaName: string,
 	keys: LegacyMfaKeys,
+	reservedEmail?: (email: string) => boolean,
 ) {
 	const schema = checkedProjectSchema(schemaName);
 	const realm = createProjectEngineStore(database, schema);
@@ -232,6 +235,8 @@ export function createProjectOAuthStore(
 			)
 				return null;
 			if (await profileDenied("signup")) return null;
+			if (reservedEmail?.(email))
+				return { error: reservedProjectEmailError.code };
 			const created = await client.query<{ id: string }>(
 				`INSERT INTO "${schema}"."user" (id, email, name, image, "emailVerified", "twoFactorEnabled", "isAnonymous")
 				VALUES ($1,$2,$3,$4,$5,FALSE,FALSE) ON CONFLICT (email) DO NOTHING RETURNING id`,

@@ -27,6 +27,7 @@ import { createControlSecurity } from "../control/security";
 import { defaultSecurityPolicy, securitySubject } from "../control/security-policy";
 import { readLegacySessionCookie } from "./legacy-session-cookie";
 import { productionTwoFactor } from "../mfa";
+import { projectEmailAliases } from "../project-email-aliases";
 import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
 import { projectManagement } from "./management-plugin";
 import { localizeProjectErrors } from "./project-error-localization";
@@ -80,6 +81,7 @@ describe.skipIf(!existsSync(fixturePath))("isolated PostgreSQL owned project eng
 	let legacyDatabase: Kysely<Record<string, Record<string, unknown>>> | undefined;
 	let nativeGetSession: (headers: Headers) => Promise<{ user: { id: string } } | null>;
 	let nativeRequest: (request: Request) => Promise<Response>;
+	let nativeAliasConfiguration = "";
 	let nativeTotp: (secret: string) => Promise<string>;
 	let nativeJwks: () => Promise<JSONWebKeySet>;
 	let fixtureCreated = false;
@@ -130,6 +132,7 @@ describe.skipIf(!existsSync(fixturePath))("isolated PostgreSQL owned project eng
 			advanced: { cookiePrefix: `allauth_project_${slug}` },
 			user: { additionalFields: { directoryDisabled: { type: "boolean", input: false, required: false } } },
 			plugins: [
+				projectEmailAliases({ project: slug, readConfiguration: () => nativeAliasConfiguration }),
 				admin(),
 				organization({ ac: createAccessControl<Statements>(defaultStatements), roles: defaultRoles, dynamicAccessControl: { enabled: true } }),
 				productionTwoFactor(origin),
@@ -253,6 +256,49 @@ describe.skipIf(!existsSync(fixturePath))("isolated PostgreSQL owned project eng
 		);
 		expect(stored.rows).toEqual([{ id, email: primary }]);
 		expect(cookies(response)).toBe("");
+	});
+
+	it("rejects reserved email creation by a verified project administrator in either writer", async () => {
+		const email = "alias-admin-owner@fixture.example";
+		const alias = "alias-admin-reserved@fixture.example";
+		const owner = await seed(email);
+		const admin = await seed("alias-administrator@fixture.example");
+		await database.query(
+			`UPDATE "${schema}"."user" SET role='admin' WHERE id=$1`,
+			[admin],
+		);
+		const session = await legacySession(admin, 3600);
+		const aliases = { [alias]: owner };
+		const candidate = engine(schema, "203.0.113.109", {
+			emailAliases: aliases,
+		});
+		const create = () =>
+			request(
+				"/admin/create-user",
+				{ email: alias, name: "Duplicate" },
+				{
+					cookie: session.cookie,
+					"x-real-ip": "203.0.113.109",
+				},
+			);
+		nativeAliasConfiguration = JSON.stringify(aliases);
+		try {
+			const baseline = await nativeRequest(create());
+			expect(baseline.status).toBe(422);
+			const owned = await candidate.dispatch(create());
+			expect(owned.status).toBe(baseline.status);
+			expect(await owned.json()).toEqual(await baseline.json());
+			expect(
+				(
+					await database.query(
+						`SELECT id FROM "${schema}"."user" WHERE email=$1`,
+						[alias],
+					)
+				).rowCount,
+			).toBe(0);
+		} finally {
+			nativeAliasConfiguration = "";
+		}
 	});
 
 	it("matches configured native realm user reads and permission checks without exposing private fields", async () => {

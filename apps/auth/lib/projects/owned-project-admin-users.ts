@@ -5,6 +5,7 @@ import { passwordPolicyError } from "../auth-policy/password";
 import type { AuthPolicy } from "../auth-policy/policy";
 import { clerkCompatiblePasswords } from "../clerk-password";
 import type { ControlPrincipal } from "../control/types";
+import { reservedProjectEmailError } from "../project-email-alias-config";
 import {
 	accountLinkError,
 	accountLinkJson,
@@ -144,6 +145,7 @@ export function createOwnedProjectAdminUsers(options: {
 	readWorkspacePrincipal(headers: Headers): Promise<ControlPrincipal | null>;
 	readBody(request: Request): Promise<unknown>;
 	checkPasswordSafety?(password: string): Promise<PasswordSafety>;
+	reservedEmail?(email: string): boolean;
 	blockCreation(
 		client: PoolClient,
 		request: Request,
@@ -206,6 +208,12 @@ export function createOwnedProjectAdminUsers(options: {
 				))
 			)
 				return forbidden();
+			if (options.reservedEmail?.(email))
+				return accountLinkError(
+					reservedProjectEmailError.status,
+					reservedProjectEmailError.code,
+					reservedProjectEmailError.message,
+				);
 			if (await options.blockCreation(client, request, email))
 				return accountLinkError(
 					429,

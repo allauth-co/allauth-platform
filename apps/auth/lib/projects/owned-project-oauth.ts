@@ -10,6 +10,7 @@ import * as oauth from "oauth4webapi";
 import type { Pool, PoolClient } from "pg";
 import * as z from "zod";
 import { validAvatarPath } from "../avatars/protocol";
+import { reservedProjectEmailError } from "../project-email-alias-config";
 import type { LegacyMfaKeys } from "./legacy-mfa-record";
 import { sealLegacyMfaRecord } from "./legacy-mfa-record";
 import { readLegacySessionCookie } from "./legacy-session-cookie";
@@ -177,6 +178,7 @@ export interface OwnedProjectOAuthOptions {
 	tokenKeys?: LegacyMfaKeys;
 	signUpEnabled: boolean;
 	requireEmailVerification: boolean;
+	reservedEmail?(email: string): boolean;
 	defaultErrorURL: string;
 	broker: Credentials & {
 		issuer: string;
@@ -295,6 +297,7 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 		options.database,
 		options.project.schemaName,
 		tokenKeys,
+		options.reservedEmail,
 	);
 	const linked = createOwnedProjectLinkedAccounts(
 		options.database,
@@ -332,6 +335,10 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 			401,
 		],
 		USER_EMAIL_NOT_FOUND: ["User email not found", 401],
+		[reservedProjectEmailError.code]: [
+			reservedProjectEmailError.message,
+			reservedProjectEmailError.status,
+		],
 		SIGN_UP_DISABLED: [
 			"New account registration is disabled for this application.",
 			403,
@@ -1459,6 +1466,17 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 					link,
 				);
 				if (rejectedProfile) return profileFailure();
+				if (
+					account &&
+					"error" in account &&
+					account.error === reservedProjectEmailError.code
+				)
+					return errorRedirect(
+						account.error,
+						flow ?? undefined,
+						true,
+						reservedProjectEmailError.message,
+					);
 				if (!account || "error" in account) throw rejected;
 				if (link) {
 					if (

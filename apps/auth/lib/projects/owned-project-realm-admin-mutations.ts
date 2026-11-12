@@ -2,6 +2,7 @@ import type { PoolClient } from "pg";
 import * as z from "zod";
 import type { PasswordPolicy } from "../auth-policy/password";
 import { passwordPolicyError } from "../auth-policy/password";
+import { reservedProjectEmailError } from "../project-email-alias-config";
 import {
 	accountLinkError,
 	accountLinkHeaders,
@@ -135,6 +136,7 @@ export function createOwnedProjectRealmAdminMutations(options: {
 	passwordPolicy: PasswordPolicy;
 	checkPasswordSafety?: RealmAdminPasswordSafety;
 	primaryOrigin: string;
+	reservedEmail?(email: string): boolean;
 	blockAdminCreation(
 		client: PoolClient,
 		request: Request,
@@ -347,6 +349,8 @@ export function createOwnedProjectRealmAdminMutations(options: {
 					throw new Error("A realm administrator creation email was expected.");
 				if (await realmAdminEmailInUse(client, fields.email))
 					return userFailure(realmAdminDuplicateEmail);
+				if (options.reservedEmail?.(fields.email))
+					return userFailure(reservedProjectEmailError);
 				if (
 					await options.blockAdminCreation(
 						client,

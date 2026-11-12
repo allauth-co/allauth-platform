@@ -1,6 +1,9 @@
+import { reservedProjectEmailError } from "../project-email-alias-config";
+
 const callbackCodes = new Set([
 	"AUTHENTICATION_FAILED",
 	"ALLAUTH_SECURITY_BLOCKED",
+	reservedProjectEmailError.code,
 	"account_not_linked",
 	"account_ownership_conflict",
 	"directory_identity_inactive",

@@ -218,6 +218,7 @@ interface OwnedProjectEngineOptions {
 		| "signingSecret"
 		| "signUpEnabled"
 		| "requireEmailVerification"
+		| "reservedEmail"
 		| "authorizeLinkedAccounts"
 		| "passwordSignIn"
 		| "passkeySignIn"
@@ -2097,6 +2098,7 @@ export function createOwnedProjectEngine(
 		adminProject &&
 		createOwnedProjectAdminUsers({
 			...options.adminDeletion,
+			reservedEmail: emailAliases.reserved,
 			project: adminProject,
 			store,
 			origin,
@@ -2313,6 +2315,7 @@ export function createOwnedProjectEngine(
 		options.oauth &&
 		createOwnedProjectOAuth({
 			...options.oauth,
+			reservedEmail: emailAliases.reserved,
 			database: options.database,
 			project: options.project,
 			baseURL: origin,
@@ -2573,6 +2576,7 @@ export function createOwnedProjectEngine(
 	};
 	const realmAdminMutations = createOwnedProjectRealmAdminMutations({
 		store,
+		reservedEmail: emailAliases.reserved,
 		readBody: requestBody,
 		checkOrigin: sessionMutationOrigin,
 		readCookie: tokenFrom,

@@ -11,6 +11,12 @@ const aliasesSchema = z.record(
 
 export type ProjectEmailAliasMap = Readonly<Record<string, string>>;
 
+export const reservedProjectEmailError = {
+	status: 422,
+	code: "USER_ALREADY_EXISTS_USE_ANOTHER_EMAIL",
+	message: "User already exists. Use another email.",
+} as const;
+
 /** A separate server variable keeps each realm's verified migration aliases private and isolated. */
 export function projectEmailAliasVariable(project: string): string {
 	if (!/^[a-z][a-z0-9-]{1,47}$/.test(project))

@@ -12,6 +12,8 @@ import { securitySubject } from "../control/security-policy";
 import { newWebhookSigningSecret } from "../control/webhook-contract";
 import type { ControlWebhookEnvelope } from "../control/webhooks";
 import { deliverPendingWebhooks } from "../control/webhooks";
+import type { ProjectEmailAliasMap } from "../project-email-alias-config";
+import { projectEmailAliasVariable } from "../project-email-alias-config";
 import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
 import { createOwnedProjectEngine } from "./owned-project-engine";
 
@@ -45,13 +47,16 @@ const broker = {
 type Dispatch = (request: Request) => Promise<Response>;
 type ScopedDB = Kysely<Record<string, Record<string, unknown>>>;
 
-function native(database: ScopedDB) {
+function native(database: ScopedDB, aliases?: ProjectEmailAliasMap) {
 	const options = createAuthOptions(
 		{ db: database, type: "postgres", transaction: true },
 		{
 			ALLAUTH_AUTH_URL: origin,
 			ALLAUTH_AUTH_SECRET: secret,
 			AUTH_RUNTIME: "node",
+			...(aliases
+				? { [projectEmailAliasVariable(slug)]: JSON.stringify(aliases) }
+				: {}),
 			SCIM_CREDENTIAL_HASH_SECRET:
 				"synthetic-provider-callback-scim-fixture-key",
 		},
@@ -76,10 +81,15 @@ function native(database: ScopedDB) {
 	});
 }
 
-function owned(database: Pool, schema: string) {
+function owned(
+	database: Pool,
+	schema: string,
+	emailAliases?: ProjectEmailAliasMap,
+) {
 	return createOwnedProjectEngine({
 		database,
 		project: { schemaName: schema, slug },
+		emailAliases,
 		baseURL: origin,
 		basePath,
 		trustedOrigins: [],
@@ -175,9 +185,12 @@ describe.skipIf(!existsSync(fixturePath))(
 			const owner = "fixture-denied-linked-owner";
 			const linkedSubject = "fixture-denied-google-linked-subject";
 			const signupSubject = "fixture-denied-google-signup-subject";
+			const reservedSubject = "fixture-reserved-google-signup-subject";
+			const reservedEmail = "reserved-provider-alias@fixture.example";
 			const storedEmail = "fixture-allowed-existing@fixture.example";
 			const blockedStoredEmail = `stored@${domain}`;
 			const callbackIP = "192.0.2.177";
+			const aliasCallbackIP = "192.0.2.178";
 			const ruleId = randomUUID();
 			await database.query(
 				`INSERT INTO ${scope}."allauthWebhookEndpoint" (id,url,"eventTypes","encryptedSecret") VALUES ($1,'https://callback-policy-hook.fixture.example/events','["security.*","auth.sign-in"]',$2)`,
@@ -252,7 +265,7 @@ describe.skipIf(!existsSync(fixturePath))(
 					);
 				});
 			const target = (path: string) => `${origin}${basePath}${path}`;
-			const headers = { "x-real-ip": callbackIP, "user-agent": userAgent };
+			const headers = { "user-agent": userAgent };
 			const observed = async () =>
 				(
 					await database.query<{ id: string; event: object }>(
@@ -260,29 +273,36 @@ describe.skipIf(!existsSync(fixturePath))(
 						[endpoint],
 					)
 				).rows;
-			const failureKey = await securitySubject(secret, "fail-ip", callbackIP);
-			const countFailures = async () =>
+			const countFailures = async (address: string) =>
 				(
 					await database.query<{ count: number }>(
 						`SELECT count FROM ${scope}."allauthSecurityCounter" WHERE key=$1`,
-						[failureKey],
+						[await securitySubject(secret, "fail-ip", address)],
 					)
 				).rows[0]?.count ?? 0;
 			async function exercise(
 				dispatch: Dispatch,
 				subject: string,
-				mode: "linked" | "signup" | "stored",
+				mode: "linked" | "signup" | "stored" | "alias",
 			) {
 				const email =
-					mode === "stored"
-						? "allowed-provider-profile@fixture.example"
-						: `${mode}@${domain}`;
-				const failures = await countFailures();
+					mode === "alias"
+						? reservedEmail
+						: mode === "stored"
+							? "allowed-provider-profile@fixture.example"
+							: `${mode}@${domain}`;
+				const address = mode === "alias" ? aliasCallbackIP : callbackIP;
+				const requestHeaders = { ...headers, "x-real-ip": address };
+				const failures = await countFailures(address);
 				const code = randomUUID();
 				const started = await dispatch(
 					new Request(target("/sign-in/social"), {
 						method: "POST",
-						headers: { ...headers, origin, "content-type": "application/json" },
+						headers: {
+							...requestHeaders,
+							origin,
+							"content-type": "application/json",
+						},
 						body: JSON.stringify({
 							provider: "google",
 							callbackURL: `${origin}/account`,
@@ -322,7 +342,7 @@ describe.skipIf(!existsSync(fixturePath))(
 				const response = await dispatch(
 					new Request(callback, {
 						headers: {
-							...headers,
+							...requestHeaders,
 							cookie: started.headers
 								.getSetCookie()
 								.map((header) => header.split(";", 1)[0])
@@ -339,18 +359,23 @@ describe.skipIf(!existsSync(fixturePath))(
 				const destination = new URL(response.headers.get("location")!);
 				expect(destination.pathname).toBe("/auth-error");
 				expect(Object.fromEntries(destination.searchParams)).toEqual(
-					mode === "stored"
+					mode === "alias"
 						? {
-								error: "ALLAUTH_SECURITY_BLOCKED",
-								error_description:
-									"This authentication request is temporarily unavailable. Try again later.",
+								error: "USER_ALREADY_EXISTS_USE_ANOTHER_EMAIL",
+								error_description: "User already exists. Use another email.",
 							}
-						: {
-								error: "validation_failed",
-								error_description: "User validation failed",
-							},
+						: mode === "stored"
+							? {
+									error: "ALLAUTH_SECURITY_BLOCKED",
+									error_description:
+										"This authentication request is temporarily unavailable. Try again later.",
+								}
+							: {
+									error: "validation_failed",
+									error_description: "User validation failed",
+								},
 				);
-				expect(await countFailures()).toBe(failures + 1);
+				expect(await countFailures(address)).toBe(failures + 1);
 				expect(
 					(await database.query(`SELECT id FROM ${scope}."session"`)).rowCount,
 				).toBe(0);
@@ -487,6 +512,29 @@ describe.skipIf(!existsSync(fixturePath))(
 				expect(
 					await exercise(candidate.dispatch, linkedSubject, "stored"),
 				).toEqual(stored);
+				const aliases = { [reservedEmail]: owner };
+				const aliasEvents = await exercise(
+					native(nativeDatabase, aliases).handler,
+					reservedSubject,
+					"alias",
+				);
+				expect(aliasEvents).toEqual(
+					expect.arrayContaining([
+						{ ...failure, ipAddress: aliasCallbackIP },
+						{
+							...authFailure("USER_ALREADY_EXISTS_USE_ANOTHER_EMAIL"),
+							ipAddress: aliasCallbackIP,
+						},
+					]),
+				);
+				expect(aliasEvents).toHaveLength(2);
+				expect(
+					await exercise(
+						owned(database, schema, aliases).dispatch,
+						reservedSubject,
+						"alias",
+					),
+				).toEqual(aliasEvents);
 				expect(
 					(
 						await database.query(
@@ -513,8 +561,14 @@ describe.skipIf(!existsSync(fixturePath))(
 					[ruleId],
 				);
 				await database.query(
-					`DELETE FROM ${scope}."allauthSecurityCounter" WHERE key=$1`,
-					[await securitySubject(secret, "fail-ip", callbackIP)],
+					`DELETE FROM ${scope}."allauthSecurityCounter" WHERE key=ANY($1::text[])`,
+					[
+						await Promise.all([
+							securitySubject(secret, "fail-ip", callbackIP),
+							securitySubject(secret, "fail-ip", aliasCallbackIP),
+							securitySubject(secret, "signup-ip", aliasCallbackIP),
+						]),
+					],
 				);
 				await database.query(
 					`DELETE FROM ${scope}."user" WHERE id=$1 OR email=$2`,
