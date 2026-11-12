@@ -16,6 +16,8 @@ import type { AuthEnvironment } from "../configuration";
 import type { ControlDatabase } from "../control/types";
 import { defaultSecurityPolicy } from "../control/security";
 import { projectProxySecret } from "../projects/proxy";
+import { openLegacyMfaRecord } from "../projects/legacy-mfa-record";
+import { consumeProjectRecoveryCode } from "../projects/recovery-code-store";
 import { projectRegistryPool, provisionProject } from "../projects/registry";
 import type { Project } from "../projects/registry";
 import { closeProjectInstances, projectSecret, withHostedProjectAuth, withProjectAuth, withProjectAuthEngine } from "../projects/runtime";
@@ -26,6 +28,7 @@ import { createWorkspace } from "../workspaces/repository";
 import { proxy } from "../../proxy";
 import { GET as configGET } from "../../app/api/config/route";
 import { GET as nativeGET, POST as nativePOST } from "../../app/api/auth/[...all]/route";
+import { GET as hostedSdkGET, POST as hostedSdkPOST } from "../../app/api/auth/hosted-ui/[...all]/route";
 import { GET as sessionsGET } from "../../app/api/account/sessions/route";
 import { POST as revokePOST } from "../../app/api/account/sessions/revoke/route";
 import { GET as projectGET, POST as projectPOST } from "../../app/api/projects/[slug]/auth/[...all]/route";
@@ -303,6 +306,161 @@ describe.skipIf(!existsSync(fixturePath))("real PostgreSQL hosted authentication
 		for (const session of body.sessions) for (const key of Object.keys(session)) expect(["id", "createdAt", "expiresAt", "ipAddress", "userAgent"]).toContain(key);
 		expect(JSON.stringify(body)).not.toContain(rootUserId); expect(JSON.stringify(body)).not.toContain(betaUserId);
 		expect((await sessionsGET(await signedRequest(host(alpha), "/api/account/sessions", { headers: { cookie: rootCookie } }))).status).toBe(401);
+	});
+
+	it("compares a selected development project's signed hosted and proxy sessions without changing authority", async () => {
+		const workspacePrincipal = await requireWorkspacePrincipal(native.auth as unknown as AuthInstance, new Headers({ cookie: rootCookie }));
+		const project = await provisionProject({
+			name: "Session shadow fixture",
+			slug: "session-shadow-development",
+			primaryOrigin: "https://session-shadow.fixture.example",
+			origins: [],
+			environment: "development",
+		}, { clientId: "local-shadow-broker", clientSecret: "local-shadow-broker-secret" }, rootUserId, env, { workspaceId: alpha.workspaceId, principal: workspacePrincipal });
+		const previousShadow = process.env.ALLAUTH_PROJECT_SESSION_SHADOW_IDS;
+		const previousUI = process.env.ALLAUTH_PROJECT_HOSTED_UI_PROJECT_IDS;
+		process.env.ALLAUTH_PROJECT_SESSION_SHADOW_IDS = [project.id, alpha.id].join(",");
+		process.env.ALLAUTH_PROJECT_HOSTED_UI_PROJECT_IDS = [project.id, alpha.id].join(",");
+		const info = vi.spyOn(console, "info").mockImplementation(() => {});
+		const previousFetch = globalThis.fetch;
+		try {
+			const userId = await withHostedProjectAuth(project, host(project), (instance) => seed(instance, project.name), env);
+			const hostedLogin = await nativePOST(await signedRequest(host(project), "/api/auth/sign-in/email", {
+				method: "POST", body: JSON.stringify({ email: sharedEmail, password }),
+			}));
+			expect(hostedLogin.status).toBe(200);
+			const hostedCookie = cookies(hostedLogin);
+			const session = await nativeGET(await signedRequest(host(project), "/api/auth/get-session", { headers: { cookie: hostedCookie } }));
+			expect(await session.json()).toMatchObject({ user: { id: userId } });
+			const foreign = await nativeGET(await signedRequest(host(project), "/api/auth/get-session", { headers: { cookie: rootCookie } }));
+			expect(await foreign.json()).toBeNull();
+
+			const base = `${platformOrigin}/api/projects/${project.slug}/auth`;
+			const directLogin = await withProjectAuth(project.slug, (instance) => instance.handler(new Request(`${base}/sign-in/email`, {
+				method: "POST", headers: { "content-type": "application/json", origin: platformOrigin, "x-real-ip": "203.0.113.39" },
+				body: JSON.stringify({ email: sharedEmail, password }),
+			})), env);
+			expect(directLogin.status).toBe(200);
+			const proxyCookie = cookies(directLogin);
+			const appProxy = createAllAuthProxy({
+				appOrigin: project.primaryOrigin, allauthURL: platformOrigin,
+				project: project.slug, proxySecret: projectProxySecret(project, env),
+				getClientIP: () => "203.0.113.39",
+			});
+			vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+				const request = input instanceof Request ? input : new Request(input, init);
+				if (request.url === `${base}/get-session`) {
+					return projectGET(request, { params: Promise.resolve({ slug: project.slug }) });
+				}
+				return previousFetch(input, init);
+			});
+			const direct = await appProxy(new Request(`${project.primaryOrigin}/api/allauth/get-session`, {
+				headers: { cookie: proxyCookie },
+			}), { params: Promise.resolve({ all: ["get-session"] }) });
+			expect(await direct.json()).toMatchObject({ user: { id: userId } });
+
+			const productionLogin = await login(alpha);
+			const previous = await nativeGET(await signedRequest(host(alpha), "/api/auth/get-session", { headers: { cookie: productionLogin.cookie } }));
+			expect(await previous.json()).toMatchObject({ user: { id: alphaUserId } });
+			const newUI = await hostedSdkPOST(await signedRequest(host(project), "/api/auth/hosted-ui/sign-in/email", {
+				method: "POST", ip: "192.0.2.156", headers: { accept: "application/json" },
+				body: JSON.stringify({ email: sharedEmail, password }),
+			}));
+			expect(newUI.status).toBe(200);
+			const uiSignIn = await newUI.json();
+			expect(uiSignIn).toMatchObject({ user: { id: userId } });
+			expect(uiSignIn).not.toHaveProperty("token");
+			const uiSession = await hostedSdkGET(await signedRequest(host(project), "/api/auth/hosted-ui/get-session", {
+				headers: { accept: "application/json", cookie: cookies(newUI) },
+			}));
+			expect(await uiSession.json()).toMatchObject({ user: { id: userId } });
+			expect((await hostedSdkGET(await signedRequest(host(alpha), "/api/auth/hosted-ui/get-session", {
+				headers: { accept: "application/json", cookie: productionLogin.cookie },
+			}))).status).toBe(404);
+
+			const comparisons = info.mock.calls
+				.map(([message]) => message)
+				.filter((message): message is string => typeof message === "string" && message.includes("allauth.project_session_shadow"))
+				.map((message) => JSON.parse(message) as unknown);
+			expect(comparisons).toEqual(Array.from({ length: 4 }, () => ({
+				event: "allauth.project_session_shadow", projectId: project.id, outcome: "match",
+			})));
+		} finally {
+			info.mockRestore();
+			vi.stubGlobal("fetch", previousFetch);
+			if (previousShadow === undefined) delete process.env.ALLAUTH_PROJECT_SESSION_SHADOW_IDS;
+			else process.env.ALLAUTH_PROJECT_SESSION_SHADOW_IDS = previousShadow;
+			if (previousUI === undefined) delete process.env.ALLAUTH_PROJECT_HOSTED_UI_PROJECT_IDS;
+			else process.env.ALLAUTH_PROJECT_HOSTED_UI_PROJECT_IDS = previousUI;
+		}
+	});
+
+	it("consumes a recovery code from an existing enrolment and lets the legacy engine use the remaining codes", async () => {
+		const email = "recovery-compatibility@hosted.fixture.example";
+		const jar = new Map<string, string>();
+		const request = async (path: string, body: unknown) => {
+			const response = await nativePOST(await signedRequest(host(alpha), `/api/auth${path}`, {
+				method: "POST", ip: "192.0.2.133",
+				headers: { cookie: [...jar.values()].join("; ") },
+				body: JSON.stringify(body),
+			}));
+			for (const value of response.headers.getSetCookie()) {
+				const pair = value.split(";", 1)[0]!;
+				const name = pair.slice(0, pair.indexOf("="));
+				if (/;\s*Max-Age=0(?:;|$)/i.test(value)) jar.delete(name);
+				else jar.set(name, pair);
+			}
+			return response;
+		};
+		const userId = await withHostedProjectAuth(alpha, host(alpha), (instance) => seed(instance, "Recovery fixture", email), env);
+		expect((await request("/sign-in/email", { email, password })).status).toBe(200);
+		const enrollment = await request("/two-factor/enable", { password });
+		expect(enrollment.status).toBe(200);
+		const { backupCodes } = await enrollment.json() as { backupCodes: string[] };
+		expect(backupCodes.length).toBeGreaterThan(2);
+		const pool = projectRegistryPool(env);
+		const factor = (await pool.query<{ secret: string }>(
+			`SELECT secret FROM "${alpha.schemaName}"."twoFactor" WHERE "userId" = $1`,
+			[userId],
+		)).rows[0]!;
+		const { keys, code } = await withHostedProjectAuth(alpha, host(alpha), async (instance) => {
+			const { secretConfig } = await instance.$context;
+			const keys = typeof secretConfig === "string" ? { secret: secretConfig } : secretConfig;
+			const secret = openLegacyMfaRecord(factor.secret, keys);
+			const { code } = await instance.api.generateTOTP({ body: { secret } });
+			return { keys, code };
+		}, env);
+		expect((await request("/two-factor/verify-totp", { code })).status).toBe(200);
+		const transactions = new Pool({ connectionString: String(env.DATABASE_URL), max: 2 });
+		const consume = async (schemaName: string) => {
+			const client = await transactions.connect();
+			try {
+				await client.query("BEGIN");
+				const result = await consumeProjectRecoveryCode(client, {
+					schemaName, userId, code: backupCodes[0]!, keys,
+				});
+				await client.query("COMMIT");
+				return result;
+			} catch (error) {
+				await client.query("ROLLBACK");
+				throw error;
+			} finally {
+				client.release();
+			}
+		};
+		try {
+			expect(await consume(beta.schemaName)).toBe("invalid");
+			const concurrent = await Promise.all([consume(alpha.schemaName), consume(alpha.schemaName)]);
+			expect(concurrent.sort()).toEqual(["consumed", "invalid"]);
+			expect(await consume(alpha.schemaName)).toBe("invalid");
+		} finally {
+			await transactions.end();
+		}
+
+		const rejected = await request("/two-factor/verify-backup-code", { code: backupCodes[0], disableSession: true });
+		expect(rejected.status).toBe(401);
+		const accepted = await request("/two-factor/verify-backup-code", { code: backupCodes[1], disableSession: true });
+		expect(accepted.status).toBe(200);
 	});
 
 	it("re-resolves custom mappings for API and SSR so disabled routing invalidates already minted proofs", async () => {

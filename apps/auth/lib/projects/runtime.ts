@@ -73,18 +73,22 @@ import {
 	projectRegistryPool,
 } from "./registry";
 import { consumeProxySessionCheck } from "./session-introspection-admission";
+import { readProjectSessionPrincipal } from "./session-principal";
+import { observeProjectSessions, projectSessionShadowSelected } from "./session-shadow";
 import { checkedProjectSchema } from "./validation";
 
 type Instance = ReturnType<typeof createAuth>;
 interface Entry {
 	auth: Instance;
+	engine: AuthEngine;
 	env: AuthEnvironment;
 	project: Project;
 	pool: Pool;
+	shadowPool?: Pool;
 }
-const entries = createBoundedProjectCache<Entry>(8, (entry) =>
-	entry.pool.end(),
-);
+const entries = createBoundedProjectCache<Entry>(8, async (entry) => {
+	await Promise.all([entry.pool.end(), entry.shadowPool?.end()]);
+});
 const instances = new WeakMap<Instance, Entry>();
 
 /** Platform authority is read afresh from the platform DB, never copied from a project role. */
@@ -143,6 +147,7 @@ async function build(
 	pool.on("error", () =>
 		console.error("AllAuth project database connection error."),
 	);
+	let shadowPool: Pool | undefined;
 	const secret = projectSecret(environment, project.id);
 	const env = {
 		...environment,
@@ -353,11 +358,35 @@ async function build(
 			(userId) =>
 				eraseOwnedAvatarsBeforeDelete(userId, avatarScope, pool, environment),
 		);
-		const entry = { auth: instance, env, project, pool };
+		const legacy = legacyAuthEngine(instance);
+		let engine = legacy;
+		if (projectSessionShadowSelected(environment, project)) {
+			const context = await instance.$context;
+			const shadow = new Pool({
+				connectionString: setting(environment, "DATABASE_URL"),
+				max: 1,
+				connectionTimeoutMillis: 150,
+				idleTimeoutMillis: 5000,
+				statement_timeout: 100,
+				allowExitOnIdle: true,
+				options: "-c default_transaction_read_only=on",
+			});
+			shadow.on("error", () => console.error("AllAuth project session comparison connection error."));
+			shadowPool = shadow;
+			engine = observeProjectSessions(legacy, {
+				projectId: project.id,
+				basePath,
+				read: (headers) => readProjectSessionPrincipal(shadow, project, headers, {
+					signingSecret: context.secret,
+					secureCookies: context.authCookies.sessionToken.attributes.secure === true,
+				}),
+			});
+		}
+		const entry = { auth: instance, engine, env, project, pool, shadowPool };
 		instances.set(instance, entry);
 		return entry;
 	} catch (error) {
-		await pool.end();
+		await Promise.all([pool.end(), shadowPool?.end()]);
 		throw error;
 	}
 }
@@ -383,7 +412,7 @@ export async function withProjectAuth<T>(
 	// Transport secrets can rotate while the native auth instance remains cached.
 	// Verification must receive the registry row read for this request.
 	return entries.use(
-		`${project.id}:${configured.version}:origins:${projectOriginFingerprint(project)}:owned-avatars:${ownedAvatarSelected(env, project.id)}:native-passkeys:${selectedNativePasskeys(env, project).version}:google:${googleProvider.version}:microsoft:${microsoftConfigurationVersion(microsoft)}:apple:${appleConfigurationVersion(apple)}:${apple ? Math.floor(Date.now() / 86400000) : 0}`,
+		`${project.id}:${configured.version}:shadow:${projectSessionShadowSelected(env, project)}:origins:${projectOriginFingerprint(project)}:owned-avatars:${ownedAvatarSelected(env, project.id)}:native-passkeys:${selectedNativePasskeys(env, project).version}:google:${googleProvider.version}:microsoft:${microsoftConfigurationVersion(microsoft)}:apple:${appleConfigurationVersion(apple)}:${apple ? Math.floor(Date.now() / 86400000) : 0}`,
 		() => build(project, env, configured.policy, googleProvider),
 		(entry) => callback(entry.auth, entry.env, project),
 	);
@@ -410,7 +439,7 @@ export function withProjectAuthEngine<T>(
 			if (!entry) throw new Error("Project instance is unavailable.");
 			return callback(
 				{
-					engine: legacyAuthEngine(instance),
+					engine: entry.engine,
 					consumeAdmission: (key) => consumeProxySessionCheck(entry.pool, key),
 				},
 				env,
@@ -440,7 +469,7 @@ export async function withHostedProjectAuth<T>(
 	const microsoft = readProjectMicrosoftProvider(environment, project.slug);
 	const origin = `https://${hostname}`;
 	return entries.use(
-		`${project.id}:${configured.version}:origins:${projectOriginFingerprint(project)}:owned-avatars:${ownedAvatarSelected(environment, project.id)}:native-passkeys:${selectedNativePasskeys(environment, project, origin).version}:google:${googleProvider.version}:microsoft:${microsoftConfigurationVersion(microsoft)}:apple:${appleConfigurationVersion(apple)}:${apple ? Math.floor(Date.now() / 86400000) : 0}:${origin}`,
+		`${project.id}:${configured.version}:shadow:${projectSessionShadowSelected(environment, project)}:origins:${projectOriginFingerprint(project)}:owned-avatars:${ownedAvatarSelected(environment, project.id)}:native-passkeys:${selectedNativePasskeys(environment, project, origin).version}:google:${googleProvider.version}:microsoft:${microsoftConfigurationVersion(microsoft)}:apple:${appleConfigurationVersion(apple)}:${apple ? Math.floor(Date.now() / 86400000) : 0}:${origin}`,
 		() =>
 			build(project, environment, configured.policy, googleProvider, origin),
 		(entry) => callback(entry.auth, entry.env, project),
@@ -457,7 +486,11 @@ export function withHostedProjectAuthEngine<T>(
 	return withHostedProjectAuth(
 		project,
 		hostname,
-		(instance, env) => callback(legacyAuthEngine(instance), env),
+		(instance, env) => {
+			const entry = instances.get(instance);
+			if (!entry) throw new Error("Hosted project instance is unavailable.");
+			return callback(entry.engine, env);
+		},
 		environment,
 	);
 }

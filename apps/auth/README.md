@@ -22,7 +22,7 @@ Free includes AllAuth attribution, up to 20 members per application end-user org
 
 AllAuth React SDK 2.0.0 owns the client, components and signed proxy integration. Its package has zero Better Auth dependencies and works with the existing platform endpoints. Customers choose when to upgrade their applications. [Integration guide](INTEGRATION.md) · [SDK 2.0.0 release notes](https://allauth.co/releases/sdk-2-0-0)
 
-The server dispatches authentication and session operations through an AllAuth interface backed by Better Auth. The project engine, hosted sign-in UI and shared OAuth/OIDC issuer still use Better Auth. [Engine interface](lib/auth-engine.ts) · [Server adapter](lib/legacy-auth-engine.ts) · [Provider inventory](PLUGINS.md)
+The server dispatches authentication and session operations through an AllAuth interface backed by Better Auth. The project engine, hosted sign-in UI and shared OAuth/OIDC issuer still use Better Auth. [Engine interface](lib/auth-engine.ts) · [Server adapter](lib/legacy-auth-engine.ts) · [Provider inventory](PLUGINS.md) · [Engine migration and rollout](docs/allauth-engine-migration.md)
 
 ## Source development
 
