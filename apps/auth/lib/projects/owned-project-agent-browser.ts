@@ -222,6 +222,33 @@ export function ownedAgentRevokeInput(body: unknown) {
 	return parsed.success ? parsed.data : invalidAgentBody(parsed.error);
 }
 
+/** Expire due agent sessions and approvals owned by the current browser principal. */
+export async function cleanupOwnedBrowserAgents(
+	client: PoolClient,
+	userId: string,
+	body: unknown,
+) {
+	if (hasRemoteAgentKeys(body)) return remoteAgentKeysDisabled();
+	const agents = await client.query(
+		`WITH due AS (
+		 SELECT id FROM "agent" WHERE "userId"=$1 AND status='active' AND "expiresAt"<=transaction_timestamp()
+		 ORDER BY id FOR UPDATE
+		 ) UPDATE "agent" a SET status='expired',"updatedAt"=transaction_timestamp() FROM due WHERE a.id=due.id`,
+		[userId],
+	);
+	const approvals = await client.query(
+		`WITH due AS (
+		 SELECT id FROM "approvalRequest" WHERE "userId"=$1 AND status='pending' AND "expiresAt"<=transaction_timestamp()
+		 ORDER BY id FOR UPDATE
+		 ) UPDATE "approvalRequest" a SET status='expired',"updatedAt"=transaction_timestamp() FROM due WHERE a.id=due.id`,
+		[userId],
+	);
+	return json({
+		expired: agents.rowCount ?? 0,
+		approvals_expired: approvals.rowCount ?? 0,
+	});
+}
+
 function missingRevocationTarget() {
 	return problem(
 		400,

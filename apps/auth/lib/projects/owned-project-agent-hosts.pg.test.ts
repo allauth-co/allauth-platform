@@ -41,6 +41,16 @@ const sessionOwner = {
 	id: "agent-host-fixture-session-owner",
 	email: "session-owner@agent-hosts.fixture.example",
 };
+const cleanupOwners = [
+	{
+		id: "agent-host-fixture-cleanup-native",
+		email: "cleanup-native@agent-hosts.fixture.example",
+	},
+	{
+		id: "agent-host-fixture-cleanup-owned",
+		email: "cleanup-owned@agent-hosts.fixture.example",
+	},
+] as const;
 
 function realm(slug: string) {
 	const id = randomUUID();
@@ -126,6 +136,7 @@ describe.skipIf(!existsSync(fixture))(
 		let machineCookie: string;
 		let registrationCookie: string;
 		let sessionCookie: string;
+		let cleanupCookies: string[];
 		let dependentKey: string;
 		let created = false;
 
@@ -208,6 +219,7 @@ describe.skipIf(!existsSync(fixture))(
 				machineOwner,
 				registrationOwner,
 				sessionOwner,
+				...cleanupOwners,
 			]) {
 				await database.query(
 					`INSERT INTO "${alpha.schemaName}"."user" (id,name,email,"emailVerified",role) VALUES ($1,$1,$2,true,'user')`,
@@ -232,6 +244,9 @@ describe.skipIf(!existsSync(fixture))(
 			machineCookie = await signIn(machineOwner.email);
 			registrationCookie = await signIn(registrationOwner.email);
 			sessionCookie = await signIn(sessionOwner.email);
+			cleanupCookies = await Promise.all(
+				cleanupOwners.map(({ email }) => signIn(email)),
+			);
 			dependentKey = JSON.stringify(
 				await exportJWK(
 					(await generateKeyPair("EdDSA", { extractable: true })).publicKey,
@@ -590,6 +605,146 @@ describe.skipIf(!existsSync(fixture))(
 			expect(await ownerOfOther.json()).toMatchObject({
 				agent_id: otherId,
 				metadata: {},
+			});
+		});
+
+		it("expires only the current browser owner's due agents and approvals atomically across writers", async () => {
+			const path = "/agent/cleanup";
+			const schema = `"${alpha.schemaName}"`;
+			const seed = async (actor: typeof owner, cookie: string) => {
+				const host = await createHost(actor.id, cookie);
+				const [dueAgent, futureAgent] = await seedDependents(host.hostId);
+				const dueApproval = await pendingApproval(host.hostId, "ciba", actor);
+				const futureApproval = await pendingApproval(
+					host.hostId,
+					"ciba",
+					actor,
+				);
+				await database.query(
+					`UPDATE ${schema}."agent" SET "userId"=$3,status='active',"expiresAt"=CASE WHEN id=$1 THEN now()-interval '1 minute' ELSE now()+interval '5 minutes' END WHERE id IN ($1,$2)`,
+					[dueAgent, futureAgent, actor.id],
+				);
+				await database.query(
+					`UPDATE ${schema}."approvalRequest" SET "expiresAt"=now()-interval '1 minute' WHERE id=$1`,
+					[dueApproval.approvalId],
+				);
+				return {
+					dueAgent,
+					futureAgent,
+					dueApproval: dueApproval.approvalId,
+					futureApproval: futureApproval.approvalId,
+				};
+			};
+			const snapshot = async (fixture: Awaited<ReturnType<typeof seed>>) => {
+				const agent = await database.query<{
+					id: string;
+					status: string;
+					publicKey: string;
+					kid: string | null;
+					grant: string;
+				}>(
+					`SELECT a.id,a.status,a."publicKey",a.kid,g.status AS grant FROM ${schema}."agent" a JOIN ${schema}."agentCapabilityGrant" g ON g."agentId"=a.id WHERE a.id=ANY($1::text[])`,
+					[[fixture.dueAgent, fixture.futureAgent]],
+				);
+				const approval = await database.query<{ id: string; status: string }>(
+					`SELECT id,status FROM ${schema}."approvalRequest" WHERE id=ANY($1::text[])`,
+					[[fixture.dueApproval, fixture.futureApproval]],
+				);
+				return [
+					agent.rows.find(({ id }) => id === fixture.dueAgent),
+					agent.rows.find(({ id }) => id === fixture.futureAgent),
+					approval.rows.find(({ id }) => id === fixture.dueApproval),
+					approval.rows.find(({ id }) => id === fixture.futureApproval),
+				].map((row) => {
+					if (!row) throw new Error("Cleanup fixture row was missing.");
+					const { id: _id, ...data } = row;
+					return data;
+				});
+			};
+			const call = (
+				cookie: string,
+				address = "192.0.2.151",
+				project = alpha,
+			) => {
+				const input = new Request(request(project, path, cookie), {
+					method: "POST",
+				});
+				input.headers.set("x-real-ip", address);
+				return input;
+			};
+			const reference = await seed(cleanupOwners[0], cleanupCookies[0]);
+			const fixture = await seed(cleanupOwners[1], cleanupCookies[1]);
+			const before = await snapshot(fixture);
+			const unauthorized = await legacy.handler(call(""));
+			const unauthenticated = await owned.dispatch(call(""));
+			expect([unauthorized.status, unauthenticated.status]).toEqual([401, 401]);
+			expect(await unauthorized.json()).toEqual(await unauthenticated.json());
+			expect(
+				(await outside.dispatch(call(cleanupCookies[1], "192.0.2.152", beta)))
+					.status,
+			).toBe(401);
+			expect((await disabled.dispatch(call(cleanupCookies[1]))).status).toBe(
+				501,
+			);
+			const nativeResponse = await legacy.handler(call(cleanupCookies[0]));
+			expect(nativeResponse.status).toBe(200);
+			expect(await nativeResponse.json()).toEqual({
+				expired: 1,
+				approvals_expired: 1,
+			});
+			expect(await snapshot(fixture)).toEqual(before);
+			const aged = await signIn(cleanupOwners[1].email);
+			const active = await legacy.handler(request(alpha, "/get-session", aged));
+			const { session } = (await active.json()) as { session: { id: string } };
+			await database.query(
+				`UPDATE ${schema}."session" SET "createdAt"=now()-interval '6 minutes' WHERE id=$1`,
+				[session.id],
+			);
+			await database.query(`CREATE FUNCTION ${schema}."rejectFixtureCleanup"() RETURNS trigger LANGUAGE plpgsql AS $$
+				BEGIN RAISE EXCEPTION 'fixture approval cleanup failed'; END;
+			$$`);
+			try {
+				await database.query(`CREATE TRIGGER "rejectFixtureCleanup" BEFORE UPDATE ON ${schema}."approvalRequest"
+					FOR EACH ROW WHEN (NEW.status='expired') EXECUTE FUNCTION ${schema}."rejectFixtureCleanup"()`);
+				await expect(owned.dispatch(call(aged))).rejects.toThrow(
+					"fixture approval cleanup failed",
+				);
+				expect(await snapshot(fixture)).toEqual(before);
+			} finally {
+				await database.query(
+					`DROP TRIGGER IF EXISTS "rejectFixtureCleanup" ON ${schema}."approvalRequest"`,
+				);
+				await database.query(
+					`DROP FUNCTION ${schema}."rejectFixtureCleanup"()`,
+				);
+			}
+			const result = await owned.dispatch(call(aged));
+			expect(result.status).toBe(200);
+			expect(await result.json()).toEqual({ expired: 1, approvals_expired: 1 });
+			const saved = await snapshot(fixture);
+			expect(saved).toEqual(await snapshot(reference));
+			expect(saved).toMatchObject([
+				{
+					status: "expired",
+					publicKey: dependentKey,
+					kid: "fixture-kid",
+					grant: "active",
+				},
+				{ status: "active" },
+				{ status: "expired" },
+				{ status: "pending" },
+			]);
+			const repeat = await owned.dispatch(call(aged));
+			expect(repeat.status).toBe(200);
+			expect(await repeat.json()).toEqual({ expired: 0, approvals_expired: 0 });
+			expect((await owned.dispatch(call(aged))).status).toBe(200);
+			expect((await owned.dispatch(call(aged))).status).toBe(429);
+			legacy = await native(nativePool);
+			const resumed = await legacy.handler(call(aged));
+			expect(resumed.status).toBe(200);
+			expect(await resumed.json()).toEqual({
+				expired: 0,
+				approvals_expired: 0,
 			});
 		});
 
