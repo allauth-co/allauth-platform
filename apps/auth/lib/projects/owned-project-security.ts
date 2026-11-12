@@ -12,6 +12,7 @@ import {
 	securitySubject,
 	type SecurityPolicy,
 } from "../control/security-policy";
+import { checkpointOwnedProjectWrites } from "./owned-project-engine-store";
 
 type SecurityDatabase = Pick<PoolClient, "query">;
 
@@ -93,15 +94,12 @@ export function createOwnedProjectSecurity(options: SecurityOptions) {
 		return !monitor;
 	}
 
-	async function checkRules(
+	async function matchingRule(
 		client: SecurityDatabase,
-		request: Request,
 		policy: SecurityPolicy,
 		email?: string,
 		ip?: string | null,
-		reportMonitor = true,
 	) {
-		if (policy.mode === "monitor" && !reportMonitor) return false;
 		const domain = email?.includes("@")
 			? canonicalDomain(email.slice(email.lastIndexOf("@") + 1))
 			: null;
@@ -112,10 +110,24 @@ export function createOwnedProjectSecurity(options: SecurityOptions) {
 			 LIMIT 1`,
 			[ip ?? null, domain],
 		);
-		if (rows[0])
-			return blocked(client, request, policy, "explicit-rule", rows[0]);
+		if (rows[0]) return { signal: "explicit-rule", rule: rows[0] };
 		return domain && policy.blockedEmailDomains.includes(domain)
-			? blocked(client, request, policy, "email-domain-policy")
+			? { signal: "email-domain-policy", rule: undefined }
+			: null;
+	}
+
+	async function checkRules(
+		client: SecurityDatabase,
+		request: Request,
+		policy: SecurityPolicy,
+		email?: string,
+		ip?: string | null,
+		reportMonitor = true,
+	) {
+		if (policy.mode === "monitor" && !reportMonitor) return false;
+		const match = await matchingRule(client, policy, email, ip);
+		return match
+			? blocked(client, request, policy, match.signal, match.rule)
 			: false;
 	}
 
@@ -147,6 +159,24 @@ export function createOwnedProjectSecurity(options: SecurityOptions) {
 			[key, scope, current, cutoff, limit, until],
 		);
 		return rows[0].count;
+	}
+
+	async function signupVelocityExceeded(
+		client: SecurityDatabase,
+		policy: SecurityPolicy,
+		ip: string,
+	) {
+		const limit = policy.maxSignUpsPerIp;
+		return (
+			(await increment(
+				client,
+				"signup-ip",
+				ip,
+				policy.signUpWindowSeconds,
+				limit,
+				policy.blockSeconds,
+			)) > limit
+		);
 	}
 
 	function failureSubjects(ip: string, identity?: RequestIdentity) {
@@ -234,21 +264,8 @@ export function createOwnedProjectSecurity(options: SecurityOptions) {
 					return true;
 			}
 		}
-		if (input?.signup) {
-			const limit = policy.maxSignUpsPerIp;
-			if (
-				(await increment(
-					client,
-					"signup-ip",
-					ip,
-					policy.signUpWindowSeconds,
-					limit,
-					policy.blockSeconds,
-				)) > limit
-			) {
-				return blocked(client, request, policy, "signup-velocity");
-			}
-		}
+		if (input?.signup && (await signupVelocityExceeded(client, policy, ip)))
+			return blocked(client, request, policy, "signup-velocity");
 		return false;
 	}
 
@@ -327,6 +344,25 @@ export function createOwnedProjectSecurity(options: SecurityOptions) {
 
 	return {
 		admit,
+		async prepareProviderSignup(
+			client: PoolClient,
+			request: Request,
+			email: string,
+		) {
+			const policy = await readPolicy(client);
+			const ip = trustedIP(request);
+			const match = await matchingRule(client, policy, email, ip);
+			if (match && policy.mode === "enforce") return null;
+			const overLimit =
+				ip && (await signupVelocityExceeded(client, policy, ip));
+			if (overLimit && policy.mode === "enforce") return null;
+			// Native stores the counter independently of the provisional identity and its events.
+			const rollback = await checkpointOwnedProjectWrites(client);
+			if (match)
+				await blocked(client, request, policy, match.signal, match.rule);
+			if (overLimit) await blocked(client, request, policy, "signup-velocity");
+			return rollback;
+		},
 		async denyProvisioning(
 			client: SecurityDatabase,
 			request: Request,

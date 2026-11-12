@@ -82,6 +82,21 @@ export function afterOwnedProjectCommit(
 	effects.push(effect);
 }
 
+/** Roll back provisional writes and their effects without undoing earlier admissions. */
+export async function checkpointOwnedProjectWrites(client: PoolClient) {
+	const effects = commitEffects.get(client);
+	if (!effects)
+		throw new Error(
+			"A project transaction is required for a write checkpoint.",
+		);
+	const effectCount = effects.length;
+	await client.query("SAVEPOINT owned_project_writes");
+	return async () => {
+		await client.query("ROLLBACK TO SAVEPOINT owned_project_writes");
+		effects.length = effectCount;
+	};
+}
+
 /** All calls in a transaction, including database triggers, use the selected realm's schema. */
 export function createProjectEngineStore(database: Pool, schemaName: string) {
 	const schema = checkedProjectSchema(schemaName);

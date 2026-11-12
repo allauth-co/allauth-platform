@@ -8,7 +8,10 @@ import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { createAuthOptions } from "../auth";
 import { defaultAuthPolicy } from "../auth-policy/policy";
-import { securitySubject } from "../control/security-policy";
+import {
+	defaultSecurityPolicy,
+	securitySubject,
+} from "../control/security-policy";
 import { newWebhookSigningSecret } from "../control/webhook-contract";
 import type { ControlWebhookEnvelope } from "../control/webhooks";
 import { deliverPendingWebhooks } from "../control/webhooks";
@@ -191,6 +194,8 @@ describe.skipIf(!existsSync(fixturePath))(
 			const blockedStoredEmail = `stored@${domain}`;
 			const callbackIP = "192.0.2.177";
 			const aliasCallbackIP = "192.0.2.178";
+			const velocityCallbackIP = "192.0.2.179";
+			const monitorCallbackIP = "192.0.2.180";
 			const ruleId = randomUUID();
 			await database.query(
 				`INSERT INTO ${scope}."allauthWebhookEndpoint" (id,url,"eventTypes","encryptedSecret") VALUES ($1,'https://callback-policy-hook.fixture.example/events','["security.*","auth.sign-in"]',$2)`,
@@ -273,27 +278,35 @@ describe.skipIf(!existsSync(fixturePath))(
 						[endpoint],
 					)
 				).rows;
-			const countFailures = async (address: string) =>
+			const counterCount = async (address: string, scopeName = "fail-ip") =>
 				(
 					await database.query<{ count: number }>(
 						`SELECT count FROM ${scope}."allauthSecurityCounter" WHERE key=$1`,
-						[await securitySubject(secret, "fail-ip", address)],
+						[await securitySubject(secret, scopeName, address)],
 					)
 				).rows[0]?.count ?? 0;
 			async function exercise(
 				dispatch: Dispatch,
 				subject: string,
-				mode: "linked" | "signup" | "stored" | "alias",
+				mode: "linked" | "signup" | "stored" | "alias" | "velocity",
+				fixtureIP?: string,
 			) {
 				const email =
-					mode === "alias"
+					mode === "alias" || mode === "velocity"
 						? reservedEmail
 						: mode === "stored"
 							? "allowed-provider-profile@fixture.example"
 							: `${mode}@${domain}`;
-				const address = mode === "alias" ? aliasCallbackIP : callbackIP;
+				const address =
+					fixtureIP ??
+					(mode === "velocity"
+						? velocityCallbackIP
+						: mode === "alias"
+							? aliasCallbackIP
+							: callbackIP);
 				const requestHeaders = { ...headers, "x-real-ip": address };
-				const failures = await countFailures(address);
+				const failures = await counterCount(address);
+				const signups = await counterCount(address, "signup-ip");
 				const code = randomUUID();
 				const started = await dispatch(
 					new Request(target("/sign-in/social"), {
@@ -375,7 +388,10 @@ describe.skipIf(!existsSync(fixturePath))(
 									error_description: "User validation failed",
 								},
 				);
-				expect(await countFailures(address)).toBe(failures + 1);
+				expect(await counterCount(address)).toBe(failures + 1);
+				expect(await counterCount(address, "signup-ip")).toBe(
+					signups + (mode === "alias" || mode === "velocity" ? 1 : 0),
+				);
 				expect(
 					(await database.query(`SELECT id FROM ${scope}."session"`)).rowCount,
 				).toBe(0);
@@ -528,6 +544,30 @@ describe.skipIf(!existsSync(fixturePath))(
 					]),
 				);
 				expect(aliasEvents).toHaveLength(2);
+				const velocityKey = await securitySubject(
+					secret,
+					"signup-ip",
+					velocityCallbackIP,
+				);
+				await database.query(
+					`INSERT INTO ${scope}."allauthSecurityCounter" (key,scope,count,"windowStartedAt","updatedAt") VALUES ($1,'signup-ip',$2,statement_timestamp(),statement_timestamp())`,
+					[velocityKey, defaultSecurityPolicy.maxSignUpsPerIp],
+				);
+				const limitedEvents = await exercise(
+					native(nativeDatabase, aliases).handler,
+					reservedSubject,
+					"velocity",
+				);
+				expect(limitedEvents).toEqual(
+					expect.arrayContaining([
+						{ ...failure, ipAddress: velocityCallbackIP },
+						{
+							...authFailure("validation_failed"),
+							ipAddress: velocityCallbackIP,
+						},
+					]),
+				);
+				expect(limitedEvents).toHaveLength(2);
 				expect(
 					await exercise(
 						owned(database, schema, aliases).dispatch,
@@ -535,6 +575,52 @@ describe.skipIf(!existsSync(fixturePath))(
 						"alias",
 					),
 				).toEqual(aliasEvents);
+				expect(
+					await exercise(
+						owned(database, schema, aliases).dispatch,
+						reservedSubject,
+						"velocity",
+					),
+				).toEqual(limitedEvents);
+				await database.query(
+					`INSERT INTO ${scope}."allauthSecurityPolicy" (id,policy) VALUES ('default',$1)`,
+					[
+						{
+							...defaultSecurityPolicy,
+							mode: "monitor",
+							maxSignUpsPerIp: 1,
+							blockedEmailDomains: ["fixture.example"],
+						},
+					],
+				);
+				await database.query(
+					`INSERT INTO ${scope}."allauthSecurityCounter" (key,scope,count,"windowStartedAt","updatedAt") VALUES ($1,'signup-ip',1,statement_timestamp(),statement_timestamp())`,
+					[await securitySubject(secret, "signup-ip", monitorCallbackIP)],
+				);
+				const monitoredAlias = await exercise(
+					native(nativeDatabase, aliases).handler,
+					reservedSubject,
+					"alias",
+					monitorCallbackIP,
+				);
+				expect(monitoredAlias).toEqual(
+					expect.arrayContaining([
+						{ ...failure, ipAddress: monitorCallbackIP },
+						{
+							...authFailure("USER_ALREADY_EXISTS_USE_ANOTHER_EMAIL"),
+							ipAddress: monitorCallbackIP,
+						},
+					]),
+				);
+				expect(monitoredAlias).toHaveLength(2);
+				expect(
+					await exercise(
+						owned(database, schema, aliases).dispatch,
+						reservedSubject,
+						"alias",
+						monitorCallbackIP,
+					),
+				).toEqual(monitoredAlias);
 				expect(
 					(
 						await database.query(
@@ -561,12 +647,19 @@ describe.skipIf(!existsSync(fixturePath))(
 					[ruleId],
 				);
 				await database.query(
+					`DELETE FROM ${scope}."allauthSecurityPolicy" WHERE id='default'`,
+				);
+				await database.query(
 					`DELETE FROM ${scope}."allauthSecurityCounter" WHERE key=ANY($1::text[])`,
 					[
 						await Promise.all([
 							securitySubject(secret, "fail-ip", callbackIP),
 							securitySubject(secret, "fail-ip", aliasCallbackIP),
 							securitySubject(secret, "signup-ip", aliasCallbackIP),
+							securitySubject(secret, "fail-ip", velocityCallbackIP),
+							securitySubject(secret, "signup-ip", velocityCallbackIP),
+							securitySubject(secret, "fail-ip", monitorCallbackIP),
+							securitySubject(secret, "signup-ip", monitorCallbackIP),
 						]),
 					],
 				);

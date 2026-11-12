@@ -196,6 +196,12 @@ export interface OwnedProjectOAuthOptions {
 		request: Request,
 		email: string,
 	): Promise<boolean>;
+	/** Commit signup admission even when provisional account writes are discarded. */
+	prepareBrowserSignup?(
+		client: PoolClient,
+		request: Request,
+		email: string,
+	): Promise<(() => Promise<void>) | null>;
 	/** Inject a scoped session/MFA operation. Its response is released only after the account transaction commits. */
 	complete(
 		client: PoolClient,
@@ -1420,6 +1426,14 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 				clearState,
 				"User validation failed",
 			);
+		const callbackFailure = (error: unknown) =>
+			error === rejectedSignupProfile
+				? profileFailure(true)
+				: errorRedirect(
+						error === rejected ? "account_not_linked" : "internal_server_error",
+						flow ?? undefined,
+						true,
+					);
 		try {
 			const linkSession = browserToken(request);
 			flow = await store.consume(state, provider, linkSession);
@@ -1444,89 +1458,111 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 			const anonymousUserId = flow.serverContext?.anonymousUserId;
 			const response = await store.transaction(async (client) => {
 				let rejectedProfile = false;
-				const account = await store.bind(
-					client,
-					identity,
-					{
-						signUpEnabled: options.signUpEnabled,
-						requireEmailVerification:
-							options.requireEmailVerification &&
-							provider !== "microsoft" &&
-							provider !== "apple",
-						async denyProfile(email, operation) {
-							rejectedProfile =
-								(await options.denyBrowserProfile?.(client, request, email)) ===
-								true;
-							// Native signup rolls its policy event back with the provisional identity.
-							if (rejectedProfile && operation === "signup")
-								throw rejectedSignupProfile;
-							return rejectedProfile;
+				const signup: { denied?: boolean; rollback?: () => Promise<void> } = {};
+				try {
+					const account = await store.bind(
+						client,
+						identity,
+						{
+							signUpEnabled: options.signUpEnabled,
+							requireEmailVerification:
+								options.requireEmailVerification &&
+								provider !== "microsoft" &&
+								provider !== "apple",
+							async denyProfile(email, operation) {
+								if (operation === "signup" && options.prepareBrowserSignup) {
+									const rollback = await options.prepareBrowserSignup(
+										client,
+										request,
+										email,
+									);
+									if (!rollback) {
+										signup.denied = true;
+										return true;
+									}
+									signup.rollback = rollback;
+									return false;
+								}
+								rejectedProfile =
+									(await options.denyBrowserProfile?.(
+										client,
+										request,
+										email,
+									)) === true;
+								// Native signup rolls its policy event back with the provisional identity.
+								if (rejectedProfile && operation === "signup")
+									throw rejectedSignupProfile;
+								return rejectedProfile;
+							},
 						},
-					},
-					link,
-				);
-				if (rejectedProfile) return profileFailure();
-				if (
-					account &&
-					"error" in account &&
-					account.error === reservedProjectEmailError.code
-				)
-					return errorRedirect(
-						account.error,
-						flow ?? undefined,
-						true,
-						reservedProjectEmailError.message,
+						link,
 					);
-				if (!account || "error" in account) throw rejected;
-				if (link) {
+					if (signup.denied) return profileFailure(true);
+					if (rejectedProfile) return profileFailure();
 					if (
-						options.authorizeLinkedAccounts &&
-						!(await options.authorizeLinkedAccounts(client, {
-							request,
-							user: account.user,
-							operation: "link-callback",
-						}))
-					)
-						throw rejected;
-					return publicRedirect(destination.href);
-				}
-				const response = await options.complete(client, {
-					request,
-					user: account.user,
-					provider,
-					destination: ((account.registered && newUser) || destination).href,
-					verificationDestination: destination.href,
-					anonymousUserId,
-					registered: account.registered,
-					transport: "browser",
-				});
-				if (response.status >= 400) {
-					// The native session gate follows token rotation for a verified, already-linked profile.
-					if (
-						options.denyBrowserProfile &&
-						account.existingBinding &&
-						identity.email &&
-						identity.email.toLowerCase() !== account.user.email.toLowerCase() &&
-						(await isStoredAccountPolicyDenial(response))
-					)
+						account &&
+						"error" in account &&
+						account.error === reservedProjectEmailError.code
+					) {
+						await signup.rollback?.();
 						return errorRedirect(
-							projectSecurityBlockedCode,
+							account.error,
 							flow ?? undefined,
-							false,
-							projectSecurityBlockedMessage,
+							true,
+							reservedProjectEmailError.message,
 						);
-					throw rejected;
+					}
+					if (!account || "error" in account) throw rejected;
+					if (link) {
+						if (
+							options.authorizeLinkedAccounts &&
+							!(await options.authorizeLinkedAccounts(client, {
+								request,
+								user: account.user,
+								operation: "link-callback",
+							}))
+						)
+							throw rejected;
+						return publicRedirect(destination.href);
+					}
+					const response = await options.complete(client, {
+						request,
+						user: account.user,
+						provider,
+						destination: ((account.registered && newUser) || destination).href,
+						verificationDestination: destination.href,
+						anonymousUserId,
+						registered: account.registered,
+						transport: "browser",
+					});
+					if (response.status >= 400) {
+						// The native session gate follows token rotation for a verified, already-linked profile.
+						if (
+							options.denyBrowserProfile &&
+							account.existingBinding &&
+							identity.email &&
+							identity.email.toLowerCase() !==
+								account.user.email.toLowerCase() &&
+							(await isStoredAccountPolicyDenial(response))
+						)
+							return errorRedirect(
+								projectSecurityBlockedCode,
+								flow ?? undefined,
+								false,
+								projectSecurityBlockedMessage,
+							);
+						throw rejected;
+					}
+					return response;
+				} catch (error) {
+					if (!signup.rollback) throw error;
+					await signup.rollback();
+					return callbackFailure(error);
 				}
-				return response;
 			});
 			return navigation(response, expireState);
 		} catch (error) {
-			if (error === rejectedSignupProfile) return profileFailure(true);
-			return errorRedirect(
-				error === rejected ? "account_not_linked" : "internal_server_error",
-				flow ?? undefined,
-				true,
-			);
+			return callbackFailure(error);
 		}
 	}
 
