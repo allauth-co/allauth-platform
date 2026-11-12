@@ -1,6 +1,5 @@
 import { setting } from "@/lib/configuration";
 import { edgeHeaders } from "@/lib/domains/edge";
-import { withPortalAuthEngine } from "@/lib/domains/hosting";
 import {
 	hostedSdkEndpoint,
 	hostedSdkProjectEnabled,
@@ -10,6 +9,7 @@ import {
 	hostedSdkFailure,
 	hostedSdkResponse,
 } from "@/lib/domains/hosted-sdk-response";
+import { withPortalAuthEngine } from "@/lib/domains/hosting";
 
 async function handle(request: Request) {
 	const endpoint = hostedSdkEndpoint(
@@ -59,6 +59,18 @@ async function handle(request: Request) {
 			)
 				return hostedSdkFailure(400, "A sign-in code must be requested.");
 		}
+		if (endpoint === "account-info") {
+			const accountId = url.searchParams.get("accountId");
+			if (url.searchParams.size !== 1 || !accountId || accountId.length > 160)
+				return hostedSdkFailure(400, "Select a linked account.");
+		}
+		if (
+			(endpoint === "account-info" ||
+				endpoint === "two-factor/enable" ||
+				endpoint === "two-factor/generate-backup-codes") &&
+			bound.headers.has("authorization")
+		)
+			return hostedSdkFailure(403, "A browser session is required.");
 
 		// The gateway verifies the original URL and body before this dispatch.
 		url.pathname = `/api/auth/${endpoint}`;

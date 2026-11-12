@@ -73,6 +73,7 @@ jobs:
           lib/domains/hosted-sdk.test.ts lib/hosted-sdk-page.test.ts lib/hosted-sdk-ui-render.test.ts
           lib/domains/hosted-organization-preview.test.ts lib/hosted-organization-ui-render.test.ts
           lib/domains/hosted-header-render.test.ts lib/domains/hosted-account-profile-render.test.ts
+          lib/domains/hosted-account-security-render.test.ts
           lib/branding/portal.test.ts lib/shared.test.ts lib/oauth-consent-render.test.ts
           lib/domains/portal-session.test.ts lib/app-entry.test.ts lib/console-entry.test.ts
           lib/oauth-picker-portal.test.ts lib/oauth-picker-render.test.ts

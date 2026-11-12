@@ -1,6 +1,6 @@
 import { sso } from "@better-auth/sso";
-import { admin, emailOTP, magicLink, username } from "better-auth/plugins";
 import { symmetricDecrypt } from "better-auth/crypto";
+import { admin, emailOTP, magicLink, username } from "better-auth/plugins";
 import { getTestInstance } from "better-auth/test";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { GET, POST } from "../../app/api/auth/hosted-ui/[...all]/route";
@@ -167,6 +167,111 @@ describe("hosted SDK transport", () => {
 			(await GET(request("get-session", "GET", { accept: "*/*" }))).status,
 		).toBe(404);
 		expect(gateway.dispatch).toHaveBeenCalledTimes(1);
+	});
+
+	it("confines account security aliases and one-time credentials to exact successful operations", async () => {
+		verifiedFixture();
+		const totpURI = "otpauth://totp/AllAuth:fixture?secret=JBSWY3DPEHPK3PXP";
+		const backupCodes = ["12345-abcde"];
+		gateway.dispatch.mockImplementation(async (incoming: Request) => {
+			const url = new URL(incoming.url);
+			if (url.pathname.endsWith("/account-info")) {
+				expect(url.search).toBe("?accountId=opaque-row");
+				return Response.json({
+					account: { accountId: "provider-subject" },
+					data: { login: "fixture", access_token: "secret", roles: ["admin"] },
+					user: {
+						email: "fixture@example.test",
+						name: "Fixture",
+						providerId: "provider",
+					},
+				});
+			}
+			return Response.json(
+				{
+					status: true,
+					totpURI,
+					backupCodes,
+					secret: "raw",
+					token: "secret",
+					other: { totp_uri: totpURI, backup_codes: backupCodes },
+				},
+				{ status: url.search ? 400 : 200 },
+			);
+		});
+		for (const path of [
+			"account-info",
+			"account-info?accountId=opaque-row&userId=other",
+			"account-info?accountId=one&accountId=two",
+		]) {
+			expect((await GET(request(path))).status).toBe(400);
+		}
+		for (const path of [
+			"change-password",
+			"link-social",
+			"unlink-account",
+			"delete-user",
+			"passkey/verify-registration",
+			"passkey/update-passkey",
+			"passkey/delete-passkey",
+			"two-factor/enable",
+			"two-factor/disable",
+			"two-factor/generate-backup-codes",
+		]) {
+			expect((await GET(request(path))).status).toBe(404);
+			expect(
+				(
+					await POST(
+						request(path, "POST", { origin: "https://foreign.example" }),
+					)
+				).status,
+			).toBe(403);
+		}
+		for (const path of [
+			"list-accounts",
+			"passkey/list-user-passkeys",
+			"passkey/generate-register-options",
+			"account-info?accountId=opaque-row",
+		]) {
+			expect((await POST(request(path, "POST", { origin }))).status).toBe(404);
+		}
+		const bearer = request("two-factor/enable", "POST", { origin });
+		bearer.headers.set("authorization", "Bearer browser-fixture");
+		expect((await POST(bearer)).status).toBe(403);
+		expect(gateway.dispatch).not.toHaveBeenCalled();
+		expect(
+			await (await GET(request("account-info?accountId=opaque-row"))).json(),
+		).toEqual({
+			data: { login: "fixture" },
+			user: { email: "fixture@example.test", name: "Fixture" },
+		});
+		async function post(path: string) {
+			const response = await POST(request(path, "POST", { origin }));
+			expect(response.headers.get("cache-control")).toBe("no-store");
+			return response.json();
+		}
+		for (const path of [
+			"two-factor/enable?denied=true",
+			"two-factor/disable",
+			"two-factor/verify-totp",
+			"delete-user",
+		]) {
+			const result = await post(path);
+			expect(result).not.toHaveProperty("totpURI");
+			expect(result).not.toHaveProperty("backupCodes");
+			expect(result).toHaveProperty("other", {});
+		}
+		const enrollment = await post("two-factor/enable");
+		expect(enrollment).toEqual({ totpURI, backupCodes });
+		const rotation = await post("two-factor/generate-backup-codes");
+		expect(rotation).toEqual({ status: true, backupCodes });
+		expect(
+			(await POST(request("two-factor/get-totp-uri", "POST", { origin })))
+				.status,
+		).toBe(404);
+		expect(
+			(await GET(request("delete-user/callback?token=synthetic"))).status,
+		).toBe(404);
 	});
 
 	it("limits hosted profile operations to the verified realm and returns issued API keys once", async () => {
@@ -604,28 +709,6 @@ describe("hosted SDK transport", () => {
 		);
 		expect(signup.status).toBe(200);
 		const user = (await signup.json()) as { user: { id: string } };
-		const enrollment = await remember(
-			await nativeRequest("two-factor/enable", { password }),
-		);
-		expect(enrollment.status).toBe(200);
-		const ctx = await auth.$context;
-		const factor = await ctx.adapter.findOne<{ secret: string }>({
-			model: "twoFactor",
-			where: [{ field: "userId", value: user.user.id }],
-		});
-		expect(factor).not.toBeNull();
-		const secret = await symmetricDecrypt({
-			key: ctx.secretConfig,
-			data: factor!.secret,
-		});
-		const { code } = await auth.api.generateTOTP({ body: { secret } });
-		expect(
-			(await remember(await nativeRequest("two-factor/verify-totp", { code })))
-				.status,
-		).toBe(200);
-		await remember(await nativeRequest("sign-out", {}));
-		jar.clear();
-
 		verifiedFixture();
 		gateway.dispatch.mockImplementation(async (incoming: Request) => {
 			const response = await auth.handler(incoming);
@@ -652,6 +735,38 @@ describe("hosted SDK transport", () => {
 				),
 			);
 		}
+		const enrollment = await bridge("two-factor/enable", { password });
+		expect(enrollment.status).toBe(200);
+		const setup = (await enrollment.json()) as {
+			totpURI: string;
+			backupCodes: string[];
+		};
+		expect(new URL(setup.totpURI).protocol).toBe("otpauth:");
+		expect(setup.backupCodes).toHaveLength(10);
+		const ctx = await auth.$context;
+		const factor = await ctx.adapter.findOne<{ secret: string }>({
+			model: "twoFactor",
+			where: [{ field: "userId", value: user.user.id }],
+		});
+		expect(factor).not.toBeNull();
+		const secret = await symmetricDecrypt({
+			key: ctx.secretConfig,
+			data: factor!.secret,
+		});
+		const { code } = await auth.api.generateTOTP({ body: { secret } });
+		const verified = await bridge("two-factor/verify-totp", { code });
+		expect(verified.status).toBe(200);
+		expect(await verified.json()).toMatchObject({ user: { id: user.user.id } });
+		const regenerated = await bridge("two-factor/generate-backup-codes", {
+			password,
+		});
+		expect(regenerated.status).toBe(200);
+		const rotated = (await regenerated.json()) as { backupCodes: string[] };
+		expect(rotated.backupCodes).toHaveLength(10);
+		expect(rotated.backupCodes).not.toEqual(setup.backupCodes);
+		await remember(await nativeRequest("sign-out", {}));
+		jar.clear();
+
 		const primary = await bridge("sign-in/email", {
 			email,
 			password,
@@ -670,6 +785,7 @@ describe("hosted SDK transport", () => {
 		expect(await (await nativeRequest("get-session")).json()).toMatchObject({
 			user: { id: user.user.id },
 		});
+		expect((await bridge("two-factor/disable", { password })).status).toBe(200);
 	});
 
 	it("scopes email code creation to sign-in", async () => {

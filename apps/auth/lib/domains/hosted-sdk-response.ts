@@ -5,6 +5,7 @@ const privateFields = new Set([
 	"token",
 	"otp",
 	"backupcodes",
+	"totpuri",
 	"sessiontoken",
 	"accesstoken",
 	"refreshtoken",
@@ -14,6 +15,7 @@ const privateFields = new Set([
 	"authorization",
 	"password",
 	"passwordhash",
+	"secret",
 	"clientsecret",
 	"privatekey",
 	"encryptedprivatekey",
@@ -49,6 +51,78 @@ function hostedPersonalKeyValue(data: unknown, issued: boolean) {
 	)
 		return clean;
 	return { ...clean, key: data.key };
+}
+
+function record(value: unknown) {
+	return value && typeof value === "object" && !Array.isArray(value)
+		? (Object.fromEntries(Object.entries(value)) as Record<string, unknown>)
+		: {};
+}
+
+function linkedAccountValue(value: unknown) {
+	const { data, user } = record(value);
+	function displayFields(fields: unknown, keys: string[]) {
+		return Object.fromEntries(
+			Object.entries(record(fields)).filter(
+				([key, entry]) =>
+					keys.includes(key) &&
+					typeof entry === "string" &&
+					entry.length <= 512,
+			),
+		);
+	}
+	return {
+		data: displayFields(data, ["login", "username"]),
+		user: displayFields(user, ["email", "name"]),
+	};
+}
+
+function issuedTotpUri(value: unknown) {
+	if (typeof value !== "string" || value.length > 4096) return undefined;
+	try {
+		const uri = new URL(value);
+		const secrets = uri.searchParams.getAll("secret");
+		if (
+			uri.protocol === "otpauth:" &&
+			uri.hostname === "totp" &&
+			uri.pathname !== "/" &&
+			!uri.username &&
+			!uri.password &&
+			!uri.port &&
+			!uri.hash &&
+			secrets.length === 1 &&
+			/^[a-z2-7]+=*$/i.test(secrets[0] ?? "")
+		)
+			return value;
+	} catch {
+		return undefined;
+	}
+}
+
+function hostedMfaIssueValue(data: unknown, enrollment: boolean) {
+	const { backupCodes, method, status, totpURI } = record(data);
+	const codes =
+		Array.isArray(backupCodes) &&
+		backupCodes.length > 0 &&
+		backupCodes.length <= 64 &&
+		backupCodes.every(
+			(code: unknown) =>
+				typeof code === "string" && /^[a-z\d-]{1,128}$/i.test(code),
+		)
+			? backupCodes
+			: undefined;
+	const uri = enrollment ? issuedTotpUri(totpURI) : undefined;
+	return enrollment
+		? {
+				...(method === "totp" && { method }),
+				...(uri && codes && { totpURI: uri, backupCodes: codes }),
+			}
+		: {
+				...(status === true && {
+					status,
+					...(codes && { backupCodes: codes }),
+				}),
+			};
 }
 
 export function hostedSdkFailure(status: number, message: string) {
@@ -166,7 +240,13 @@ export async function hostedSdkResponse(
 					data,
 					endpoint === "api-key/create" && response.ok,
 				)
-			: browserValue(data);
+			: response.ok && endpoint === "account-info"
+				? linkedAccountValue(data)
+				: response.ok &&
+						(endpoint === "two-factor/enable" ||
+							endpoint === "two-factor/generate-backup-codes")
+					? hostedMfaIssueValue(data, endpoint === "two-factor/enable")
+					: browserValue(data);
 		return Response.json(value, {
 			status: response.status,
 			headers,

@@ -5,17 +5,22 @@ type AccountEndpoint =
 	| "update-user"
 	| "api-key/list"
 	| "api-key/create"
-	| "api-key/delete";
+	| "api-key/delete"
+	| "account-info"
+	| "delete-user"
+	| "unlink-account";
 
 /** Use the verified accounts gateway for browser operations outside the published SDK types. */
 export async function hostedAccountRequest(
 	endpoint: AccountEndpoint,
 	body?: object,
 	signal?: AbortSignal,
+	query?: URLSearchParams,
 ): Promise<unknown> {
 	const headers = new Headers({ accept: "application/json" });
 	if (body) headers.set("content-type", "application/json");
-	const response = await fetch(`${hostedSdkBasePath}/${endpoint}`, {
+	const path = `${hostedSdkBasePath}/${endpoint}${query?.size ? `?${query}` : ""}`;
+	const response = await fetch(path, {
 		method: body ? "POST" : "GET",
 		headers,
 		...(body && { body: JSON.stringify(body) }),
@@ -25,6 +30,15 @@ export async function hostedAccountRequest(
 		signal,
 	});
 	const result: unknown = await response.json().catch(() => null);
-	if (!response.ok) throw new Error(authError(result));
+	if (!response.ok) {
+		const code =
+			result &&
+			typeof result === "object" &&
+			"code" in result &&
+			typeof result.code === "string"
+				? result.code
+				: undefined;
+		throw Object.assign(new Error(authError(result)), { code });
+	}
 	return result;
 }

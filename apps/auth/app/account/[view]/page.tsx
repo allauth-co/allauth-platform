@@ -1,9 +1,10 @@
 import { headers } from "next/headers";
 import { notFound, redirect } from "next/navigation";
 import { Settings } from "@/components/better-auth-ui/settings/settings";
-import { portalSession } from "@/lib/domains/hosting";
 import { PageHeading } from "@/components/console/common";
+import { HostedAccountSecurity } from "@/components/hosted-account-security";
 import { HostedAccountOrganizations } from "@/components/hosted-account-settings";
+import { portalSession } from "@/lib/domains/hosting";
 export default async function Page({
 	params,
 }: {
@@ -28,7 +29,7 @@ export default async function Page({
 			{view === "organizations" ? (
 				<HostedAccountOrganizations>{legacy}</HostedAccountOrganizations>
 			) : (
-				legacy
+				<HostedAccountSecurity>{legacy}</HostedAccountSecurity>
 			)}
 		</div>
 	);
