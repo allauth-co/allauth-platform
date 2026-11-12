@@ -1231,6 +1231,114 @@ describe.skipIf(!existsSync(fixture))(
 			}
 		});
 
+		it("clears the active organization and team when a password change replaces the session", async () => {
+			const schema = `"${alpha.schemaName}"`;
+			const organizationId = randomUUID();
+			const teamId = randomUUID();
+			const replacementPassword = "Replacement-fixture-password-82!";
+			const { rows } = await database.query<{ password: string }>(
+				`SELECT password FROM ${schema}.account WHERE "userId"=$1 AND "providerId"='credential'`,
+				[eventUserId],
+			);
+			await database.query(
+				`INSERT INTO ${schema}.organization (id,name,slug,"createdAt")
+				 VALUES ($1,'Password rotation fixture','password-rotation-fixture',now())`,
+				[organizationId],
+			);
+			await database.query(
+				`INSERT INTO ${schema}.team (id,name,"memberCount","organizationId","createdAt")
+				 VALUES ($1,'Password rotation team',1,$2,now())`,
+				[teamId, organizationId],
+			);
+			await database.query(
+				`INSERT INTO ${schema}.member (id,"organizationId","userId",role,"createdAt")
+				 VALUES ($1,$2,$3,'member',now())`,
+				[randomUUID(), organizationId, eventUserId],
+			);
+			await database.query(
+				`INSERT INTO ${schema}."teamMember" (id,"teamId","userId","createdAt")
+				 VALUES ($1,$2,$3,now())`,
+				[randomUUID(), teamId, eventUserId],
+			);
+			const breachFetch = vi
+				.spyOn(globalThis, "fetch")
+				.mockImplementation(
+					async () => new Response(`${"0".repeat(35)}:0\r\n`),
+				);
+			try {
+				for (const writer of ["legacy", "owned"] as const) {
+					const otherWriter = writer === "legacy" ? "owned" : "legacy";
+					const active = await browserSession(eventEmail);
+					const sibling = await browserSession(eventEmail);
+					await database.query(
+						`UPDATE ${schema}."session" SET "activeOrganizationId"=$1,"activeTeamId"=$2 WHERE id=$3`,
+						[organizationId, teamId, active.id],
+					);
+					try {
+						const response = await send(
+							writer,
+							"/change-password",
+							{
+								currentPassword: password,
+								newPassword: replacementPassword,
+								revokeOtherSessions: true,
+							},
+							active.cookie,
+						);
+						expect(response.status).toBe(200);
+						const sessionCookieName = active.cookie.split("=", 1)[0];
+						const replacementCookie =
+							response.headers
+								.getSetCookie()
+								.find((cookie) => cookie.startsWith(`${sessionCookieName}=`))
+								?.split(";", 1)[0] ?? "";
+						expect(replacementCookie).toBeTruthy();
+						const replacement = await send(
+							otherWriter,
+							"/get-session",
+							undefined,
+							replacementCookie,
+						);
+						expect(replacement.status).toBe(200);
+						const replacementBody = (await replacement.json()) as {
+							session: { id: string };
+						};
+						expect(replacementBody).toMatchObject({
+							user: { id: eventUserId },
+							session: { activeOrganizationId: null },
+						});
+						expect(replacementBody.session.id).not.toBe(active.id);
+						const saved = await database.query(
+							`SELECT "activeOrganizationId","activeTeamId" FROM ${schema}."session" WHERE id=$1`,
+							[replacementBody.session.id],
+						);
+						expect(saved.rows).toEqual([
+							{ activeOrganizationId: null, activeTeamId: null },
+						]);
+						for (const revoked of [active, sibling]) {
+							const lookup = await send(
+								otherWriter,
+								"/get-session",
+								undefined,
+								revoked.cookie,
+							);
+							expect(await lookup.json()).toBeNull();
+						}
+					} finally {
+						await database.query(
+							`UPDATE ${schema}.account SET password=$2 WHERE "userId"=$1 AND "providerId"='credential'`,
+							[eventUserId, rows[0].password],
+						);
+					}
+				}
+			} finally {
+				breachFetch.mockRestore();
+				await database.query(`DELETE FROM ${schema}.organization WHERE id=$1`, [
+					organizationId,
+				]);
+			}
+		});
+
 		it("rolls back the profile and session mutations when their event cannot be recorded", async () => {
 			const active = await browserSession(eventEmail);
 			const sibling = await browserSession(eventEmail);

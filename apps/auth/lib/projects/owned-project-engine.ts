@@ -2642,7 +2642,7 @@ export function createOwnedProjectEngine(
 					request,
 					!tokenFrom(request.headers, rememberCookie),
 					path,
-					session,
+					{ ...session, activeOrganizationId: null, activeTeamId: null },
 				);
 				for (const cookie of multiSessionTokens(request.headers)) {
 					if (tokens.includes(cookie.token))
