@@ -672,7 +672,7 @@ export async function closeProjectInstances() {
 }
 
 /** Pair dispatch and admission with the same checked PostgreSQL project schema. */
-export function withProjectAuthEngine<T>(
+export async function withProjectAuthEngine<T>(
 	slug: string,
 	callback: (
 		scope: ProjectAuthScope,
@@ -681,18 +681,29 @@ export function withProjectAuthEngine<T>(
 	) => Promise<T>,
 	environment?: AuthEnvironment,
 ): Promise<T> {
-	return withDirectProjectEntry(
-		slug,
-		(entry, project) =>
-			callback(
-				{
-					engine: entry.engine,
-					consumeAdmission: (key) => consumeProxySessionCheck(entry.pool, key),
-				},
-				entry.env,
-				project,
-			),
-		environment,
+	const env = environment || (await getAuthEnvironment());
+	return withResolvedProjectAuthEngine(await getProject(slug, env), callback, env);
+}
+
+/** Admit the same immutable registry binding used to verify the app proxy. */
+export function withResolvedProjectAuthEngine<T>(
+	project: Project,
+	callback: (
+		scope: ProjectAuthScope,
+		env: AuthEnvironment,
+		project: Project,
+	) => Promise<T>,
+	environment: AuthEnvironment,
+): Promise<T> {
+	return withProjectEntry(project, environment, undefined, (entry, current) =>
+		callback(
+			{
+				engine: entry.engine,
+				consumeAdmission: (key) => consumeProxySessionCheck(entry.pool, key),
+			},
+			entry.env,
+			current,
+		),
 	);
 }
 

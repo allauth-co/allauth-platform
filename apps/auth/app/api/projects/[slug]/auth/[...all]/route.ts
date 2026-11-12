@@ -5,10 +5,16 @@ import { json } from "@/lib/api";
 import { getAuthEnvironment } from "@/lib/auth";
 import { recordSdkVersionObservation } from "@/lib/notifications/repository";
 import { backendCredentialRepository } from "@/lib/projects/backend-credentials";
-import { projectRegistryPool } from "@/lib/projects/registry";
-import { projectSecret, withProjectAuthEngine } from "@/lib/projects/runtime";
-import { handleServiceDirectoryRequest } from "@/lib/projects/service-directory-transport";
-import { handleProjectAuthentication } from "@/lib/projects/session-introspection";
+import { getProject, projectRegistryPool } from "@/lib/projects/registry";
+import {
+	projectSecret,
+	withResolvedProjectAuthEngine,
+} from "@/lib/projects/runtime";
+import {
+	handleServiceDirectoryRequest,
+	hasServiceDirectoryCredentials,
+} from "@/lib/projects/service-directory-transport";
+import { prepareProjectAuthentication } from "@/lib/projects/session-introspection";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -19,27 +25,36 @@ async function handle(
 	try {
 		const { slug } = await context.params;
 		const environment = await getAuthEnvironment();
-		const response = await withProjectAuthEngine(
-			slug,
-			async ({ engine, consumeAdmission }, _env, project) => {
-				const directory = await handleServiceDirectoryRequest(
-					request,
-					project,
-					{
-						authorize: (headers) =>
-							backendCredentialRepository(
-								projectRegistryPool(environment),
-							).authorize(project.id, headers),
-						consume: consumeAdmission,
-						read: (operation, headers, query) =>
-							engine.readDirectory(operation, headers, query),
-					},
-				);
-				if (directory) return directory;
-				const result = await handleProjectAuthentication(
-					request,
-					project,
-					environment,
+		const project = await getProject(slug, environment);
+		const prepare = () =>
+			prepareProjectAuthentication(request, project, environment, {
+				consumeBody: true,
+			});
+		const directoryRequest = hasServiceDirectoryCredentials(request, project);
+		// The dedicated directory credential path is GET-only and has no body.
+		// Other signed requests must finish verification before holding a writer lease.
+		const prepared = directoryRequest ? undefined : await prepare();
+		const response = await withResolvedProjectAuthEngine(
+			project,
+			async ({ engine, consumeAdmission }) => {
+				if (directoryRequest) {
+					const directory = await handleServiceDirectoryRequest(
+						request,
+						project,
+						{
+							authorize: (headers) =>
+								backendCredentialRepository(
+									projectRegistryPool(environment),
+								).authorize(project.id, headers),
+							consume: consumeAdmission,
+							read: (operation, headers, query) =>
+								engine.readDirectory(operation, headers, query),
+						},
+					);
+					if (directory) return directory;
+				}
+				const authentication = prepared ?? (await prepare());
+				const result = await authentication.dispatch(
 					projectSecret(environment, project.id),
 					{
 						scope: engine,
@@ -49,7 +64,7 @@ async function handle(
 					},
 				);
 				const version = request.headers.get("x-allauth-sdk-version");
-				if (request.headers.get("allauth-proxy-signature") && version) {
+				if (authentication.signed && version) {
 					// Authentication has already verified the app proxy. Optional version
 					// reporting never changes its result or adds database latency to it.
 					after(async () => {

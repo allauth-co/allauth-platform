@@ -47,7 +47,7 @@ function scopeId(scope: object): number {
 	return id;
 }
 function diagnostic(
-	dependencies: IntrospectionDependencies,
+	observe: IntrospectionDependencies["diagnostic"],
 	project: Project,
 	outcome: SessionCheckDiagnostic["outcome"],
 	code: string,
@@ -62,10 +62,7 @@ function diagnostic(
 		status,
 	};
 	try {
-		(
-			dependencies.diagnostic ??
-			((value) => console.info(JSON.stringify(value)))
-		)(event);
+		(observe ?? ((value) => console.info(JSON.stringify(value))))(event);
 	} catch {
 		/* Observability cannot change authentication. */
 	}
@@ -89,6 +86,50 @@ function authenticSessionCookie(
 	}
 }
 
+/** Verify the app proxy against the exact registry row before admitting engine work. */
+export async function prepareProjectAuthentication(
+	request: Request,
+	project: Project,
+	environment: AuthEnvironment,
+	options: {
+		consumeBody?: boolean;
+		diagnostic?: IntrospectionDependencies["diagnostic"];
+	} = {},
+) {
+	const signed = Boolean(request.headers.get("allauth-proxy-signature"));
+	let verified = request;
+	if (signed) {
+		try {
+			verified = await verifiedProjectRequest(request, project, environment, {
+				consumeBody: options.consumeBody,
+			});
+		} catch (error) {
+			diagnostic(
+				options.diagnostic,
+				project,
+				error instanceof APIError ? "verification_failed" : "service_failure",
+				"ALLAUTH_PROXY_VERIFICATION_FAILED",
+				error instanceof APIError ? error.statusCode : 503,
+			);
+			throw error;
+		}
+	}
+	return {
+		signed,
+		dispatch: (
+			sessionSecret: string,
+			dependencies: IntrospectionDependencies,
+		) =>
+			dispatchProjectAuthentication(
+				verified,
+				project,
+				signed,
+				sessionSecret,
+				dependencies,
+			),
+	};
+}
+
 /** Signed server introspection retains live native authority and independently meters every caller. */
 export async function handleProjectAuthentication(
 	request: Request,
@@ -97,20 +138,22 @@ export async function handleProjectAuthentication(
 	sessionSecret: string,
 	dependencies: IntrospectionDependencies,
 ): Promise<Response> {
-	const signed = Boolean(request.headers.get("allauth-proxy-signature"));
-	let verified: Request;
-	try {
-		verified = await verifiedProjectRequest(request, project, environment);
-	} catch (error) {
-		diagnostic(
-			dependencies,
-			project,
-			error instanceof APIError ? "verification_failed" : "service_failure",
-			"ALLAUTH_PROXY_VERIFICATION_FAILED",
-			error instanceof APIError ? error.statusCode : 503,
-		);
-		throw error;
-	}
+	const authentication = await prepareProjectAuthentication(
+		request,
+		project,
+		environment,
+		{ diagnostic: dependencies.diagnostic },
+	);
+	return authentication.dispatch(sessionSecret, dependencies);
+}
+
+async function dispatchProjectAuthentication(
+	verified: Request,
+	project: Project,
+	signed: boolean,
+	sessionSecret: string,
+	dependencies: IntrospectionDependencies,
+): Promise<Response> {
 	const url = new URL(verified.url);
 	const introspection =
 		signed &&
@@ -159,7 +202,7 @@ export async function handleProjectAuthentication(
 	);
 	if (result.status === 429)
 		diagnostic(
-			dependencies,
+			dependencies.diagnostic,
 			project,
 			"rate_limited",
 			"ALLAUTH_SESSION_CHECK_RATE_LIMITED",
@@ -167,7 +210,7 @@ export async function handleProjectAuthentication(
 		);
 	else if (result.status >= 500)
 		diagnostic(
-			dependencies,
+			dependencies.diagnostic,
 			project,
 			"service_failure",
 			"ALLAUTH_SESSION_CHECK_UNAVAILABLE",
@@ -175,7 +218,7 @@ export async function handleProjectAuthentication(
 		);
 	else if (result.status === 401 || result.status === 403)
 		diagnostic(
-			dependencies,
+			dependencies.diagnostic,
 			project,
 			"verification_failed",
 			"ALLAUTH_SESSION_CHECK_REJECTED",
@@ -183,7 +226,7 @@ export async function handleProjectAuthentication(
 		);
 	else if (result.status === 200 && (await result.clone().text()) === "null")
 		diagnostic(
-			dependencies,
+			dependencies.diagnostic,
 			project,
 			"invalid_session",
 			"ALLAUTH_SESSION_INVALID",

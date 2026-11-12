@@ -23,6 +23,7 @@ import {
 import { canonicalIP } from "../control/security-policy";
 import { authenticationEmail } from "../email/authentication";
 import { emailConfigured, sendAuthEmail } from "../email/send";
+import { projectEmailAliasVariable } from "../project-email-aliases";
 import {
 	nativePasskeyCapability,
 	realmPasskeyOptions,
@@ -51,8 +52,8 @@ import { backendCredentialRepository } from "./backend-credentials";
 import { projectBrokerTwoFactor } from "./broker-two-factor";
 import { readLegacyProjectKeyring } from "./legacy-project-keyring";
 import { createOwnedEmailVerification } from "./owned-email-verification";
-import { createOwnedProjectApplicationConsole } from "./owned-project-application-console";
 import { createOwnedProjectAppleDeletion } from "./owned-project-apple-deletion";
+import { createOwnedProjectApplicationConsole } from "./owned-project-application-console";
 import { createOwnedProjectEmailCallbackPolicy } from "./owned-project-email-callback";
 import { createOwnedProjectEngine } from "./owned-project-engine";
 import { createProjectEngineStore } from "./owned-project-engine-store";
@@ -363,11 +364,19 @@ function projectSupport(options: Options, platformOrigin: string) {
 /** Assemble an explicitly selected internal development realm. This function does not select a runtime. */
 export async function createOwnedProjectRuntimeCandidate(options: Options) {
 	const { database, project, env, policy, defer } = options;
+	if (
+		setting(
+			env,
+			projectEmailAliasVariable(projectSlug.parse(project.slug)),
+		).trim()
+	)
+		throw new Error(
+			"Configured project email aliases require the legacy writer.",
+		);
 	const { signingSecret, encryptionKeys } = readLegacyProjectKeyring(
 		options.signingSecret,
 		process.env.BETTER_AUTH_SECRETS,
 	);
-	projectSlug.parse(project.slug);
 	const platform = authOrigin(env);
 	const transport = options.transport;
 	const hosted = transport.kind === "hosted";
