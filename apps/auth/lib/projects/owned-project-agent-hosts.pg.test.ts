@@ -33,6 +33,10 @@ const machineOwner = {
 	id: "agent-host-fixture-machine-owner",
 	email: "machine-owner@agent-hosts.fixture.example",
 };
+const registrationOwner = {
+	id: "agent-host-fixture-registration-owner",
+	email: "registration-owner@agent-hosts.fixture.example",
+};
 
 function realm(slug: string) {
 	const id = randomUUID();
@@ -110,6 +114,7 @@ describe.skipIf(!existsSync(fixture))(
 		let ownerCookie: string;
 		let peerCookie: string;
 		let machineCookie: string;
+		let registrationCookie: string;
 		let dependentKey: string;
 		let created = false;
 
@@ -186,7 +191,7 @@ describe.skipIf(!existsSync(fixture))(
 				pg.release();
 			}
 			const hash = await clerkCompatiblePasswords.hash(password);
-			for (const user of [owner, peer, machineOwner]) {
+			for (const user of [owner, peer, machineOwner, registrationOwner]) {
 				await database.query(
 					`INSERT INTO "${alpha.schemaName}"."user" (id,name,email,"emailVerified",role) VALUES ($1,$1,$2,true,'user')`,
 					[user.id, user.email],
@@ -208,6 +213,7 @@ describe.skipIf(!existsSync(fixture))(
 			ownerCookie = await signIn(owner.email);
 			peerCookie = await signIn(peer.email);
 			machineCookie = await signIn(machineOwner.email);
+			registrationCookie = await signIn(registrationOwner.email);
 			dependentKey = JSON.stringify(
 				await exportJWK(
 					(await generateKeyPair("EdDSA", { extractable: true })).publicKey,
@@ -1065,28 +1071,42 @@ describe.skipIf(!existsSync(fixture))(
 
 		const agentAudience = `${origin}${alpha.basePath}`;
 		const statusPath = "/agent/status";
-		async function nativeMachine(label: string) {
+		async function nativeMachineHost(label: string, cookie = machineCookie) {
 			const hostKey = await generateKeyPair("EdDSA", { extractable: true });
-			const agentKey = await generateKeyPair("EdDSA", { extractable: true });
 			const kid = `fixture-machine-${label}`;
 			const host = await legacy.handler(
-				request(alpha, "/host/create", machineCookie, {
+				request(alpha, "/host/create", cookie, {
 					name: label,
 					public_key: { ...(await exportJWK(hostKey.publicKey)), kid },
 				}),
 			);
 			expect(host.status).toBe(200);
 			const { hostId } = (await host.json()) as { hostId: string };
-			const registration = await new SignJWT({
-				agent_public_key: await exportJWK(agentKey.publicKey),
+			return { hostId, hostKey, kid };
+		}
+
+		async function registerProof(
+			host: Awaited<ReturnType<typeof nativeMachineHost>>,
+			key: Awaited<ReturnType<typeof generateKeyPair>>,
+			hostName?: string,
+		) {
+			return new SignJWT({
+				agent_public_key: await exportJWK(key.publicKey),
+				...(hostName ? { host_name: hostName } : {}),
 			})
-				.setProtectedHeader({ alg: "EdDSA", typ: "host+jwt", kid })
-				.setIssuer(hostId)
+				.setProtectedHeader({ alg: "EdDSA", typ: "host+jwt", kid: host.kid })
+				.setIssuer(host.hostId)
 				.setAudience(agentAudience)
 				.setIssuedAt()
 				.setExpirationTime("45s")
 				.setJti(randomUUID())
-				.sign(hostKey.privateKey);
+				.sign(host.hostKey.privateKey);
+		}
+
+		async function nativeMachine(label: string) {
+			const host = await nativeMachineHost(label);
+			const agentKey = await generateKeyPair("EdDSA", { extractable: true });
+			const registration = await registerProof(host, agentKey);
 			const agent = await legacy.handler(
 				request(
 					alpha,
@@ -1103,14 +1123,14 @@ describe.skipIf(!existsSync(fixture))(
 			const body = (await agent.json()) as { agent_id: string };
 			expect(body).toMatchObject({
 				status: "active",
-				host_id: hostId,
+				host_id: host.hostId,
 				agent_capability_grants: [],
 			});
-			return { hostId, agentId: body.agent_id, hostKey, agentKey, kid };
+			return { ...host, agentId: body.agent_id, agentKey };
 		}
 
 		function hostProof(
-			machine: Awaited<ReturnType<typeof nativeMachine>>,
+			machine: Awaited<ReturnType<typeof nativeMachineHost>>,
 			issuer = machine.hostId,
 			audience = agentAudience,
 		) {
@@ -1319,6 +1339,245 @@ describe.skipIf(!existsSync(fixture))(
 				[machine.agentId],
 			);
 			expect(record.rows).toEqual([{ status: "active", expired: true }]);
+		});
+
+		function machineRegistration(
+			proof: string,
+			name: string,
+			properties: object = {},
+			ip = "192.0.2.103",
+		) {
+			const input = request(
+				alpha,
+				"/agent/register",
+				"",
+				{ name, mode: "delegated", ...properties },
+				`Bearer ${proof}`,
+			);
+			input.headers.set("x-real-ip", ip);
+			input.headers.delete("origin");
+			return input;
+		}
+
+		it("registers the signed host's delegated agent and preserves native-readable rows after rollback", async () => {
+			const host = await nativeMachineHost(
+				"Registration host",
+				registrationCookie,
+			);
+			const key = await generateKeyPair("EdDSA", { extractable: true });
+			const proof = await registerProof(host, key, "Renamed registration host");
+			const name = "  Fixture registered agent  ";
+			const created = await owned.dispatch(machineRegistration(proof, name));
+			expect(
+				created.status,
+				created.ok ? undefined : await created.clone().text(),
+			).toBe(200);
+			const { agent_id: agentId } = (await created.clone().json()) as {
+				agent_id: string;
+			};
+			expect(await created.json()).toEqual({
+				agent_id: agentId,
+				host_id: host.hostId,
+				name: name.trim(),
+				mode: "delegated",
+				status: "active",
+				agent_capability_grants: [],
+			});
+			const {
+				rows: [agent],
+			} = await database.query(
+				`SELECT "userId","hostId","publicKey",status,mode,extract(epoch FROM "expiresAt"-"activatedAt")::int AS lifetime
+				FROM "${alpha.schemaName}"."agent" WHERE id=$1`,
+				[agentId],
+			);
+			expect(agent).toEqual({
+				userId: registrationOwner.id,
+				hostId: host.hostId,
+				publicKey: JSON.stringify(await exportJWK(key.publicKey)),
+				status: "active",
+				mode: "delegated",
+				lifetime: 900,
+			});
+			const {
+				rows: [heartbeat],
+			} = await database.query(
+				`SELECT name,"lastUsedAt" IS NOT NULL AS used,extract(epoch FROM "expiresAt"-"lastUsedAt")::int AS lifetime FROM "${alpha.schemaName}"."agentHost" WHERE id=$1`,
+				[host.hostId],
+			);
+			expect(heartbeat).toEqual({
+				name: "Renamed registration host",
+				used: true,
+				lifetime: 900,
+			});
+			const replay = await candidate(alpha, true).dispatch(
+				machineRegistration(proof, name),
+			);
+			expect(replay.status).toBe(401);
+			expect(await replay.json()).toMatchObject({ error: "jti_replay" });
+			const duplicate = await owned.dispatch(
+				machineRegistration(await registerProof(host, key), name),
+			);
+			expect(duplicate.status).toBe(409);
+			expect(await duplicate.json()).toMatchObject({ error: "agent_exists" });
+			const inactive = await generateKeyPair("EdDSA", { extractable: true });
+			const requiresApproval = await owned.dispatch(
+				machineRegistration(await registerProof(host, inactive), name, {
+					force_approval: true,
+				}),
+			);
+			expect(requiresApproval.status).toBe(501);
+			const configuredOut = await owned.dispatch(
+				machineRegistration(await registerProof(host, inactive), name, {
+					capabilities: ["fixture.unconfigured"],
+				}),
+			);
+			expect(configuredOut.status).toBe(400);
+			expect(await configuredOut.json()).toMatchObject({
+				error: "invalid_capabilities",
+			});
+			const { rows } = await database.query(
+				`SELECT id FROM "${alpha.schemaName}"."agent" WHERE "hostId"=$1`,
+				[host.hostId],
+			);
+			expect(rows).toEqual([{ id: agentId }]);
+			const missing = await owned.dispatch(
+				request(alpha, "/agent/register", registrationCookie, { name }),
+			);
+			expect(missing.status).toBe(401);
+			const unknown = await registerProof(
+				{ ...host, hostId: randomUUID() },
+				key,
+			);
+			const unknownNative = await legacy.handler(
+				machineRegistration(unknown, name),
+			);
+			const unknownOwned = await owned.dispatch(
+				machineRegistration(unknown, name),
+			);
+			expect(unknownNative.status).toBe(403);
+			expect(unknownOwned.status).toBe(403);
+			expect(await unknownOwned.json()).toEqual(await unknownNative.json());
+			const otherRealm = await outside.dispatch(
+				request(beta, "/agent/register", "", { name }, `Bearer ${proof}`),
+			);
+			expect(otherRealm.status).toBe(403);
+			legacy = await native(nativePool);
+			const legacyStatus = await legacy.handler(
+				request(
+					alpha,
+					`${statusPath}?agent_id=${agentId}`,
+					"",
+					undefined,
+					`Bearer ${await hostProof(host)}`,
+				),
+			);
+			expect(legacyStatus.status).toBe(200);
+			expect(await legacyStatus.json()).toMatchObject({
+				agent_id: agentId,
+				user_id: registrationOwner.id,
+				status: "active",
+				host_id: host.hostId,
+			});
+			const otherKey = await generateKeyPair("EdDSA", { extractable: true });
+			const afterRollback = await legacy.handler(
+				machineRegistration(
+					await registerProof(host, otherKey),
+					"Registration after rollback",
+				),
+			);
+			expect(afterRollback.status).toBe(200);
+			const { agent_id: otherId } = (await afterRollback.json()) as {
+				agent_id: string;
+			};
+			const candidateStatus = await owned.dispatch(
+				request(
+					alpha,
+					`${statusPath}?agent_id=${otherId}`,
+					"",
+					undefined,
+					`Bearer ${await hostProof(host)}`,
+				),
+			);
+			expect(candidateStatus.status).toBe(200);
+			expect(await candidateStatus.json()).toMatchObject({
+				agent_id: otherId,
+				user_id: registrationOwner.id,
+				status: "active",
+			});
+		});
+
+		it("serializes the native five-active-agent limit across hosts for the same owner", async () => {
+			const first = await nativeMachineHost(
+				"Limit host one",
+				registrationCookie,
+			);
+			const second = await nativeMachineHost(
+				"Limit host two",
+				registrationCookie,
+			);
+			const {
+				rows: [existing],
+			} = await database.query<{ count: number }>(
+				`SELECT count(*)::int AS count FROM "${alpha.schemaName}"."agent" WHERE "userId"=$1 AND status='active'`,
+				[registrationOwner.id],
+			);
+			for (let i = existing.count; i < 4; i++) {
+				const key = await generateKeyPair("EdDSA", { extractable: true });
+				const created = await owned.dispatch(
+					machineRegistration(
+						await registerProof(first, key),
+						`Fixture agent ${i}`,
+						{},
+						"192.0.2.104",
+					),
+				);
+				expect(created.status).toBe(200);
+			}
+			const proofs = await Promise.all(
+				[first, second].map(async (host) =>
+					registerProof(
+						host,
+						await generateKeyPair("EdDSA", { extractable: true }),
+					),
+				),
+			);
+			const attempts = await Promise.all(
+				proofs.map((proof) =>
+					owned.dispatch(
+						machineRegistration(
+							proof,
+							"Concurrent delegated agent",
+							{},
+							"192.0.2.104",
+						),
+					),
+				),
+			);
+			expect(attempts.map(({ status }) => status).sort()).toEqual([200, 400]);
+			expect(
+				await attempts.find(({ status }) => status === 400)?.json(),
+			).toEqual({
+				error: "agent_limit_reached",
+				message: "Maximum number of active agents per user reached",
+			});
+			const { rows } = await database.query(
+				`SELECT count(*)::int AS count FROM "${alpha.schemaName}"."agent" WHERE "userId"=$1 AND status='active'`,
+				[registrationOwner.id],
+			);
+			expect(rows).toEqual([{ count: 5 }]);
+			const old = await legacy.handler(
+				machineRegistration(
+					await registerProof(
+						first,
+						await generateKeyPair("EdDSA", { extractable: true }),
+					),
+					"Native limit comparison",
+					{},
+					"192.0.2.104",
+				),
+			);
+			expect(old.status).toBe(400);
+			expect(await old.json()).toMatchObject({ error: "agent_limit_reached" });
 		});
 	},
 );

@@ -10,6 +10,7 @@ import {
 	createOwnedAgentHost,
 	enrollOwnedAgentHost,
 } from "./owned-project-agent-enrollment";
+import { registerOwnedProjectAgent } from "./owned-project-agent-registration";
 import { readOwnedAgentStatus } from "./owned-project-agent-status";
 import type { createProjectEngineStore } from "./owned-project-engine-store";
 import { admitOwnedProjectNativeRoute } from "./owned-project-native-admission";
@@ -114,6 +115,7 @@ export function createOwnedProjectAgentHosts(options: BrowserHosts) {
 			request.method === "POST" && path === "/agent/approve-capability";
 		const pending = request.method === "GET" && path === "/agent/ciba/pending";
 		const status = request.method === "GET" && path === "/agent/status";
+		const register = request.method === "POST" && path === "/agent/register";
 		const write =
 			decision ||
 			(request.method === "POST" &&
@@ -122,10 +124,10 @@ export function createOwnedProjectAgentHosts(options: BrowserHosts) {
 		const read =
 			request.method === "GET" &&
 			(path === "/host/get" || path === "/host/list");
-		if (!write && !read && !enroll && !pending && !status) return;
+		if (!write && !read && !enroll && !pending && !status && !register) return;
 		const limited = await options.store.transaction((client) =>
 			admitOwnedProjectNativeRoute(client, options.trustedIP(request), path, {
-				max: decision ? 5 : pending || status ? 300 : 100,
+				max: register ? 10 : decision ? 5 : pending || status ? 300 : 100,
 				windowMs: 60_000,
 			}),
 		);
@@ -134,6 +136,12 @@ export function createOwnedProjectAgentHosts(options: BrowserHosts) {
 			return options.store.transaction((client) =>
 				readOwnedAgentStatus(client, request),
 			);
+		if (register) {
+			const body = await options.readBody(request);
+			return options.store.transaction((client) =>
+				registerOwnedProjectAgent(client, request, body),
+			);
+		}
 		if (request.headers.has("authorization")) {
 			if (path === "/host/revoke" && request.headers.get("authorization"))
 				return forbidden(

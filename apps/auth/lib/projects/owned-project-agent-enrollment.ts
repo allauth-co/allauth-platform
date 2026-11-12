@@ -59,7 +59,7 @@ export function agentHostCapabilities(value: string | null): string[] {
 	}
 }
 
-function invalidBody(error: z.ZodError) {
+export function invalidAgentBody(error: z.ZodError) {
 	return agentHostJSON(
 		{
 			code: "VALIDATION_ERROR",
@@ -87,9 +87,13 @@ function invalidKey() {
 	);
 }
 
-async function hostKey(
-	input: z.infer<typeof jwkInput>,
+/** Validate and retain the native inline public-JWK storage format. */
+export async function readOwnedAgentPublicKey(
+	value: unknown,
 ): Promise<HostKey | Response> {
+	const parsed = jwkInput.safeParse(value);
+	if (!parsed.success) return invalidKey();
+	const input = parsed.data;
 	if (!input.kty || !input.x) return invalidKey();
 	const algorithm = input.crv ?? input.kty;
 	if (algorithm !== "Ed25519")
@@ -177,9 +181,9 @@ export async function createOwnedAgentHost(
 			400,
 		);
 	const parsed = createInput.safeParse(body);
-	if (!parsed.success) return invalidBody(parsed.error);
+	if (!parsed.success) return invalidAgentBody(parsed.error);
 	const { name, public_key, default_capabilities } = parsed.data;
-	const key = public_key ? await hostKey(public_key) : null;
+	const key = public_key ? await readOwnedAgentPublicKey(public_key) : null;
 	if (key instanceof Response) return key;
 	if (default_capabilities?.length)
 		return protocolError(
@@ -239,9 +243,9 @@ export async function enrollOwnedAgentHost(client: PoolClient, body: unknown) {
 			400,
 		);
 	const parsed = enrollInput.safeParse(body);
-	if (!parsed.success) return invalidBody(parsed.error);
+	if (!parsed.success) return invalidAgentBody(parsed.error);
 	const { token, public_key, name } = parsed.data;
-	const key = await hostKey(public_key);
+	const key = await readOwnedAgentPublicKey(public_key);
 	if (key instanceof Response) return key;
 	await lockKey(client, key);
 	const { rows: pending } = await client.query<Host & { live: boolean }>(

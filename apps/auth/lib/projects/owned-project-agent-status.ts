@@ -1,29 +1,22 @@
-import { createHash } from "node:crypto";
-import {
-	base64url,
-	decodeJwt,
-	decodeProtectedHeader,
-	importJWK,
-	jwtVerify,
-} from "jose";
 import type { JWTPayload } from "jose";
 import type { PoolClient } from "pg";
 import { agentHostJSON as json } from "./owned-project-agent-enrollment";
+import {
+	agentMachineAudience,
+	agentMachineProblem as problem,
+	consumeAgentMachineReplay,
+	decodeAgentMachineJWT,
+	invalidAgentJWT as invalidJWT,
+	readAgentMachineHost,
+	validAgentIdentifier as validIdentifier,
+	verifyAgentMachineJWT as verifyInline,
+} from "./owned-project-agent-machine";
 
 const statusPath = "/agent/status";
-const jwtMaxAge = 60;
-const replayWindow = jwtMaxAge + 30;
 const heartbeatLifetime = 900;
 const activationLifetime = 3600;
 const absoluteLifetime = 86400;
 
-type Host = {
-	id: string;
-	userId: string | null;
-	publicKey: string | null;
-	jwksUrl: string | null;
-	status: string;
-};
 type Agent = {
 	id: string;
 	name: string;
@@ -48,7 +41,6 @@ type Grant = {
 	expiresAt: Date | null;
 };
 
-const hostFields = `id,"userId","publicKey","jwksUrl",status`;
 const agentFields = `id,name,"hostId","userId","publicKey","jwksUrl",status,mode,"createdAt","activatedAt","expiresAt","lastUsedAt"`;
 const grantRank = new Map([
 	["active", 0],
@@ -57,113 +49,8 @@ const grantRank = new Map([
 	["revoked", 3],
 ]);
 
-function problem(
-	status: number,
-	code: string,
-	message: string,
-	origin?: string,
-) {
-	const response = json({ error: code, message }, status);
-	if (origin && status === 401)
-		response.headers.set(
-			"WWW-Authenticate",
-			`AgentAuth discovery="${origin}/.well-known/agent-configuration"`,
-		);
-	return response;
-}
-
-function invalidJWT(origin: string) {
-	return problem(
-		401,
-		"invalid_jwt",
-		"JWT is invalid, expired, or signature failed",
-		origin,
-	);
-}
-
 function agentNotFound(status: 401 | 404, origin?: string) {
 	return problem(status, "agent_not_found", "Agent not found", origin);
-}
-
-function validIdentifier(value: unknown): value is string {
-	return (
-		typeof value === "string" &&
-		value.length > 0 &&
-		value.length <= 512 &&
-		!value.includes("\0")
-	);
-}
-
-async function verifyInline(
-	token: string,
-	row: Pick<Host, "publicKey" | "jwksUrl">,
-	audience: string[],
-	origin: string,
-) {
-	let key: Awaited<ReturnType<typeof importJWK>>;
-	try {
-		const jwk: unknown = row.publicKey && JSON.parse(row.publicKey);
-		if (
-			row.jwksUrl ||
-			!jwk ||
-			typeof jwk !== "object" ||
-			Array.isArray(jwk) ||
-			!("kty" in jwk) ||
-			jwk.kty !== "OKP" ||
-			!("crv" in jwk) ||
-			jwk.crv !== "Ed25519" ||
-			!("x" in jwk) ||
-			typeof jwk.x !== "string" ||
-			!/^[A-Za-z0-9_-]{43}$/.test(jwk.x) ||
-			base64url.encode(base64url.decode(jwk.x)) !== jwk.x ||
-			["d", "p", "q", "dp", "dq", "qi", "oth", "k"].some(
-				(field) => field in jwk,
-			)
-		)
-			throw new Error("Invalid inline public key.");
-		key = await importJWK(
-			jwk as { kty: "OKP"; crv: "Ed25519"; x: string },
-			"EdDSA",
-		);
-	} catch {
-		return problem(
-			401,
-			"invalid_public_key",
-			"Public key is invalid or malformed",
-			origin,
-		);
-	}
-	try {
-		const { payload } = await jwtVerify(token, key, {
-			algorithms: ["EdDSA"],
-			audience,
-			maxTokenAge: jwtMaxAge,
-		});
-		return payload;
-	} catch {
-		return invalidJWT(origin);
-	}
-}
-
-async function consumeReplay(client: PoolClient, agentId: string, jti: string) {
-	const digest = createHash("sha256")
-		.update(JSON.stringify(["agent-status", agentId, jti]))
-		.digest("base64url");
-	const prefix = "agent-status-jti:";
-	const { rowCount } = await client.query(
-		`INSERT INTO "verification" (id,identifier,value,"expiresAt") VALUES ($1,$2,$1,clock_timestamp()+$3::int*interval '1 second')
-		 ON CONFLICT (id) DO UPDATE SET "expiresAt"=EXCLUDED."expiresAt","updatedAt"=statement_timestamp()
-		 WHERE "verification".identifier=EXCLUDED.identifier AND "verification"."expiresAt"<=clock_timestamp()`,
-		[digest, prefix + digest, replayWindow],
-	);
-	if (rowCount)
-		await client.query(
-			`DELETE FROM "verification" WHERE id IN (
-		 SELECT id FROM "verification" WHERE starts_with(identifier,$1) AND "expiresAt"<=clock_timestamp()
-		 ORDER BY "expiresAt" LIMIT 32 FOR UPDATE SKIP LOCKED)`,
-			[prefix],
-		);
-	return rowCount === 1;
 }
 
 function parseConstraints(value: string) {
@@ -292,37 +179,17 @@ export async function readOwnedAgentStatus(
 	const url = new URL(request.url);
 	if (request.method !== "GET" || !url.pathname.endsWith(statusPath))
 		return problem(404, "not_found", "Not found");
-	const baseURL = url.origin + url.pathname.slice(0, -statusPath.length);
-	const audience = [url.origin, baseURL, `${baseURL}/capability/execute`];
+	const audience = agentMachineAudience(url, statusPath);
 	const ids = url.searchParams.getAll("agent_id");
-	const token = /^Bearer\s+(\S+)$/i.exec(
-		request.headers.get("authorization") ?? "",
-	)?.[1];
-	if (!token || token.split(".").length !== 3)
+	const decoded = decodeAgentMachineJWT(request);
+	if (decoded === null)
 		return problem(401, "unauthorized", "Authentication required");
-	if (token.length > 8192) return invalidJWT(url.origin);
-	let claims: JWTPayload;
-	let typ: unknown;
-	try {
-		const header = decodeProtectedHeader(token);
-		if (header.alg !== "EdDSA") return invalidJWT(url.origin);
-		typ = header.typ;
-		claims = decodeJwt(token);
-	} catch {
-		return invalidJWT(url.origin);
-	}
+	if (decoded === false) return invalidJWT(url.origin);
+	const { token, typ, claims } = decoded;
 	if (typ === "host+jwt") {
 		if (!validIdentifier(claims.iss)) return invalidJWT(url.origin);
-		const { rows: hosts } = await client.query<Host>(
-			`SELECT ${hostFields} FROM "agentHost" WHERE id=$1 OR kid=$1 ORDER BY id LIMIT 2 FOR SHARE`,
-			[claims.iss],
-		);
-		const host = hosts[0];
-		if (
-			hosts.length !== 1 ||
-			!host.userId ||
-			!["active", "pending"].includes(host.status)
-		)
+		const host = await readAgentMachineHost(client, claims.iss, "share");
+		if (!host?.userId || !["active", "pending"].includes(host.status))
 			return agentNotFound(401, url.origin);
 		const verified = await verifyInline(token, host, audience, url.origin);
 		if (verified instanceof Response) return verified;
@@ -365,8 +232,8 @@ export async function readOwnedAgentStatus(
 	if (claims.iss !== undefined && claims.iss !== observed.hostId)
 		return invalidJWT(url.origin);
 	const host = (
-		await client.query<Host>(
-			`SELECT ${hostFields} FROM "agentHost" WHERE id=$1 AND status='active' FOR SHARE`,
+		await client.query<{ userId: string | null }>(
+			`SELECT "userId" FROM "agentHost" WHERE id=$1 AND status='active' FOR SHARE`,
 			[observed.hostId],
 		)
 	).rows[0];
@@ -393,7 +260,14 @@ export async function readOwnedAgentStatus(
 		return invalidJWT(url.origin);
 	const inactive = inactiveAgent(agent, Date.now(), url.origin);
 	if (inactive) return inactive;
-	if (!(await consumeReplay(client, agent.id, verified.jti)))
+	if (
+		!(await consumeAgentMachineReplay(
+			client,
+			"agent-status",
+			agent.id,
+			verified.jti,
+		))
+	)
 		return problem(401, "jti_replay", "JWT has already been used", url.origin);
 	if (!matchesBinding(verified, request, url))
 		return problem(
