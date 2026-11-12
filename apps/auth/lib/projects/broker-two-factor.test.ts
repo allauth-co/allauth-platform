@@ -54,8 +54,12 @@ describe("signed project broker MFA boundary", () => {
 					method: "POST",
 					headers: {
 						origin,
+						"allauth-proxy-origin": origin,
 						"content-type": "application/json",
-						...(signature ? { "allauth-proxy-signature": signature } : {}),
+						cookie: `__Secure-allauth_project_${project.slug}.broker_mfa_ticket=${"a".repeat(64)}; __Secure-allauth_project_${project.slug}.broker_mfa_binding=${"b".repeat(64)}`,
+						...(signature === undefined
+							? {}
+							: { "allauth-proxy-signature": signature }),
 					},
 					body: JSON.stringify({ code: "123456", method: "totp" }),
 				},
@@ -63,6 +67,15 @@ describe("signed project broker MFA boundary", () => {
 		await expect(
 			handleProjectAuthentication(
 				request(),
+				project,
+				env,
+				"unused",
+				dependencies,
+			),
+		).rejects.toMatchObject({ statusCode: 403 });
+		await expect(
+			handleProjectAuthentication(
+				request(""),
 				project,
 				env,
 				"unused",

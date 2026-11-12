@@ -15,8 +15,18 @@ import { readLegacySessionCookie } from "./legacy-session-cookie";
 import { createOwnedProjectMfa } from "./owned-mfa";
 import { createOwnedMfaEnrollment } from "./owned-mfa-enrollment";
 import { createOwnedProjectPasskeyHttp } from "./owned-passkey-http";
+import type { OwnedProjectAccountDeletionOptions } from "./owned-project-account-deletion";
+import { createOwnedProjectAccountDeletion } from "./owned-project-account-deletion";
+import type { ProjectAccountLinkOptions } from "./owned-project-account-links";
 import type { ProjectBackchannelTarget } from "./owned-project-backchannel-logout";
 import { createOwnedProjectBackchannelLogout } from "./owned-project-backchannel-logout";
+import type { AuthorizeProjectBrokerMfa } from "./owned-project-broker-mfa";
+import { verifyOwnedProjectBrokerMfa } from "./owned-project-broker-mfa";
+import {
+	admitOwnedProjectBrokerMfa,
+	projectBrokerMfaPath,
+} from "./owned-project-broker-mfa-admission";
+import { createOwnedProjectEmailChange } from "./owned-project-email-change";
 import type { OwnedProjectEmailSignInOptions } from "./owned-project-email-sign-in";
 import { createOwnedProjectEmailSignIn } from "./owned-project-email-sign-in";
 import type { ProjectSession, ProjectUser } from "./owned-project-engine-store";
@@ -25,6 +35,7 @@ import {
 	createProjectEngineStore,
 	projectUserResponse,
 } from "./owned-project-engine-store";
+import { createOwnedProjectIssuer } from "./owned-project-issuer";
 import type { OwnedProjectOAuthOptions } from "./owned-project-oauth";
 import {
 	createOwnedProjectOAuth,
@@ -97,6 +108,13 @@ interface OwnedProjectEngineOptions {
 	signingSecret: string;
 	policy: AuthPolicy;
 	mfaKeys?: LegacyMfaKeys;
+	accountLinks?: Pick<
+		ProjectAccountLinkOptions,
+		"publicLinkBaseURL" | "defer" | "deliver" | "onDeliveryFailure"
+	> & {
+		emailChange?: boolean;
+		beforeDelete?: OwnedProjectAccountDeletionOptions["beforeDelete"];
+	};
 	passwordChange?: Pick<
 		OwnedProjectPasswordChangeOptions,
 		"checkPasswordSafety"
@@ -110,6 +128,8 @@ interface OwnedProjectEngineOptions {
 		getBranding?(): Promise<ApplicationBranding>;
 	};
 	appName?: string;
+	/** Enable the project issuer candidate in the isolated compatibility fixture. */
+	issuer?: boolean;
 	signUp?: Omit<
 		Parameters<typeof createOwnedSignUpHttp>[0],
 		| "database"
@@ -172,6 +192,7 @@ interface OwnedProjectEngineOptions {
 		Parameters<typeof createOwnedProjectBackchannelLogout>[0],
 		"post" | "defer" | "observe"
 	>;
+	brokerTwoFactor?: AuthorizeProjectBrokerMfa;
 	security?: {
 		requireTrustedIP?: boolean;
 		newDevice?: {
@@ -278,6 +299,8 @@ export function createOwnedProjectEngine(
 	options: OwnedProjectEngineOptions,
 ): AuthEngine {
 	const policy = authPolicySchema.parse(options.policy);
+	const missingSupportAdapter =
+		policy.supportAccess?.enabled && !options.support;
 	const slug = projectSlug.parse(options.project.slug);
 	const origin = projectOrigin.parse(options.baseURL);
 	const secure = origin.startsWith("https://");
@@ -294,6 +317,15 @@ export function createOwnedProjectEngine(
 		options.database,
 		options.project.schemaName,
 	);
+	const issuer =
+		options.issuer &&
+		createOwnedProjectIssuer({
+			database: options.database,
+			schemaName: options.project.schemaName,
+			issuer: `${origin}${options.basePath}`,
+			keys: options.oauth?.tokenKeys ??
+				options.mfaKeys ?? { secret: options.signingSecret },
+		});
 	const backchannel =
 		options.backchannelLogout &&
 		createOwnedProjectBackchannelLogout({
@@ -614,7 +646,7 @@ export function createOwnedProjectEngine(
 			(!providerProof?.allowUnverifiedEmail || policy.mfaMode === "required")
 		)
 			return failure(403, "EMAIL_NOT_VERIFIED", "Email not verified");
-		if (policy.supportAccess?.enabled) return unsupported();
+		if (missingSupportAdapter) return unsupported();
 		if (await security.denySession(client, request, user.email))
 			return securityBlocked();
 		if (policy.mfaMode === "required" && !user.twoFactorEnabled)
@@ -841,7 +873,7 @@ export function createOwnedProjectEngine(
 						!activeUser(user) ||
 						(policy.mfaMode === "required" && !user.emailVerified) ||
 						!user.twoFactorEnabled ||
-						policy.supportAccess?.enabled
+						missingSupportAdapter
 					)
 						throw changedMfaOwner;
 					if (await security.denySession(client, request, user.email))
@@ -895,7 +927,7 @@ export function createOwnedProjectEngine(
 				"EMAIL_PASSWORD_DISABLED",
 				"Email and password is not enabled",
 			);
-		if (policy.supportAccess?.enabled) return unsupported();
+		if (missingSupportAdapter) return unsupported();
 		const raw = await requestBody(request);
 		const body =
 			field === "email"
@@ -1389,6 +1421,101 @@ export function createOwnedProjectEngine(
 			},
 		});
 
+	const accountLinks = options.accountLinks && {
+		...options.accountLinks,
+		database: options.database,
+		project: options.project,
+		baseURL: origin,
+		basePath: options.basePath,
+		trustedOrigins: options.trustedOrigins,
+		async authority(client: PoolClient, request: Request) {
+			const token = tokenFrom(request.headers);
+			if (!token) return null;
+			const found = await store.session(token, refreshWindow, client);
+			return (
+				found && {
+					userId: found.user.id,
+					sessionId: found.session.id,
+					token,
+					impersonatedBy: found.session.impersonatedBy,
+					eligible:
+						policy.mfaMode !== "required" ||
+						(found.user.emailVerified && found.user.twoFactorEnabled === true),
+				}
+			);
+		},
+	};
+	const emailChange =
+		accountLinks?.emailChange &&
+		createOwnedProjectEmailChange({
+			...accountLinks,
+			signingSecret: options.signingSecret,
+			admitVerification: (request) =>
+				factorAdmission(request, "change-email-verification"),
+			async complete(client, { request, user, current, callbackURL }) {
+				if (current) {
+					const headers = new Headers();
+					writeCookie(
+						headers,
+						sessionCookie,
+						current.token,
+						tokenFrom(request.headers, rememberCookie)
+							? undefined
+							: policy.sessionExpiresInSeconds,
+					);
+					return headers;
+				}
+				const response = await primaryResult(
+					client,
+					user,
+					request,
+					true,
+					"/verify-email",
+					callbackURL,
+				);
+				if (
+					!callbackURL &&
+					response.status === 200 &&
+					response.headers
+						.getSetCookie()
+						.some(
+							(cookie) =>
+								cookie.startsWith(`${sessionCookie}=`) &&
+								!cookie.includes("Max-Age=0"),
+						)
+				)
+					return new Headers(response.headers);
+				return response;
+			},
+		});
+	const accountDeletion =
+		accountLinks?.beforeDelete &&
+		createOwnedProjectAccountDeletion({
+			...accountLinks,
+			beforeDelete: accountLinks.beforeDelete,
+			async revokeSessions(client, request, userId, path) {
+				const { rows } = await client.query<{ token: string }>(
+					'SELECT token FROM "session" WHERE "userId"=$1 ORDER BY id',
+					[userId],
+				);
+				const tokens = rows.map(({ token }) => token);
+				const removed = await store.revoke(
+					{ tokens },
+					path,
+					Boolean(backchannel),
+					client,
+				);
+				if (!removed) throw unavailableLogout;
+				deliverLogoutAfterCommit(client, request, removed.targets);
+				const headers = new Headers();
+				clearSessionCookies(headers);
+				for (const cookie of multiSessionTokens(request.headers))
+					if (tokens.includes(cookie.token))
+						writeCookie(headers, cookie.name, "", 0);
+				return headers;
+			},
+		});
+
 	const oauth =
 		options.oauth &&
 		createOwnedProjectOAuth({
@@ -1653,6 +1780,21 @@ export function createOwnedProjectEngine(
 		)
 			return forbidden();
 		const path = url.pathname.slice(options.basePath.length);
+		const issuerResponse = issuer && (await issuer(path, request));
+		if (issuerResponse) return issuerResponse;
+		if (
+			path === projectBrokerMfaPath &&
+			request.method === "POST" &&
+			options.brokerTwoFactor
+		)
+			return verifyOwnedProjectBrokerMfa(request, {
+				authorize: options.brokerTwoFactor,
+				admit: (verified) =>
+					store.transaction((client) =>
+						admitOwnedProjectBrokerMfa(client, options.trustedIP(verified)),
+					),
+				readBody: (verified) => requestBody(verified, 2048),
+			});
 		const directoryResponse = await directory?.dispatch(path, request);
 		if (directoryResponse) return directoryResponse;
 		if (path === "/sdk/config" && request.method === "GET") {
@@ -1711,6 +1853,35 @@ export function createOwnedProjectEngine(
 			// The IdP posts cross-site. The SAML service validates the signed response
 			// against the stored, single-use request for this realm and provider.
 			return sso.samlCallback(request, provider);
+		}
+		if (emailChange && path === "/change-email" && request.method === "POST") {
+			if (!trustedRequest(request.headers, true)) return forbidden();
+			const denied = await factorAdmission(request, "change-email");
+			if (denied) return denied;
+			return emailChange.start(request, await requestBody(request));
+		}
+		if (emailChange && path === "/verify-email" && request.method === "GET") {
+			const response = await emailChange.verify(request);
+			if (response) return response;
+		}
+		if (
+			accountDeletion &&
+			path === "/delete-user" &&
+			request.method === "POST"
+		) {
+			if (!trustedRequest(request.headers, true)) return forbidden();
+			const denied = await factorAdmission(request, "delete-user");
+			if (denied) return denied;
+			return accountDeletion.start(request, await requestBody(request));
+		}
+		if (
+			accountDeletion &&
+			path === "/delete-user/callback" &&
+			request.method === "GET"
+		) {
+			const denied = await factorAdmission(request, "delete-user-callback");
+			if (denied) return denied;
+			return accountDeletion.confirm(request);
 		}
 		const recovery = await recoveryHttp?.(request);
 		if (recovery) return recovery;

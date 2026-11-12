@@ -5,11 +5,17 @@ import { jwt } from "better-auth/plugins";
 import { getTestInstance } from "better-auth/test";
 import { exportJWK, generateKeyPair, SignJWT } from "jose";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { createAllAuthProxy } from "../sdk/next";
 import type { AuthInstance } from "./api";
 import { brokerLogin } from "./broker-login";
 import type { AuthEnvironment } from "./configuration";
 import { productionTwoFactor } from "./mfa";
 import { verifyBrokerTwoFactor, completeBrokerTwoFactor } from "./broker-two-factor";
+import { projectBrokerTwoFactor } from "./projects/broker-two-factor";
+import type { ProjectBrokerFactor } from "./projects/owned-project-broker-mfa";
+import { verifyOwnedProjectBrokerMfa } from "./projects/owned-project-broker-mfa";
+import { projectProxySecret, verifiedProjectRequest } from "./projects/proxy";
+import type { Project } from "./projects/registry";
 
 const platform = "https://allauth.fixture.example";
 const callback = "https://onsavii.fixture.example/api/allauth/callback/allauth";
@@ -89,6 +95,107 @@ async function googleCallback(state: Awaited<ReturnType<typeof fixture>>, handof
 	const query = new URLSearchParams({ code: "fixture-google-code", state: google.searchParams.get("state")! });
 	const response = navigation ? await state.native.auth.handler(new Request(`${platform}/api/auth/callback/google?${query}`, { headers: { cookie: cookies(handoff), accept: "text/html,application/xhtml+xml", "sec-fetch-mode": "navigate", "sec-fetch-site": "cross-site", "sec-fetch-dest": "document" } })) : await state.request(`/callback/google?${query}`, cookies(handoff));
 	return { google, response };
+}
+
+async function throughOwnedProjectRelay(
+	instance: AuthInstance,
+	identity: { clientId: string; slug: string; origin: string },
+	challenge: URL,
+	{ binding, ...factor }: ProjectBrokerFactor & { binding: string },
+) {
+	const project: Project = {
+		id: "eb032a3c-ce0c-46da-8430-77ec39a11ddd",
+		slug: identity.slug,
+		name: "Relay fixture",
+		schemaName: "allauth_project_eb032a3cce0c46da843077ec39a11ddd",
+		workspaceId: "fixture-workspace",
+		applicationId: "fixture-application",
+		primaryOrigin: identity.origin,
+		origins: [identity.origin],
+		environment: "development",
+		brokerClientId: identity.clientId,
+		brokerSecret: "fixture-unused-broker-secret",
+		proxyVersion: "fixture-v1",
+		createdBy: "fixture-owner",
+		createdAt: new Date(0),
+		updatedAt: new Date(0),
+	};
+	const environment = { ALLAUTH_AUTH_SECRET: secret };
+	const proxy = createAllAuthProxy({
+		project: project.slug,
+		appOrigin: identity.origin,
+		allauthURL: platform,
+		proxySecret: projectProxySecret(project, environment),
+		brokerTwoFactor: { signInUrl: "/sign-in" },
+	});
+	const bindingCookie = `__Secure-allauth_project_${project.slug}.broker_mfa_binding=${binding}`;
+	const accepted = await proxy(
+		new Request(challenge, { headers: { cookie: bindingCookie } }),
+		{
+			params: Promise.resolve({ all: ["broker-two-factor", "accept"] }),
+		},
+	);
+	expect(accepted.status).toBe(303);
+	expect(
+		new URL(accepted.headers.get("location")!).searchParams.get("challenge"),
+	).toBe("broker-two-factor");
+	const upstream = globalThis.fetch;
+	vi.stubGlobal(
+		"fetch",
+		(input: string | URL | Request, init?: RequestInit) => {
+			const request = new Request(input, init);
+			if (
+				request.url !==
+				`${platform}/api/projects/${project.slug}/auth/broker-two-factor/verify`
+			)
+				return upstream(input, init);
+			return verifyOwnedProjectBrokerMfa(request, {
+				async authorize(incoming) {
+					const verified = await verifiedProjectRequest(
+						incoming,
+						project,
+						environment,
+					);
+					return {
+						request: verified,
+						verify: (factor) =>
+							projectBrokerTwoFactor(
+								verified,
+								project,
+								instance,
+								platform,
+								factor,
+							),
+					};
+				},
+				admit: async () => null,
+				readBody: (verified) => verified.json(),
+			});
+		},
+	);
+	try {
+		const response = await proxy(
+			new Request(`${identity.origin}/api/allauth/broker-two-factor/verify`, {
+				method: "POST",
+				headers: {
+					origin: identity.origin,
+					cookie: `${bindingCookie}; ${cookies(accepted)}`,
+					"content-type": "application/json",
+				},
+				body: JSON.stringify(factor),
+			}),
+			{ params: Promise.resolve({ all: ["broker-two-factor", "verify"] }) },
+		);
+		expect(response.status).toBe(200);
+		expect(
+			response.headers
+				.getSetCookie()
+				.filter((cookie) => cookie.includes("Max-Age=0")),
+		).toHaveLength(2);
+		return (await response.json()) as { url: string };
+	} finally {
+		vi.stubGlobal("fetch", upstream);
+	}
 }
 
 afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); });
@@ -233,8 +340,10 @@ describe("native Google broker login handoff", () => {
 		"navigation",
 		"unknown",
 		"password-browser-handoff",
+		"owned-project-relay",
 	] as const)("handles in-app broker MFA securely (%s)", async (scenario) => {
-		const state = await fixture(false, scenario !== "consent", scenario === "rate");
+		const requiresConsent = scenario === "consent" || scenario === "owned-project-relay";
+		const state = await fixture(false, !requiresConsent, scenario === "rate");
 		const first = await state.authorize();
 		const firstHandoff = await state.handoff(first.query);
 		const upstream = await googleNetwork(
@@ -516,13 +625,9 @@ describe("native Google broker login handoff", () => {
 				new Headers(),
 			),
 		).rejects.toMatchObject({ statusCode: 401 });
-		const verified = await verifyBrokerTwoFactor(
-			instance,
-			platform,
-			identity,
-			input,
-			new Headers(),
-		);
+		const verified = scenario === "owned-project-relay"
+			? await throughOwnedProjectRelay(instance, identity, challengeURL, { code: input.code, method: input.method, binding })
+			: await verifyBrokerTwoFactor(instance, platform, identity, input, new Headers());
 		expect(verified.url).toContain(
 			`${platform}/api/broker-two-factor/complete?receipt=`,
 		);
@@ -566,7 +671,7 @@ describe("native Google broker login handoff", () => {
 		);
 		expect(completed.status).toBe(302);
 		const destination = new URL(completed.headers.get("location")!);
-		if (scenario === "consent") {
+		if (requiresConsent) {
 			expect(destination.origin).toBe(platform);
 			expect(destination.pathname).toBe("/oauth/consent");
 			expect(destination.searchParams.has("code")).toBe(false);
@@ -576,6 +681,16 @@ describe("native Google broker login handoff", () => {
 					secret,
 				),
 			).toBe(true);
+			if (scenario === "owned-project-relay") {
+				const consent = await state.request("/oauth2/consent", mergedCookies(pending, completed), {
+					accept: true, oauth_query: destination.searchParams.toString(),
+				});
+				expect(consent.status).toBe(200);
+				const callbackURL = new URL((await consent.json() as { url: string }).url);
+				expect(`${callbackURL.origin}${callbackURL.pathname}`).toBe(callback);
+				expect(callbackURL.searchParams.get("code")).toBeTruthy();
+				expect(callbackURL.searchParams.get("state")).toBe("fixture-rp-state");
+			}
 		} else {
 			expect(`${destination.origin}${destination.pathname}`).toBe(callback);
 			expect(destination.searchParams.get("code")).toBeTruthy();

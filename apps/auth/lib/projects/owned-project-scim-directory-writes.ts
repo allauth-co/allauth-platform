@@ -270,7 +270,8 @@ async function reconcileMembership(
 	);
 }
 
-async function reconcileDirectory(
+/** Recalculates scoped directory access and the linked user's global identity state. */
+export async function reconcileOwnedSCIMDirectory(
 	client: Client,
 	userId: string,
 	organizationId: string,
@@ -486,7 +487,7 @@ export async function ownedSCIMDirectoryWriter(
 				`UPDATE "scimSubject" SET "profileSourceId" = $2, revision = revision + 1, "updatedAt" = statement_timestamp() WHERE "userId" = $1`,
 				[userId, id],
 			);
-		await reconcileDirectory(
+		await reconcileOwnedSCIMDirectory(
 			client,
 			userId,
 			organizationId,
@@ -516,7 +517,7 @@ export async function ownedSCIMDirectoryWriter(
 			WHERE id = $1 AND "connectionId" = $2 AND "provisioningDomainId" = $3 RETURNING *`,
 			[id, connectionId, domain, ...profileValues(connectionId, profile)],
 		);
-		await reconcileDirectory(
+		await reconcileOwnedSCIMDirectory(
 			client,
 			current.userId,
 			organizationId,
@@ -574,7 +575,7 @@ export async function ownedSCIMDirectoryWriter(
 			`DELETE FROM "scimUser" WHERE id = $1 AND "connectionId" = $2 AND "provisioningDomainId" = $3`,
 			[id, connectionId, domain],
 		);
-		await reconcileDirectory(
+		await reconcileOwnedSCIMDirectory(
 			client,
 			current.userId,
 			organizationId,

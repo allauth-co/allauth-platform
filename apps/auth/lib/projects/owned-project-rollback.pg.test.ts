@@ -4,7 +4,14 @@ import { oauthProvider } from "@better-auth/oauth-provider";
 import { symmetricDecrypt } from "better-auth/crypto";
 import { admin, jwt, username } from "better-auth/plugins";
 import { getTestInstance } from "better-auth/test";
-import { createLocalJWKSet, jwtVerify } from "jose";
+import {
+	calculateJwkThumbprint,
+	createLocalJWKSet,
+	exportJWK,
+	generateKeyPair,
+	jwtVerify,
+	SignJWT,
+} from "jose";
 import { Kysely, PostgresDialect } from "kysely";
 import { Pool } from "pg";
 import { describe, expect, it } from "vitest";
@@ -29,6 +36,7 @@ const secret = "local-rollback-fixture-cookie-and-credential-secret";
 const password = "local-fixture-old-password";
 const newPassword = "local-fixture-new-password";
 const redirect = "https://connected.fixture.example/callback";
+const resource = "https://connected.fixture.example/resource";
 
 function request(
 	path: string,
@@ -98,6 +106,7 @@ async function openLegacy(connectionString: string) {
 						grantTypes: ["authorization_code", "refresh_token"],
 						clientPrivileges: ({ action }) => action === "create",
 						refreshTokenReuseInterval: 0,
+						enforcePerClientResources: true,
 						silenceWarnings: {
 							oauthAuthServerConfig: true,
 							openidConfig: true,
@@ -153,11 +162,12 @@ interface Tokens {
 	refresh_token?: string;
 }
 
-async function grant(
+async function authorize(
 	dispatch: (input: Request) => Promise<Response>,
 	cookie: string,
 	client: OAuthClient,
 	scope: string,
+	optional: Record<string, string> = {},
 ) {
 	const codeVerifier = randomBytes(32).toString("base64url");
 	const state = randomUUID();
@@ -171,6 +181,7 @@ async function grant(
 		code_challenge: createHash("sha256")
 			.update(codeVerifier)
 			.digest("base64url"),
+		...optional,
 	});
 	const authorization = request(`/oauth2/authorize?${query}`, cookie);
 	authorization.headers.set("accept", "text/html");
@@ -180,22 +191,63 @@ async function grant(
 	expect(`${location.origin}${location.pathname}`).toBe(redirect);
 	expect(location.searchParams.get("state")).toBe(state);
 	expect(location.searchParams.get("code")).toBeTruthy();
-	const tokens = await dispatch(
-		request(
-			"/oauth2/token",
-			"",
-			new URLSearchParams({
-				grant_type: "authorization_code",
-				code: location.searchParams.get("code") ?? "",
-				code_verifier: codeVerifier,
-				redirect_uri: redirect,
-				client_id: client.client_id,
-				client_secret: client.client_secret ?? "",
-			}),
-		),
-	);
+	return new URLSearchParams({
+		...clientCredentials(client),
+		grant_type: "authorization_code",
+		code: location.searchParams.get("code") ?? "",
+		code_verifier: codeVerifier,
+		redirect_uri: redirect,
+	});
+}
+
+async function grant(
+	dispatch: (input: Request) => Promise<Response>,
+	cookie: string,
+	client: OAuthClient,
+	scope: string,
+) {
+	const form = await authorize(dispatch, cookie, client, scope);
+	const tokens = await dispatch(request("/oauth2/token", "", form));
 	expect(tokens.status).toBe(200);
 	return (await tokens.json()) as Tokens;
+}
+
+async function dpopIdentity() {
+	const pair = await generateKeyPair("ES256");
+	const jwk = await exportJWK(pair.publicKey);
+	const jkt = await calculateJwkThumbprint(jwk);
+	return {
+		jkt,
+		proof: () =>
+			new SignJWT({ htu: issuer + "/oauth2/token", htm: "POST" })
+				.setProtectedHeader({ typ: "dpop+jwt", alg: "ES256", jwk })
+				.setIssuedAt()
+				.setJti(randomUUID())
+				.sign(pair.privateKey),
+	};
+}
+
+async function seedResource(legacy: Legacy, client: OAuthClient) {
+	await legacy.database
+		.insertInto("oauthResource")
+		.values({
+			id: randomUUID(),
+			identifier: resource,
+			name: "Fixture resource",
+			accessTokenTtl: 110,
+			refreshTokenTtl: 1000,
+			dpopBoundAccessTokensRequired: true,
+			customClaims: JSON.stringify({ feature: "rollback", sub: "ignored" }),
+		})
+		.execute();
+	await legacy.database
+		.insertInto("oauthClientResource")
+		.values({
+			id: randomUUID(),
+			clientId: client.client_id,
+			resourceId: resource,
+		})
+		.execute();
 }
 
 function clientCredentials(client: OAuthClient) {
@@ -313,6 +365,19 @@ async function seedLegacyRealm(url: string) {
 		);
 		expect(surviving.id_token).toBeTruthy();
 		expect(surviving.refresh_token).toBeTruthy();
+		await seedResource(legacy, client);
+		const dpop = await dpopIdentity();
+		const code = await authorize(
+			auth.handler,
+			mfa.cookie,
+			client,
+			"openid offline_access",
+			{
+				resource,
+				nonce: "original-browser-nonce",
+				dpop_jkt: dpop.jkt,
+			},
+		);
 		return {
 			account,
 			mfa,
@@ -321,6 +386,8 @@ async function seedLegacyRealm(url: string) {
 			client,
 			revoked,
 			surviving,
+			code,
+			dpop,
 			pending: cookies(pending),
 			keys: await auth.api.getJwks(),
 		};
@@ -344,6 +411,7 @@ async function useCandidate(url: string, initial: SeededRealm) {
 			policy: defaultAuthPolicy,
 			trustedIP: () => "192.0.2.11",
 			passwordChange: { checkPasswordSafety: async () => "allowed" },
+			issuer: true,
 		});
 		const prior = await dispatch(
 			request("/get-session", initial.account.cookie),
@@ -414,7 +482,103 @@ async function useCandidate(url: string, initial: SeededRealm) {
 			}),
 		);
 		expect(recovery.status).toBe(200);
-		return { updated: cookies(change), recovered: cookies(recovery) };
+		const jwks = await dispatch(request("/jwks"));
+		expect(await jwks.json()).toEqual(initial.keys);
+		const rotate = (clientSecret: string) =>
+			dispatch(
+				request(
+					"/oauth2/token",
+					"",
+					new URLSearchParams({
+						...clientCredentials(initial.client),
+						client_secret: clientSecret,
+						grant_type: "refresh_token",
+						refresh_token: initial.surviving.refresh_token ?? "",
+					}),
+				),
+			);
+		const wrongSecret = await rotate("incorrect-isolated-client-secret");
+		expect(wrongSecret.status).toBe(401);
+		expect(await wrongSecret.json()).toMatchObject({ error: "invalid_client" });
+		const issued = await rotate(initial.client.client_secret ?? "");
+		expect(issued.status).toBe(200);
+		const token = (await issued.json()) as Tokens & {
+			expires_in: number;
+			scope: string;
+		};
+		expect(token).toMatchObject({
+			expires_in: 300,
+			scope: "openid offline_access",
+		});
+		expect(token.refresh_token).not.toBe(initial.surviving.refresh_token);
+		expect(token.id_token).toBeTruthy();
+		const exchange = async (
+			identity: Awaited<ReturnType<typeof dpopIdentity>>,
+		) => {
+			const input = request("/oauth2/token", "", initial.code);
+			input.headers.set("dpop", await identity.proof());
+			return dispatch(input);
+		};
+		const proofMismatch = await exchange(await dpopIdentity());
+		expect(proofMismatch.status).toBe(400);
+		expect(await proofMismatch.json()).toMatchObject({
+			error: "invalid_dpop_proof",
+		});
+		// A mismatched sender proof leaves the original in-flight authorization usable.
+		const codeRequest = request("/oauth2/token", "", initial.code);
+		codeRequest.headers.set("dpop", await initial.dpop.proof());
+		const bound = await dispatch(codeRequest);
+		expect(bound.status).toBe(200);
+		const resourceToken = (await bound.json()) as Tokens;
+		expect(resourceToken).toMatchObject({
+			expires_in: 110,
+			token_type: "DPoP",
+		});
+		const publicKeys = createLocalJWKSet(initial.keys);
+		const access = await jwtVerify(resourceToken.access_token, publicKeys, {
+			issuer,
+			audience: resource,
+			typ: "at+jwt",
+		});
+		expect(access.payload).toMatchObject({
+			sub: initial.mfaUser.id,
+			feature: "rollback",
+			cnf: { jkt: initial.dpop.jkt },
+		});
+		const identity = await jwtVerify(resourceToken.id_token ?? "", publicKeys, {
+			issuer,
+			audience: initial.client.client_id,
+		});
+		expect(identity.payload.nonce).toBe("original-browser-nonce");
+		const rotateBound = async (
+			identity: Awaited<ReturnType<typeof dpopIdentity>>,
+		) => {
+			const input = request(
+				"/oauth2/token",
+				"",
+				new URLSearchParams({
+					...clientCredentials(initial.client),
+					grant_type: "refresh_token",
+					refresh_token: resourceToken.refresh_token ?? "",
+				}),
+			);
+			input.headers.set("dpop", await identity.proof());
+			return dispatch(input);
+		};
+		const rotated = await rotateBound(initial.dpop);
+		expect(rotated.status).toBe(200);
+		const currentBound = (await rotated.json()) as Tokens;
+		expect(currentBound.refresh_token).toBeTruthy();
+		const mismatchedReplay = await rotateBound(await dpopIdentity());
+		expect(await mismatchedReplay.json()).toMatchObject({
+			error: "invalid_dpop_proof",
+		});
+		return {
+			updated: cookies(change),
+			recovered: cookies(recovery),
+			token,
+			resourceToken: currentBound,
+		};
 	} finally {
 		await database.end();
 	}
@@ -477,7 +641,7 @@ async function verifyRollback(
 					new URLSearchParams({
 						...clientCredentials(initial.client),
 						grant_type: "refresh_token",
-						refresh_token: initial.surviving.refresh_token ?? "",
+						refresh_token: state.token.refresh_token ?? "",
 					}),
 				),
 			);
@@ -485,7 +649,7 @@ async function verifyRollback(
 		expect(result.status).toBe(200);
 		const tokens = (await result.json()) as Tokens;
 		expect(tokens.refresh_token).toBeTruthy();
-		expect(tokens.refresh_token).not.toBe(initial.surviving.refresh_token);
+		expect(tokens.refresh_token).not.toBe(state.token.refresh_token);
 		const claims = {
 			issuer,
 			audience: initial.client.client_id,
@@ -497,8 +661,43 @@ async function verifyRollback(
 			keySet,
 			claims,
 		);
+		const candidate = await jwtVerify(
+			state.token.id_token ?? "",
+			keySet,
+			claims,
+		);
 		const updated = await jwtVerify(tokens.id_token ?? "", keySet, claims);
+		expect(candidate.protectedHeader.kid).toBe(original.protectedHeader.kid);
 		expect(updated.protectedHeader.kid).toBe(original.protectedHeader.kid);
+		expect(candidate.payload.at_hash).toBe(
+			createHash("sha256")
+				.update(state.token.access_token)
+				.digest()
+				.subarray(0, 16)
+				.toString("base64url"),
+		);
+		const boundRefresh = request(
+			"/oauth2/token",
+			"",
+			new URLSearchParams({
+				...clientCredentials(initial.client),
+				grant_type: "refresh_token",
+				refresh_token: state.resourceToken.refresh_token ?? "",
+			}),
+		);
+		boundRefresh.headers.set("dpop", await initial.dpop.proof());
+		const restoredGrant = await dispatch(boundRefresh);
+		expect(restoredGrant.status).toBe(200);
+		const bound = (await restoredGrant.json()) as Tokens;
+		expect(bound).toMatchObject({ expires_in: 110, token_type: "DPoP" });
+		const audience = await jwtVerify(bound.access_token, keySet, {
+			issuer,
+			audience: resource,
+		});
+		expect(audience.payload).toMatchObject({
+			sub: initial.mfaUser.id,
+			cnf: { jkt: initial.dpop.jkt },
+		});
 		const reused = await refresh();
 		expect(reused.status).toBe(400);
 		expect(await reused.json()).toMatchObject({ error: "invalid_grant" });

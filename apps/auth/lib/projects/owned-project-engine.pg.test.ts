@@ -26,7 +26,9 @@ import { defaultSecurityPolicy, securitySubject } from "../control/security-poli
 import { readLegacySessionCookie } from "./legacy-session-cookie";
 import { productionTwoFactor } from "../mfa";
 import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
+import { projectManagement } from "./management-plugin";
 import { createOwnedProjectBackchannelLogout } from "./owned-project-backchannel-logout";
+import { createOwnedProjectIssuerKeys } from "./owned-project-issuer-keys";
 import { createOwnedEmailVerification } from "./owned-email-verification";
 import { createOwnedProjectEngine } from "./owned-project-engine";
 import { afterOwnedProjectCommit, createProjectEngineStore } from "./owned-project-engine-store";
@@ -93,7 +95,7 @@ describe.skipIf(!existsSync(fixturePath))("isolated PostgreSQL owned project eng
 			for (const name of [schema, otherSchema]) {
 				await client.query(`CREATE SCHEMA "${name}"`);
 				await client.query(`SET search_path TO "${name}"`);
-				for (const migration of ["001-initial-auth.sql", "002-control-plane.sql", "005-free-plugins.sql"]) {
+				for (const migration of ["001-initial-auth.sql", "002-control-plane.sql", "005-free-plugins.sql", "016-invitation-import-provenance.sql"]) {
 					await client.query(readFileSync(new URL(`../../migrations/${migration}`, import.meta.url), "utf8"));
 				}
 			}
@@ -127,7 +129,7 @@ describe.skipIf(!existsSync(fixturePath))("isolated PostgreSQL owned project eng
 				organization({ ac: createAccessControl<Statements>(defaultStatements), roles: defaultRoles, dynamicAccessControl: { enabled: true } }),
 				productionTwoFactor(origin),
 				{ id: "fixture-control-security", hooks: nativeSecurity.hooks },
-				jwt({ jwt: { issuer: `${origin}${basePath}` }, jwks: { keyPairConfig: { alg: "RS256" } } }),
+				jwt({ jwt: { issuer: `${origin}${basePath}` }, jwks: { keyPairConfig: { alg: "RS256" }, gracePeriod: 7 * 86400 } }),
 				multiSession({ maximumSessions: 5 }),
 				serviceDirectory({ project: slug, projectId: directoryProjectId, environment: "development", authorize: authorizeDirectory }),
 			],
@@ -150,10 +152,21 @@ describe.skipIf(!existsSync(fixturePath))("isolated PostgreSQL owned project eng
 		}
 	});
 
-	function engine(schemaName = schema, ip: string | null = "203.0.113.17") {
+	function engine(
+		schemaName = schema,
+		ip: string | null = "203.0.113.17",
+		overrides: Partial<Parameters<typeof createOwnedProjectEngine>[0]> = {},
+	) {
 		return createOwnedProjectEngine({
-			database, project: { slug, schemaName }, baseURL: origin, basePath, trustedOrigins: [],
-			signingSecret, policy: defaultAuthPolicy, trustedIP: () => ip,
+			database,
+			project: { slug, schemaName },
+			baseURL: origin,
+			basePath,
+			trustedOrigins: [],
+			signingSecret,
+			policy: defaultAuthPolicy,
+			trustedIP: () => ip,
+			...overrides,
 		});
 	}
 
@@ -254,44 +267,312 @@ describe.skipIf(!existsSync(fixturePath))("isolated PostgreSQL owned project eng
 		}
 	});
 
-	it("finishes password and username MFA in either engine without a session before verification", async () => {
-		const email = "interop-mfa@fixture.example";
+	it.each([
+		false,
+		true,
+	])("finishes password and username MFA in either engine with connected support enabled=%s", async (supportEnabled) => {
+		const username = `interop_mfa_${supportEnabled}`;
+		const email = `${username}@fixture.example`;
 		const id = await seed(email, { mfa: true });
 		const secret = "legacy-totp-fixture-secret";
-		await database.query(`UPDATE "${schema}"."user" SET username = 'interop_mfa' WHERE id = $1`, [id]);
+		await database.query(
+			`UPDATE "${schema}"."user" SET username = $2 WHERE id = $1`,
+			[id, username],
+		);
 		await database.query(
 			`INSERT INTO "${schema}"."twoFactor"(id, "userId", secret, "backupCodes", verified)
 			VALUES ($1,$2,$3,$4,true)`,
-			[randomUUID(), id, await symmetricEncrypt({ key: signingSecret, data: secret }),
-				await symmetricEncrypt({ key: signingSecret, data: '["abcde-fghij"]' })],
+			[
+				randomUUID(),
+				id,
+				await symmetricEncrypt({ key: signingSecret, data: secret }),
+				await symmetricEncrypt({ key: signingSecret, data: '["abcde-fghij"]' }),
+			],
 		);
-		const owner = engine();
-		const initial = await owner.dispatch(request("/sign-in/username", { username: "INTEROP_MFA", password, rememberMe: false }));
+		const callbackUrl =
+			"https://support.fixture.example/api/allauth/support/callback";
+		const policy = supportEnabled
+			? { ...defaultAuthPolicy, supportAccess: { enabled: true, callbackUrl } }
+			: defaultAuthPolicy;
+		const owner = engine(schema, supportEnabled ? "203.0.113.118" : undefined, {
+			policy,
+			...(supportEnabled
+				? {
+						support: {
+							projectId: randomUUID(),
+							workspaceId: randomUUID(),
+							platformOrigin: origin,
+							configuration: async () => ({
+								callbackUrl,
+								proxyVersion: "fixture-v1",
+							}),
+							authorizeStoredActor: async () => false,
+							verifyProxy: async () => null,
+						},
+					}
+				: {}),
+		});
+		if (supportEnabled) {
+			const unconfigured = engine(schema, undefined, { policy });
+			expect(
+				(
+					await unconfigured.dispatch(
+						request("/sign-in/email", { email, password }),
+					)
+				).status,
+			).toBe(501);
+			const ordinaryEmail = "connected-support-password@fixture.example";
+			const ordinaryId = await seed(ordinaryEmail);
+			const ordinary = await owner.dispatch(
+				request("/sign-in/email", { email: ordinaryEmail, password }),
+			);
+			expect(ordinary.status).toBe(200);
+			expect(
+				await nativeGetSession(new Headers({ cookie: cookies(ordinary) })),
+			).toMatchObject({ user: { id: ordinaryId } });
+		}
+		const initial = await owner.dispatch(
+			request("/sign-in/username", {
+				username: username.toUpperCase(),
+				password,
+				rememberMe: false,
+			}),
+		);
 		expect(initial.status).toBe(200);
-		expect(await initial.json()).toMatchObject({ twoFactorRedirect: true, twoFactorMethods: ["totp"] });
+		expect(await initial.json()).toMatchObject({
+			twoFactorRedirect: true,
+			twoFactorMethods: ["totp"],
+		});
 		const pending = cookies(initial);
 		expect(pending).not.toContain(".session_token");
-		expect(await (await owner.dispatch(request("/get-session", undefined, { cookie: pending }))).json()).toBeNull();
-		const legacyCompleted = await nativeRequest(request("/two-factor/verify-totp", { code: await nativeTotp(secret) }, { cookie: pending }));
+		expect(
+			await (
+				await owner.dispatch(
+					request("/get-session", undefined, { cookie: pending }),
+				)
+			).json(),
+		).toBeNull();
+		const legacyCompleted = await nativeRequest(
+			request(
+				"/two-factor/verify-totp",
+				{ code: await nativeTotp(secret) },
+				{ cookie: pending },
+			),
+		);
 		expect(legacyCompleted.status).toBe(200);
-		expect(await (await owner.dispatch(request("/get-session", undefined, { cookie: cookies(legacyCompleted) }))).json())
-			.toMatchObject({ user: { id } });
+		expect(
+			await (
+				await owner.dispatch(
+					request("/get-session", undefined, {
+						cookie: cookies(legacyCompleted),
+					}),
+				)
+			).json(),
+		).toMatchObject({ user: { id } });
 
-		const prior = await nativeRequest(request("/sign-in/email", { email, password }));
+		const prior = await nativeRequest(
+			request("/sign-in/email", { email, password }),
+		);
 		expect(prior.status).toBe(200);
 		expect(await prior.json()).toMatchObject({ twoFactorRedirect: true });
 		const legacyPending = cookies(prior);
-		const completed = await owner.dispatch(request("/two-factor/verify-backup-code", {
-			code: "abcde-fghij", trustDevice: true,
-		}, { cookie: legacyPending }));
+		const completed = await owner.dispatch(
+			request(
+				"/two-factor/verify-backup-code",
+				{
+					code: "abcde-fghij",
+					trustDevice: true,
+				},
+				{ cookie: legacyPending },
+			),
+		);
 		expect(completed.status).toBe(200);
-		expect(await nativeGetSession(new Headers({ cookie: cookies(completed) }))).toMatchObject({ user: { id } });
-		expect((await owner.dispatch(request("/two-factor/verify-backup-code", { code: "abcde-fghij" }, { cookie: legacyPending }))).status).toBe(401);
-		const trustCookie = cookies(completed).split("; ").find((value) => value.includes(".trust_device="));
+		expect(
+			await nativeGetSession(new Headers({ cookie: cookies(completed) })),
+		).toMatchObject({ user: { id } });
+		expect(
+			(
+				await owner.dispatch(
+					request(
+						"/two-factor/verify-backup-code",
+						{ code: "abcde-fghij" },
+						{ cookie: legacyPending },
+					),
+				)
+			).status,
+		).toBe(401);
+		const trustCookie = cookies(completed)
+			.split("; ")
+			.find((value) => value.includes(".trust_device="));
 		expect(trustCookie).toBeTruthy();
-		const trusted = await owner.dispatch(request("/sign-in/email", { email, password }, { cookie: trustCookie! }));
+		const trusted = await owner.dispatch(
+			request("/sign-in/email", { email, password }, { cookie: trustCookie! }),
+		);
 		expect(await trusted.json()).toMatchObject({ user: { id } });
-		expect(await nativeGetSession(new Headers({ cookie: cookies(trusted) }))).toMatchObject({ user: { id } });
+		expect(
+			await nativeGetSession(new Headers({ cookie: cookies(trusted) })),
+		).toMatchObject({ user: { id } });
+	});
+
+	it("shares the native broker MFA admission window across rollout and rollback", async () => {
+		const appOrigin = "https://broker-fixture.example";
+		const project = {
+			id: directoryProjectId,
+			slug,
+			schemaName: schema,
+			proxyVersion: "broker-mfa-fixture",
+			origins: [appOrigin],
+		} as Project;
+		const environment = {
+			ALLAUTH_AUTH_SECRET: "isolated-project-mfa-transport-fixture-secret",
+		};
+		const rawBody = '{ "method": "totp", "code": " 123456 " }';
+		const completion = `${origin}/api/broker-two-factor/complete?receipt=${"a".repeat(64)}`;
+		const clientIP = "2001:db8:3333:4444:1:2:3:4";
+		const proof = vi.fn(
+			async (verified: Request, body: { code: string; method: string }) => {
+				expect(await verified.clone().text()).toBe(rawBody);
+				expect(verified.headers.get("x-real-ip")).toBe(clientIP);
+				expect(body).toEqual({ code: "123456", method: "totp" });
+				return Response.json(
+					{ url: completion },
+					{ headers: { "Cache-Control": "no-store" } },
+				);
+			},
+		);
+		const candidate = engine(schema, undefined, {
+			project,
+			trustedOrigins: [appOrigin],
+			trustedIP: (verified) => verified.headers.get("x-real-ip"),
+			async brokerTwoFactor(incoming) {
+				const verified = await verifiedProjectRequest(
+					incoming,
+					project,
+					environment,
+				);
+				return { request: verified, verify: (body) => proof(verified, body) };
+			},
+		});
+		const route = "/broker-two-factor/verify";
+		const key = `2001:0db8:3333:4444:0000:0000:0000:0000|${route}`;
+		const rates = `"${schema}"."rateLimit"`;
+		const native = await getTestInstance(
+			{
+				baseURL: origin,
+				basePath,
+				secret: signingSecret,
+				trustedOrigins: [appOrigin],
+				database: { db: legacyDatabase!, type: "postgres" },
+				rateLimit: { enabled: true, storage: "database", max: 100, window: 60 },
+				advanced: { ipAddress: { ipAddressHeaders: ["x-real-ip"] } },
+				logger: { disabled: true },
+				plugins: [
+					projectManagement({
+						projectId: project.id,
+						baseURL: origin,
+						requirePlatformAdmin: async () => {
+							throw new Error("Unexpected workspace admin check");
+						},
+						brokerTwoFactor: proof,
+					}),
+				],
+			},
+			{ disableTestUser: true },
+		);
+		const nativeDispatch = async (request: Request) =>
+			native.auth.handler(
+				await verifiedProjectRequest(request, project, environment),
+			);
+		const bucket = async () =>
+			(
+				await database.query<{ count: number; lastRequest: string }>(
+					`SELECT count, "lastRequest" FROM ${rates} WHERE "key" = $1`,
+					[key],
+				)
+			).rows[0];
+		expect(
+			(
+				await candidate.dispatch(
+					request(route, { code: "123456", method: "totp" }),
+				)
+			).status,
+		).toBe(403);
+		const originalFetch = globalThis.fetch;
+		try {
+			let dispatch = nativeDispatch;
+			let wire: Response | undefined;
+			let dispatchError: unknown;
+			vi.stubGlobal(
+				"fetch",
+				async (input: string | URL | Request, init?: RequestInit) => {
+					try {
+						const response = await dispatch(new Request(input, init));
+						wire = response.clone();
+						return response;
+					} catch (error) {
+						dispatchError = error;
+						throw error;
+					}
+				},
+			);
+			const proxy = createAllAuthProxy({
+				project: slug,
+				appOrigin,
+				allauthURL: origin,
+				proxySecret: projectProxySecret(project, environment),
+				getClientIP: () => clientIP,
+				brokerTwoFactor: { signInUrl: "/sign-in" },
+			});
+			const send = () =>
+				proxy(
+					new Request(`${appOrigin}/api/allauth${route}`, {
+						method: "POST",
+						headers: { origin: appOrigin, "content-type": "application/json" },
+						body: rawBody,
+					}),
+					{ params: Promise.resolve({ all: ["broker-two-factor", "verify"] }) },
+				);
+			await database.query(
+				`INSERT INTO ${rates} (id, "key", count, "lastRequest") VALUES ($1,$2,98,$3)`,
+				[randomUUID(), key, Date.now()],
+			);
+			const nativeAllowed = await send();
+			expect(dispatchError).toBeUndefined();
+			expect(nativeAllowed.status).toBe(200);
+			expect((await bucket()).count).toBe(99);
+			dispatch = candidate.dispatch;
+			const verified = await send();
+			expect(await verified.json()).toEqual({ url: completion });
+			expect((await bucket()).count).toBe(100);
+			const beforeDenied = await bucket();
+			expect((await send()).status).toBe(429);
+			const ownedRetry = Number(wire?.headers.get("x-retry-after"));
+			const ownedBody = await wire?.json();
+			expect(ownedRetry).toBeGreaterThan(0);
+			expect(ownedRetry).toBeLessThanOrEqual(60);
+			const remaining = Math.ceil(
+				(Number(beforeDenied.lastRequest) + 60_000 - Date.now()) / 1000,
+			);
+			expect(Math.abs(ownedRetry - remaining)).toBeLessThanOrEqual(1);
+			dispatch = nativeDispatch;
+			expect((await send()).status).toBe(429);
+			expect(await wire?.json()).toEqual(ownedBody);
+			expect(wire?.headers.get("x-retry-after")).toMatch(/^[1-9][0-9]*$/);
+			expect(await bucket()).toEqual(beforeDenied);
+			expect(proof).toHaveBeenCalledTimes(2);
+			await database.query(
+				`UPDATE ${rates} SET "lastRequest" = $2 WHERE "key" = $1`,
+				[key, Date.now() - 61_000],
+			);
+			dispatch = candidate.dispatch;
+			expect((await send()).status).toBe(200);
+			expect((await bucket()).count).toBe(1);
+			dispatch = nativeDispatch;
+			expect((await send()).status).toBe(200);
+			expect((await bucket()).count).toBe(2);
+		} finally {
+			vi.stubGlobal("fetch", originalFetch);
+		}
 	});
 
 	it("rotates and revokes sessions on MFA enrolment and disable", async () => {
@@ -531,7 +812,11 @@ describe.skipIf(!existsSync(fixturePath))("isolated PostgreSQL owned project eng
 		const targets = [randomUUID(), randomUUID()].map((sessionId) => ({
 			clientId: audience, sessionId, userId: "fixture-user", url: "https://client.fixture.example/logout",
 		}));
-		await Promise.all(targets.map((target) => deliver([target])));
+		const keyring = createOwnedProjectIssuerKeys({ database, schemaName: otherSchema, keys: { secret: signingSecret } });
+		const [publishedKeys] = await Promise.all([
+			keyring.publicKeys(),
+			...targets.map((target) => deliver([target])),
+		]);
 		expect(published).toHaveLength(2);
 		const keys = await database.query<{ id: string; publicKey: string; privateKey: string; alg: string }>(
 			`SELECT id, "publicKey", "privateKey", alg FROM "${otherSchema}"."jwks"`,
@@ -541,11 +826,37 @@ describe.skipIf(!existsSync(fixturePath))("isolated PostgreSQL owned project eng
 		const oldPrivate = JSON.parse(await symmetricDecrypt({ key: signingSecret, data: JSON.parse(key.privateKey) }));
 		const publicKey = { ...JSON.parse(key.publicKey), alg: key.alg, kid: key.id };
 		expect(oldPrivate).toMatchObject({ kty: "RSA", n: publicKey.n, d: expect.any(String) });
+		expect(publishedKeys).toEqual({ keys: [publicKey] });
 		const verified = await Promise.all(published.map((token) =>
 			jwtVerify(token, createLocalJWKSet({ keys: [publicKey] }), { issuer, audience, typ: "logout+jwt" }),
 		));
 		expect(verified.map(({ payload }) => payload.sid)).toEqual(expect.arrayContaining(targets.map((target) => target.sessionId)));
 		expect(new Set(verified.map(({ payload }) => payload.jti)).size).toBe(2);
+	});
+
+	it("publishes existing native keys through the same seven-day rotation window", async () => {
+		const native = await nativeJwks();
+		const active = native.keys[0]!;
+		const inGrace = randomUUID();
+		const expired = randomUUID();
+		await database.query(
+			`INSERT INTO "${schema}"."jwks"(id, "publicKey", "privateKey", "createdAt", "expiresAt", alg)
+			 VALUES ($1,$3,'fixture-unused',NOW()-interval '35 days',NOW()-interval '6 days',$4),
+			 ($2,$3,'fixture-unused',NOW()-interval '40 days',NOW()-interval '8 days',$4)`,
+			[inGrace, expired, JSON.stringify({ kty: active.kty, n: active.n, e: active.e }), active.alg],
+		);
+		try {
+			const keyring = createOwnedProjectIssuerKeys({ database, schemaName: schema, keys: { secret: signingSecret } });
+			const published = await keyring.publicKeys();
+			const legacy = await nativeJwks();
+			expect(published.keys).toHaveLength(legacy.keys.length);
+			expect(published.keys).toEqual(expect.arrayContaining(legacy.keys));
+			expect(published.keys.map(({ kid }) => kid)).toContain(inGrace);
+			expect(published.keys.map(({ kid }) => kid)).not.toContain(expired);
+			expect(published.keys.every((key) => !("d" in key))).toBe(true);
+		} finally {
+			await database.query(`DELETE FROM "${schema}"."jwks" WHERE id = ANY($1::text[])`, [[inGrace, expired]]);
+		}
 	});
 
 	it("keeps the old session and suppresses logout effects if its replacement rolls back", async () => {

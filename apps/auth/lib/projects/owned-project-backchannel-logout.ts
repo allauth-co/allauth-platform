@@ -1,37 +1,15 @@
-import { randomBytes, randomUUID } from "node:crypto";
-import { exportJWK, generateKeyPair, importJWK, type JWK, SignJWT } from "jose";
-import type { Pool, PoolClient } from "pg";
-import {
-	type LegacyMfaKeys,
-	openLegacyMfaRecord,
-	sealLegacyMfaRecord,
-} from "./legacy-mfa-record";
-import { createProjectEngineStore } from "./owned-project-engine-store";
+import { randomBytes } from "node:crypto";
+import { SignJWT } from "jose";
+import type { Pool } from "pg";
+import type { LegacyMfaKeys } from "./legacy-mfa-record";
 import {
 	fetchPublicProjectHttps,
 	publicProjectHttpsURL,
 } from "./owned-project-https";
+import { createOwnedProjectIssuerKeys } from "./owned-project-issuer-keys";
 
 const event = "http://schemas.openid.net/event/backchannel-logout";
 const tokenLifetimeSeconds = 120;
-const keyLifetimeSeconds = 30 * 86400;
-const algorithm = "RS256";
-const signingAlgorithms = new Set([
-	algorithm,
-	"RS384",
-	"RS512",
-	"PS256",
-	"PS384",
-	"PS512",
-	"ES256",
-	"ES384",
-	"ES512",
-	"EdDSA",
-	"Ed25519",
-	"ML-DSA-44",
-	"ML-DSA-65",
-	"ML-DSA-87",
-]);
 type LogoutTransport = (
 	url: URL,
 	body: URLSearchParams,
@@ -72,67 +50,7 @@ interface BackchannelOptions {
 export function createOwnedProjectBackchannelLogout(
 	options: BackchannelOptions,
 ) {
-	const store = createProjectEngineStore(options.database, options.schemaName);
-
-	async function latestKey(client: PoolClient) {
-		const { rows } = await client.query<{
-			id: string;
-			alg: string | null;
-			privateKey: string;
-		}>(
-			`SELECT id, alg, "privateKey" FROM "jwks"
-			 WHERE "expiresAt" IS NULL OR "expiresAt" > statement_timestamp()
-			 ORDER BY (COALESCE(alg, $1) = $1) DESC, "createdAt" DESC, id DESC LIMIT 1`,
-			[algorithm],
-		);
-		return rows[0];
-	}
-
-	async function signingKey() {
-		const row = await store.transaction(async (client) => {
-			const existing = await latestKey(client);
-			if (existing) return existing;
-			await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [
-				`allauth-issuer-key:${options.schemaName}`,
-			]);
-			const concurrent = await latestKey(client);
-			if (concurrent) return concurrent;
-			const pair = await generateKeyPair(algorithm, { extractable: true });
-			const [privateKey, publicKey] = await Promise.all([
-				exportJWK(pair.privateKey),
-				exportJWK(pair.publicKey),
-			]);
-			const inserted = {
-				id: randomUUID(),
-				alg: algorithm,
-				privateKey: JSON.stringify(
-					sealLegacyMfaRecord(JSON.stringify(privateKey), options.keys),
-				),
-			};
-			await client.query(
-				`INSERT INTO "jwks" (id, alg, "privateKey", "publicKey", "createdAt", "expiresAt")
-				 VALUES ($1, $2, $3, $4, statement_timestamp(),
-				   statement_timestamp() + $5::integer * interval '1 second')`,
-				[
-					inserted.id,
-					inserted.alg,
-					inserted.privateKey,
-					JSON.stringify(publicKey),
-					keyLifetimeSeconds,
-				],
-			);
-			return inserted;
-		});
-		const alg = row.alg ?? algorithm;
-		if (!signingAlgorithms.has(alg))
-			throw new Error("Invalid existing issuer signing algorithm.");
-		const sealed: unknown = JSON.parse(row.privateKey);
-		if (typeof sealed !== "string")
-			throw new Error("Invalid existing issuer key envelope.");
-		const jwk = JSON.parse(openLegacyMfaRecord(sealed, options.keys)) as JWK;
-		const key = await importJWK(jwk, alg);
-		return { id: row.id, alg, key };
-	}
+	const { signingKey } = createOwnedProjectIssuerKeys(options);
 
 	const post = options.post ?? postToRelyingParty;
 	async function deliver(targets: readonly ProjectBackchannelTarget[]) {

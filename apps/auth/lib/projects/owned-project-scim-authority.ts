@@ -1,13 +1,16 @@
-import { createHash, createHmac, timingSafeEqual } from "node:crypto";
+import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import type { Pool, PoolClient } from "pg";
+import {
+	ownedSCIMCredentialDigest,
+	ownedSCIMCredentialHashVersion,
+	ownedSCIMCredentialId,
+	ownedSCIMLastUsedIntervalMs,
+	parseOwnedSCIMScopes,
+} from "./owned-project-scim-managed-credentials";
 import { checkedProjectSchema } from "./validation";
 
-const scopes = [
-	"scim.users.read",
-	"scim.users.write",
-	"scim.groups.read",
-	"scim.groups.write",
-] as const;
+const missingBinding =
+	"SCIM connection requires an established provisioning binding";
 
 export interface OwnedProjectSCIMConnection {
 	connectionId: string;
@@ -23,6 +26,7 @@ export type OwnedProjectSCIMDenial = {
 interface ManagedCredential extends OwnedProjectSCIMConnection {
 	tokenDigest: string;
 	serializedScopes: string;
+	lastUsedAt: Date | null;
 }
 
 interface ConnectionBinding extends OwnedProjectSCIMConnection {
@@ -41,25 +45,12 @@ function deny(
 	return { ok: false, status, detail };
 }
 
-function readScopes(value: string): readonly string[] | undefined {
-	try {
-		const parsed: unknown = JSON.parse(value);
-		if (
-			Array.isArray(parsed) &&
-			parsed.length > 0 &&
-			new Set(parsed).size === parsed.length &&
-			parsed.every((scope: unknown) => scopes.some((known) => known === scope))
-		)
-			return parsed;
-	} catch {
-		return;
-	}
-}
-
 interface AuthorityOptions {
 	database: Pool;
 	schemaName: string;
 	credentialHashSecret: string;
+	/** Opts the fixture authority into managed first-use binding and last-used accounting. */
+	manageCredentialUsage?: boolean;
 }
 
 function createAuthority(options: AuthorityOptions, write: boolean) {
@@ -73,24 +64,24 @@ function createAuthority(options: AuthorityOptions, write: boolean) {
 		credentialId: string,
 		token: string,
 		resource: "Users" | "Groups",
+		initialize: boolean,
+		verified: (lastUsedAt: Date | null) => void,
 	): Promise<
 		| OwnedProjectSCIMDenial
 		| { ok: true; connection: OwnedProjectSCIMConnection }
 	> {
 		const credential = (
 			await client.query<ManagedCredential>(
-				`SELECT k."tokenDigest", k."serializedScopes", c."connectionId", c."provisioningDomainId"
+				`SELECT k."tokenDigest", k."serializedScopes", k."lastUsedAt", c."connectionId", c."provisioningDomainId"
 			 FROM "${schema}"."scimManagedCredential" k
 			 JOIN "${schema}"."scimManagedConnection" c ON c.id = k."connectionRecordId"
-			 WHERE k."credentialId" = $1 AND k."hashVersion" = 'v1' AND k.status = 'active'
-			   AND k."expiresAt" > $2 AND c.status = 'active'${write ? " FOR SHARE OF k" : ""}`,
-				[credentialId, new Date()],
+			 WHERE k."credentialId" = $1 AND k."hashVersion" = $2 AND k.status = 'active'
+			   AND k."expiresAt" > $3 AND c.status = 'active'${write || initialize ? " FOR SHARE OF k" : ""}`,
+				[credentialId, ownedSCIMCredentialHashVersion, new Date()],
 			)
 		).rows[0];
 		if (!credential) return deny(401, "Invalid SCIM bearer token");
-		const digest = createHmac("sha256", credentialHashSecret)
-			.update(token)
-			.digest("base64url");
+		const digest = ownedSCIMCredentialDigest(credentialHashSecret, token);
 		const encoder = new TextEncoder();
 		const storedDigest = encoder.encode(credential.tokenDigest);
 		const computedDigest = encoder.encode(digest);
@@ -99,11 +90,13 @@ function createAuthority(options: AuthorityOptions, write: boolean) {
 			!timingSafeEqual(storedDigest, computedDigest)
 		)
 			return deny(401, "Invalid SCIM bearer token");
+		verified(credential.lastUsedAt);
 
-		const permissions = readScopes(credential.serializedScopes);
+		const permissions = parseOwnedSCIMScopes(credential.serializedScopes);
 		if (!permissions)
 			return deny(500, "Managed SCIM credential scope policy is invalid");
-		const required = `scim.${resource.toLowerCase()}.${write ? "write" : "read"}`;
+		const required =
+			`scim.${resource === "Users" ? "users" : "groups"}.${write ? "write" : "read"}` as const;
 		if (!permissions.includes(required))
 			return deny(
 				403,
@@ -112,18 +105,25 @@ function createAuthority(options: AuthorityOptions, write: boolean) {
 
 		const { connectionId, provisioningDomainId } = credential;
 		const connectionKey = ownedSCIMScopedKey(["scim-connection", connectionId]);
-		const binding = (
-			await client.query<ConnectionBinding>(
-				`SELECT "connectionId", "provisioningDomainId", "decommissionStatus"
+		const loadBinding = async () =>
+			(
+				await client.query<ConnectionBinding>(
+					`SELECT "connectionId", "provisioningDomainId", "decommissionStatus"
 			 FROM "${schema}"."scimConnectionBinding" WHERE "connectionKey" = $1`,
-				[connectionKey],
-			)
-		).rows[0];
-		if (!binding)
-			return deny(
-				409,
-				"SCIM connection requires an established provisioning binding",
+					[connectionKey],
+				)
+			).rows[0];
+		let binding = await loadBinding();
+		if (!binding && initialize) {
+			await client.query(
+				`INSERT INTO "${schema}"."scimConnectionBinding"
+				(id,"connectionId","connectionKey","provisioningDomainId","createdAt","decommissionStatus","decommissionReconciledUserCount","decommissionBatchCount","decommissionRevision")
+				VALUES ($1,$2,$3,$4,statement_timestamp(),'active',0,0,0) ON CONFLICT ("connectionKey") DO NOTHING`,
+				[randomUUID(), connectionId, connectionKey, provisioningDomainId],
 			);
+			binding = await loadBinding();
+		}
+		if (!binding) return deny(409, missingBinding);
 		if (
 			binding.connectionId !== connectionId ||
 			binding.provisioningDomainId !== provisioningDomainId
@@ -137,6 +137,25 @@ function createAuthority(options: AuthorityOptions, write: boolean) {
 		return { ok: true, connection: { connectionId, provisioningDomainId } };
 	}
 
+	async function noteUse(credentialId: string, at: Date) {
+		try {
+			await database.query(
+				`UPDATE "${schema}"."scimManagedCredential" k SET "lastUsedAt" = $2
+				WHERE k."credentialId" = $1 AND k.status = 'active' AND k."hashVersion" = $3 AND k."expiresAt" > $2
+				AND (k."lastUsedAt" IS NULL OR k."lastUsedAt" <= $4)
+				AND EXISTS (SELECT 1 FROM "${schema}"."scimManagedConnection" c WHERE c.id = k."connectionRecordId" AND c.status = 'active')`,
+				[
+					credentialId,
+					at,
+					ownedSCIMCredentialHashVersion,
+					new Date(at.getTime() - ownedSCIMLastUsedIntervalMs),
+				],
+			);
+		} catch {
+			// Accounting is best effort and cannot change authorization.
+		}
+	}
+
 	async function transaction<T>(
 		headers: Headers,
 		resource: "Users" | "Groups",
@@ -144,19 +163,21 @@ function createAuthority(options: AuthorityOptions, write: boolean) {
 			client: Pick<PoolClient, "query">,
 			connection: OwnedProjectSCIMConnection,
 		) => Promise<T>,
+		initialize = false,
 	): Promise<OwnedProjectSCIMDenial | { ok: true; value: T }> {
 		const token = headers.get("authorization")?.match(/^Bearer\s+(.+)$/i)?.[1];
 		if (!token) return deny(401, "SCIM bearer token is required");
-		const credentialId = token.match(
-			/^(ba_scim_credential_[A-Za-z0-9_-]+)\.([A-Za-z0-9_-]+)$/,
-		)?.[1];
+		const credentialId = ownedSCIMCredentialId(token);
 		if (!credentialId) return deny(401, "Invalid SCIM bearer token");
 
 		const client = await database.connect();
 		let discard = false;
+		let accountAt: Date | undefined;
 		try {
 			await client.query(
-				write ? "BEGIN" : "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY",
+				write || initialize
+					? "BEGIN"
+					: "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY",
 			);
 			await client.query(`SET LOCAL search_path TO "${schema}"`);
 			const authorization = await authorize(
@@ -164,6 +185,15 @@ function createAuthority(options: AuthorityOptions, write: boolean) {
 				credentialId,
 				token,
 				resource,
+				initialize,
+				(lastUsedAt) => {
+					if (
+						options.manageCredentialUsage &&
+						(!lastUsedAt ||
+							lastUsedAt.getTime() + ownedSCIMLastUsedIntervalMs <= Date.now())
+					)
+						accountAt = new Date();
+				},
 			);
 			const result = authorization.ok
 				? {
@@ -171,7 +201,7 @@ function createAuthority(options: AuthorityOptions, write: boolean) {
 						value: await select(client, authorization.connection),
 					}
 				: authorization;
-			if (authorization.ok && write) {
+			if (authorization.ok && write && !initialize) {
 				const { connectionId, provisioningDomainId } = authorization.connection;
 				const fenced = await client.query(
 					`UPDATE "${schema}"."scimConnectionBinding" SET "decommissionRevision" = "decommissionRevision" + 1
@@ -201,9 +231,35 @@ function createAuthority(options: AuthorityOptions, write: boolean) {
 			throw error;
 		} finally {
 			client.release(discard);
+			if (accountAt) await noteUse(credentialId, accountAt);
 		}
 	}
-	return transaction;
+	return async function execute<T>(
+		headers: Headers,
+		resource: "Users" | "Groups",
+		select: (
+			client: Pick<PoolClient, "query">,
+			connection: OwnedProjectSCIMConnection,
+		) => Promise<T>,
+	) {
+		const result = await transaction(headers, resource, select);
+		if (
+			result.ok ||
+			!options.manageCredentialUsage ||
+			result.status !== 409 ||
+			result.detail !== missingBinding
+		)
+			return result;
+		const initialized = await transaction(
+			headers,
+			resource,
+			async () => null,
+			true,
+		);
+		return initialized.ok
+			? transaction(headers, resource, select)
+			: initialized;
+	};
 }
 
 /** Runs a SCIM read with an established managed bearer binding in one read-only snapshot. */

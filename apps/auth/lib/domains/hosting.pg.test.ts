@@ -33,6 +33,9 @@ import { GET as sessionsGET } from "../../app/api/account/sessions/route";
 import { POST as revokePOST } from "../../app/api/account/sessions/revoke/route";
 import { GET as projectGET, POST as projectPOST } from "../../app/api/projects/[slug]/auth/[...all]/route";
 import { GET as discoveryGET } from "../../app/.well-known/openid-configuration/route";
+import { GET as authorizationDiscoveryGET } from "../../app/.well-known/oauth-authorization-server/route";
+import { discoveryDocument } from "../discovery";
+import { ownedProjectIssuerMetadata } from "../projects/owned-project-issuer-metadata";
 import { createAllAuthClient } from "../../sdk/client";
 import { createAllAuthProxy } from "../../sdk/next";
 import { edgeHeaders, portalHeader, signEdgeRequest, signPortalBinding, verifyPortalBinding } from "./edge";
@@ -227,6 +230,27 @@ describe.skipIf(!existsSync(fixturePath))("real PostgreSQL hosted authentication
 		expect(document.issuer).toBe(`https://${host(alpha)}/api/auth`);
 		for (const endpoint of [document.authorization_endpoint, document.token_endpoint, document.jwks_uri]) expect(endpoint.startsWith(`https://${host(alpha)}/api/auth/`)).toBe(true);
 		const other = await discoveryGET(await signedRequest(host(beta), "/.well-known/openid-configuration")); expect((await other.json() as { issuer: string }).issuer).toBe(`https://${host(beta)}/api/auth`);
+	});
+
+	it("publishes the same project OAuth and OpenID capabilities for verified hosted and slug issuers", async () => {
+		const hostname = host(alpha);
+		const hostedDocument = ownedProjectIssuerMetadata({
+			origin: `https://${hostname}`, basePath: "/api/auth", slug: alpha.slug,
+		});
+		for (const [path, discovery] of [
+			["/.well-known/openid-configuration", discoveryGET],
+			["/.well-known/oauth-authorization-server", authorizationDiscoveryGET],
+		] as const) {
+			const response = await discovery(await signedRequest(hostname, path));
+			expect(response.status).toBe(200);
+			expect(await response.json()).toEqual(hostedDocument);
+		}
+		await withProjectAuth(alpha.slug, async (instance) => {
+			const basePath = `/api/projects/${alpha.slug}/auth`;
+			const candidate = ownedProjectIssuerMetadata({ origin: platformOrigin, basePath, slug: alpha.slug });
+			expect(candidate).toEqual(discoveryDocument(await instance.api.getOpenIdConfig()));
+			expect(candidate).toEqual(discoveryDocument(await instance.api.getOAuthServerConfig()));
+		}, env);
 	});
 
 	it("selects fresh shared application branding only from its signed hosted realm", async () => {

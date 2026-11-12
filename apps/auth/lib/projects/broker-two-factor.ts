@@ -1,16 +1,12 @@
 import { APIError } from "better-auth";
 import { runWithAdapter } from "@better-auth/core/context";
-import * as z from "zod";
 import type { AuthInstance } from "../api";
 import { verifyBrokerTwoFactor } from "../broker-two-factor";
+import type { ProjectBrokerFactor } from "./owned-project-broker-mfa";
+import { projectBrokerTwoFactorBody } from "./owned-project-broker-mfa";
 import type { Project } from "./registry";
 
-export const projectBrokerTwoFactorBody = z
-	.object({
-		code: z.string().trim().min(1).max(128),
-		method: z.enum(["totp", "backup"]),
-	})
-	.strict();
+export { projectBrokerTwoFactorBody } from "./owned-project-broker-mfa";
 
 /** Invoked with the current registry row after verifiedProjectRequest has authenticated the signed transport. */
 export async function projectBrokerTwoFactor(
@@ -18,12 +14,12 @@ export async function projectBrokerTwoFactor(
 	project: Project,
 	platform: AuthInstance,
 	platformOrigin: string,
-	parsedBody?: z.infer<typeof projectBrokerTwoFactorBody>,
+	parsedBody?: ProjectBrokerFactor,
 ): Promise<Response> {
 	const origin = request.headers.get("allauth-proxy-origin");
 	if (
 		request.method !== "POST" ||
-		!request.headers.has("allauth-proxy-signature") ||
+		!request.headers.get("allauth-proxy-signature") ||
 		!origin ||
 		!project.origins.includes(origin) ||
 		request.headers.get("origin") !== origin

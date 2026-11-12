@@ -63,6 +63,7 @@ jobs:
         run: >-
           pnpm exec vitest run --root apps/auth --config vitest.config.ts
           lib/configuration-aliases.test.ts lib/clerk-password.test.ts lib/mfa.test.ts sdk/next.test.ts
+          lib/broker-login.test.ts lib/projects/broker-two-factor.test.ts
           lib/domains/hosting.pg.test.ts lib/projects/runtime.test.ts
           lib/projects/session-introspection.test.ts lib/projects/session-introspection.legacy.test.ts
           lib/projects/service-directory-transport.test.ts lib/projects/sdk-version-observation.test.ts
@@ -72,6 +73,7 @@ jobs:
           lib/domains/hosted-sdk.test.ts lib/hosted-sdk-page.test.ts lib/hosted-sdk-ui-render.test.ts
           lib/projects/legacy-mfa-record.test.ts lib/projects/session-shadow.test.ts
           lib/projects/owned-project-engine.pg.test.ts lib/projects/owned-project-rollback.pg.test.ts
+          lib/projects/owned-project-account-links.pg.test.ts lib/projects/owned-project-broker-mfa.test.ts
           lib/projects/owned-password-reset.pg.test.ts
           lib/projects/owned-project-password-change.pg.test.ts lib/auth-policy/password.test.ts
           lib/projects/owned-mfa.pg.test.ts lib/projects/owned-mfa-enrollment.pg.test.ts
@@ -81,6 +83,7 @@ jobs:
           lib/projects/owned-project-enterprise-catalog.pg.test.ts
           lib/projects/owned-project-scim.pg.test.ts lib/projects/owned-project-scim-resources.pg.test.ts
           lib/projects/owned-project-scim-user-writes.pg.test.ts lib/projects/owned-project-scim-group-writes.pg.test.ts
+          lib/projects/owned-project-scim-management.pg.test.ts lib/projects/owned-project-scim-decommission.pg.test.ts
           lib/projects/owned-project-sso.pg.test.ts lib/projects/owned-project-sso-saml.pg.test.ts
           lib/projects/owned-project-https.test.ts lib/avatars/profile.test.ts
           lib/projects/owned-project-support.pg.test.ts lib/projects/support-plugin.test.ts
