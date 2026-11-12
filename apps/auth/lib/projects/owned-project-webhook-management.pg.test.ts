@@ -3,7 +3,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { runWithAdapter } from "@better-auth/core/context";
 import { oauthProvider } from "@better-auth/oauth-provider";
 import { APIError, betterAuth } from "better-auth";
-import { symmetricDecrypt } from "better-auth/crypto";
+import { symmetricDecrypt, symmetricEncrypt } from "better-auth/crypto";
 import {
 	admin,
 	anonymous,
@@ -23,6 +23,7 @@ import { defaultAuthPolicy } from "../auth-policy/policy";
 import { clerkCompatiblePasswords } from "../clerk-password";
 import { allauthControl } from "../control";
 import { recordControlEvent } from "../control/events";
+import { defaultSecurityPolicy } from "../control/security-policy";
 import type { ControlPrincipal } from "../control/types";
 import type {
 	ControlWebhookDelivery,
@@ -39,6 +40,7 @@ import {
 	createControlWebhooks,
 	deliverPendingWebhooks,
 } from "../control/webhooks";
+import type { EmailEnvironment } from "../email/send";
 import {
 	revokeAuthenticationChallenges,
 	revokeUserGrants,
@@ -227,6 +229,7 @@ describe.skipIf(!existsSync(fixture))(
 		function installedNative(
 			policy = defaultAuthPolicy,
 			authorizeAdmin = readRoot,
+			email?: EmailEnvironment["EMAIL"],
 		) {
 			const options = createAuthOptions(
 				{ db: projectDatabase, type: "postgres", transaction: true },
@@ -238,6 +241,9 @@ describe.skipIf(!existsSync(fixture))(
 					EMAIL_PROVIDER: "cloudflare",
 					CLOUDFLARE_ACCOUNT_ID: "",
 					CLOUDFLARE_EMAIL_API_TOKEN: "",
+					...(email
+						? { EMAIL_FROM: "security@webhook-management.fixture.example", EMAIL: email }
+						: {}),
 				},
 				{
 					name: "Webhook project fixture",
@@ -1034,6 +1040,381 @@ describe.skipIf(!existsSync(fixture))(
 				JSON.stringify(a).localeCompare(JSON.stringify(b)),
 			);
 		}
+
+		it("delivers signed new-device and notification failure events across writers after a live session", async () => {
+			const owner = randomUUID();
+			const email = `${owner}@webhook-management.fixture.example`;
+			const backupCode = "test3-67890";
+			const realm = `"${alpha.schemaName}"`;
+			const sibling = `"${beta.schemaName}"`;
+			const deviceName = `__Secure-allauth_project_${alpha.slug}.control_device`;
+			const deferred: (() => Promise<void>)[] = [];
+			const notifications: string[] = [];
+			async function failDelivery(recipient: string) {
+				notifications.push(recipient);
+				throw new Error("Synthetic new-device delivery failure");
+			}
+			const stock = installedNative(defaultAuthPolicy, readRoot, {
+				send: ({ to }) => failDelivery(to),
+			});
+			const candidate = createOwnedProjectEngine({
+				database,
+				project: alpha,
+				baseURL: origin,
+				basePath: alpha.path,
+				signingSecret: alpha.secret,
+				policy: defaultAuthPolicy,
+				trustedOrigins: [],
+				trustedIP: (input) => input.headers.get("x-real-ip"),
+				security: {
+					newDevice: {
+						defer: (work) => deferred.push(work),
+						notify: (user) => failDelivery(user.email),
+					},
+				},
+			});
+			await database.query(
+				`INSERT INTO ${realm}."user" (id,name,email,"emailVerified") VALUES ($1,'New device fixture',$2,TRUE)`,
+				[owner, email],
+			);
+			await database.query(
+				`INSERT INTO ${realm}."account" (id,"accountId","providerId","userId",password,"updatedAt") VALUES ($1,$2,'credential',$2,$3,now())`,
+				[randomUUID(), owner, await clerkCompatiblePasswords.hash(password)],
+			);
+			const subscription = await endpoint("legacy", "device-security", [
+				"security.*",
+			]);
+			const cookie = (response: Response, name: string) =>
+				response.headers
+					.getSetCookie()
+					.find((value) => value.startsWith(`${name}=`))
+					?.split(";", 1)[0];
+			const pairs = (response: Response) =>
+				response.headers
+					.getSetCookie()
+					.map((value) => value.split(";", 1)[0])
+					.join("; ");
+			function deviceRequest(
+				path: string,
+				ip: string,
+				body?: object,
+				cookies?: string,
+			) {
+				const input = request(`${alpha.path}${path}`, body, cookies);
+				input.headers.set("x-real-ip", ip);
+				return input;
+			}
+			const privateValues = [email, password, backupCode];
+			const observe = () => signedEvents(subscription, privateValues);
+			async function expectNewDeviceEvents(ipAddress: string) {
+				const identity = {
+					userId: owner,
+					ipAddress,
+					userAgent: "webhook-management-fixture",
+				};
+				const events = await observe();
+				expect(events).toHaveLength(2);
+				expect(events).toEqual(
+					expect.arrayContaining([
+						{
+							event: {
+								...identity,
+								type: "security.new-device",
+								outcome: "success",
+								metadata: { newDevice: true },
+							},
+						},
+						{
+							event: {
+								...identity,
+								type: "security.new-device-notification-failed",
+								outcome: "failure",
+								metadata: {},
+							},
+						},
+					]),
+				);
+			}
+			const drain = async () => {
+				for (const work of deferred.splice(0)) await work();
+			};
+			try {
+				for (const [first, second] of [
+					[stock.handler, candidate.dispatch],
+					[candidate.dispatch, stock.handler],
+				] as const) {
+					await database.query(
+						`UPDATE ${realm}."user" SET "twoFactorEnabled"=FALSE WHERE id=$1`,
+						[owner],
+					);
+					await database.query(
+						`DELETE FROM ${realm}."twoFactor" WHERE "userId"=$1`,
+						[owner],
+					);
+					await database.query(
+						`DELETE FROM ${realm}."allauthKnownDevice" WHERE "userId"=$1`,
+						[owner],
+					);
+					notifications.length = 0;
+					const initial = await first(
+						deviceRequest("/sign-in/email", "192.0.2.204", { email, password }),
+					);
+					expect(initial.status).toBe(200);
+					const initialDevice = cookie(initial, deviceName);
+					expect(initialDevice).toBeTruthy();
+					const repeated = await second(
+						deviceRequest(
+							"/sign-in/email",
+							"192.0.2.205",
+							{ email, password },
+							initialDevice,
+						),
+					);
+					expect(repeated.status).toBe(200);
+					expect(cookie(repeated, deviceName)).toBe(initialDevice);
+					await drain();
+					expect(await observe()).toEqual([]);
+					expect(notifications).toEqual([]);
+
+					const changed = await second(
+						deviceRequest("/sign-in/email", "192.0.2.206", { email, password }),
+					);
+					expect(changed.status).toBe(200);
+					expect(cookie(changed, deviceName)).toBeTruthy();
+					expect(cookie(changed, deviceName)).not.toBe(initialDevice);
+					await drain();
+					await expectNewDeviceEvents("192.0.2.206");
+					expect(notifications).toEqual([email]);
+
+					await database.query(
+						`INSERT INTO ${realm}."twoFactor" (id,secret,"backupCodes","userId",verified) VALUES ($1,$2,$3,$4,TRUE)`,
+						[
+							randomUUID(),
+							await symmetricEncrypt({
+								key: alpha.secret,
+								data: "fixture-security-totp",
+							}),
+							await symmetricEncrypt({
+								key: alpha.secret,
+								data: JSON.stringify([backupCode]),
+							}),
+							owner,
+						],
+					);
+					await database.query(
+						`UPDATE ${realm}."user" SET "twoFactorEnabled"=TRUE WHERE id=$1`,
+						[owner],
+					);
+					const pending = await first(
+						deviceRequest("/sign-in/email", "192.0.2.207", { email, password }),
+					);
+					expect(pending.status).toBe(200);
+					expect(await pending.json()).toMatchObject({
+						twoFactorRedirect: true,
+					});
+					expect(cookie(pending, deviceName)).toBeUndefined();
+					const pendingSession = await second(
+						deviceRequest(
+							"/get-session",
+							"192.0.2.208",
+							undefined,
+							pairs(pending),
+						),
+					);
+					expect(await pendingSession.json()).toBeNull();
+					await drain();
+					expect(await observe()).toEqual([]);
+					expect(notifications).toEqual([email]);
+					const completed = await second(
+						deviceRequest(
+							"/two-factor/verify-backup-code",
+							"192.0.2.209",
+							{ code: backupCode },
+							pairs(pending),
+						),
+					);
+					expect(completed.status, await completed.clone().text()).toBe(200);
+					expect(cookie(completed, deviceName)).toBeTruthy();
+					await drain();
+					await expectNewDeviceEvents("192.0.2.209");
+					expect(notifications).toEqual([email, email]);
+				}
+				expect(
+					(
+						await database.query(
+							`SELECT 1 FROM ${sibling}."allauthKnownDevice" WHERE "userId"=$1`,
+							[owner],
+						)
+					).rowCount,
+				).toBe(0);
+				expect(
+					(
+						await database.query(
+							`SELECT 1 FROM ${sibling}."allauthEvent" WHERE "userId"=$1`,
+							[owner],
+						)
+					).rowCount,
+				).toBe(0);
+			} finally {
+				await database.query(
+					`DELETE FROM ${realm}."allauthWebhookEndpoint" WHERE id=$1`,
+					[subscription.endpoint.id],
+				);
+				await database.query(`DELETE FROM ${realm}."user" WHERE id=$1`, [
+					owner,
+				]);
+			}
+		});
+
+		it("delivers the same signed policy and rule events for authorized security console mutations", async () => {
+			const scope = `"${alpha.schemaName}"`;
+			const sibling = `"${beta.schemaName}"`;
+			const subscription = await endpoint("legacy", "security-console", [
+				"security.*",
+			]);
+			const previousPolicy = (
+				await database.query<{ policy: unknown; updatedAt: Date }>(
+					`SELECT policy,"updatedAt" FROM ${scope}."allauthSecurityPolicy" WHERE id='default'`,
+				)
+			).rows[0];
+			const policy = { ...defaultSecurityPolicy, maxFailuresPerIp: 21 };
+			const rule = {
+				type: "ip",
+				value: "192.0.2.221",
+				reason: "Synthetic private console rule reason",
+			};
+			const candidate = createOwnedProjectEngine({
+				database,
+				project: alpha,
+				baseURL: origin,
+				basePath: alpha.path,
+				signingSecret: alpha.secret,
+				policy: defaultAuthPolicy,
+				trustedOrigins: [],
+				trustedIP: (input) => input.headers.get("x-real-ip"),
+				adminDeletion: {
+					id: alpha.id,
+					workspaceId: alpha.workspaceId,
+					platformOrigin: origin,
+					readWorkspacePrincipal: readRoot,
+				},
+				security: { management: true },
+			});
+			const stock = installedNative();
+			const ruleIds: string[] = [];
+			const siblingEvents = async () =>
+				(
+					await database.query(
+						`SELECT count(*)::integer AS count FROM ${sibling}."allauthEvent" WHERE type LIKE 'security.%'`,
+					)
+				).rows[0]?.count;
+			const initialSibling = await siblingEvents();
+			async function exercise(dispatch: typeof stock.handler) {
+				const control = `${alpha.path}/control/security`;
+				const denied = await dispatch(
+					request(
+						`${control}/update`,
+						{ policy },
+						rootCookie,
+						"https://different-origin.fixture.example",
+					),
+				);
+				expect(denied.status).toBe(403);
+				const changed = await dispatch(
+					request(`${control}/update`, { policy }, rootCookie),
+				);
+				expect(changed.status).toBe(200);
+				expect(await changed.json()).toEqual({ policy });
+				const added = await dispatch(
+					request(`${control}/rules/add`, rule, rootCookie),
+				);
+				expect(added.status).toBe(200);
+				const { rule: saved } = (await added.json()) as {
+					rule: { id: string };
+				};
+				expect(saved).toMatchObject(rule);
+				ruleIds.push(saved.id);
+				const removed = await dispatch(
+					request(`${control}/rules/remove`, { id: saved.id }, rootCookie),
+				);
+				expect(removed.status).toBe(200);
+				expect(await removed.json()).toEqual({ success: true });
+				expect(
+					(
+						await database.query(
+							`SELECT 1 FROM ${scope}."allauthSecurityRule" WHERE id=$1`,
+							[saved.id],
+						)
+					).rowCount,
+				).toBe(0);
+				return signedEvents(
+					subscription,
+					[rootCookie, rule.value, rule.reason],
+					new Map([[saved.id, "console-rule"]]),
+				);
+			}
+			try {
+				const events = await exercise(stock.handler);
+				const identity = {
+					actorId: rootId,
+					outcome: "success",
+					ipAddress: "192.0.2.46",
+					userAgent: "webhook-management-fixture",
+				};
+				expect(events).toHaveLength(3);
+				expect(events).toEqual(
+					expect.arrayContaining([
+						{
+							event: {
+								...identity,
+								type: "security.policy.updated",
+								metadata: {
+									fields: Object.keys(policy).filter(
+										(field) => field !== "blockedEmailDomains",
+									),
+								},
+							},
+						},
+						{
+							event: {
+								...identity,
+								type: "security.rule.added",
+								targetId: "console-rule",
+								metadata: { ruleType: "ip" },
+							},
+						},
+						{
+							event: {
+								...identity,
+								type: "security.rule.removed",
+								targetId: "console-rule",
+								metadata: {},
+							},
+						},
+					]),
+				);
+				expect(await exercise(candidate.dispatch)).toEqual(events);
+				expect(await siblingEvents()).toBe(initialSibling);
+			} finally {
+				await database.query(
+					`DELETE FROM ${scope}."allauthWebhookEndpoint" WHERE id=$1`,
+					[subscription.endpoint.id],
+				);
+				await database.query(
+					`DELETE FROM ${scope}."allauthSecurityRule" WHERE id=ANY($1::text[])`,
+					[ruleIds],
+				);
+				if (previousPolicy)
+					await database.query(
+						`UPDATE ${scope}."allauthSecurityPolicy" SET policy=$1,"updatedAt"=$2 WHERE id='default'`,
+						[previousPolicy.policy, previousPolicy.updatedAt],
+					);
+				else
+					await database.query(
+						`DELETE FROM ${scope}."allauthSecurityPolicy" WHERE id='default'`,
+					);
+			}
+		});
 
 		it("signs out users linked to installed SIWE and exact realm SSO providers", async () => {
 			const installed = installedNative();
