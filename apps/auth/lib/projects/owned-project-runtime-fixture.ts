@@ -6,6 +6,8 @@ import * as consoleOrganizations from "../../app/api/admin/organizations/route";
 import * as hosted from "../../app/api/auth/[...all]/route";
 import { GET as config } from "../../app/api/config/route";
 import { GET as health } from "../../app/api/health/route";
+import * as scimConsole from "../../app/api/organizations/[organizationId]/scim/route";
+import { POST as rotateDirectory } from "../../app/api/organizations/[organizationId]/scim/[connectionId]/rotate/route";
 import * as projectAuth from "../../app/api/projects/[slug]/auth/[...all]/route";
 import { GET as brokerLogin } from "../../app/oauth/login/route";
 import { authOrigin } from "../configuration";
@@ -71,15 +73,35 @@ async function dispatch(request: Request) {
 		if (request.method === "GET") return consoleOrganizations.GET(request);
 		if (request.method === "POST") return consoleOrganizations.POST(request);
 	}
+	const scim =
+		/^\/api\/organizations\/([^/]+)\/scim(?:\/([^/]+)\/rotate)?$/.exec(path);
+	if (scim) {
+		const organizationId = scim[1]!;
+		const connectionId = scim[2];
+		if (connectionId && request.method === "POST")
+			return rotateDirectory(request, {
+				params: Promise.resolve({ organizationId, connectionId }),
+			});
+		if (!connectionId && request.method === "GET")
+			return scimConsole.GET(request, {
+				params: Promise.resolve({ organizationId }),
+			});
+		if (!connectionId && request.method === "POST")
+			return scimConsole.POST(request, {
+				params: Promise.resolve({ organizationId }),
+			});
+	}
 	const project = /^\/api\/projects\/([^/]+)\/auth\//.exec(path);
 	if (project) {
 		const context = { params: Promise.resolve({ slug: project[1]! }) };
 		if (request.method === "GET") return projectAuth.GET(request, context);
 		if (request.method === "POST") return projectAuth.POST(request, context);
+		if (request.method === "PATCH") return projectAuth.PATCH(request, context);
 	}
 	if (path.startsWith("/api/auth/")) {
 		if (request.method === "GET") return hosted.GET(request);
 		if (request.method === "POST") return hosted.POST(request);
+		if (request.method === "PATCH") return hosted.PATCH(request);
 	}
 	return new Response(null, { status: 404 });
 }
@@ -153,6 +175,7 @@ async function boot(selection: ProjectRuntimeFixtureBoot) {
 				baseURL,
 				basePath,
 				signingSecret,
+				credentialHashSecret,
 			}) =>
 				createOwnedProjectRuntimeCandidate({
 					database,
@@ -164,6 +187,7 @@ async function boot(selection: ProjectRuntimeFixtureBoot) {
 							? { kind: "hosted", origin: baseURL }
 							: { kind: "direct" },
 					signingSecret,
+					credentialHashSecret,
 					trustedIP: (request) => request.headers.get("x-real-ip"),
 					defer(work) {
 						const operation = Promise.resolve()

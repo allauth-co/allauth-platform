@@ -81,6 +81,7 @@ export async function selectRehearsalProjectEngine(
 		baseURL,
 		basePath,
 		signingSecret,
+		credentialHashSecret,
 	}) => {
 		const hosted = basePath === "/api/auth";
 		return createOwnedProjectRuntimeCandidate({
@@ -92,6 +93,7 @@ export async function selectRehearsalProjectEngine(
 				? { kind: "hosted", origin: baseURL }
 				: { kind: "direct" },
 			signingSecret,
+			credentialHashSecret,
 			// Normal dispatch verifies the signed edge or application proxy before engine code runs.
 			trustedIP: (request) =>
 				hosted

@@ -16,8 +16,10 @@ import {
 } from "@/components/hosted-organizations";
 import { HostedProjectInvitation } from "@/components/hosted-project-invitation";
 import { OrganizationManager } from "@/components/organization-manager";
+import { HostedOrganizationDetail } from "@/components/hosted-organization-detail";
 
 const legacy = vi.hoisted(() => ({ useSession: vi.fn(), list: vi.fn() }));
+const navigation = vi.hoisted(() => ({ replace: vi.fn() }));
 vi.mock("@/lib/auth-client", () => ({
 	authClient: {
 		useSession: legacy.useSession,
@@ -27,10 +29,11 @@ vi.mock("@/lib/auth-client", () => ({
 
 vi.mock("next/navigation", () => ({
 	usePathname: () => "/account/organizations",
+	useRouter: () => navigation,
 }));
 vi.mock("next/link", () => ({
-	default: ({ children, href }: { children: ReactNode; href: string }) =>
-		createElement("a", { href }, children),
+	default: ({ children, ...props }: { children: ReactNode; href: string }) =>
+		createElement("a", props, children),
 }));
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
 vi.mock("@/components/ui/app-select", () => ({
@@ -98,6 +101,7 @@ beforeEach(() => {
 	vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
 	legacy.useSession.mockReset();
 	legacy.list.mockReset();
+	navigation.replace.mockReset();
 });
 
 afterEach(async () => {
@@ -107,11 +111,15 @@ afterEach(async () => {
 	vi.unstubAllGlobals();
 });
 
-type View = "invitation" | "list" | "switch" | "manager";
+type View = "invitation" | "list" | "switch" | "manager" | "settings";
 
 function Preview({ view }: { view: View }) {
 	const client = useHostedOrganizationClient();
 	if (view === "manager") return createElement(OrganizationManager);
+	if (view === "settings")
+		return createElement(HostedOrganizationDetail, {
+			children: createElement("p", null, "Legacy organization detail"),
+		});
 	if (!client) return createElement("p", null, "Standard portal");
 	if (view === "list")
 		return createElement(HostedOrganizationSettings, { client });
@@ -418,5 +426,158 @@ it("keeps the ordinary organization manager on the legacy client outside the pre
 	);
 	expect(legacy.useSession).toHaveBeenCalled();
 	expect(legacy.list).toHaveBeenCalledOnce();
+	expect(requests).not.toHaveBeenCalled();
+});
+
+it("edits the selected hosted organization and requires explicit confirmation to delete it", async () => {
+	let current = organization;
+	const permissions = vi.fn();
+	const check = vi.fn();
+	const update = vi.fn();
+	const remove = vi.fn();
+	network(async (path, request) => {
+		switch (path) {
+			case "get-session":
+				return session;
+			case "organization/get-full-organization":
+				expect(new URL(request.url).searchParams.get("organizationId")).toBe(
+					organization.id,
+				);
+				return current;
+			case "organization/has-permission":
+				permissions(await request.json());
+				return { success: true };
+			case "organization/check-slug":
+				check(await request.json());
+				return { status: true };
+			case "organization/update": {
+				const body = (await request.json()) as {
+					organizationId: string;
+					data: { name: string; slug: string };
+				};
+				update(body);
+				current = { ...current, ...body.data };
+				return current;
+			}
+			case "organization/delete":
+				remove(await request.json());
+				return current;
+			default:
+				throw new Error(`Unexpected organization operation ${path}`);
+		}
+	});
+	const container = await render("settings");
+	await act(async () => new Promise<void>((resolve) => setTimeout(resolve, 0)));
+	expect(permissions).toHaveBeenCalledWith({
+		organizationId: organization.id,
+		permissions: { organization: ["update"] },
+	});
+	expect(permissions).toHaveBeenCalledWith({
+		organizationId: organization.id,
+		permissions: { organization: ["delete"] },
+	});
+	expect(
+		container.querySelector('a[aria-current="page"]')?.getAttribute("href"),
+	).toBe("/organization/settings");
+	const [name, slug] = [...container.querySelectorAll("input")];
+	expect(name!.value).toBe(organization.name);
+	const setInput = (input: HTMLInputElement, value: string) => {
+		Object.getOwnPropertyDescriptor(
+			Object.getPrototypeOf(input),
+			"value",
+		)!.set!.call(input, value);
+		input.dispatchEvent(new Event("input", { bubbles: true }));
+	};
+	await act(async () => {
+		setInput(name!, "Operations Group");
+		setInput(slug!, "Operations Group");
+	});
+	await vi.waitFor(async () => {
+		await act(
+			async () => new Promise<void>((resolve) => setTimeout(resolve, 0)),
+		);
+		expect(check).toHaveBeenCalledExactlyOnceWith({ slug: "operations-group" });
+	});
+	await act(async () => {
+		container
+			.querySelector("form")!
+			.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+	});
+	expect(update).toHaveBeenCalledExactlyOnceWith({
+		organizationId: organization.id,
+		data: { name: "Operations Group", slug: "operations-group" },
+	});
+	const removeButton = [...container.querySelectorAll("button")].find(
+		(button) => button.textContent === "Delete organization",
+	)!;
+	await act(async () => removeButton.click());
+	expect(remove).not.toHaveBeenCalled();
+	const dialog = document.querySelector('[role="alertdialog"]')!;
+	expect(dialog.textContent).toContain("Operations Group");
+	const confirm = [...dialog.querySelectorAll("button")].find(
+		(button) => button.textContent === "Delete organization",
+	)!;
+	await act(async () => {
+		confirm.click();
+		confirm.click();
+	});
+	expect(remove).toHaveBeenCalledExactlyOnceWith({
+		organizationId: organization.id,
+	});
+	expect(navigation.replace).toHaveBeenCalledExactlyOnceWith(
+		"/account/organizations",
+	);
+});
+
+it("preserves read-only organization settings and native errors from the leave confirmation", async () => {
+	const leave = vi.fn();
+	network(async (path, request) => {
+		if (path === "get-session") return session;
+		if (path === "organization/get-full-organization") return organization;
+		if (path === "organization/has-permission") return { success: false };
+		expect(path).toBe("organization/leave");
+		leave(await request.json());
+		return Response.json(
+			{
+				code: "YOU_CANNOT_LEAVE_THE_ORGANIZATION_AS_THE_ONLY_OWNER",
+				message: "You cannot leave the organization as the only owner",
+			},
+			{ status: 400 },
+		);
+	});
+	const container = await render("settings");
+	await act(async () => new Promise<void>((resolve) => setTimeout(resolve, 0)));
+	expect(
+		[...container.querySelectorAll("input")].every((input) => input.disabled),
+	).toBe(true);
+	expect(
+		[...container.querySelectorAll("button")].map(
+			(button) => button.textContent,
+		),
+	).not.toContain("Delete organization");
+	const trigger = [...container.querySelectorAll("button")].find(
+		(button) => button.textContent === "Leave organization",
+	)!;
+	await act(async () => trigger.click());
+	const dialog = document.querySelector('[role="alertdialog"]')!;
+	const confirm = [...dialog.querySelectorAll("button")].find(
+		(button) => button.textContent === "Leave organization",
+	)!;
+	await act(async () => confirm.click());
+	expect(leave).toHaveBeenCalledExactlyOnceWith({
+		organizationId: organization.id,
+	});
+	expect(dialog.querySelector('[role="alert"]')?.textContent).toBe(
+		"You cannot leave the organization as the only owner",
+	);
+	expect(navigation.replace).not.toHaveBeenCalled();
+});
+
+it("keeps the standard organization detail component outside the hosted preview", async () => {
+	const requests = network(() => {
+		throw new Error("Hosted settings are unavailable");
+	});
+	const container = await render("settings", false);
+	expect(container.textContent).toBe("Legacy organization detail");
 	expect(requests).not.toHaveBeenCalled();
 });

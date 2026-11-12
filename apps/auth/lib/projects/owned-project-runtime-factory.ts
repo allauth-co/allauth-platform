@@ -1,5 +1,6 @@
 import type { Pool } from "pg";
 import { withAuth, withAuthEngine } from "../auth";
+import type { AuthEngine } from "../auth-engine";
 import type { AuthPolicy } from "../auth-policy/policy";
 import { readAuthPolicy } from "../auth-policy/storage";
 import {
@@ -56,6 +57,9 @@ import { createProjectEngineStore } from "./owned-project-engine-store";
 import { admitOwnedProjectNativeRoute } from "./owned-project-native-admission";
 import { createOwnedProjectInvitationEmail } from "./owned-project-organization-email";
 import { createOwnedProjectPasswordSafety } from "./owned-project-password-safety";
+import { createOwnedProjectSCIMConsole } from "./owned-project-scim-console";
+import { checkProjectOidcConfiguration } from "./owned-project-sso-oidc";
+import { ssoProviderId } from "./owned-project-sso-store";
 import type { ProjectAvatarStorage } from "./project-avatar-upload";
 import { verifiedProjectRequest } from "./proxy";
 import type { Project } from "./registry";
@@ -76,6 +80,7 @@ type Options = {
 	/** Routing has already verified the project and the hosted binding when present. */
 	transport: TrustedTransport;
 	signingSecret: string;
+	credentialHashSecret: string;
 	trustedIP: EngineOptions["trustedIP"];
 	defer(work: () => Promise<void>): void;
 	/** Only the isolated fixture supplies alternate egress. */
@@ -140,23 +145,39 @@ async function readSupportedProviders(options: Options) {
 				"This development project's Google provider configuration is invalid.",
 			);
 	}
+	const schema = checkedProjectSchema(project.schemaName);
+	const { rows: enterprise } = await database.query<{
+		providerId: string;
+		issuer: string;
+		oidcConfig: string | null;
+		samlConfig: string | null;
+	}>(
+		`SELECT "providerId",issuer,"oidcConfig","samlConfig" FROM "${schema}"."ssoProvider"`,
+	);
+	const enterpriseProviderIds = enterprise.map((entry) => {
+		if (entry.samlConfig || !entry.oidcConfig)
+			throw new Error(
+				"This development project has a configured SAML provider outside the candidate scope.",
+			);
+		checkProjectOidcConfiguration({
+			issuer: entry.issuer,
+			oidcConfig: JSON.parse(entry.oidcConfig),
+		});
+		return ssoProviderId.parse(entry.providerId);
+	});
 	const providers = [
 		"credential",
 		"allauth",
 		...(google ? ["google"] : []),
 		...(microsoft ? ["microsoft"] : []),
 		...(apple ? ["apple"] : []),
+		...enterpriseProviderIds,
 	];
-	const schema = checkedProjectSchema(project.schemaName);
 	const {
 		rows: [snapshot],
 	} = await database.query<{ incompatible: boolean }>(
 		`
 		SELECT (
-		 EXISTS (SELECT 1 FROM "${schema}"."ssoProvider") OR
-		 EXISTS (SELECT 1 FROM "${schema}"."scimManagedConnection") OR
-		 EXISTS (SELECT 1 FROM "${schema}"."scimConnectionBinding") OR
-		 EXISTS (SELECT 1 FROM "${schema}"."allauthDirectory") OR
 		 EXISTS (
 		  SELECT 1 FROM "${schema}"."apikey" k WHERE
 		   coalesce(nullif(k."configId",''),'default') <> 'default' OR
@@ -410,7 +431,18 @@ export async function createOwnedProjectRuntimeCandidate(options: Options) {
 		keys: encryptionKeys,
 		configured: apple,
 	});
-	const engine = createOwnedProjectEngine({
+	const readWorkspacePrincipal = (headers: Headers) =>
+		withAuthEngine((root) => root.readPrincipal(headers));
+	const manageSCIMConsole = createOwnedProjectSCIMConsole({
+		database,
+		env,
+		project,
+		connector: { kind: "project-path" },
+		credentialHashSecret: options.credentialHashSecret,
+		readWorkspacePrincipal,
+		readProjectPrincipal: (headers) => engine.readPrincipal(headers),
+	});
+	const engine: AuthEngine = createOwnedProjectEngine({
 		database,
 		project,
 		policy,
@@ -434,6 +466,12 @@ export async function createOwnedProjectRuntimeCandidate(options: Options) {
 			requireUserVerification: relyingParty.requireUserVerification === true,
 		},
 		issuer: { platformOrigin: platform, errorURL: `${platform}/auth-error` },
+		sso: {
+			defaultErrorURL: `${platform}/auth-error`,
+			tokenKeys: encryptionKeys,
+		},
+		scim: { credentialHashSecret: options.credentialHashSecret },
+		manageSCIMConsole,
 		backchannelLogout: { defer, post: options.postBackchannelLogout },
 		support: projectSupport(options, platform),
 		oauth: {
@@ -573,8 +611,7 @@ export async function createOwnedProjectRuntimeCandidate(options: Options) {
 			id: project.id,
 			workspaceId: project.workspaceId,
 			platformOrigin: platform,
-			readWorkspacePrincipal: (headers) =>
-				withAuthEngine((root) => root.readPrincipal(headers)),
+			readWorkspacePrincipal,
 		},
 		organization: {
 			membershipLimit: async (client) =>

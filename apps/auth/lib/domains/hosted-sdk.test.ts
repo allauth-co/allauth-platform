@@ -184,6 +184,11 @@ describe("hosted SDK transport", () => {
 			"list-roles",
 		];
 		const writes = [
+			"check-slug",
+			"has-permission",
+			"update",
+			"delete",
+			"leave",
 			"invite-member",
 			"cancel-invitation",
 			"update-member-role",
@@ -231,7 +236,8 @@ describe("hosted SDK transport", () => {
 			).status,
 		).toBe(403);
 		expect(
-			(await POST(request("organization/delete", "POST", { origin }))).status,
+			(await POST(request("organization/set-active-team", "POST", { origin })))
+				.status,
 		).toBe(404);
 		expect(gateway.dispatch).toHaveBeenCalledTimes(
 			reads.length + writes.length,

@@ -26,6 +26,14 @@ const builtInRoles = new Map<
 	],
 ]);
 
+export function isBuiltInOrganizationRole(role: string) {
+	return builtInRoles.has(role);
+}
+
+export function isOrganizationPermissionResource(resource: string) {
+	return Object.hasOwn(allStatements, resource);
+}
+
 type RolePermissions = Map<string, Map<string, Set<string>>>;
 
 /** Merge realm-local rows with static statements. Separate roles never combine to approve a request. */

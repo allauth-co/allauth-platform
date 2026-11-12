@@ -57,6 +57,11 @@ const oauthRedirectURI = "https://rp.runtime.fixture.example/callback";
 const supportOrigin = "https://support.runtime.fixture.example";
 const supportCallback = `${supportOrigin}/api/allauth/support/callback`;
 const supportTarget = "fixture-support-target";
+const directoryOrg = "fixture-directory";
+const directoryProvider = "fixture-directory-provider";
+const directoryIssuer = "https://idp.runtime-fixture.example.net";
+const scimUser = "urn:ietf:params:scim:schemas:core:2.0:User";
+const scimPatch = "urn:ietf:params:scim:api:messages:2.0:PatchOp";
 const credentials = {
 	platform: { id: "fixture-owner", email: "owner@runtime.fixture.example" },
 	project: {
@@ -189,6 +194,8 @@ async function openProcess(
 					origin?: string;
 					clientIP?: string;
 					proxy?: Project;
+					authorization?: string;
+					method?: "PATCH";
 				} = {},
 			) {
 				const origin = options.host
@@ -196,6 +203,8 @@ async function openProcess(
 					: platformOrigin;
 				const headers = new Headers({ origin: options.origin ?? origin });
 				if (options.cookie) headers.set("cookie", options.cookie);
+				if (options.authorization)
+					headers.set("authorization", options.authorization);
 				const form = options.body instanceof URLSearchParams;
 				const body =
 					options.body === undefined
@@ -208,7 +217,7 @@ async function openProcess(
 						"content-type",
 						form ? "application/x-www-form-urlencoded" : "application/json",
 					);
-				const method = body === undefined ? "GET" : "POST";
+				const method = options.method ?? (body === undefined ? "GET" : "POST");
 				if (options.proxy) {
 					const proxyOrigin = headers.get("origin")!;
 					const timestamp = Math.floor(Date.now() / 1000).toString();
@@ -705,6 +714,33 @@ async function seed(databaseURL: string) {
 			},
 			owner.user.id,
 		);
+		await database.query(
+			`INSERT INTO "${alpha.schemaName}"."organization" (id,name,slug,"createdAt") VALUES ($1,'Fixture Directory',$1,now())`,
+			[directoryOrg],
+		);
+		await database.query(
+			`INSERT INTO "${alpha.schemaName}"."member" (id,"userId","organizationId",role,"createdAt") VALUES ($1,$2,$3,'owner',now())`,
+			[randomUUID(), credentials.project.id, directoryOrg],
+		);
+		await database.query(
+			`INSERT INTO "${alpha.schemaName}"."ssoProvider" (id,"providerId",issuer,domain,"domainVerified","organizationId","userId","oidcConfig")
+			 VALUES ($1,$1,$2,'directory.fixture.example',TRUE,$3,$4,$5)`,
+			[
+				directoryProvider,
+				directoryIssuer,
+				directoryOrg,
+				credentials.project.id,
+				JSON.stringify({
+					issuer: directoryIssuer,
+					clientId: "synthetic-directory-client",
+					clientSecret: "synthetic-directory-credential",
+					authorizationEndpoint: `${directoryIssuer}/authorize`,
+					tokenEndpoint: `${directoryIssuer}/token`,
+					jwksEndpoint: `${directoryIssuer}/jwks`,
+					pkce: true,
+				}),
+			],
+		);
 		await googleProviderRepository(database, env).update(
 			alpha,
 			{
@@ -793,6 +829,11 @@ describe.skipIf(!existsSync(fixture))(
 				};
 				const management = (project: Project) =>
 					`/api/admin/organizations?project=${project.slug}`;
+				const scimManagement = `/api/organizations/${directoryOrg}/scim`;
+				const scimProject = `?project=${alpha.slug}`;
+				const hostedScim = "/api/auth/scim/v2/Users";
+				const directScim = `${alphaPath}/scim/v2/Users`;
+				const scimName = "directory-user@runtime.fixture.example";
 				service = await open(source, false);
 				expect((await service.request("/api/health")).status).toBe(200);
 				const rootLogin = await service.request("/api/auth/sign-in/email", {
@@ -803,6 +844,30 @@ describe.skipIf(!existsSync(fixture))(
 				});
 				expect(rootLogin.status).toBe(200);
 				const rootCookie = cookie(rootLogin);
+				const directory = await service.request(scimManagement + scimProject, {
+					cookie: rootCookie,
+					body: { providerId: directoryProvider },
+				});
+				expect(
+					directory.status,
+					directory.ok ? undefined : await directory.clone().text(),
+				).toBe(201);
+				const nativeDirectory = (await directory.json()) as {
+					connection: { connectionId: string };
+					token: string;
+				};
+				const nativeDirectoryAuth = {
+					authorization: `Bearer ${nativeDirectory.token}`,
+				};
+				expect(nativeDirectory.token).toEqual(expect.any(String));
+				expect(
+					(
+						await service.request(hostedScim, {
+							...nativeDirectoryAuth,
+							host: alphaHost,
+						})
+					).status,
+				).toBe(200);
 				const impersonation = await service.request(
 					`${alphaPath}/project-admin/impersonate-user`,
 					{
@@ -898,6 +963,101 @@ describe.skipIf(!existsSync(fixture))(
 
 				service = await open(restored, true);
 				expect((await service.request("/api/health")).status).toBe(200);
+				for (const [path, host, issuer] of [
+					[`${alphaPath}/sign-in/sso`, undefined, directIssuer],
+					["/api/auth/sign-in/sso", alphaHost, hostedIssuer],
+				] as const) {
+					const started = await service.request(path, {
+						host,
+						body: {
+							providerId: directoryProvider,
+							callbackURL: `${host ? `https://${host}` : platformOrigin}/account`,
+						},
+					});
+					expect(
+						started.status,
+						started.ok ? undefined : await started.clone().text(),
+					).toBe(200);
+					const authorization = await fixtureRedirect(started);
+					expect(`${authorization.origin}${authorization.pathname}`).toBe(
+						`${directoryIssuer}/authorize`,
+					);
+					expect(authorization.searchParams.get("redirect_uri")).toBe(
+						`${issuer}/sso/callback/${directoryProvider}`,
+					);
+				}
+				const directoryList = await service.request(
+					scimManagement + scimProject,
+					{ cookie: rootCookie },
+				);
+				expect(directoryList.status).toBe(200);
+				expect(await directoryList.json()).toMatchObject({
+					connections: [
+						{
+							connection: {
+								connectionId: nativeDirectory.connection.connectionId,
+							},
+							providerId: directoryProvider,
+						},
+					],
+				});
+				expect(
+					(
+						await service.request(hostedScim, {
+							...nativeDirectoryAuth,
+							host: betaHost,
+						})
+					).status,
+				).toBe(401);
+				const added = await service.request(hostedScim, {
+					...nativeDirectoryAuth,
+					host: alphaHost,
+					body: {
+						schemas: [scimUser],
+						userName: scimName,
+						emails: [{ value: scimName, primary: true }],
+						active: true,
+					},
+				});
+				expect(
+					added.status,
+					added.ok ? undefined : await added.clone().text(),
+				).toBe(201);
+				const directoryUserId = ((await added.json()) as { id: string }).id;
+				const patched = await service.request(
+					`${directScim}/${encodeURIComponent(directoryUserId)}`,
+					{
+						...nativeDirectoryAuth,
+						method: "PATCH",
+						body: {
+							schemas: [scimPatch],
+							Operations: [{ op: "replace", path: "active", value: false }],
+						},
+					},
+				);
+				expect(
+					patched.status,
+					patched.ok ? undefined : await patched.clone().text(),
+				).toBe(200);
+				expect(await patched.json()).toMatchObject({
+					id: directoryUserId,
+					active: false,
+				});
+				const rotatedDirectory = await service.request(
+					`${scimManagement}/${nativeDirectory.connection.connectionId}/rotate${scimProject}`,
+					{ cookie: rootCookie, body: {} },
+				);
+				expect(
+					rotatedDirectory.status,
+					rotatedDirectory.ok
+						? undefined
+						: await rotatedDirectory.clone().text(),
+				).toBe(200);
+				const ownedDirectoryToken = (
+					(await rotatedDirectory.json()) as { token: string }
+				).token;
+				expect(ownedDirectoryToken).toEqual(expect.any(String));
+				expect(ownedDirectoryToken).not.toBe(nativeDirectory.token);
 				const supportStatus = await service.request(
 					`${alphaPath}/project-admin/support/status`,
 					{ cookie: supportCookies },
@@ -1240,8 +1400,8 @@ describe.skipIf(!existsSync(fixture))(
 				expect(ownedConfig.status).toBe(200);
 				expect(await ownedConfig.json()).toMatchObject({
 					apiKeys: true,
-					enterpriseSSO: false,
-					scim: false,
+					enterpriseSSO: true,
+					scim: true,
 					signUpEnabled: true,
 					googleProvider: "google",
 					microsoftProvider: "microsoft",
@@ -1528,6 +1688,24 @@ describe.skipIf(!existsSync(fixture))(
 
 				service = await open(restored, false);
 				expect((await service.request("/api/health")).status).toBe(200);
+				const restoredDirectory = await service.request(
+					`${hostedScim}/${encodeURIComponent(directoryUserId)}`,
+					{
+						authorization: `Bearer ${ownedDirectoryToken}`,
+						host: alphaHost,
+					},
+				);
+				expect(
+					restoredDirectory.status,
+					restoredDirectory.ok
+						? undefined
+						: await restoredDirectory.clone().text(),
+				).toBe(200);
+				expect(await restoredDirectory.json()).toMatchObject({
+					id: directoryUserId,
+					userName: scimName,
+					active: false,
+				});
 				const restoredSupport = await service.request(
 					`${alphaPath}/sdk/support/session`,
 					connectedSupport,
@@ -1664,7 +1842,9 @@ describe.skipIf(!existsSync(fixture))(
 					cookie: rootCookie,
 				});
 				expect(catalog.status).toBe(200);
-				expect(await catalog.json()).toMatchObject({ organizations: [] });
+				expect(await catalog.json()).toMatchObject({
+					organizations: [{ id: directoryOrg }],
+				});
 				const control = await service.request(management(beta), {
 					cookie: rootCookie,
 				});
@@ -1724,6 +1904,17 @@ describe.skipIf(!existsSync(fixture))(
 					).toBeNull();
 					await service.stop();
 					service = undefined;
+					await changed.query(
+						`UPDATE "${alpha.schemaName}"."ssoProvider" SET "samlConfig"='{}' WHERE "providerId"=$1`,
+						[directoryProvider],
+					);
+					await expect(open(restored, true)).rejects.toThrow(
+						"This development project has a configured SAML provider outside the candidate scope.",
+					);
+					await changed.query(
+						`UPDATE "${alpha.schemaName}"."ssoProvider" SET "samlConfig"=NULL WHERE "providerId"=$1`,
+						[directoryProvider],
+					);
 					await changed.query(
 						`UPDATE "${alpha.schemaName}"."apikey" SET "rateLimitMax"=101 WHERE id=$1`,
 						[ownedDirectKey.id],

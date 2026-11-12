@@ -26,6 +26,11 @@ import {
 	organizationFailure as failure,
 	organizationJson as json,
 } from "./owned-project-organization-response";
+import {
+	handleProjectOrganizationRole,
+	isOrganizationRoleRoute,
+	organizationRoleRoutes,
+} from "./owned-project-organization-roles";
 import { projectOrganizations } from "./owned-project-organization-store";
 import {
 	handleProjectOrganizationTeam,
@@ -103,6 +108,7 @@ const inviteInput = z.object({
 
 const routeMethods = {
 	...organizationLifecycleRoutes,
+	...organizationRoleRoutes,
 	...organizationTeamRoutes,
 	"/organization/check-slug": "POST",
 	"/organization/create": "POST",
@@ -444,7 +450,9 @@ export function createOwnedProjectOrganizationHttp(
 		try {
 			const runTransaction =
 				mutation &&
-				(isOrganizationLifecycleRoute(path) || isOrganizationTeamRoute(path))
+				(isOrganizationLifecycleRoute(path) ||
+					isOrganizationRoleRoute(path) ||
+					isOrganizationTeamRoute(path))
 					? retryTransaction
 					: store.transaction;
 			const result = await runTransaction<RouteResult>(async (client) => {
@@ -479,6 +487,14 @@ export function createOwnedProjectOrganizationHttp(
 				const { user, session } = principal;
 				if (isOrganizationLifecycleRoute(path))
 					return handleOrganizationLifecycle(path, realm, principal, input);
+				if (isOrganizationRoleRoute(path))
+					return handleProjectOrganizationRole(
+						path,
+						client,
+						realm,
+						principal,
+						input,
+					);
 				if (isOrganizationTeamRoute(path))
 					return handleProjectOrganizationTeam(
 						path,

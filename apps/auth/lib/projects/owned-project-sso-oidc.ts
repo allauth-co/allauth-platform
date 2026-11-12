@@ -94,11 +94,8 @@ function discoveredEndpoint(
 	throw new Error("Untrusted enterprise discovery endpoint.");
 }
 
-/** Read persisted provider settings and hydrate only missing OIDC endpoints. */
-export async function resolveProjectOidc(
-	provider: SsoProvider,
-	network: SsoFetch,
-	trustedOrigins: ReadonlySet<string>,
+function parseProjectOidc(
+	provider: Pick<SsoProvider, "issuer" | "oidcConfig">,
 ) {
 	const config = configSchema.parse(provider.oidcConfig);
 	const issuer = ssoHttpsUrl(provider.issuer);
@@ -108,6 +105,38 @@ export async function resolveProjectOidc(
 		config.overrideUserInfo
 	)
 		throw new Error("Unsupported enterprise identity configuration.");
+	return { config, issuer };
+}
+
+/** Check local compatibility without contacting the registered identity provider. */
+export function checkProjectOidcConfiguration(
+	provider: Pick<SsoProvider, "issuer" | "oidcConfig">,
+) {
+	const { config } = parseProjectOidc(provider);
+	if (
+		!config.clientSecret ||
+		config.tokenEndpointAuthentication === "private_key_jwt"
+	)
+		throw new Error(
+			"The configured provider requires an unsupported client credential.",
+		);
+	for (const endpoint of [
+		config.discoveryEndpoint,
+		config.authorizationEndpoint,
+		config.tokenEndpoint,
+		config.jwksEndpoint,
+		config.userInfoEndpoint,
+	])
+		if (endpoint) ssoHttpsUrl(endpoint);
+}
+
+/** Read persisted provider settings and hydrate only missing OIDC endpoints. */
+export async function resolveProjectOidc(
+	provider: SsoProvider,
+	network: SsoFetch,
+	trustedOrigins: ReadonlySet<string>,
+) {
+	const { config, issuer } = parseProjectOidc(provider);
 	let authorization = config.authorizationEndpoint;
 	let token = config.tokenEndpoint;
 	let jwks = config.jwksEndpoint;
