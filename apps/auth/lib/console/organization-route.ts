@@ -7,11 +7,13 @@ import {
 	consoleDatabase,
 	requireConsoleAdministrator,
 } from "./database";
+import type { ConsoleOrganizationResource } from "./organizations";
 import { executeConsoleOrganization } from "./organizations";
 
 export function consoleOrganizationRoute(
 	request: Request,
 	organizationId?: string,
+	resource?: ConsoleOrganizationResource,
 ) {
 	const slug = new URL(request.url).searchParams.get("project");
 	const readBody = () => consoleBody(request);
@@ -24,6 +26,8 @@ export function consoleOrganizationRoute(
 			readBody,
 			actor.user.id,
 			organizationId,
+			"native",
+			resource,
 		);
 		return json(result.body, result.status);
 	}
@@ -34,7 +38,12 @@ export function consoleOrganizationRoute(
 			async (manage, native, env, project) => {
 				selectWorkspace(project.workspaceId);
 				if (!manage) return legacy(native(), env);
-				const result = await manage(request, readBody, organizationId);
+				const result = await manage(
+					request,
+					readBody,
+					organizationId,
+					resource,
+				);
 				return json(result.body, result.status);
 			},
 		),

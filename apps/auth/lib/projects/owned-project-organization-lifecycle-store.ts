@@ -100,10 +100,10 @@ export function projectOrganizationLifecycle(
 	async function revokeOrganizationGrants(
 		organizationId: string,
 		userId?: string,
-		eraseGrants = false,
+		options: { eraseGrants?: boolean; keepConsent?: boolean } = {},
 	) {
 		const scope = [organizationId, userId ?? null];
-		if (eraseGrants) {
+		if (options.eraseGrants) {
 			await client.query(
 				`DELETE FROM "oauthAccessToken" WHERE "referenceId" = $1 AND ($2::text IS NULL OR "userId" = $2)`,
 				scope,
@@ -127,11 +127,12 @@ export function projectOrganizationLifecycle(
 				scope,
 			);
 		}
-		await client.query(
-			`DELETE FROM "oauthConsent" WHERE "referenceId" = $1
-			 AND ($2::text IS NULL OR "userId" = $2)`,
-			scope,
-		);
+		if (!options.keepConsent)
+			await client.query(
+				`DELETE FROM "oauthConsent" WHERE "referenceId" = $1
+				 AND ($2::text IS NULL OR "userId" = $2)`,
+				scope,
+			);
 		const { rows } = await client.query<{ id: string; value: string }>(
 			`SELECT id, value FROM "verification" WHERE "expiresAt" > statement_timestamp()
 			 AND identifier ~ '^[A-Za-z0-9_-]{43}$' AND strpos(value, '"authorization_code"') > 0
@@ -157,6 +158,14 @@ export function projectOrganizationLifecycle(
 				'DELETE FROM "verification" WHERE id = ANY($1::text[])',
 				[codes],
 			);
+	}
+
+	/** Preserve console consent while invalidating issued and pending authorization for this member. */
+	function revokeConsoleMemberGrants(organizationId: string, userId: string) {
+		return revokeOrganizationGrants(organizationId, userId, {
+			eraseGrants: true,
+			keepConsent: true,
+		});
 	}
 
 	async function removeOrganizationMember(member: OrganizationMemberRecord) {
@@ -221,7 +230,7 @@ export function projectOrganizationLifecycle(
 
 	async function deleteOrganization(id: string, eraseGrants = false) {
 		await clearOrganizationSessions(id);
-		await revokeOrganizationGrants(id, undefined, eraseGrants);
+		await revokeOrganizationGrants(id, undefined, { eraseGrants });
 		// Native foreign keys remove members, invitations, teams and custom roles.
 		await client.query('DELETE FROM "organization" WHERE id = $1', [id]);
 	}
@@ -256,6 +265,8 @@ export function projectOrganizationLifecycle(
 		updateOrganizationMemberRole,
 		hasEnterpriseOrganizationAuthority,
 		lockOrganizationMemberships,
+		clearOrganizationSessions,
+		revokeConsoleMemberGrants,
 		deleteOrganization,
 		recordOrganizationChange,
 	};

@@ -1,6 +1,7 @@
 import { APIError } from "better-auth";
 import { Kysely, PostgresDialect, sql } from "kysely";
 import type { Pool } from "pg";
+import type { ConsoleOrganizationResource } from "../console/organizations";
 import {
 	consoleOrganizationTransactionClient,
 	executeConsoleOrganization,
@@ -14,6 +15,7 @@ export type OwnedProjectOrganizationConsole = (
 	request: Request,
 	readBody: () => Promise<unknown>,
 	organizationId?: string,
+	resource?: ConsoleOrganizationResource,
 ) => Promise<{ body: unknown; status: 200 | 201 }>;
 
 type ProjectIdentity = Pick<
@@ -23,20 +25,24 @@ type ProjectIdentity = Pick<
 
 const collectionPath = "/api/admin/organizations";
 const detailPath = /^\/api\/admin\/organizations\/([^/]+)$/;
+const membersPath = /^\/api\/admin\/organizations\/([^/]+)\/members$/;
 
 function matchesConsoleOrganizationRequest(
 	request: Request,
 	url: URL,
 	organizationId?: string,
+	resource?: ConsoleOrganizationResource,
 ) {
 	if (organizationId === undefined)
 		return (
+			resource === undefined &&
 			url.pathname === collectionPath &&
 			["GET", "POST"].includes(request.method)
 		);
-	const path = detailPath.exec(url.pathname)?.[1];
-	if (!path || !["GET", "PATCH", "DELETE"].includes(request.method))
-		return false;
+	const members = resource === "members";
+	const path = (members ? membersPath : detailPath).exec(url.pathname)?.[1];
+	const allowedMethods = members ? ["GET", "POST"] : ["GET", "PATCH", "DELETE"];
+	if (!path || !allowedMethods.includes(request.method)) return false;
 	try {
 		return decodeURIComponent(path) === organizationId;
 	} catch {
@@ -61,11 +67,11 @@ export function createOwnedProjectOrganizationConsole(options: {
 		dialect: new PostgresDialect({ pool: options.database }),
 	});
 
-	return async (request, readBody, organizationId) => {
+	return async (request, readBody, organizationId, resource) => {
 		const url = new URL(request.url);
 		if (
 			url.searchParams.get("project") !== project.slug ||
-			!matchesConsoleOrganizationRequest(request, url, organizationId)
+			!matchesConsoleOrganizationRequest(request, url, organizationId, resource)
 		)
 			throw new APIError("FORBIDDEN");
 		const writing = request.method !== "GET";
@@ -94,6 +100,7 @@ export function createOwnedProjectOrganizationConsole(options: {
 				principal.user.id,
 				organizationId,
 				"owned",
+				resource,
 			);
 		});
 	};

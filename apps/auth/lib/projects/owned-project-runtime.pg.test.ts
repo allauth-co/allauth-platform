@@ -383,6 +383,60 @@ async function finishRuntimeSaml(
 	return cookie(authenticated);
 }
 
+async function seedRuntimeMembershipGrant(
+	database: Pool,
+	schema: string,
+	client: string,
+	userId: string,
+	organizationId: string,
+) {
+	const id = randomUUID();
+	const code = createHash("sha256").update(randomUUID()).digest("base64url");
+	const params = [id, client, userId, organizationId];
+	await database.query(
+		`INSERT INTO "${schema}"."oauthRefreshToken"(id,token,"clientId","userId","referenceId","expiresAt","createdAt",scopes,"rotationReplayResponse","rotationReplayExpiresAt")
+		 VALUES ($1,$1,$2,$3,$4,now()+interval '1 hour',now(),'["organization:read"]','synthetic-member-replay',now()+interval '1 minute')`,
+		params,
+	);
+	await database.query(
+		`INSERT INTO "${schema}"."oauthAccessToken"(id,token,"clientId","userId","referenceId","refreshId","expiresAt","createdAt",scopes)
+		 VALUES ($1,$1,$2,$3,$4,$1,now()+interval '1 hour',now(),'["organization:read"]')`,
+		params,
+	);
+	await database.query(
+		`INSERT INTO "${schema}"."oauthConsent"(id,"clientId","userId","referenceId","createdAt","updatedAt",scopes)
+		 VALUES ($1,$2,$3,$4,now(),now(),'["organization:read"]')`,
+		params,
+	);
+	await database.query(
+		`INSERT INTO "${schema}"."verification"(id,identifier,value,"expiresAt") VALUES ($1,$1,$2,now()+interval '1 hour')`,
+		[
+			code,
+			JSON.stringify({
+				type: "authorization_code",
+				referenceId: organizationId,
+				userId,
+			}),
+		],
+	);
+	return { id, code };
+}
+
+async function runtimeMembershipGrantState(
+	database: Pool,
+	schema: string,
+	grant: { id: string; code: string },
+) {
+	const { rows } = await database.query(
+		`SELECT EXISTS(SELECT 1 FROM "${schema}"."oauthAccessToken" WHERE id=$1) AS access,
+		 EXISTS(SELECT 1 FROM "${schema}"."oauthRefreshToken" WHERE id=$1) AS refresh,
+		 EXISTS(SELECT 1 FROM "${schema}"."oauthConsent" WHERE id=$1) AS consent,
+		 EXISTS(SELECT 1 FROM "${schema}"."verification" WHERE id=$2) AS code`,
+		[grant.id, grant.code],
+	);
+	return rows[0];
+}
+
 async function fixtureVerificationMail(
 	service: Awaited<ReturnType<typeof openProcess>>,
 	email: string,
@@ -956,13 +1010,17 @@ describe.skipIf(!existsSync(fixture))(
 					`/api/admin/organizations?project=${project.slug}`;
 				const organizationDetail = (project: Project, id: string) =>
 					`/api/admin/organizations/${encodeURIComponent(id)}?project=${project.slug}`;
+				const organizationMembers = (project: Project, id: string) =>
+					`/api/admin/organizations/${encodeURIComponent(id)}/members?project=${project.slug}`;
 				const usersPath = (project: Project) =>
 					`/api/admin/users?project=${project.slug}&search=${credentials.project.id}&limit=1`;
 				const userPath = (project: Project, metadata = false) =>
 					`/api/admin/users/${credentials.project.id}${metadata ? "/metadata" : ""}?project=${project.slug}`;
 				const nativePublicMetadata = { consoleLabel: "legacy writer" };
 				const ownedPublicMetadata = { consoleLabel: "AllAuth writer" };
-				const ownedPrivateMetadata = { fixtureInternal: "visible only to the database" };
+				const ownedPrivateMetadata = {
+					fixtureInternal: "visible only to the database",
+				};
 				const scimManagement = `/api/organizations/${directoryOrg}/scim`;
 				const scimProject = `?project=${alpha.slug}`;
 				const hostedScim = "/api/auth/scim/v2/Users";
@@ -2454,6 +2512,326 @@ describe.skipIf(!existsSync(fixture))(
 				} finally {
 					await relations.end();
 				}
+				const memberRoute = organizationMembers(alpha, ownedOrganization.id);
+				const readMembers = (suffix = "") =>
+					service!.request(`${memberRoute}${suffix}`, { cookie: rootCookie });
+				const changeMember = (body: Record<string, unknown>) =>
+					service!.request(memberRoute, { cookie: rootCookie, body });
+				const legacyOwnerList = await service.request(
+					organizationMembers(alpha, directoryOrg),
+					{ cookie: rootCookie },
+				);
+				expect(legacyOwnerList.status).toBe(200);
+				expect(await legacyOwnerList.json()).toMatchObject({
+					members: expect.arrayContaining([
+						expect.objectContaining({
+							userId: credentials.project.id,
+							role: "owner",
+						}),
+					]),
+				});
+				expect(
+					(
+						await service.request(
+							organizationMembers(beta, ownedOrganization.id),
+							{ cookie: rootCookie },
+						)
+					).status,
+				).toBe(404);
+				expect(
+					(await service.request(memberRoute, { cookie: legacyCookie })).status,
+				).toBe(401);
+				expect(
+					(
+						await service.request(memberRoute, {
+							cookie: rootCookie,
+							origin: alpha.primaryOrigin,
+							body: { action: "add", userId: supportTarget },
+						})
+					).status,
+				).toBe(403);
+				const { members: initialMembers } = (await (
+					await readMembers()
+				).json()) as { members: { id: string }[] };
+				expect(initialMembers).toHaveLength(1);
+				expect(
+					(
+						await changeMember({
+							action: "update",
+							memberId: initialMembers[0].id,
+							role: "member",
+						})
+					).status,
+				).toBe(409);
+				expect(
+					(
+						await changeMember({
+							action: "add",
+							userId: credentials.platform.id,
+						})
+					).status,
+				).toBe(404);
+				expect(
+					(
+						await changeMember({
+							action: "add",
+							userId: candidateGuestData.user.id,
+						})
+					).status,
+				).toBe(400);
+				expect(
+					(
+						await changeMember({
+							action: "add",
+							userId: supportTarget,
+							role: "missing-role",
+						})
+					).status,
+				).toBe(400);
+				const addedMember = await changeMember({
+					action: "add",
+					userId: supportTarget,
+				});
+				expect(addedMember.status, await addedMember.clone().text()).toBe(200);
+				const { member: selectedMember } = (await addedMember.json()) as {
+					member: { id: string };
+				};
+				expect(selectedMember).toMatchObject({
+					userId: supportTarget,
+					role: "member",
+				});
+				expect(
+					(await changeMember({ action: "add", userId: supportTarget })).status,
+				).toBe(409);
+				const membership = new Pool({
+					connectionString: url(restored),
+					max: 1,
+				});
+				const customRole = "fixture-reviewer";
+				let persistedMember: { id: string } | undefined;
+				try {
+					const realm = `"${alpha.schemaName}"`;
+					const organizationId = ownedOrganization.id;
+					const team = randomUUID();
+					const session = randomUUID();
+					const staleSession = randomUUID();
+					const client = randomUUID();
+					const directoryLink = randomUUID();
+					await membership.query(
+						`INSERT INTO ${realm}."organizationRole"(id,"organizationId",role,permission) VALUES ($1,$2,$3,'{"member":["update"]}')`,
+						[randomUUID(), organizationId, customRole],
+					);
+					await membership.query(
+						`INSERT INTO ${realm}."team"(id,name,"organizationId","memberCount","createdAt") VALUES ($1,'Synthetic Membership Team',$2,1,now())`,
+						[team, organizationId],
+					);
+					await membership.query(
+						`INSERT INTO ${realm}."teamMember"(id,"teamId","userId","createdAt") VALUES ($1,$2,$3,now())`,
+						[randomUUID(), team, supportTarget],
+					);
+					expect(
+						await (await readMembers(`&teamId=${team}&limit=1`)).json(),
+					).toMatchObject({
+						members: [
+							expect.objectContaining({
+								id: selectedMember.id,
+								userId: supportTarget,
+								role: "member",
+								directoryManaged: false,
+							}),
+						],
+						total: 1,
+						limit: 1,
+						offset: 0,
+					});
+					expect(
+						await (
+							await readMembers(`&teamId=${team}&excludeTeam=true`)
+						).json(),
+					).toMatchObject({
+						members: [
+							expect.objectContaining({ userId: credentials.project.id }),
+						],
+						total: 1,
+					});
+					expect((await readMembers(`&teamId=${randomUUID()}`)).status).toBe(
+						404,
+					);
+					await membership.query(
+						`INSERT INTO ${realm}."allauthDirectoryMembership"(id,"organizationId","userId","memberId","createdAt") VALUES ($1,$2,$3,$4,now())`,
+						[directoryLink, organizationId, supportTarget, selectedMember.id],
+					);
+					expect(
+						await (await readMembers(`&search=${supportTarget}`)).json(),
+					).toMatchObject({
+						members: [
+							expect.objectContaining({
+								id: selectedMember.id,
+								directoryManaged: true,
+							}),
+						],
+						total: 1,
+					});
+					for (const change of [
+						{ action: "update", memberId: selectedMember.id, role: customRole },
+						{ action: "remove", memberId: selectedMember.id },
+					]) {
+						const response = await changeMember(change);
+						expect(response.status).toBe(409);
+						expect(await response.json()).toMatchObject({
+							error: "Manage this membership through its SCIM directory.",
+						});
+					}
+					await membership.query(
+						`DELETE FROM ${realm}."allauthDirectoryMembership" WHERE id=$1`,
+						[directoryLink],
+					);
+					await membership.query(
+						`INSERT INTO ${realm}."session"(id,token,"userId","expiresAt","updatedAt","activeOrganizationId","activeTeamId")
+						 VALUES ($1,$1,$3,now()+interval '1 hour',now(),$4,$6),($2,$2,$3,now()+interval '1 hour',now(),$5,$6)`,
+						[
+							session,
+							staleSession,
+							supportTarget,
+							organizationId,
+							directoryOrg,
+							team,
+						],
+					);
+					await membership.query(
+						`INSERT INTO ${realm}."oauthClient"(id,"clientId","redirectUris") VALUES ($1,$1,'[]')`,
+						[client],
+					);
+					const preservedGrant = await seedRuntimeMembershipGrant(
+						membership,
+						alpha.schemaName,
+						client,
+						credentials.project.id,
+						organizationId,
+					);
+					const changingGrant = await seedRuntimeMembershipGrant(
+						membership,
+						alpha.schemaName,
+						client,
+						supportTarget,
+						organizationId,
+					);
+					const expectedRevocation = {
+						access: false,
+						refresh: false,
+						consent: true,
+						code: false,
+					};
+					const updated = await changeMember({
+						action: "update",
+						memberId: selectedMember.id,
+						role: customRole,
+					});
+					expect(updated.status, await updated.clone().text()).toBe(200);
+					expect(await updated.json()).toEqual({ success: true });
+					expect(
+						await runtimeMembershipGrantState(
+							membership,
+							alpha.schemaName,
+							changingGrant,
+						),
+					).toEqual(expectedRevocation);
+					const removingGrant = await seedRuntimeMembershipGrant(
+						membership,
+						alpha.schemaName,
+						client,
+						supportTarget,
+						organizationId,
+					);
+					const removed = await changeMember({
+						action: "remove",
+						memberId: selectedMember.id,
+					});
+					expect(removed.status, await removed.clone().text()).toBe(200);
+					expect(await removed.json()).toEqual({ success: true });
+					expect(
+						await runtimeMembershipGrantState(
+							membership,
+							alpha.schemaName,
+							removingGrant,
+						),
+					).toEqual(expectedRevocation);
+					expect(
+						await runtimeMembershipGrantState(
+							membership,
+							alpha.schemaName,
+							preservedGrant,
+						),
+					).toEqual({
+						access: true,
+						refresh: true,
+						consent: true,
+						code: true,
+					});
+					expect(
+						await (await readMembers(`&teamId=${team}`)).json(),
+					).toMatchObject({ members: [], total: 0 });
+					expect(
+						(
+							await membership.query(
+								`SELECT "memberCount" FROM ${realm}."team" WHERE id=$1`,
+								[team],
+							)
+						).rows,
+					).toEqual([{ memberCount: 0 }]);
+					const selections = await membership.query(
+						`SELECT id,"activeOrganizationId","activeTeamId" FROM ${realm}."session" WHERE id=ANY($1::text[])`,
+						[[session, staleSession]],
+					);
+					expect(selections.rows).toEqual(
+						expect.arrayContaining([
+							{ id: session, activeOrganizationId: null, activeTeamId: null },
+							{
+								id: staleSession,
+								activeOrganizationId: directoryOrg,
+								activeTeamId: null,
+							},
+						]),
+					);
+					const audit = await membership.query(
+						`SELECT type,"actorId","userId","organizationId" FROM ${realm}."allauthEvent" WHERE "targetId"=$1 ORDER BY type`,
+						[selectedMember.id],
+					);
+					expect(audit.rows).toEqual(
+						["added", "removed", "role-updated"].map((type) => ({
+							type: `organization.member.${type}`,
+							actorId: credentials.platform.id,
+							userId: supportTarget,
+							organizationId,
+						})),
+					);
+					await membership.query(
+						`DELETE FROM ${realm}."session" WHERE id=ANY($1::text[])`,
+						[[session, staleSession]],
+					);
+					await membership.query(`DELETE FROM ${realm}."team" WHERE id=$1`, [
+						team,
+					]);
+					await membership.query(
+						`DELETE FROM ${realm}."oauthClient" WHERE id=$1`,
+						[client],
+					);
+					await membership.query(
+						`DELETE FROM ${realm}."verification" WHERE id=$1`,
+						[preservedGrant.code],
+					);
+					const retained = await changeMember({
+						action: "add",
+						userId: supportTarget,
+						role: customRole,
+					});
+					expect(retained.status).toBe(200);
+					persistedMember = (
+						(await retained.json()) as { member: { id: string } }
+					).member;
+				} finally {
+					await membership.end();
+				}
 				const ownedConfig = await service.request("/api/config", {
 					host: alphaHost,
 				});
@@ -3009,7 +3387,7 @@ describe.skipIf(!existsSync(fixture))(
 				expect(await catalog.json()).toMatchObject({
 					organizations: expect.arrayContaining([
 						expect.objectContaining({ id: directoryOrg }),
-						patchedOrganization,
+						{ ...patchedOrganization, memberCount: 2 },
 					]),
 					total: 2,
 				});
@@ -3017,7 +3395,25 @@ describe.skipIf(!existsSync(fixture))(
 					cookie: rootCookie,
 				});
 				expect(await rollbackDetail.json()).toMatchObject({
-					organization: patchedOrganization,
+					organization: { ...patchedOrganization, memberCount: 2 },
+				});
+				const rollbackMembers = await service.request(
+					`${memberRoute}&search=${supportTarget}&limit=1`,
+					{ cookie: rootCookie },
+				);
+				expect(rollbackMembers.status).toBe(200);
+				expect(await rollbackMembers.json()).toMatchObject({
+					members: [
+						expect.objectContaining({
+							id: persistedMember?.id,
+							userId: supportTarget,
+							role: customRole,
+							directoryManaged: false,
+						}),
+					],
+					total: 1,
+					limit: 1,
+					offset: 0,
 				});
 				expect(
 					(await service.request(removableDetail, { cookie: rootCookie }))

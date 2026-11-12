@@ -211,7 +211,9 @@ export async function deleteConsoleOrganization(database: ControlDatabase, organ
 	});
 }
 
-/** Console collection and detail endpoints share a response contract across project writers. */
+export type ConsoleOrganizationResource = "members";
+
+/** The console shares a response contract across project writers. */
 export async function executeConsoleOrganization(
 	database: ControlDatabase,
 	request: Request,
@@ -219,14 +221,22 @@ export async function executeConsoleOrganization(
 	actorId: string,
 	organizationId?: string,
 	mode: "native" | "owned" = "native",
+	resource?: ConsoleOrganizationResource,
 ): Promise<{ body: unknown; status: 200 | 201 }> {
-	if (organizationId === undefined) {
+	if (resource === "members") {
+		if (organizationId === undefined) throw new APIError("BAD_REQUEST");
+		if (request.method === "GET") {
+			const query = Object.fromEntries(new URL(request.url).searchParams);
+			return { body: await listConsoleOrganizationMembers(database, organizationId, query), status: 200 };
+		}
+		if (request.method === "POST")
+			return { body: await changeConsoleMember(database, organizationId, await readBody(), actorId, mode), status: 200 };
+	} else if (organizationId === undefined) {
 		if (request.method === "GET")
 			return { body: await listConsoleOrganizations(database, consoleOrganizationListQuery(new URL(request.url).searchParams)), status: 200 };
 		if (request.method === "POST")
 			return { body: await createConsoleOrganization(database, await readBody(), actorId), status: 201 };
-	}
-	if (organizationId !== undefined) {
+	} else {
 		if (request.method === "GET")
 			return { body: await getConsoleOrganization(database, organizationId), status: 200 };
 		if (request.method === "PATCH")
@@ -237,30 +247,46 @@ export async function executeConsoleOrganization(
 	throw new APIError("METHOD_NOT_ALLOWED");
 }
 
-export async function changeConsoleMember(database: ControlDatabase, organizationId: string, raw: unknown, actorId: string) {
+export async function changeConsoleMember(
+	database: ControlDatabase,
+	organizationId: string,
+	raw: unknown,
+	actorId: string,
+	mode: "native" | "owned" = "native",
+) {
 	const input = memberInput.parse(raw);
-	return database.transaction().execute(async (transaction) => {
+	return organizationTransaction(database, async (transaction) => {
 		await organizationLock(transaction, organizationId);
 		if (input.action === "add") {
-			await validUser(transaction, input.userId); await validRole(transaction, organizationId, input.role);
+			await validUser(transaction, input.userId, mode === "owned");
+			await validRole(transaction, organizationId, input.role);
 			if ((await sql`SELECT id FROM member WHERE "organizationId"=${organizationId} AND "userId"=${input.userId}`.execute(transaction)).rows.length) throw new APIError("CONFLICT", { message: "This user is already a member." });
 			const member = (await sql<Record<string, unknown>>`INSERT INTO member (id,"organizationId","userId",role,"createdAt") VALUES (${randomUUID()},${organizationId},${input.userId},${input.role},CURRENT_TIMESTAMP) RETURNING id,"userId",role,"createdAt"`.execute(transaction)).rows[0];
 			await audit(transaction, actorId, "organization.member.added", organizationId, String(member?.id), input.userId); return { member };
 		}
-		const member = (await sql<{ id: string; userId: string; role: string }>`SELECT id,"userId",role FROM member WHERE id=${input.memberId} AND "organizationId"=${organizationId}`.execute(transaction)).rows[0];
+		// The issuer holds a member share lock while admitting organization grants.
+		const lock = mode === "owned" ? sql` FOR UPDATE` : sql``;
+		const member = (await sql<{ id: string; userId: string; role: string }>`SELECT id,"userId",role FROM member WHERE id=${input.memberId} AND "organizationId"=${organizationId}${lock}`.execute(transaction)).rows[0];
 		if (!member) throw new APIError("NOT_FOUND");
 		if ((await sql`SELECT id FROM "allauthDirectoryMembership" WHERE "memberId"=${member.id}`.execute(transaction)).rows.length) throw new APIError("CONFLICT", { message: "Manage this membership through its SCIM directory." });
-		if (input.action === "update" && input.role === "owner") await validUser(transaction, member.userId);
+		if (input.action === "update" && input.role === "owner") await validUser(transaction, member.userId, mode === "owned");
 		if (rolesInclude(member.role, "owner") && (input.action === "remove" || input.role !== "owner") && (await sql<{ count: number }>`SELECT count(*)::int AS count FROM member WHERE "organizationId"=${organizationId} AND ${roleHas("role", "owner")}`.execute(transaction)).rows[0]!.count <= 1) throw new APIError("CONFLICT", { message: "An organization must retain an owner." });
+		const lifecycle = mode === "owned"
+			? projectOrganizationLifecycle(consoleOrganizationTransactionClient(transaction))
+			: undefined;
 		if (input.action === "update") { await validRole(transaction, organizationId, input.role); await sql`UPDATE member SET role=${input.role} WHERE id=${member.id}`.execute(transaction); }
 		else {
 			await sql`DELETE FROM "teamMember" WHERE "userId"=${member.userId} AND "teamId" IN (SELECT id FROM team WHERE "organizationId"=${organizationId})`.execute(transaction);
 			await sql`UPDATE team t SET "memberCount"=(SELECT count(*) FROM "teamMember" tm WHERE tm."teamId"=t.id),"updatedAt"=CURRENT_TIMESTAMP WHERE t."organizationId"=${organizationId}`.execute(transaction);
 			await sql`DELETE FROM member WHERE id=${member.id}`.execute(transaction);
-			await sql`UPDATE session SET "activeOrganizationId"=NULL,"activeTeamId"=NULL WHERE "userId"=${member.userId} AND "activeOrganizationId"=${organizationId}`.execute(transaction);
+			if (lifecycle) await lifecycle.clearOrganizationSessions(organizationId, member.userId);
+			else await sql`UPDATE session SET "activeOrganizationId"=NULL,"activeTeamId"=NULL WHERE "userId"=${member.userId} AND "activeOrganizationId"=${organizationId}`.execute(transaction);
 		}
-		await sql`DELETE FROM "oauthAccessToken" WHERE "userId"=${member.userId} AND "referenceId"=${organizationId}`.execute(transaction);
-		await sql`DELETE FROM "oauthRefreshToken" WHERE "userId"=${member.userId} AND "referenceId"=${organizationId}`.execute(transaction);
+		if (lifecycle) await lifecycle.revokeConsoleMemberGrants(organizationId, member.userId);
+		else {
+			await sql`DELETE FROM "oauthAccessToken" WHERE "userId"=${member.userId} AND "referenceId"=${organizationId}`.execute(transaction);
+			await sql`DELETE FROM "oauthRefreshToken" WHERE "userId"=${member.userId} AND "referenceId"=${organizationId}`.execute(transaction);
+		}
 		await audit(transaction, actorId, input.action === "update" ? "organization.member.role-updated" : "organization.member.removed", organizationId, member.id, member.userId); return { success: true };
 	});
 }
