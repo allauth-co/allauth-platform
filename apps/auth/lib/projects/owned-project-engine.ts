@@ -403,6 +403,27 @@ export function createOwnedProjectEngine(
 				},
 			},
 			readSession: (request, client) => currentSession(request.headers, client),
+			async authorizeConsentManagement(client, request, write) {
+				const bearer = serverSessionBearer(request.headers);
+				if (!bearer && !trustedRequest(request.headers, write)) return null;
+				const current = await eligibleSession(
+					bearer ?? tokenFrom(request.headers),
+					client,
+				);
+				if (!current) return null;
+				if (!write) return current.user.id;
+				const user = await store.lockUser(client, current.user.id);
+				if (
+					!user ||
+					user.banned ||
+					user.directoryDisabled ||
+					(policy.mfaMode === "required" &&
+						(!user.emailVerified || !user.twoFactorEnabled)) ||
+					!(await store.lockSession(client, current.token, user.id, false))
+				)
+					return null;
+				return user.id;
+			},
 			async readConsoleOAuthSession(request, client) {
 				return (
 					(await support?.readConsoleOAuthSession(request, client)) ?? null

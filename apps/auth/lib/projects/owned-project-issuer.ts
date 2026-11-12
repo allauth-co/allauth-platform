@@ -2,6 +2,7 @@ import type { LegacyMfaKeys } from "./legacy-mfa-record";
 import { createProjectEngineStore } from "./owned-project-engine-store";
 import type { OwnedProjectIssuerAuthorizationOptions } from "./owned-project-issuer-authorization";
 import { createOwnedProjectIssuerAuthorization } from "./owned-project-issuer-authorization";
+import { createOwnedProjectConsentManagement } from "./owned-project-issuer-consent-management";
 import { createOwnedProjectIssuerDevice } from "./owned-project-issuer-device";
 import { issuerJSON } from "./owned-project-issuer-http";
 import { createOwnedProjectIssuerIntrospection } from "./owned-project-issuer-introspection";
@@ -20,6 +21,10 @@ const providerAdmission = new Map<string, { methods: string[]; max: number }>([
 	["/oauth2/userinfo", { methods: ["GET", "POST"], max: 60 }],
 	["/oauth2/continue", { methods: ["POST"], max: 100 }],
 	["/oauth2/consent", { methods: ["POST"], max: 100 }],
+	["/oauth2/get-consent", { methods: ["GET"], max: 100 }],
+	["/oauth2/get-consents", { methods: ["GET"], max: 100 }],
+	["/oauth2/update-consent", { methods: ["POST"], max: 100 }],
+	["/oauth2/delete-consent", { methods: ["POST"], max: 100 }],
 	["/oauth2/end-session", { methods: ["GET", "POST"], max: 100 }],
 	["/oauth2/end-session/confirm", { methods: ["POST"], max: 100 }],
 	["/jwks", { methods: ["GET"], max: 100 }],
@@ -31,6 +36,9 @@ export function createOwnedProjectIssuer(
 		projectSlug: string;
 		platformOrigin: string;
 		trustedIP(request: Request): string | null;
+		authorizeConsentManagement: Parameters<
+			typeof createOwnedProjectConsentManagement
+		>[0]["authorize"];
 		logout: Pick<
 			OwnedProjectIssuerLogoutOptions,
 			"sessionCookie" | "revokeSession" | "clearBrowserSession"
@@ -39,6 +47,11 @@ export function createOwnedProjectIssuer(
 ) {
 	const store = createProjectEngineStore(options.database, options.schemaName);
 	const authorization = createOwnedProjectIssuerAuthorization(options);
+	const consentManagement = createOwnedProjectConsentManagement({
+		store,
+		readBody: options.readBody,
+		authorize: options.authorizeConsentManagement,
+	});
 	const device = createOwnedProjectIssuerDevice(options);
 	const logout = createOwnedProjectIssuerLogout({
 		...options,
@@ -75,6 +88,7 @@ export function createOwnedProjectIssuer(
 			return userinfo(request);
 		return (
 			(await authorization(path, request)) ??
+			(await consentManagement(path, request)) ??
 			(await logout(path, request)) ??
 			device(path, request)
 		);

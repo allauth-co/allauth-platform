@@ -10,8 +10,10 @@ import { decodeJwt } from "jose";
 import { Kysely, PostgresDialect } from "kysely";
 import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { defaultAuthPolicy } from "../auth-policy/policy";
 import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
 import { readLegacySessionCookie } from "./legacy-session-cookie";
+import { createOwnedProjectEngine } from "./owned-project-engine";
 import { createOwnedProjectIssuerAuthorization } from "./owned-project-issuer-authorization";
 import { readSignedProjectIssuerQuery } from "./owned-project-issuer-authorization-query";
 import { issuerDigest } from "./owned-project-issuer-http";
@@ -285,6 +287,88 @@ describe.skipIf(!existsSync(fixture))(
 				throw new Error("Issuer authorization route is unavailable.");
 			return response;
 		}
+
+		it("preserves ownership and stored updates for connected-app consent management", async () => {
+			const engine = createOwnedProjectEngine({
+				database,
+				project: { slug: "issuer-fixture", schemaName: schema },
+				policy: defaultAuthPolicy,
+				baseURL: origin,
+				basePath: "/api/auth",
+				trustedOrigins: [origin],
+				signingSecret: secret,
+				trustedIP: () => "192.0.2.29",
+				issuer: true,
+			});
+			const owner = await browser();
+			const other = await browser();
+			const clientId = await registration();
+			const id = randomUUID();
+			await database.query(
+				`INSERT INTO "${schema}"."oauthConsent" (id,"clientId","userId",scopes,"createdAt","updatedAt") VALUES ($1,$2,$3,'["openid","email"]',now(),now())`,
+				[id, clientId, owner.userId],
+			);
+			const ownerSession = { cookie: owner.cookie };
+			const idQuery = new URLSearchParams({ id });
+			const consentRequest = (cookie = owner.cookie) =>
+				request("/oauth2/get-consent", { cookie, query: idQuery });
+			const native = await legacy(consentRequest());
+			expect(native.status).toBe(200);
+			const nativeData = await native.json();
+			expect(await (await engine.dispatch(consentRequest())).json()).toEqual(
+				nativeData,
+			);
+			expect(
+				await (
+					await engine.dispatch(request("/oauth2/get-consents", ownerSession))
+				).json(),
+			).toEqual([nativeData]);
+			expect((await engine.dispatch(consentRequest(other.cookie))).status).toBe(
+				401,
+			);
+			expect(
+				await (
+					await engine.dispatch(
+						request("/oauth2/get-consents", { cookie: other.cookie }),
+					)
+				).json(),
+			).toEqual([]);
+			const patch = (
+				scopes: string[],
+				cookie = owner.cookie,
+				caller = origin,
+			) =>
+				request("/oauth2/update-consent", {
+					cookie,
+					caller,
+					body: { id, update: { scopes } },
+				});
+			expect(
+				(await engine.dispatch(patch(["openid"], other.cookie))).status,
+			).toBe(401);
+			expect(
+				(
+					await engine.dispatch(
+						patch(["openid"], owner.cookie, "https://other.fixture.example"),
+					)
+				).status,
+			).toBe(401);
+			expect((await engine.dispatch(patch(["unsupported"]))).status).toBe(400);
+			const updated = await engine.dispatch(patch(["openid"]));
+			expect(updated.status).toBe(200);
+			expect(await (await legacy(consentRequest())).json()).toEqual(
+				await updated.json(),
+			);
+			expect((await legacy(patch(["profile"]))).status).toBe(200);
+			expect(
+				await (await engine.dispatch(consentRequest())).json(),
+			).toMatchObject({ scopes: ["profile"] });
+			const removed = await engine.dispatch(
+				request("/oauth2/delete-consent", { ...ownerSession, body: { id } }),
+			);
+			expect(removed.status).toBe(200);
+			expect((await legacy(consentRequest())).status).toBe(404);
+		});
 
 		it("resumes native consent, writes legacy-readable grants, and redeems the code after switching back", async () => {
 			const clientId = await registration();
