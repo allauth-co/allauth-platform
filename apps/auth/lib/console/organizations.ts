@@ -211,7 +211,12 @@ export async function deleteConsoleOrganization(database: ControlDatabase, organ
 	});
 }
 
-export type ConsoleOrganizationResource = "members";
+const consoleOrganizationResources = {
+	members: { list: listConsoleOrganizationMembers, change: changeConsoleMember },
+	teams: { list: listConsoleOrganizationTeams, change: changeConsoleTeam },
+} as const;
+
+export type ConsoleOrganizationResource = keyof typeof consoleOrganizationResources;
 
 /** The console shares a response contract across project writers. */
 export async function executeConsoleOrganization(
@@ -223,14 +228,15 @@ export async function executeConsoleOrganization(
 	mode: "native" | "owned" = "native",
 	resource?: ConsoleOrganizationResource,
 ): Promise<{ body: unknown; status: 200 | 201 }> {
-	if (resource === "members") {
+	if (resource !== undefined) {
 		if (organizationId === undefined) throw new APIError("BAD_REQUEST");
+		const operation = consoleOrganizationResources[resource];
 		if (request.method === "GET") {
 			const query = Object.fromEntries(new URL(request.url).searchParams);
-			return { body: await listConsoleOrganizationMembers(database, organizationId, query), status: 200 };
+			return { body: await operation.list(database, organizationId, query), status: 200 };
 		}
 		if (request.method === "POST")
-			return { body: await changeConsoleMember(database, organizationId, await readBody(), actorId, mode), status: 200 };
+			return { body: await operation.change(database, organizationId, await readBody(), actorId, mode), status: 200 };
 	} else if (organizationId === undefined) {
 		if (request.method === "GET")
 			return { body: await listConsoleOrganizations(database, consoleOrganizationListQuery(new URL(request.url).searchParams)), status: 200 };
@@ -292,7 +298,7 @@ export async function changeConsoleMember(
 }
 export async function changeConsoleTeam(database: ControlDatabase, organizationId: string, raw: unknown, actorId: string) {
 	const input = teamInput.parse(raw);
-	return database.transaction().execute(async (transaction) => {
+	return organizationTransaction(database, async (transaction) => {
 		await organizationLock(transaction, organizationId); let teamId: string;
 		if (input.action === "create") {
 			teamId = randomUUID(); await sql`INSERT INTO team (id,name,"organizationId","memberCount","createdAt","updatedAt") VALUES (${teamId},${input.name},${organizationId},0,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)`.execute(transaction);
@@ -309,7 +315,13 @@ export async function changeConsoleTeam(database: ControlDatabase, organizationI
 			}
 			else {
 				if (!(await sql`SELECT id FROM member WHERE "organizationId"=${organizationId} AND "userId"=${input.userId}`.execute(transaction)).rows.length) throw new APIError("BAD_REQUEST", { message: "Choose an organization member." });
-				if (input.action === "add-member") await sql`INSERT INTO "teamMember" (id,"teamId","userId","membershipKey","createdAt") VALUES (${randomUUID()},${teamId},${input.userId},${createHash("sha256").update(JSON.stringify([teamId,input.userId])).digest("base64url")},CURRENT_TIMESTAMP) ON CONFLICT ("membershipKey") DO NOTHING`.execute(transaction);
+				if (input.action === "add-member") {
+					const key = createHash("sha256").update(JSON.stringify([teamId, input.userId])).digest("base64url");
+					await sql`INSERT INTO "teamMember" (id,"teamId","userId","membershipKey","createdAt")
+					 SELECT ${randomUUID()},${teamId},${input.userId},${key},CURRENT_TIMESTAMP
+					 WHERE NOT EXISTS (SELECT 1 FROM "teamMember" WHERE "teamId"=${teamId} AND "userId"=${input.userId})
+					 ON CONFLICT ("membershipKey") DO NOTHING`.execute(transaction);
+				}
 				else { await sql`DELETE FROM "teamMember" WHERE "teamId"=${teamId} AND "userId"=${input.userId}`.execute(transaction); await sql`UPDATE session SET "activeTeamId"=NULL WHERE "userId"=${input.userId} AND "activeTeamId"=${teamId}`.execute(transaction); }
 				await sql`UPDATE team SET "memberCount"=(SELECT count(*) FROM "teamMember" WHERE "teamId"=${teamId}),"updatedAt"=CURRENT_TIMESTAMP WHERE id=${teamId}`.execute(transaction);
 			}

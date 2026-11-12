@@ -24,8 +24,7 @@ type ProjectIdentity = Pick<
 >;
 
 const collectionPath = "/api/admin/organizations";
-const detailPath = /^\/api\/admin\/organizations\/([^/]+)$/;
-const membersPath = /^\/api\/admin\/organizations\/([^/]+)\/members$/;
+const detailPath = /^\/api\/admin\/organizations\/([^/]+)(?:\/([^/]+))?$/;
 
 function matchesConsoleOrganizationRequest(
 	request: Request,
@@ -39,12 +38,12 @@ function matchesConsoleOrganizationRequest(
 			url.pathname === collectionPath &&
 			["GET", "POST"].includes(request.method)
 		);
-	const members = resource === "members";
-	const path = (members ? membersPath : detailPath).exec(url.pathname)?.[1];
-	const allowedMethods = members ? ["GET", "POST"] : ["GET", "PATCH", "DELETE"];
-	if (!path || !allowedMethods.includes(request.method)) return false;
+	const path = detailPath.exec(url.pathname);
+	const methods = resource ? ["GET", "POST"] : ["GET", "PATCH", "DELETE"];
+	if (!path || path[2] !== resource || !methods.includes(request.method))
+		return false;
 	try {
-		return decodeURIComponent(path) === organizationId;
+		return decodeURIComponent(path[1]) === organizationId;
 	} catch {
 		return false;
 	}

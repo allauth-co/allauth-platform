@@ -4,6 +4,7 @@ import { APIError } from "better-auth";
 import { GET as openid } from "../../app/.well-known/openid-configuration/route";
 import * as consoleOrganizationMembers from "../../app/api/admin/organizations/[organizationId]/members/route";
 import * as consoleOrganizationDetail from "../../app/api/admin/organizations/[organizationId]/route";
+import * as consoleOrganizationTeams from "../../app/api/admin/organizations/[organizationId]/teams/route";
 import * as consoleOrganizations from "../../app/api/admin/organizations/route";
 import { PATCH as consoleUserMetadata } from "../../app/api/admin/users/[userId]/metadata/route";
 import { GET as consoleUser } from "../../app/api/admin/users/[userId]/route";
@@ -93,20 +94,22 @@ async function dispatch(request: Request) {
 		if (request.method === "POST") return consoleOrganizations.POST(request);
 	}
 	const organization =
-		/^\/api\/admin\/organizations\/([^/]+)(?:\/(members))?$/.exec(path);
+		/^\/api\/admin\/organizations\/([^/]+)(?:\/(members|teams))?$/.exec(path);
 	if (organization) {
 		const context = {
 			params: Promise.resolve({
 				organizationId: decodeURIComponent(organization[1]!),
 			}),
 		};
-		if (organization[2] === "members") {
-			if (request.method === "GET")
-				return consoleOrganizationMembers.GET(request, context);
-			if (request.method === "POST")
-				return consoleOrganizationMembers.POST(request, context);
+		if (organization[2]) {
+			const resource =
+				organization[2] === "members"
+					? consoleOrganizationMembers
+					: consoleOrganizationTeams;
+			if (request.method === "GET") return resource.GET(request, context);
+			if (request.method === "POST") return resource.POST(request, context);
+			return new Response(null, { status: 405 });
 		}
-		if (organization[2]) return new Response(null, { status: 405 });
 		if (request.method === "GET")
 			return consoleOrganizationDetail.GET(request, context);
 		if (request.method === "PATCH")

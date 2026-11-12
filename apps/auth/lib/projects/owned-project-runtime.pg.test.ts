@@ -1012,6 +1012,8 @@ describe.skipIf(!existsSync(fixture))(
 					`/api/admin/organizations/${encodeURIComponent(id)}?project=${project.slug}`;
 				const organizationMembers = (project: Project, id: string) =>
 					`/api/admin/organizations/${encodeURIComponent(id)}/members?project=${project.slug}`;
+				const organizationTeams = (project: Project, id: string) =>
+					`/api/admin/organizations/${encodeURIComponent(id)}/teams?project=${project.slug}`;
 				const usersPath = (project: Project) =>
 					`/api/admin/users?project=${project.slug}&search=${credentials.project.id}&limit=1`;
 				const userPath = (project: Project, metadata = false) =>
@@ -2832,6 +2834,233 @@ describe.skipIf(!existsSync(fixture))(
 				} finally {
 					await membership.end();
 				}
+				const teamsRoute = organizationTeams(alpha, ownedOrganization.id);
+				const readTeams = (suffix = "") =>
+					service!.request(`${teamsRoute}${suffix}`, { cookie: rootCookie });
+				const changeTeam = (body: Record<string, unknown>) =>
+					service!.request(teamsRoute, { cookie: rootCookie, body });
+				expect(await (await readTeams()).json()).toEqual({
+					teams: [],
+					total: 0,
+					limit: 25,
+					offset: 0,
+				});
+				expect(
+					(
+						await service.request(
+							organizationTeams(beta, ownedOrganization.id),
+							{ cookie: rootCookie },
+						)
+					).status,
+				).toBe(404);
+				expect(
+					(await service.request(teamsRoute, { cookie: legacyCookie })).status,
+				).toBe(401);
+				expect(
+					(
+						await service.request(teamsRoute, {
+							cookie: rootCookie,
+							origin: alpha.primaryOrigin,
+							body: { action: "create", name: "Untrusted Team" },
+						})
+					).status,
+				).toBe(403);
+				async function createTeam(name: string) {
+					const created = await changeTeam({ action: "create", name });
+					expect(created.status, await created.clone().text()).toBe(200);
+					const result = (await created.json()) as {
+						success: boolean;
+						teamId: string;
+					};
+					expect(result).toEqual({ success: true, teamId: expect.any(String) });
+					return result.teamId;
+				}
+				const deletedTeam = await createTeam("Temporary Fixture Team");
+				const retainedTeam = await createTeam("Surviving Fixture Team");
+				const teamName = "Renamed Surviving Fixture Team";
+				const teamUpdate = await changeTeam({
+					action: "update",
+					teamId: retainedTeam,
+					name: teamName,
+				});
+				expect(await teamUpdate.json()).toEqual({
+					success: true,
+					teamId: retainedTeam,
+				});
+				expect(
+					(
+						await changeTeam({
+							action: "add-member",
+							teamId: retainedTeam,
+							userId: credentials.platform.id,
+						})
+					).status,
+				).toBe(400);
+				expect(
+					(
+						await changeTeam({
+							action: "add-member",
+							teamId: retainedTeam,
+							userId: credentials.project.id,
+						})
+					).status,
+				).toBe(200);
+				expect(
+					await (await readTeams("&search=Surviving&limit=1")).json(),
+				).toMatchObject({
+					teams: [{ id: retainedTeam, name: teamName, memberCount: 1 }],
+					total: 1,
+					limit: 1,
+					offset: 0,
+				});
+				const teamDatabase = new Pool({
+					connectionString: url(restored),
+					max: 1,
+				});
+				try {
+					const realm = `"${alpha.schemaName}"`;
+					const session = randomUUID();
+					const nativeSeat = randomUUID();
+					await teamDatabase.query(
+						`INSERT INTO ${realm}."teamMember"(id,"teamId","userId","createdAt") VALUES ($1,$2,$3,now())`,
+						[nativeSeat, deletedTeam, supportTarget],
+					);
+					expect(
+						(
+							await changeTeam({
+								action: "add-member",
+								teamId: deletedTeam,
+								userId: supportTarget,
+							})
+						).status,
+					).toBe(200);
+					const seats = await teamDatabase.query(
+						`SELECT id FROM ${realm}."teamMember" WHERE "teamId"=$1`,
+						[deletedTeam],
+					);
+					expect(seats.rows).toEqual([{ id: nativeSeat }]);
+					await teamDatabase.query(
+						`INSERT INTO ${realm}."session"(id,token,"userId","expiresAt","updatedAt","activeOrganizationId","activeTeamId")
+						 VALUES ($1,$1,$2,now()+interval '1 hour',now(),$3,$4)`,
+						[session, supportTarget, ownedOrganization.id, deletedTeam],
+					);
+					const removedSeat = await changeTeam({
+						action: "remove-member",
+						teamId: deletedTeam,
+						userId: supportTarget,
+					});
+					expect(await removedSeat.json()).toEqual({
+						success: true,
+						teamId: deletedTeam,
+					});
+					const cleared = await teamDatabase.query(
+						`SELECT "activeOrganizationId","activeTeamId" FROM ${realm}."session" WHERE id=$1`,
+						[session],
+					);
+					expect(cleared.rows).toEqual([
+						{ activeOrganizationId: ownedOrganization.id, activeTeamId: null },
+					]);
+					await teamDatabase.query(
+						`UPDATE ${realm}."session" SET "activeTeamId"=$1 WHERE id=$2`,
+						[deletedTeam, session],
+					);
+					const invites = [
+						{
+							id: randomUUID(),
+							teams: `${deletedTeam},${retainedTeam}`,
+							expected: retainedTeam,
+							status: "pending",
+							hours: 1,
+						},
+						{
+							id: randomUUID(),
+							teams: deletedTeam,
+							expected: null,
+							status: "pending",
+							hours: 1,
+						},
+						{
+							id: randomUUID(),
+							teams: deletedTeam,
+							expected: deletedTeam,
+							status: "accepted",
+							hours: 1,
+						},
+						{
+							id: randomUUID(),
+							teams: deletedTeam,
+							expected: deletedTeam,
+							status: "pending",
+							hours: -1,
+						},
+					];
+					for (const invite of invites) {
+						await teamDatabase.query(
+							`INSERT INTO ${realm}."invitation"(id,"organizationId",email,role,"teamId",status,"expiresAt","inviterId")
+							 VALUES ($1,$2,$3,'member',$4,$5,now()+$6::int*interval '1 hour',$7)`,
+							[
+								invite.id,
+								ownedOrganization.id,
+								`${invite.id}@runtime.fixture.example`,
+								invite.teams,
+								invite.status,
+								invite.hours,
+								credentials.project.id,
+							],
+						);
+					}
+					const deleted = await changeTeam({
+						action: "delete",
+						teamId: deletedTeam,
+					});
+					expect(deleted.status, await deleted.clone().text()).toBe(200);
+					expect(await deleted.json()).toEqual({
+						success: true,
+						teamId: deletedTeam,
+					});
+					const survivingInvites = await teamDatabase.query(
+						`SELECT id,"teamId",status FROM ${realm}."invitation" WHERE id=ANY($1::text[])`,
+						[invites.map((invite) => invite.id)],
+					);
+					expect(survivingInvites.rows).toEqual(
+						expect.arrayContaining(
+							invites.map((invite) => ({
+								id: invite.id,
+								teamId: invite.expected,
+								status: invite.status,
+							})),
+						),
+					);
+					expect(
+						(
+							await teamDatabase.query(
+								`SELECT "activeTeamId" FROM ${realm}."session" WHERE id=$1`,
+								[session],
+							)
+						).rows,
+					).toEqual([{ activeTeamId: null }]);
+					const audit = await teamDatabase.query(
+						`SELECT type,"actorId","organizationId" FROM ${realm}."allauthEvent" WHERE "targetId"=$1 ORDER BY type`,
+						[deletedTeam],
+					);
+					expect(audit.rows).toEqual(
+						["add-member", "create", "delete", "remove-member"].map((type) => ({
+							type: `organization.team.${type}`,
+							actorId: credentials.platform.id,
+							organizationId: ownedOrganization.id,
+						})),
+					);
+					await teamDatabase.query(
+						`DELETE FROM ${realm}."session" WHERE id=$1`,
+						[session],
+					);
+					await teamDatabase.query(
+						`DELETE FROM ${realm}."invitation" WHERE id=ANY($1::text[])`,
+						[invites.map((invite) => invite.id)],
+					);
+				} finally {
+					await teamDatabase.end();
+				}
 				const ownedConfig = await service.request("/api/config", {
 					host: alphaHost,
 				});
@@ -3387,7 +3616,7 @@ describe.skipIf(!existsSync(fixture))(
 				expect(await catalog.json()).toMatchObject({
 					organizations: expect.arrayContaining([
 						expect.objectContaining({ id: directoryOrg }),
-						{ ...patchedOrganization, memberCount: 2 },
+						{ ...patchedOrganization, memberCount: 2, teamCount: 1 },
 					]),
 					total: 2,
 				});
@@ -3395,12 +3624,26 @@ describe.skipIf(!existsSync(fixture))(
 					cookie: rootCookie,
 				});
 				expect(await rollbackDetail.json()).toMatchObject({
-					organization: { ...patchedOrganization, memberCount: 2 },
+					organization: {
+						...patchedOrganization,
+						memberCount: 2,
+						teamCount: 1,
+					},
 				});
 				const rollbackMembers = await service.request(
 					`${memberRoute}&search=${supportTarget}&limit=1`,
 					{ cookie: rootCookie },
 				);
+				const rollbackTeams = await service.request(teamsRoute, {
+					cookie: rootCookie,
+				});
+				expect(rollbackTeams.status).toBe(200);
+				expect(await rollbackTeams.json()).toMatchObject({
+					teams: [{ id: retainedTeam, name: teamName, memberCount: 1 }],
+					total: 1,
+					limit: 25,
+					offset: 0,
+				});
 				expect(rollbackMembers.status).toBe(200);
 				expect(await rollbackMembers.json()).toMatchObject({
 					members: [
