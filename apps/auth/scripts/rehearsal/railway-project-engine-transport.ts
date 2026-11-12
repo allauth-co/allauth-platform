@@ -307,12 +307,16 @@ export async function createRailwayProjectEngineTransport(profilePath: string) {
 			assert.ok(variant === "release" || variant === "candidate");
 			assert.ok(db === source || db === restored);
 			const prefix = `AllAuth rehearsal ${profile.baseRevision}`;
-			if (db === source) {
-				assert.equal(variant, "release");
+			const baseline = db === source;
+			if (baseline) assert.equal(variant, "release");
+			if (baseline && Object.keys(values).length === 0) {
 				await waitForDeployment(`${prefix} legacy baseline`);
 				return;
 			}
-			const message = `${prefix} ${variant === "candidate" ? "owned candidate" : "legacy rollback"}`;
+			const phase = baseline
+				? "legacy baseline"
+				: variant === "candidate" ? "owned candidate" : "legacy rollback";
+			const message = `${prefix} ${phase}`;
 			const current = await deployments();
 			assert.deepEqual(await activeDeployments(), []);
 			assert.ok(
@@ -333,7 +337,7 @@ export async function createRailwayProjectEngineTransport(profilePath: string) {
 					"--skip-deploys",
 					...Object.entries(settings).map(([key, value]) => `${key}=${value}`),
 				],
-				"configure the restored synthetic rehearsal app",
+				"configure the synthetic rehearsal app",
 			);
 			await railway(
 				[

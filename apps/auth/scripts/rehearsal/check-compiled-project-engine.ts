@@ -6,6 +6,7 @@ import { setTimeout } from "node:timers/promises";
 import { promisify } from "node:util";
 import { getCookies } from "better-auth/cookies";
 import { createLocalJWKSet, jwtVerify, type JSONWebKeySet } from "jose";
+import { defaultAuthPolicy } from "../../lib/auth-policy/policy";
 import { clerkCompatiblePasswords } from "../../lib/clerk-password";
 import { signEdgeRequest } from "../../lib/domains/edge";
 import { projectEmailAliasVariable } from "../../lib/project-email-alias-config";
@@ -130,6 +131,7 @@ async function request(
 		realm,
 		host,
 		accept,
+		method = body ? "POST" : "GET",
 		clientIP = "192.0.2.54",
 	}: {
 		body?: object;
@@ -137,10 +139,10 @@ async function request(
 		realm?: Realm;
 		host?: string;
 		accept?: string;
+		method?: "GET" | "POST" | "PATCH";
 		clientIP?: string;
 	} = {},
 ) {
-	const method = body ? "POST" : "GET";
 	const form = body instanceof URLSearchParams;
 	const data = form ? body.toString() : body ? JSON.stringify(body) : "";
 	const headers = new Headers({
@@ -297,6 +299,66 @@ async function startConnectedApplication(realm: Realm, cookie: string) {
 			assert.equal(updated.keyId, grant.keyId, "The project issuer retains the signing key.");
 			assert.ok(updated.refresh !== grant.refresh, "The issuer rotates the offline grant.");
 			grant = updated;
+		},
+	};
+}
+
+async function startConfiguredWebhook(realm: Realm, cookie: string) {
+	const schema = `allauth_project_${realm.id.replaceAll("-", "")}`;
+	const id = randomUUID();
+	const path = `/api/projects/${realm.slug}/auth/control/webhooks`;
+	const fixturePolicy = {
+		...defaultAuthPolicy,
+		mfaMode: "optional" as const,
+		requireEmailVerification: false,
+	};
+	const policy = JSON.stringify(fixturePolicy).replaceAll("'", "''");
+	await query(source, `
+		INSERT INTO public."allauthAuthConfiguration" (id,policy,version,"updatedBy")
+		VALUES ('${realm.id}','${policy}',1,'isolated-writer-rehearsal');
+		INSERT INTO "${schema}"."allauthWebhookEndpoint" (id,url,"eventTypes","encryptedSecret",enabled)
+		VALUES ('${id}','https://webhook.rehearsal.invalid/events','["mfa.*"]','disabled-fixture-placeholder',false);
+	`);
+	async function read() {
+		const result = await request(path, { cookie });
+		expectStatus(result, 200, "The compiled project lists its existing configured webhook.");
+		const { endpoints } = JSON.parse(result.body) as {
+			endpoints: { id: string; eventTypes: string[]; enabled: boolean }[];
+		};
+		const endpoint = endpoints.find((item) => item.id === id);
+		assert.deepEqual(endpoint?.eventTypes, ["mfa.*"]);
+		assert.equal(endpoint?.enabled, false);
+		assert.ok(!result.body.includes("encryptedSecret"));
+	}
+	function changePolicy() {
+		return request(`/api/admin/configuration?project=${realm.slug}`, {
+			cookie,
+			method: "PATCH",
+			body: { version: 1, policy: { ...fixturePolicy, requireEmailVerification: true } },
+		});
+	}
+	await read();
+	return {
+		async rotate() {
+			await read();
+			expectStatus(await changePolicy(), 409, "The active writer refuses an incompatible webhook policy.");
+			const result = await request(`${path}/rotate`, { cookie, body: { id } });
+			expectStatus(result, 200, "The AllAuth writer rotates the configured webhook credential.");
+			assert.ok(typeof (JSON.parse(result.body) as { secret?: unknown }).secret === "string");
+			assert.equal(
+				await query(restored, `SELECT ("encryptedSecret"<>'disabled-fixture-placeholder')::text FROM "${schema}"."allauthWebhookEndpoint" WHERE id='${id}'`),
+				"true",
+			);
+		},
+		async removeAfterRollback() {
+			await read();
+			expectStatus(await changePolicy(), 200, "Legacy accepts the same policy change after rollback.");
+			const result = await request(`${path}/delete`, { cookie, body: { id } });
+			expectStatus(result, 200, "The restored legacy writer removes the same endpoint.");
+			assert.equal(
+				await query(restored, `SELECT count(*) FROM "${schema}"."allauthWebhookEndpoint" WHERE id='${id}'`),
+				"0",
+			);
 		},
 	};
 }
@@ -516,6 +578,9 @@ try {
 	}
 	await start(releaseImage, source);
 	const { owned, control, rootCookie } = await seed();
+	const configuredWebhook = internalSelection
+		? await startConfiguredWebhook(owned, rootCookie)
+		: undefined;
 	const direct = `/api/projects/${owned.slug}/auth`;
 	const controlPath = `/api/projects/${control.slug}/auth`;
 	const selected = {
@@ -701,6 +766,7 @@ try {
 		});
 		await assert.rejects(internalWriter("switch", "legacy", "0", "allauth"));
 		await hostedPage(managedHost, true);
+		await configuredWebhook?.rotate();
 		expectStatus(
 			await request("/api/auth/hosted-ui/sdk/config", { host }),
 			200,
@@ -948,6 +1014,7 @@ try {
 	);
 	await checkKey("/api/auth", { host, cookie: ownedHostedCookie });
 	await connected?.rotate();
+	await configuredWebhook?.removeAfterRollback();
 	if (ownedManagedCookie)
 		assert.equal(
 			await currentSession("/api/auth/get-session", {
