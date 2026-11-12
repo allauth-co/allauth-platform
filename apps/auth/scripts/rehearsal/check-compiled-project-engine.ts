@@ -11,11 +11,13 @@ import { clerkCompatiblePasswords } from "../../lib/clerk-password";
 import { signEdgeRequest } from "../../lib/domains/edge";
 import { projectEmailAliasVariable } from "../../lib/project-email-alias-config";
 import { platformWorkspaceId } from "../../lib/workspaces/types";
+import { productionProjectEngineRevisionsSetting } from "../project-engine-rollout-selection.mjs";
 import { createRailwayProjectEngineTransport } from "./railway-project-engine-transport";
 
 const execute = promisify(execFile);
 const [target, argument] = process.argv.slice(2);
-const internalSelection = target === "--internal" || target === "--internal-railway";
+const productionCohort = target === "--production-cohort";
+const fencedSelection = target === "--internal" || target === "--internal-railway" || productionCohort;
 const onRailway = target === "--railway" || target === "--internal-railway";
 if (onRailway) assert.ok(argument, "Pass the isolated Railway fixture profile.");
 const railway = onRailway && argument
@@ -23,14 +25,14 @@ const railway = onRailway && argument
 	: undefined;
 const [releaseImage, rehearsalImage] = railway
 	? ["release", "candidate"]
-	: internalSelection
+	: fencedSelection
 		? [argument, argument]
 		: [target, argument];
 assert.ok(
 	releaseImage && rehearsalImage,
 	"Pass the normal release and project-engine-rehearsal Docker images.",
 );
-if (!internalSelection) assert.notEqual(releaseImage, rehearsalImage);
+if (!fencedSelection) assert.notEqual(releaseImage, rehearsalImage);
 const run = randomUUID().replaceAll("-", "");
 const network = `allauth-engine-rehearsal-${run}`;
 const database = `${network}-db`;
@@ -385,7 +387,7 @@ async function start(
 	values: Record<string, string> = {},
 	readiness = 200,
 ) {
-	if (internalSelection)
+	if (fencedSelection)
 		values = {
 			...values,
 			[projectEmailAliasVariable(ownedSlug)]: JSON.stringify({ [alternateEmail]: accountId }),
@@ -464,7 +466,7 @@ async function seed() {
 		return (JSON.parse(response.body) as { workspace: { id: string } })
 			.workspace.id;
 	}
-	const workspaceId = internalSelection
+	const workspaceId = fencedSelection && !productionCohort
 		? platformWorkspaceId
 		: await createFixtureWorkspace();
 	assert.match(workspaceId, /^[a-f0-9-]{36}$/);
@@ -509,12 +511,13 @@ async function seed() {
 		assert.match(proxyVersion, /^[a-f0-9-]{36}$/);
 		return { ...project, proxyVersion };
 	}
-	const control = await create("compiled-engine-control", "production");
+	const control = await create("compiled-engine-control", productionCohort ? "development" : "production");
 	const owned = await create(
 		ownedSlug,
-		"development",
+		productionCohort ? "production" : "development",
 		control.applicationId,
 	);
+	const unselected = productionCohort ? await create("compiled-engine-unselected", "production") : undefined;
 	const pairId = randomUUID();
 	await query(
 		source,
@@ -528,7 +531,7 @@ async function seed() {
 		 ('${randomUUID()}','${pairId}','${owned.id}','frontend-api','api.${customDomain}','${randomUUID()}',now(),'${randomUUID()}','active','active',now());
 	`,
 	);
-	return { owned, control, rootCookie: cookie };
+	return { owned, control, unselected, rootCookie: cookie };
 }
 
 let networkCreated = false;
@@ -577,8 +580,8 @@ try {
 		);
 	}
 	await start(releaseImage, source);
-	const { owned, control, rootCookie } = await seed();
-	const configuredWebhook = internalSelection
+	const { owned, control, unselected, rootCookie } = await seed();
+	const configuredWebhook = fencedSelection
 		? await startConfiguredWebhook(owned, rootCookie)
 		: undefined;
 	const direct = `/api/projects/${owned.slug}/auth`;
@@ -589,7 +592,7 @@ try {
 		ALLAUTH_REHEARSAL_DATABASE_NONCE: databaseNonce,
 	};
 	const login = { email: accountEmail, password: oldPassword };
-	const ownedLogin = internalSelection ? { ...login, email: alternateEmail } : login;
+	const ownedLogin = fencedSelection ? { ...login, email: alternateEmail } : login;
 	const original = await request(`${direct}/sign-in/email`, {
 		realm: owned,
 		body: ownedLogin,
@@ -610,12 +613,12 @@ try {
 		"Native sign-in through the verified hosted binding.",
 	);
 	const originalHostedCookie = sessionCookie(originalHosted);
-	const connected = internalSelection ? await startConnectedApplication(owned, originalHostedCookie) : undefined;
+	const connected = fencedSelection ? await startConnectedApplication(owned, originalHostedCookie) : undefined;
 	const managedHost = `${owned.slug}-accounts.${portalDomain}`;
 	const managedApi = `${owned.slug}-api.${portalDomain}`;
 	const nativeHostedSessions: { hostname: string; cookie: string; id: string }[] = [];
 	let ownedManagedCookie: string | undefined;
-	if (internalSelection) {
+	if (fencedSelection) {
 		for (const { hostname, clientIP } of [
 			{ hostname: managedHost, clientIP: "192.0.2.56" },
 			{ hostname: host, clientIP: "192.0.2.57" },
@@ -653,6 +656,14 @@ try {
 		404,
 		"The baseline writer is legacy.",
 	);
+	if (productionCohort) {
+		await assert.rejects(projectWriter("status"));
+		await assert.rejects(writerOperator("register-production", owned.id, randomUUID()));
+		await writerOperator("register-production", owned.id, owned.workspaceId);
+		assert.deepEqual(await projectWriter("status"), { writer: "legacy", revision: 0 });
+		expectStatus(await request(`${direct}/not-installed`, { realm: owned }), 404,
+			"Registering a production project keeps its legacy writer.");
+	}
 	await stop(source);
 	await query(
 		"postgres",
@@ -681,7 +692,7 @@ try {
 			"A failed selection does not change its sibling.",
 		);
 	}
-	if (!railway && !internalSelection) {
+	if (!railway && !fencedSelection) {
 		await start(rehearsalImage, restored);
 		expectStatus(
 			await request(`${direct}/not-installed`, { realm: owned }),
@@ -697,12 +708,16 @@ try {
 		await stop(restored);
 	}
 
-	async function internalWriter(...args: string[]) {
-		const output = railway
+	async function writerOperator(...args: string[]) {
+		return railway
 			? await railway.internalWriter(args)
 			: await docker(
 				"exec", application, "node", "scripts/project-engine-writer.mjs", ...args,
 			);
+	}
+
+	async function projectWriter(...args: string[]) {
+		const output = await writerOperator(...(productionCohort ? ["--project", owned.id, ...args] : args));
 		return JSON.parse(output) as { writer: string; revision: number };
 	}
 
@@ -748,8 +763,13 @@ try {
 		}
 	}
 
-	let internalEnvironment: Record<string, string> = {};
-	if (internalSelection) {
+	function projectSelection(id: string): Record<string, string> {
+		return productionCohort
+			? { [productionProjectEngineRevisionsSetting]: JSON.stringify({ [id]: 0 }) }
+			: { ALLAUTH_PROJECT_ENGINE_INTERNAL_ID: id };
+	}
+	let fencedEnvironment: Record<string, string> = {};
+	if (fencedSelection) {
 		const mail = {
 			EMAIL_PROVIDER: "cloudflare",
 			EMAIL_FROM: "security@project-engine-rehearsal.invalid",
@@ -760,7 +780,7 @@ try {
 			await start(
 				releaseImage,
 				restored,
-				{ ...mail, ALLAUTH_PROJECT_ENGINE_INTERNAL_ID: control.id },
+				{ ...mail, ...projectSelection(unselected?.id ?? control.id) },
 				503,
 			);
 			expectStatus(
@@ -772,25 +792,25 @@ try {
 			await start(
 				releaseImage,
 				restored,
-				{ ALLAUTH_PROJECT_ENGINE_INTERNAL_ID: owned.id },
+				projectSelection(owned.id),
 				503,
 			);
 			await stop(restored);
 		}
-		internalEnvironment = { ...mail, ALLAUTH_PROJECT_ENGINE_INTERNAL_ID: owned.id };
-		await start(rehearsalImage, restored, internalEnvironment);
-		assert.deepEqual(await internalWriter("status"), { writer: "legacy", revision: 0 });
+		fencedEnvironment = { ...mail, ...projectSelection(owned.id) };
+		await start(rehearsalImage, restored, fencedEnvironment);
+		assert.deepEqual(await projectWriter("status"), { writer: "legacy", revision: 0 });
 		expectStatus(
 			await request(`${direct}/not-installed`, { realm: owned }),
 			404,
-			"The protected project keeps the legacy writer until the database switch.",
+			"The selected project keeps the legacy writer until the database switch.",
 		);
 		await hostedPage(managedHost, false);
 		await hostedPage(host, false);
-		assert.deepEqual(await internalWriter("switch", "legacy", "0", "allauth"), {
+		assert.deepEqual(await projectWriter("switch", "legacy", "0", "allauth"), {
 			writer: "allauth", revision: 1,
 		});
-		await assert.rejects(internalWriter("switch", "legacy", "0", "allauth"));
+		await assert.rejects(projectWriter("switch", "legacy", "0", "allauth"));
 		await hostedPage(managedHost, true);
 		await hostedPage(host, true);
 		await configuredWebhook?.rotate();
@@ -802,7 +822,7 @@ try {
 	} else {
 		await start(rehearsalImage, restored, selected);
 	}
-	if (railway && !internalSelection) {
+	if (railway && !fencedSelection) {
 		const marker = createHash("sha256").update(databaseNonce).digest("hex");
 		await query(
 			restored,
@@ -835,6 +855,9 @@ try {
 		404,
 		"The sibling realm remains on legacy.",
 	);
+	if (unselected)
+		expectStatus(await request(`/api/projects/${unselected.slug}/auth/not-installed`, { realm: unselected }),
+			404, "An unregistered production project remains on legacy.");
 	expectStatus(
 		await request("/api/auth/not-installed"),
 		404,
@@ -866,9 +889,9 @@ try {
 		null,
 	);
 	await connected?.rotate();
-	const fixturePassword = internalSelection ? oldPassword : newPassword;
+	const fixturePassword = fencedSelection ? oldPassword : newPassword;
 	async function switchDirectSession() {
-		if (internalSelection) {
+		if (fencedSelection) {
 			const signedOut = await request("/api/auth/sign-out", {
 				host,
 				cookie: originalHostedCookie,
@@ -917,7 +940,7 @@ try {
 	}
 	const ownedCookie = await switchDirectSession();
 	const ownedHosted = await request(
-		internalSelection ? "/api/auth/hosted-ui/sign-in/email" : "/api/auth/sign-in/email",
+		fencedSelection ? "/api/auth/hosted-ui/sign-in/email" : "/api/auth/sign-in/email",
 		{
 			host,
 			accept: "application/json",
@@ -926,7 +949,7 @@ try {
 	);
 	expectStatus(ownedHosted, 200, "The AllAuth hosted route signs in.");
 	const ownedHostedCookie = sessionCookie(ownedHosted);
-	if (internalSelection) {
+	if (fencedSelection) {
 		expectStatus(
 			await request("/api/auth/hosted-ui/sdk/config", { host: managedHost }),
 			200,
@@ -985,27 +1008,33 @@ try {
 	await checkKey("/api/auth", { host, cookie: ownedHostedCookie });
 	await stop(restored);
 
-	if (internalSelection) {
+	if (fencedSelection) {
 		if (!railway) {
 			await start(releaseImage, restored, {}, 503);
 			expectStatus(await request(`${direct}/get-session`, { realm: owned, cookie: ownedCookie }),
 				503, "A replica missing the active realm selection fails closed.");
 			expectStatus(await request(`${controlPath}/not-installed`, { realm: control }),
 				404, "A replica missing the active realm selection cannot cross into its sibling.");
-			await stop(restored);
+			if (productionCohort) {
+				expectStatus(await request("/api/auth/get-session", { host, cookie: ownedHostedCookie }),
+					503, "The unselected active production accounts API fails closed.");
+				const stalePage = await request("/sign-in", { host });
+				assert.ok(stalePage.body.includes("Sign-in is temporarily unavailable"));
+			} else await stop(restored);
 		}
-		await start(releaseImage, restored, internalEnvironment);
-		assert.deepEqual(await internalWriter("status"), { writer: "allauth", revision: 1 });
-		expectStatus(
-			await request(`${direct}/not-installed`, { realm: owned }),
-			501,
-			"The restored deployment reads the committed AllAuth writer.",
-		);
-		assert.deepEqual(await internalWriter("switch", "allauth", "1", "legacy"), {
+		if (!productionCohort) await start(releaseImage, restored, fencedEnvironment);
+		assert.deepEqual(await projectWriter("status"), { writer: "allauth", revision: 1 });
+		if (!productionCohort)
+			expectStatus(
+				await request(`${direct}/not-installed`, { realm: owned }),
+				501,
+				"The restored deployment reads the committed AllAuth writer.",
+			);
+		assert.deepEqual(await projectWriter("switch", "allauth", "1", "legacy"), {
 			writer: "legacy", revision: 2,
 		});
-		await assert.rejects(internalWriter("switch", "legacy", "2", "allauth"));
-		assert.deepEqual(await internalWriter("status"), { writer: "legacy", revision: 2 });
+		await assert.rejects(projectWriter("switch", "legacy", "2", "allauth"));
+		assert.deepEqual(await projectWriter("status"), { writer: "legacy", revision: 2 });
 		expectStatus(await request("/api/health"), 200, "The restored writer remains ready.");
 		await hostedPage(managedHost, false);
 		await hostedPage(host, false);
@@ -1066,7 +1095,7 @@ try {
 		200,
 		"Native reads the project password after rollback.",
 	);
-	if (!internalSelection) {
+	if (!fencedSelection) {
 		expectStatus(
 			// A second synthetic browser has its own admission bucket.
 			await request(`${direct}/sign-in/email`, {
@@ -1086,7 +1115,7 @@ try {
 		200,
 		"The sibling realm retains its password.",
 	);
-	if (internalSelection)
+	if (fencedSelection)
 		expectStatus(
 			await request(`${controlPath}/sign-in/email`, {
 				realm: control,
@@ -1098,9 +1127,11 @@ try {
 		);
 	await stop(restored);
 	console.log(
-		internalSelection
-			? "Compiled internal project writer fence and hosted sign-in passed from legacy to AllAuth and back."
-			: "Compiled project rehearsal passed from legacy to AllAuth and back.",
+		productionCohort
+			? "Compiled production project enrollment, cutover and rollback passed."
+			: fencedSelection
+				? "Compiled internal project writer fence and hosted sign-in passed from legacy to AllAuth and back."
+				: "Compiled project rehearsal passed from legacy to AllAuth and back.",
 	);
 } finally {
 	await railway?.stop();

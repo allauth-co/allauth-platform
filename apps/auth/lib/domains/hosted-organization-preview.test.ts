@@ -65,5 +65,5 @@ it("leaves the preview off for production, API hosts, other projects and the emp
 		ALLAUTH_EDGE_SECRET: fixture.secret,
 	});
 	expect(await hostedOrganizationPreview(incoming)).toBe(false);
-	expect(fixture.resolveBinding).not.toHaveBeenCalled();
+	expect(fixture.resolveBinding).toHaveBeenCalledOnce();
 });

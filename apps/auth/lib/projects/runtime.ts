@@ -70,13 +70,15 @@ import { projectOriginFingerprint } from "./origins";
 import type { OwnedProjectSCIMConsole } from "./owned-project-scim-console";
 import {
 	internalProjectEngineSelected,
-	internalProjectPreparationRevision,
 	projectAgentReplayApproved,
 	projectAgentReplayBridgeSelected,
-	selectInternalProjectEngine,
+	projectEnginePreparationRevision,
+	projectEngineSelected,
+	selectProjectEngine,
 } from "./project-engine-internal-selection";
-import { protectedProjectWriterLease } from "./project-engine-internal-writer";
+import { projectWriterLease } from "./project-engine-internal-writer";
 import { selectRehearsalProjectEngine } from "./project-engine-rehearsal-selection";
+import { projectWriterUnavailable } from "./project-engine-unavailable";
 import {
 	projectEngineWriterConnectionOptions,
 	type ProjectEngineWriterState,
@@ -543,12 +545,14 @@ async function withProjectEntry<T>(
 		(await selectRehearsalProjectEngine(project, env));
 	if (rehearsal)
 		return withConfiguredProjectEntry(project, env, publicOrigin, callback, rehearsal);
-	const lease = protectedProjectWriterLease(project, env);
+	const lease = projectWriterLease(project, env);
 	if (!lease) return withConfiguredProjectEntry(project, env, publicOrigin, callback);
 	return lease.withCurrent(({ writer, revision }) => {
-		const candidate = writer === "allauth" ? selectInternalProjectEngine(project, env, { revision, preparing: false }) : undefined;
+		const candidate = writer === "allauth"
+			? selectProjectEngine(project, env, { revision, preparing: false })
+			: undefined;
 		if (writer === "allauth" && !candidate)
-			throw new Error("The internal project writer is unavailable.");
+			throw projectWriterUnavailable();
 		return withConfiguredProjectEntry(
 			project, env, publicOrigin, callback, candidate, { writer, revision },
 		);
@@ -576,11 +580,12 @@ async function withConfiguredProjectEntry<T>(
 				.update(aliasConfiguration)
 				.digest("hex")
 		: "";
-	const samlApproval = owned && writer && setting(env, "ALLAUTH_PROJECT_ENGINE_ENCRYPTED_SAML_APPROVAL");
+	const internal = owned && writer && internalProjectEngineSelected(env, project);
+	const samlApproval = internal && setting(env, "ALLAUTH_PROJECT_ENGINE_ENCRYPTED_SAML_APPROVAL");
 	const samlApprovalVersion = samlApproval
 		? createHmac("sha256", setting(env, "ALLAUTH_AUTH_SECRET")).update(samlApproval).digest("hex")
 		: "";
-	const agentApproval = owned && writer && setting(env, "ALLAUTH_PROJECT_ENGINE_AGENT_REPLAY_APPROVAL");
+	const agentApproval = internal && setting(env, "ALLAUTH_PROJECT_ENGINE_AGENT_REPLAY_APPROVAL");
 	const agentApprovalVersion = agentApproval
 		? createHmac("sha256", setting(env, "ALLAUTH_AUTH_SECRET")).update(agentApproval).digest("hex")
 		: "";
@@ -747,34 +752,37 @@ export function withHostedProjectAuth<T>(
 	);
 }
 
-/** Check the active internal writer and prepare a selected candidate without dispatching a request. */
-export function confirmInternalProjectEngine(
+/** Check the active writer and prepare a selected candidate without dispatching a request. */
+export function confirmProjectEngine(
 	project: Project,
 	env: AuthEnvironment,
 	hostname?: string,
 ) {
-	const lease = protectedProjectWriterLease(project, env);
-	if (!internalProjectEngineSelected(env, project) || !lease)
-		throw new Error("The internal project selection changed.");
+	const lease = projectWriterLease(project, env);
+	if (!projectEngineSelected(env, project) || !lease)
+		throw new Error("The project selection changed.");
 	const origin = hostname ? `https://${hostname}` : undefined;
 	return lease.withCurrent(async ({ writer, revision }) => {
 		// Keep preflight separate from live cache entries. Legacy can
 		// still change configuration until the database commits the switch.
-		const preparing = writer === "legacy" && revision === internalProjectPreparationRevision(env);
-		if (preparing) projectAgentReplayApproved(project, env, { revision, preparing });
+		const preparing = writer === "legacy" && revision === projectEnginePreparationRevision(env, project);
+		if (preparing && internalProjectEngineSelected(env, project))
+			projectAgentReplayApproved(project, env, { revision, preparing });
 		const useCandidate = preparing || writer === "allauth";
-		const candidate = useCandidate ? selectInternalProjectEngine(project, env, { revision, preparing }) : undefined;
+		const candidate = useCandidate ? selectProjectEngine(project, env, { revision, preparing }) : undefined;
+		if (useCandidate && !candidate)
+			throw new Error("The project writer is unavailable.");
 		await withConfiguredProjectEntry(
 			project,
 			env,
 			origin,
 			async (entry) => {
 				const expected = useCandidate ? "owned" : "legacy";
-				if (entry.kind !== expected || !internalProjectEngineSelected(env, entry.project))
-					throw new Error("The internal project writer is unavailable.");
+				if (entry.kind !== expected || !projectEngineSelected(env, entry.project))
+					throw new Error("The project writer is unavailable.");
 				if (entry.kind === "owned") await entry.engine.verifySamlReadiness?.();
 			},
-			useCandidate ? candidate : undefined,
+			candidate,
 			preparing ? { writer: "allauth", revision: revision + 1 } : { writer, revision },
 			preparing,
 		);

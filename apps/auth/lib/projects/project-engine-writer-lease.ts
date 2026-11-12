@@ -25,7 +25,7 @@ export interface ProjectEngineWriterLease extends ProjectEngineWriterState {
 
 type Binding = Pick<
 	Project,
-	"id" | "schemaName" | "workspaceId" | "environment"
+	"id" | "schemaName" | "workspaceId" | "environment" | "projectEngineFenced"
 >;
 type Database = Pick<Pool, "connect">;
 interface Options {
@@ -44,7 +44,10 @@ interface ActiveLease {
 
 const activeLease = new AsyncLocalStorage<ActiveLease>();
 
-function retainPendingWork<Result>(current: ActiveLease, work: Promise<Result>) {
+function retainPendingWork<Result>(
+	current: ActiveLease,
+	work: Promise<Result>,
+) {
 	current.pending.add(work);
 	void work.then(
 		() => current.pending.delete(work),
@@ -75,7 +78,7 @@ function failure(code: string, message: string) {
 function scopeFailure() {
 	return failure(
 		"ALLAUTH_PROJECT_WRITER_SCOPE_FORBIDDEN",
-		"The project writer requires the exact protected internal development realm.",
+		"The project writer requires the exact registered realm binding.",
 	);
 }
 
@@ -130,18 +133,25 @@ export function projectEngineWriterConnectionOptions(
 }
 
 /**
- * Fence operations and compare-and-set switches for one trusted internal project.
+ * Fence operations and compare-and-set switches for one registered project.
  * Use a dedicated lease pool shared by nested direct and hosted calls, and tag
  * each engine's mutation pool with the admitted project, writer and revision.
  */
 export function createProjectEngineWriterLease(options: Options) {
 	const { database, selectedProjectId } = options;
 	const project = Object.freeze({ ...options.project });
+	const production =
+		project.environment === "production" &&
+		project.projectEngineFenced === true;
+	const internal =
+		project.environment === "development" &&
+		project.workspaceId === platformWorkspaceId &&
+		project.projectEngineFenced !== true;
 	if (
 		!projectId.test(selectedProjectId) ||
 		project.id !== selectedProjectId ||
-		project.workspaceId !== platformWorkspaceId ||
-		project.environment !== "development" ||
+		!projectId.test(project.workspaceId) ||
+		(!production && !internal) ||
 		project.schemaName !==
 			`allauth_project_${selectedProjectId.replaceAll("-", "")}`
 	)
@@ -169,7 +179,7 @@ export function createProjectEngineWriterLease(options: Options) {
 			 FROM public."allauthProject" p
 			 JOIN public."allauthWorkspace" w ON w.id=p."workspaceId"
 			 LEFT JOIN public."allauthProjectEngineWriter" f ON f."projectId"=p.id
-			 WHERE p.id=$1`,
+			 WHERE p.id=$1 ${production ? 'AND public.allauth_project_engine_production_allowed(p.id,p."workspaceId",p."schemaName")' : ""}`,
 			[project.id],
 		);
 		const binding = rows[0];
@@ -178,8 +188,8 @@ export function createProjectEngineWriterLease(options: Options) {
 			binding.id !== project.id ||
 			binding.schemaName !== project.schemaName ||
 			binding.workspaceId !== project.workspaceId ||
-			binding.environment !== "development" ||
-			binding.protected !== true
+			binding.environment !== project.environment ||
+			(internal && binding.protected !== true)
 		)
 			throw scopeFailure();
 		if (!binding.webhookGuardReady)

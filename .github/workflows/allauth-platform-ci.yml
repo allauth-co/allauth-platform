@@ -79,6 +79,7 @@ jobs:
           lib/projects/session-introspection.test.ts lib/projects/session-introspection.legacy.test.ts
           lib/projects/service-directory-transport.test.ts lib/projects/sdk-version-observation.test.ts
           lib/projects/proxy-boundary.test.ts lib/projects/owned-project-runtime-factory.test.ts
+          lib/projects/project-engine-rollout-selection.test.ts
       - name: Test first-party project engine compatibility
         run: >-
           pnpm exec vitest run --root apps/auth --config vitest.config.ts
@@ -133,6 +134,8 @@ jobs:
           pnpm exec vitest run --root apps/auth --config vitest.config.ts
           lib/projects/owned-project-runtime.pg.test.ts
           lib/projects/project-engine-writer-lease.pg.test.ts
+          lib/projects/project-engine-production-fence.pg.test.ts
+          lib/projects/project-engine-production-operator.pg.test.ts
       - name: Test billing, platform administration, self-hosting and public pages
         run: >-
           pnpm exec vitest run --root apps/auth --config vitest.config.ts

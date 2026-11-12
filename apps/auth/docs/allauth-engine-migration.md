@@ -105,6 +105,42 @@ pnpm --dir apps/auth exec tsx scripts/rehearsal/check-compiled-project-engine.ts
   --internal allauth-auth:internal-rehearsal
 ```
 
+## Production project cohorts
+
+Start production cohorts after the internal pilot passes. Confirm the exact production project and workspace IDs through the management surface, verify its configured flows on the legacy writer, and collect its baseline. Use the release container and deployment database role to register that project and read its writer revision.
+
+```sh
+node scripts/project-engine-writer.mjs register-production "$PROJECT_ID" "$WORKSPACE_ID"
+node scripts/project-engine-writer.mjs --project "$PROJECT_ID" status
+```
+
+Registration pins the production realm to its current workspace and schema and leaves its writer unchanged. A repeated registration of the same binding is safe. Configure `ALLAUTH_PROJECT_ENGINE_PRODUCTION_REVISIONS` on each rollout-capable replica as a JSON object mapping each selected production project ID to its exact prepared legacy writer revision. The setting defaults to an empty selection. For a newly registered project at revision `0`, its entry has the form `{"00000000-0000-4000-8000-000000000002":0}` with the verified project ID in place of the example ID.
+
+Register the project before starting the prepared deployment. Confirm its readiness, then drain all older replicas and wait for their admitted requests and database connections to finish before switching. Exercise the signed app proxy and each verified accounts hostname while the legacy writer is still active. Switch one project at a time and check its identity, session and connected-application contracts before promoting another cohort. Replicas serve an active AllAuth writer only when their prepared legacy revision matches the one used for its activation.
+
+```sh
+node scripts/project-engine-writer.mjs --project "$PROJECT_ID" switch legacy "$LEGACY_REVISION" allauth
+node scripts/project-engine-writer.mjs --project "$PROJECT_ID" status
+```
+
+Activation rechecks stored OAuth grants, webhook configuration, and SAML compatibility under the project writer lock. Projects with configured Agent Auth state or encrypted SAML require a production approval path before activation. The protected development approvals are scoped to the internal pilot.
+
+To roll back, read the current AllAuth revision and switch that exact revision to the legacy writer. The registered project ID is sufficient for status and rollback even after deployment selection is removed.
+
+```sh
+node scripts/project-engine-writer.mjs --project "$PROJECT_ID" status
+node scripts/project-engine-writer.mjs --project "$PROJECT_ID" switch allauth "$ALLAUTH_REVISION" legacy
+```
+
+Verify restored readiness, existing sessions, the signed proxy, all accounts hostnames and configured integrations. The binding and writer fence persist through rollback. A later activation uses the new legacy revision and another verified deployment preparation.
+
+Use the same normal runtime image from the internal rehearsal to verify a registered production realm with an isolated Docker database.
+
+```sh
+pnpm --dir apps/auth exec tsx scripts/rehearsal/check-compiled-project-engine.ts \
+  --production-cohort allauth-auth:internal-rehearsal
+```
+
 ## Compiled project rehearsal
 
 From the repository root, build both standalone images and run the fixture:

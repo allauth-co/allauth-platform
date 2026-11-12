@@ -8,8 +8,12 @@ import type { Project } from "./registry";
 let writerPool: Pool | undefined;
 
 /** Keep the admission connection independent of registry and engine queries made inside the lease. */
-export function protectedProjectWriterLease(project: Project, env: AuthEnvironment) {
-	if (!protectedInternalProject(project)) return;
+export function projectWriterLease(project: Project, env: AuthEnvironment) {
+	if (
+		!protectedInternalProject(project) &&
+		project.projectEngineFenced !== true
+	)
+		return;
 	if (!writerPool) {
 		writerPool = new Pool({
 			connectionString: setting(env, "DATABASE_URL"),
@@ -19,7 +23,7 @@ export function protectedProjectWriterLease(project: Project, env: AuthEnvironme
 			allowExitOnIdle: true,
 		});
 		writerPool.on("error", () =>
-			console.error("AllAuth internal project writer database connection error."),
+			console.error("AllAuth project writer database connection error."),
 		);
 	}
 	return createProjectEngineWriterLease({

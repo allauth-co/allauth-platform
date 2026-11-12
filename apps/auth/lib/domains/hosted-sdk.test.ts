@@ -3,8 +3,10 @@ import { symmetricDecrypt } from "better-auth/crypto";
 import { admin, emailOTP, magicLink, username } from "better-auth/plugins";
 import { getTestInstance } from "better-auth/test";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { GET as authGet, OPTIONS as authOptions } from "../../app/api/auth/[...all]/route";
 import { GET, POST } from "../../app/api/auth/hosted-ui/[...all]/route";
 import { productionTwoFactor } from "../mfa";
+import { projectWriterUnavailable } from "../projects/project-engine-unavailable";
 import { edgeHeaders } from "./edge";
 import {
 	hostedSdkBasePath,
@@ -63,6 +65,7 @@ function verifiedFixture(
 	kind = "accounts",
 	projectId = id,
 	environment = "development",
+	projectEngineFenced = false,
 ) {
 	gateway.withPortalAuthEngine.mockImplementation(
 		async (incoming: Request, callback) => {
@@ -73,7 +76,7 @@ function verifiedFixture(
 				{ [envKey]: configured },
 				new Request(url, incoming),
 				{
-					project: { id: projectId, slug, environment },
+					project: { id: projectId, slug, environment, projectEngineFenced },
 					kind,
 					hostname: url.hostname,
 				},
@@ -158,6 +161,32 @@ describe("first-party hosted SDK selection", () => {
 });
 
 describe("hosted SDK transport", () => {
+	it("keeps an open production form connected to the restored legacy writer", async () => {
+		verifiedFixture("", "accounts", id, "production", true);
+		gateway.dispatch.mockResolvedValue(Response.json({ emailPassword: true }));
+		const response = await GET(request("sdk/config"));
+		expect(response.status).toBe(200);
+		expect(await response.json()).toEqual({ emailPassword: true });
+		expect(gateway.dispatch).toHaveBeenCalledOnce();
+		verifiedFixture("", "accounts", otherId, "production");
+		expect((await GET(request("sdk/config"))).status).toBe(404);
+		expect(gateway.dispatch).toHaveBeenCalledOnce();
+	});
+
+	it("returns a private 503 without fallback when the active project writer is unavailable", async () => {
+		gateway.withPortalAuthEngine.mockRejectedValue(projectWriterUnavailable());
+		const responses = await Promise.all([
+			GET(request("sdk/config")),
+			authGet(new Request(`${origin}/api/auth/get-session`)),
+			authOptions(new Request(`${origin}/api/auth/get-session`, { method: "OPTIONS" })),
+		]);
+		for (const response of responses) {
+			expect(response.status).toBe(503);
+			expect(response.headers.get("cache-control")).toContain("no-store");
+		}
+		expect(gateway.dispatch).not.toHaveBeenCalled();
+	});
+
 	it("does not reach a platform engine for an unsigned or unavailable endpoint", async () => {
 		expect(
 			(await GET(request("sdk/config", "GET", { signed: false }))).status,

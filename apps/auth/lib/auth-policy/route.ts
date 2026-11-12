@@ -11,7 +11,7 @@ import { emailConfigured } from "../email/send";
 import { readProjectAppleProvider } from "../project-providers/apple";
 import { readProjectMicrosoftProvider } from "../project-providers/microsoft";
 import { googleProviderRepository } from "../project-providers/repository";
-import { protectedProjectWriterLease } from "../projects/project-engine-internal-writer";
+import { projectWriterLease } from "../projects/project-engine-internal-writer";
 import type { ProjectEngineWriter } from "../projects/project-engine-writer-lease";
 import { getProject, projectRegistryPool } from "../projects/registry";
 import { checkedProjectSchema } from "../projects/validation";
@@ -145,7 +145,7 @@ export async function authConfigurationRoute(
 								return work(dependencies(transaction, activeWriter));
 							},
 						);
-						const lease = protectedProjectWriterLease(project, env);
+						const lease = projectWriterLease(project, env);
 						return lease ? lease.withCurrent(({ writer }) => save(writer)) : save();
 					},
 				};

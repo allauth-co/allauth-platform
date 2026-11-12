@@ -16,15 +16,14 @@ import {
 	hostedSdkBasePath,
 	hostedSdkViewRequest,
 } from "@/lib/domains/hosted-sdk-policy";
-import {
-	hasHostedSdkSelection,
-	hostedSdkSelected,
-} from "@/lib/domains/hosted-sdk-selection";
+import { hostedSdkSelected } from "@/lib/domains/hosted-sdk-selection";
 import { portalSession, withPortalHeadersEngine } from "@/lib/domains/hosting";
 import { emailConfigured } from "@/lib/email/send";
+import { isProjectWriterUnavailable } from "@/lib/projects/project-engine-unavailable";
 import { AllAuthAuth } from "./better-auth-ui/allauth-auth";
 import { HostedProjectAuth } from "./hosted-project-auth";
 import { HostedProjectIssuerNavigation } from "./hosted-project-auth-status";
+import { HostedProjectUnavailable } from "./hosted-project-unavailable";
 
 export type HostedProjectAuthPageProps = {
 	searchParams: Promise<HostedSdkSearchParams>;
@@ -59,19 +58,18 @@ export async function HostedProjectAuthPage({
 	if (!requestHeaders.has(portalHeader)) return standardForm;
 
 	const env = await getAuthEnvironment();
-	if (!hasHostedSdkSelection(env)) return standardForm;
 	const params = await searchParams;
-	if (view === "authRedirect") {
-		if (params.interface !== undefined) return standardForm;
-		const navigation = await withPortalHeadersEngine(
-			requestHeaders,
-			async (engine, _bound, binding) => {
-				if (
-					!binding ||
-					binding.kind !== "accounts" ||
-					!(await hostedSdkSelected(env, binding.project))
-				)
-					return null;
+	const result = await withPortalHeadersEngine(
+		requestHeaders,
+		async (engine, _bound, binding) => {
+			if (
+				!binding ||
+				binding.kind !== "accounts" ||
+				!(await hostedSdkSelected(env, binding.project))
+			)
+				return null;
+			if (view === "authRedirect") {
+				if (params.interface !== undefined) return null;
 				const request = hostedAuthRedirectRequest(
 					params,
 					`https://${binding.hostname}`,
@@ -86,32 +84,15 @@ export async function HostedProjectAuthPage({
 						)))
 				)
 					return null;
-				if (request.issuer) return request;
+				if (request.issuer)
+					return { kind: "issuer", destination: request.destination } as const;
 				const destination = (await portalSession(requestHeaders))
 					? request.destination
 					: request.signIn;
-				return { destination };
-			},
-		);
-		if (!navigation) return standardForm;
-		if ("issuer" in navigation && navigation.issuer)
-			return (
-				<HostedProjectIssuerNavigation destination={navigation.destination} />
-			);
-		redirect(navigation.destination);
-	}
-	const request = hostedSdkViewRequest(view, params);
-	if (!request) return standardForm;
-
-	const project = await withPortalHeadersEngine(
-		requestHeaders,
-		async (engine, _bound, binding) => {
-			if (
-				!binding ||
-				binding.kind !== "accounts" ||
-				!(await hostedSdkSelected(env, binding.project))
-			)
-				return null;
+				return { kind: "redirect", destination } as const;
+			}
+			const request = hostedSdkViewRequest(view, params);
+			if (!request) return null;
 			if (
 				request.oauthQuery &&
 				!(await verifiedHostedOAuthContinuation(
@@ -149,27 +130,33 @@ export async function HostedProjectAuthPage({
 			)
 				return null;
 			return {
-				showRecovery,
-				showPassword,
-				showEmail,
-				showSso,
-				showBroker: !(
-					"googleProvider" in data && data.googleProvider === "google"
+				kind: "form",
+				component: (
+					<HostedProjectAuth
+						view={request.username ? "username" : view}
+						basePath={hostedSdkBasePath}
+						destination={request.destination}
+						legacyPath={request.legacyPath}
+						resetStatus={request.resetStatus}
+						callbackStatus={request.callbackStatus}
+						showRecovery={showRecovery}
+						showPassword={showPassword}
+						showEmail={showEmail}
+						showSso={showSso}
+						showBroker={!("googleProvider" in data && data.googleProvider === "google")}
+					/>
 				),
-			};
+			} as const;
 		},
-	);
+	).catch((error: unknown) => {
+		if (!isProjectWriterUnavailable(error)) throw error;
+		return { kind: "unavailable" } as const;
+	});
 
-	if (!project) return standardForm;
-	return (
-		<HostedProjectAuth
-			view={request.username ? "username" : view}
-			basePath={hostedSdkBasePath}
-			destination={request.destination}
-			legacyPath={request.legacyPath}
-			resetStatus={request.resetStatus}
-			callbackStatus={request.callbackStatus}
-			{...project}
-		/>
-	);
+	if (!result) return standardForm;
+	if (result.kind === "unavailable") return <HostedProjectUnavailable />;
+	if (result.kind === "redirect") redirect(result.destination);
+	if (result.kind === "issuer")
+		return <HostedProjectIssuerNavigation destination={result.destination} />;
+	return result.component;
 }

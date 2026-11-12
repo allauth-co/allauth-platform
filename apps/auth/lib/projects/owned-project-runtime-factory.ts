@@ -84,7 +84,7 @@ import {
 	ownedWebhookSelectors,
 } from "./owned-project-webhook-admission";
 import type { ProjectAvatarStorage } from "./project-avatar-upload";
-import { projectAgentReplayBridgeSelected } from "./project-engine-internal-selection";
+import { projectAgentReplayBridgeSelected, projectEngineSelected } from "./project-engine-internal-selection";
 import { verifiedProjectRequest } from "./proxy";
 import type { Project } from "./registry";
 import {
@@ -241,22 +241,23 @@ async function readSupportedProviders(
 	if (admission)
 		verifyLocalRuntimeFixture(options, admission);
 	if (
-		project.environment !== "development" ||
+		(project.environment !== "development" && !projectEngineSelected(env, project)) ||
 		!/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(project.id) ||
 		project.schemaName !== `allauth_project_${project.id.replaceAll("-", "")}`
 	)
 		throw new Error(
-			"This development project's configuration requires adapters outside the candidate scope.",
+			"This project's configuration requires adapters outside the candidate scope.",
 		);
 	const registered = await getProject(project.slug, env);
 	if (
 		registered.id !== project.id ||
 		registered.schemaName !== project.schemaName ||
 		registered.workspaceId !== project.workspaceId ||
-		registered.environment !== "development"
+		registered.environment !== project.environment ||
+		(project.environment === "production" && !projectEngineSelected(env, registered))
 	)
 		throw new Error(
-			"The selected development project does not match its registry binding.",
+			"The selected project does not match its registry binding.",
 		);
 	const microsoft = readProjectMicrosoftProvider(env, registered.slug);
 	const apple = readProjectAppleProvider(env, registered.slug);

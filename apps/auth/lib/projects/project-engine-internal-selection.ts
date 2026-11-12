@@ -4,6 +4,11 @@ import {
 	agentReplayBridgeIdSetting,
 	verifyAgentReplayDrainEvidence,
 } from "../../scripts/project-agent-replay-evidence.mjs";
+import {
+	productionProjectEngineRevisionsSetting,
+	projectEngineIdPattern,
+	readProductionProjectEngineRevisions,
+} from "../../scripts/project-engine-rollout-selection.mjs";
 import type { AuthEnvironment } from "../configuration";
 import { setting } from "../configuration";
 import { platformWorkspaceId } from "../workspaces/types";
@@ -12,7 +17,7 @@ import type { ProjectEngineBuilder } from "./runtime";
 
 export const internalProjectEngineIdSetting =
 	"ALLAUTH_PROJECT_ENGINE_INTERNAL_ID";
-const projectIdPattern = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/;
+export { productionProjectEngineRevisionsSetting };
 
 /** Prepare only the legacy revision explicitly selected for activation. */
 export function internalProjectPreparationRevision(env: AuthEnvironment) {
@@ -26,15 +31,21 @@ export function internalProjectPreparationRevision(env: AuthEnvironment) {
 
 type ProjectBinding = Pick<
 	Project,
-	"id" | "environment" | "workspaceId" | "schemaName"
+	"id" | "environment" | "workspaceId" | "schemaName" | "projectEngineFenced"
 >;
+
+function exactProjectSchema(project: ProjectBinding) {
+	return (
+		projectEngineIdPattern.test(project.id) &&
+		project.schemaName === `allauth_project_${project.id.replaceAll("-", "")}`
+	);
+}
 
 export function protectedInternalProject(project: ProjectBinding) {
 	return (
-		projectIdPattern.test(project.id) &&
 		project.environment === "development" &&
 		project.workspaceId === platformWorkspaceId &&
-		project.schemaName === `allauth_project_${project.id.replaceAll("-", "")}`
+		exactProjectSchema(project)
 	);
 }
 
@@ -46,6 +57,53 @@ export function internalProjectEngineSelected(
 	return (
 		setting(env, internalProjectEngineIdSetting).trim() === project.id &&
 		protectedInternalProject(project)
+	);
+}
+
+function registeredProductionProject(project: ProjectBinding) {
+	return (
+		project.projectEngineFenced === true &&
+		project.environment === "production" &&
+		projectEngineIdPattern.test(project.workspaceId) &&
+		exactProjectSchema(project)
+	);
+}
+
+export function productionProjectEngineRevisions(env: AuthEnvironment) {
+	return readProductionProjectEngineRevisions(
+		setting(env, productionProjectEngineRevisionsSetting),
+	);
+}
+
+export function projectEngineSelected(
+	env: AuthEnvironment,
+	project: ProjectBinding,
+) {
+	return (
+		internalProjectEngineSelected(env, project) ||
+		(registeredProductionProject(project) &&
+			productionProjectEngineRevisions(env).has(project.id))
+	);
+}
+
+export function projectEnginePreparationRevision(
+	env: AuthEnvironment,
+	project: ProjectBinding,
+) {
+	if (internalProjectEngineSelected(env, project))
+		return internalProjectPreparationRevision(env);
+	if (registeredProductionProject(project))
+		return productionProjectEngineRevisions(env).get(project.id);
+}
+
+export function projectEnginePreparedForWriter(
+	env: AuthEnvironment,
+	project: ProjectBinding,
+	writer: { revision: number; preparing: boolean },
+) {
+	const expected = writer.preparing ? writer.revision : writer.revision - 1;
+	return (
+		expected >= 0 && projectEnginePreparationRevision(env, project) === expected
 	);
 }
 
@@ -83,12 +141,13 @@ export function projectAgentReplayApproved(
 		: false;
 }
 
-export function selectInternalProjectEngine(
+export function selectProjectEngine(
 	project: Project,
 	env: AuthEnvironment,
 	writer: { revision: number; preparing: boolean },
 ): ProjectEngineBuilder | undefined {
-	if (!internalProjectEngineSelected(env, project)) return;
+	if (!projectEnginePreparedForWriter(env, project, writer)) return;
+	const internal = protectedInternalProject(project);
 	return async ({
 		database,
 		project,
@@ -115,12 +174,11 @@ export function selectInternalProjectEngine(
 				: { kind: "direct" },
 			signingSecret,
 			credentialHashSecret,
-			encryptedSamlApproval: readProjectEncryptedSamlApproval(
-				env,
-				project,
-				writer,
-			),
-			agentReplayApproved: projectAgentReplayApproved(project, env, writer),
+			encryptedSamlApproval: internal
+				? readProjectEncryptedSamlApproval(env, project, writer)
+				: undefined,
+			agentReplayApproved:
+				internal && projectAgentReplayApproved(project, env, writer),
 			// The accounts gateway and signed application proxy verify these values before dispatch.
 			trustedIP(request) {
 				if (hosted) return request.headers.get("x-real-ip");

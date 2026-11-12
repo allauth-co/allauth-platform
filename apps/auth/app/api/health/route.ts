@@ -3,7 +3,10 @@ import { readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import { Pool } from "pg";
 import { setting } from "@/lib/configuration";
-import { internalProjectEngineIdSetting } from "@/lib/projects/project-engine-internal-selection";
+import {
+	internalProjectEngineIdSetting,
+	productionProjectEngineRevisions,
+} from "@/lib/projects/project-engine-internal-selection";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -46,19 +49,24 @@ export async function GET() {
 		);
 		if (migration.rows[0]?.checksum !== checksum)
 			throw new Error("Schema migration is pending or mismatched");
-		const selected = setting({}, internalProjectEngineIdSetting).trim();
+		const internal = setting({}, internalProjectEngineIdSetting).trim();
+		const production = productionProjectEngineRevisions({});
+		if (internal && production.has(internal))
+			throw new Error("A project cannot be selected in both rollout environments.");
+		const selected = [...production.keys()];
+		if (internal) selected.unshift(internal);
 		const unmatchedWriter = await pool.query(
 			`SELECT 1 FROM public."allauthProjectEngineWriter"
-			 WHERE writer='allauth' AND "projectId" IS DISTINCT FROM $1 LIMIT 1`,
-			[selected || null],
+			 WHERE writer='allauth' AND NOT ("projectId" = ANY($1::text[])) LIMIT 1`,
+			[selected],
 		);
 		if (unmatchedWriter.rowCount)
-			throw new Error("An active internal project writer is missing from this deployment.");
-		if (selected) {
-			const { verifyInternalProjectEngineReadiness } = await import(
+			throw new Error("An active project writer is missing from this deployment.");
+		if (selected.length) {
+			const { verifyProjectEngineReadiness } = await import(
 				"@/lib/projects/project-engine-internal-readiness"
 			);
-			await verifyInternalProjectEngineReadiness(pool, {});
+			await verifyProjectEngineReadiness(pool, {}, selected);
 		}
 		return Response.json({ status: "ok" }, { headers });
 	} catch {

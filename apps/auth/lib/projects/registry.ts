@@ -26,6 +26,7 @@ export interface Project {
 	applicationId: string;
 	environment: "development" | "production";
 	workspaceId: string;
+	projectEngineFenced?: boolean;
 	brokerClientId: string;
 	brokerSecret: string;
 	proxyVersion: string;

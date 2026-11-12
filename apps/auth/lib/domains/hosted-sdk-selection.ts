@@ -2,9 +2,12 @@ import type { AuthEnvironment } from "../configuration";
 import { setting } from "../configuration";
 import {
 	internalProjectEngineIdSetting,
-	internalProjectEngineSelected,
+	productionProjectEngineRevisions,
+	projectEnginePreparedForWriter,
+	projectEngineSelected,
 } from "../projects/project-engine-internal-selection";
-import { protectedProjectWriterLease } from "../projects/project-engine-internal-writer";
+import { projectWriterLease } from "../projects/project-engine-internal-writer";
+import { projectWriterUnavailable } from "../projects/project-engine-unavailable";
 import type { Project } from "../projects/registry";
 import {
 	hostedSdkProjectEnabled,
@@ -14,7 +17,8 @@ import {
 export function hasHostedSdkSelection(env: AuthEnvironment) {
 	return Boolean(
 		setting(env, hostedSdkProjectIdsSetting).trim() ||
-			setting(env, internalProjectEngineIdSetting).trim(),
+			setting(env, internalProjectEngineIdSetting).trim() ||
+			productionProjectEngineRevisions(env).size,
 	);
 }
 
@@ -24,13 +28,19 @@ function independentlyPreviewed(env: AuthEnvironment, project: Project) {
 
 /** Keep forms already open during rollback connected to the currently admitted engine. */
 export function hostedSdkTransportEnabled(env: AuthEnvironment, project: Project) {
-	return independentlyPreviewed(env, project) || internalProjectEngineSelected(env, project);
+	return independentlyPreviewed(env, project) ||
+		(project.environment === "production" && project.projectEngineFenced === true) ||
+		projectEngineSelected(env, project);
 }
 
 /** New pages follow the authoritative writer unless explicitly previewing the first-party UI. */
 export async function hostedSdkSelected(env: AuthEnvironment, project: Project) {
-	if (independentlyPreviewed(env, project)) return true;
-	if (!internalProjectEngineSelected(env, project)) return false;
-	const lease = protectedProjectWriterLease(project, env);
-	return (await lease?.read())?.writer === "allauth";
+	const previewed = independentlyPreviewed(env, project);
+	const lease = projectWriterLease(project, env);
+	if (!lease) return previewed;
+	const { writer, revision } = await lease.read();
+	if (writer === "legacy") return previewed;
+	if (!projectEnginePreparedForWriter(env, project, { revision, preparing: false }))
+		throw projectWriterUnavailable();
+	return true;
 }

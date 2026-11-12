@@ -2,6 +2,7 @@ import { withPortalAuthEngine } from "@/lib/domains/hosting";
 import { authOrigin } from "@/lib/configuration";
 import { localDevelopmentAuthRequest } from "@/lib/local-development";
 import { projectOpenApiPath } from "@/lib/projects/owned-project-openapi";
+import { isProjectWriterUnavailable } from "@/lib/projects/project-engine-unavailable";
 
 const publicProtocolPaths = new Set(["/api/auth/oauth2/token", "/api/auth/oauth2/userinfo", "/api/auth/jwks"]);
 function protocolHeaders(request: Request, headers: Headers) {
@@ -11,6 +12,12 @@ function protocolHeaders(request: Request, headers: Headers) {
 		headers.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
 		headers.set("Access-Control-Allow-Headers", "authorization, content-type, dpop");
 	}
+}
+function unavailable(request: Request, error: unknown) {
+	if (!isProjectWriterUnavailable(error)) throw error;
+	const response = Response.json({ error: "Authentication is temporarily unavailable." }, { status: 503 });
+	protocolHeaders(request, response.headers);
+	return response;
 }
 async function handle(request: Request) {
 	const response = await withPortalAuthEngine(request, async (engine, env, bound, binding) => {
@@ -37,8 +44,8 @@ async function handle(request: Request) {
 		const origin=bound.headers.get("origin");
 		if(binding && origin && binding.project.origins.includes(origin)) {result.headers.set("Access-Control-Allow-Origin",origin);result.headers.set("Access-Control-Allow-Credentials","true");result.headers.append("Vary","Origin");}
 		return result;
-	});
+	}).catch((error: unknown) => unavailable(request, error));
 	return response;
 }
 export const GET = handle; export const POST = handle; export const PUT = handle; export const PATCH = handle; export const DELETE = handle;
-export async function OPTIONS(request: Request) { return withPortalAuthEngine(request,async (_engine,_env,bound,binding)=>{ const headers=new Headers();protocolHeaders(request,headers);const origin=bound.headers.get("origin");if(binding && origin && binding.project.origins.includes(origin)){headers.set("Access-Control-Allow-Origin",origin);headers.set("Access-Control-Allow-Credentials","true");headers.set("Access-Control-Allow-Methods","GET, POST, OPTIONS");headers.set("Access-Control-Allow-Headers","content-type, authorization");headers.set("Vary","Origin");} return new Response(null,{status:204,headers}); }); }
+export async function OPTIONS(request: Request) { return withPortalAuthEngine(request,async (_engine,_env,bound,binding)=>{ const headers=new Headers();protocolHeaders(request,headers);const origin=bound.headers.get("origin");if(binding && origin && binding.project.origins.includes(origin)){headers.set("Access-Control-Allow-Origin",origin);headers.set("Access-Control-Allow-Credentials","true");headers.set("Access-Control-Allow-Methods","GET, POST, OPTIONS");headers.set("Access-Control-Allow-Headers","content-type, authorization");headers.set("Vary","Origin");} return new Response(null,{status:204,headers}); }).catch((error: unknown) => unavailable(request, error)); }

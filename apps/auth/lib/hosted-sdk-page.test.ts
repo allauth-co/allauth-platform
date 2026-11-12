@@ -3,8 +3,10 @@ import { AllAuthAuth } from "@/components/better-auth-ui/allauth-auth";
 import { HostedProjectAuth } from "@/components/hosted-project-auth";
 import { HostedProjectAuthPage } from "@/components/hosted-project-auth-page";
 import { HostedProjectIssuerNavigation } from "@/components/hosted-project-auth-status";
+import { HostedProjectUnavailable } from "@/components/hosted-project-unavailable";
 import type { HostedProjectAuthPageProps } from "@/components/hosted-project-auth-page";
 import { portalHeader } from "./domains/edge";
+import { projectWriterUnavailable } from "./projects/project-engine-unavailable";
 import { platformWorkspaceId } from "./workspaces/types";
 
 const runtime = vi.hoisted(() => ({
@@ -287,12 +289,17 @@ it("keeps an unsigned OAuth query in the standard page even when preview is conf
 	runtime.headers.mockResolvedValue(
 		new Headers({ [portalHeader]: "fixture-proof" }),
 	);
+	const engine = engineConfiguration({ emailPassword: true });
+	runtime.withPortalHeadersEngine.mockImplementation(async (_headers, select) =>
+		select(engine, new Headers(), { kind: "accounts", project, hostname: accountsHostname }),
+	);
 	const result = await HostedProjectAuthPage({
 		view: "signIn",
 		searchParams: Promise.resolve({ client_id: "fixture" }),
 	});
 	expect(result.type).toBe(AllAuthAuth);
-	expect(runtime.withPortalHeadersEngine).not.toHaveBeenCalled();
+	expect(runtime.withPortalHeadersEngine).toHaveBeenCalledOnce();
+	expect(engine.dispatch).not.toHaveBeenCalled();
 });
 
 it("renders verified signed OAuth sign-in and MFA with the exact continuation", async () => {
@@ -501,6 +508,53 @@ it("keeps production on the standard page even when the immutable ID appears in 
 	expect(result.type).toBe(AllAuthAuth);
 });
 
+it("checks the verified portal writer before rendering a legacy fallback on a stale deployment", async () => {
+	runtime.headers.mockResolvedValue(new Headers({ [portalHeader]: "fixture-proof" }));
+	runtime.getAuthEnvironment.mockResolvedValue({});
+	runtime.withPortalHeadersEngine.mockRejectedValue(projectWriterUnavailable());
+
+	const page = await HostedProjectAuthPage({
+		view: "signIn",
+		searchParams: Promise.resolve({ interface: "legacy" }),
+	});
+	expect(page.type).toBe(HostedProjectUnavailable);
+	expect(runtime.withPortalHeadersEngine).toHaveBeenCalledOnce();
+});
+
+it("switches registered production sign-in by the current writer and requires its exact preparation revision", async () => {
+	runtime.headers.mockResolvedValue(new Headers({ [portalHeader]: "fixture-proof" }));
+	const production = {
+		...project,
+		environment: "production",
+		workspaceId: "c61c3ddc-de6c-4fc8-b307-bd8bf308d859",
+		schemaName: `allauth_project_${project.id.replaceAll("-", "")}`,
+		projectEngineFenced: true,
+	};
+	const engine = engineConfiguration({ emailPassword: true });
+	runtime.withPortalHeadersEngine.mockImplementation(async (_headers, select) =>
+		select(engine, new Headers(), { kind: "accounts", project: production, hostname: accountsHostname }),
+	);
+	const read = () => HostedProjectAuthPage({ view: "signIn", searchParams: Promise.resolve({}) });
+	const prepare = (revision: number) => runtime.getAuthEnvironment.mockResolvedValue({
+		ALLAUTH_PROJECT_ENGINE_PRODUCTION_REVISIONS: JSON.stringify({ [production.id]: revision }),
+	});
+	prepare(0);
+	runtime.readWriter.mockResolvedValue({ writer: "legacy", revision: 0 });
+	expect((await read()).type).toBe(AllAuthAuth);
+	runtime.readWriter.mockResolvedValue({ writer: "allauth", revision: 1 });
+	expect((await read()).type).toBe(HostedProjectAuth);
+	runtime.readWriter.mockResolvedValue({ writer: "legacy", revision: 2 });
+	expect((await read()).type).toBe(AllAuthAuth);
+	runtime.readWriter.mockResolvedValue({ writer: "allauth", revision: 3 });
+	expect((await read()).type).toBe(HostedProjectUnavailable);
+	prepare(2);
+	expect((await read()).type).toBe(HostedProjectAuth);
+	runtime.getAuthEnvironment.mockResolvedValue({});
+	expect((await read()).type).toBe(HostedProjectUnavailable);
+	runtime.readWriter.mockResolvedValue({ writer: "legacy", revision: 4 });
+	expect((await read()).type).toBe(AllAuthAuth);
+});
+
 it("only selects alternate sign-in methods when the verified project can offer them", async () => {
 	runtime.headers.mockResolvedValue(
 		new Headers({ [portalHeader]: "fixture-proof" }),
@@ -626,7 +680,7 @@ it("selects email status views only for an enabled hosted project without a bear
 		}),
 	});
 	expect(bearer.type).toBe(AllAuthAuth);
-	expect(runtime.withPortalHeadersEngine).not.toHaveBeenCalled();
+	expect(runtime.withPortalHeadersEngine).toHaveBeenCalledOnce();
 
 	runtime.getAuthEnvironment.mockResolvedValue({});
 	const standard = await HostedProjectAuthPage({
@@ -635,7 +689,7 @@ it("selects email status views only for an enabled hosted project without a bear
 	});
 	expect(standard.type).toBe(AllAuthAuth);
 	expect(standard.props).toEqual({ path: "reset-link-sent" });
-	expect(runtime.withPortalHeadersEngine).not.toHaveBeenCalled();
+	expect(runtime.withPortalHeadersEngine).toHaveBeenCalledTimes(2);
 });
 
 it("uses the first-party sign-in on the verified accounts domain of the selected internal writer", async () => {

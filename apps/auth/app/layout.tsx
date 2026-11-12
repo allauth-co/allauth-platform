@@ -6,11 +6,13 @@ import { headers } from "next/headers";
 import { SiteFrame } from "@/components/console/site-frame";
 import { HostedAccountHeader } from "@/components/hosted-account-header";
 import { HostedOrganizationProvider } from "@/components/hosted-organization-client";
+import { HostedProjectUnavailable } from "@/components/hosted-project-unavailable";
 import { LegacyAccountHeader } from "@/components/legacy-auth-ui";
 import Providers from "@/components/providers";
 import { portalBranding } from "@/lib/branding/portal";
 import { applicationMetadata } from "@/lib/branding/presentation";
 import { hostedOrganizationPreview } from "@/lib/domains/hosted-organization-preview";
+import { isProjectWriterUnavailable } from "@/lib/projects/project-engine-unavailable";
 
 export async function generateMetadata() {
 	return applicationMetadata(await portalBranding(await headers()));
@@ -20,13 +22,16 @@ export default async function RootLayout({
 }: {
 	children: React.ReactNode;
 }) {
-	const preview = await hostedOrganizationPreview(await headers());
+	const preview = await hostedOrganizationPreview(await headers()).catch((error: unknown) => {
+		if (!isProjectWriterUnavailable(error)) throw error;
+		return null;
+	});
 	return (
 		<html lang="en" suppressHydrationWarning>
 			<body
 				className={`${GeistSans.variable} ${GeistMono.variable} font-sans min-h-screen bg-background`}
 			>
-				<Providers hostedPreview={preview}>
+				{preview === null ? <HostedProjectUnavailable /> : <Providers hostedPreview={preview}>
 					<HostedOrganizationProvider enabled={preview}>
 						<SiteFrame
 							header={
@@ -36,7 +41,7 @@ export default async function RootLayout({
 							{children}
 						</SiteFrame>
 					</HostedOrganizationProvider>
-				</Providers>
+				</Providers>}
 			</body>
 		</html>
 	);

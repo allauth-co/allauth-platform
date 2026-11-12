@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AuthEnvironment } from "../configuration";
 import { projectEmailAliasVariable } from "../project-email-alias-config";
 import type { Project } from "./registry";
-import { verifyInternalProjectEngineReadiness } from "./project-engine-internal-readiness";
+import { verifyProjectEngineReadiness } from "./project-engine-internal-readiness";
 import { closeProjectInstances, withHostedProjectAuthEngine, withProjectAuth, withProjectAuthEngine } from "./runtime";
 import * as projectRuntime from "./runtime";
 import { platformWorkspaceId } from "../workspaces/types";
@@ -206,7 +206,7 @@ describe("protected internal project writer selection", () => {
 			selected,
 		);
 		expect(hosted.status).toBe(202);
-		await expect(dispatch(internal, environment)).rejects.toThrow("The internal project writer is unavailable.");
+		await expect(dispatch(internal, environment)).rejects.toThrow("The project writer is unavailable.");
 		for (const rejected of [
 			{ ...internal, workspaceId: project().workspaceId },
 			{ ...internal, environment: "production" as const },
@@ -215,7 +215,7 @@ describe("protected internal project writer selection", () => {
 		])
 			expect((await dispatch(rejected, selected)).status).toBe(204);
 		await expect(dispatch(internal, { ...selected, ALLAUTH_PROJECT_ENGINE_INTERNAL_ID: `${id},*` }))
-			.rejects.toThrow("The internal project writer is unavailable.");
+			.rejects.toThrow("The project writer is unavailable.");
 		fixture.admitted = { writer: "legacy", revision: 2 };
 		expect((await dispatch(internal, selected)).status).toBe(204);
 		expect((await dispatch(internal, environment)).status).toBe(204);
@@ -231,6 +231,60 @@ describe("protected internal project writer selection", () => {
 	});
 });
 
+it("uses the production writer only for the registered immutable project and rejects a stale replica", async () => {
+	const id = "0953c4f5-a783-4e91-9055-a05ead278cd0";
+	const production: Project = {
+		...project(),
+		id,
+		schemaName: `allauth_project_${id.replaceAll("-", "")}`,
+		projectEngineFenced: true,
+	};
+	const siblingId = "8d0da368-94b3-4897-988e-39c320a3e852";
+	const sibling: Project = {
+		...production,
+		id: siblingId,
+		slug: "fixture-sibling",
+		schemaName: `allauth_project_${siblingId.replaceAll("-", "")}`,
+		projectEngineFenced: false,
+	};
+	const selected = { ...environment, ALLAUTH_PROJECT_ENGINE_PRODUCTION_REVISIONS: JSON.stringify({ [id]: 0 }) };
+	const otherSelection = { ...environment, ALLAUTH_PROJECT_ENGINE_PRODUCTION_REVISIONS: JSON.stringify({ [sibling.id]: 0 }) };
+	const hostname = "accounts.production.fixture.example";
+	fixture.getProject.mockImplementation(async (slug: string) => slug === production.slug ? production : sibling);
+	fixture.readAuthPolicy.mockResolvedValue(defaultStoredAuthPolicy());
+	const direct = (realm: Project, env: AuthEnvironment) => withProjectAuthEngine(
+		realm.slug,
+		({ engine }) => engine.dispatch(new Request("https://allauth.example/request")),
+		env,
+	);
+	const hosted = (env: AuthEnvironment) => withHostedProjectAuthEngine(
+		production,
+		hostname,
+		(engine) => engine.dispatch(new Request(`https://${hostname}/api/auth/get-session`)),
+		env,
+	);
+
+	expect((await direct(production, selected)).status).toBe(204);
+	fixture.admitted = { writer: "allauth", revision: 1 };
+	expect((await direct(production, selected)).status).toBe(202);
+	expect((await hosted(selected)).status).toBe(202);
+	expect((await direct(sibling, selected)).status).toBe(204);
+	await expect(direct(production, environment)).rejects.toThrow("The project writer is unavailable.");
+	await expect(hosted(otherSelection)).rejects.toThrow("The project writer is unavailable.");
+	fixture.admitted = { writer: "legacy", revision: 2 };
+	expect((await direct(production, environment)).status).toBe(204);
+	expect((await hosted(environment)).status).toBe(204);
+	await expect(projectRuntime.confirmProjectEngine(production, selected)).resolves.toBeUndefined();
+	const reselected = { ...environment, ALLAUTH_PROJECT_ENGINE_PRODUCTION_REVISIONS: JSON.stringify({ [id]: 2 }) };
+	await expect(projectRuntime.confirmProjectEngine(production, reselected)).resolves.toBeUndefined();
+	fixture.admitted = { writer: "allauth", revision: 3 };
+	await expect(direct(production, selected)).rejects.toThrow("The project writer is unavailable.");
+	await expect(hosted(selected)).rejects.toThrow("The project writer is unavailable.");
+	await expect(projectRuntime.confirmProjectEngine(production, selected)).rejects.toThrow("The project writer is unavailable.");
+	expect((await direct(production, reselected)).status).toBe(202);
+	expect((await hosted(reselected)).status).toBe(202);
+});
+
 it("rejects readiness when either verified transport loses the exact internal realm", async () => {
 	const id = "8d0da368-94b3-4897-988e-39c320a3e852";
 	const internal: Project = {
@@ -244,25 +298,25 @@ it("rejects readiness when either verified transport loses the exact internal re
 	const query = vi.fn(async (sql: string) => ({ rows: sql.includes('"allauthCustomHostname"') ? [] : [{ slug: internal.slug, webhookGuardInstalled: true }] }));
 	const database = { query } as unknown as Pick<Pool, "query">;
 	query.mockResolvedValueOnce({ rows: [{ slug: internal.slug, webhookGuardInstalled: false }] });
-	await expect(verifyInternalProjectEngineReadiness(database, selected))
+	await expect(verifyProjectEngineReadiness(database, selected, [id]))
 		.rejects.toThrow("The project webhook writer migration is unavailable.");
 	const hostname = "fixture-app-accounts.allauth.co";
 	fixture.getProject.mockReset().mockResolvedValue(internal);
 	fixture.resolveHostedBinding.mockResolvedValueOnce({
 		kind: "accounts", hostname, project: { ...internal, schemaName: project().schemaName },
 	});
-	await expect(verifyInternalProjectEngineReadiness(database, selected)).rejects.toThrow(
-		"The internal project accounts hostname is unavailable.",
+	await expect(verifyProjectEngineReadiness(database, selected, [id])).rejects.toThrow(
+		"The project accounts hostname is unavailable.",
 	);
 	expect(fixture.createOwned).not.toHaveBeenCalled();
 	fixture.resolveHostedBinding.mockResolvedValueOnce({ kind: "accounts", hostname, project: internal });
 	fixture.getProject
 		.mockResolvedValueOnce(internal)
 		.mockResolvedValueOnce({ ...internal, id: "0953c4f5-a783-4e91-9055-a05ead278cd0" });
-	const confirm = vi.spyOn(projectRuntime, "confirmInternalProjectEngine").mockResolvedValue(undefined);
+	const confirm = vi.spyOn(projectRuntime, "confirmProjectEngine").mockResolvedValue(undefined);
 	try {
-		await expect(verifyInternalProjectEngineReadiness(database, selected)).rejects.toThrow(
-			"The internal project selection changed during readiness.",
+		await expect(verifyProjectEngineReadiness(database, selected, [id])).rejects.toThrow(
+			"The project selection changed during readiness.",
 		);
 		expect(confirm).toHaveBeenNthCalledWith(1, internal, selected);
 		expect(confirm).toHaveBeenNthCalledWith(2, internal, selected, hostname);
@@ -295,27 +349,27 @@ it("requires each active custom accounts transport to prepare the selected proje
 	fixture.resolveHostedBinding.mockImplementation(async (hostname: string) => ({
 		kind: "accounts", hostname, project: internal,
 	}));
-	const confirm = vi.spyOn(projectRuntime, "confirmInternalProjectEngine").mockImplementation(
+	const confirm = vi.spyOn(projectRuntime, "confirmProjectEngine").mockImplementation(
 		async (_project, _settings, hostname) => {
 			if (hostname === custom) throw new Error("Fixture custom transport is unavailable.");
 		},
 	);
 	try {
-		await expect(verifyInternalProjectEngineReadiness(database, selected)).rejects.toThrow(
+		await expect(verifyProjectEngineReadiness(database, selected, [id])).rejects.toThrow(
 			"Fixture custom transport is unavailable.",
 		);
 		expect(confirm).toHaveBeenCalledWith(internal, selected);
 		for (const hostname of [managed, custom, additional])
 			expect(confirm).toHaveBeenCalledWith(internal, selected, hostname);
 		confirm.mockResolvedValue(undefined);
-		await expect(verifyInternalProjectEngineReadiness(database, selected)).resolves.toBeUndefined();
+		await expect(verifyProjectEngineReadiness(database, selected, [id])).resolves.toBeUndefined();
 		fixture.resolveHostedBinding.mockImplementation(async (hostname: string) => ({
 			kind: "accounts",
 			hostname,
 			project: hostname === custom ? { ...internal, id: "0953c4f5-a783-4e91-9055-a05ead278cd0" } : internal,
 		}));
-		await expect(verifyInternalProjectEngineReadiness(database, selected)).rejects.toThrow(
-			"The internal project accounts hostname is unavailable.",
+		await expect(verifyProjectEngineReadiness(database, selected, [id])).rejects.toThrow(
+			"The project accounts hostname is unavailable.",
 		);
 		fixture.resolveHostedBinding.mockImplementation(async (hostname: string) => ({
 			kind: "accounts", hostname, project: internal,
@@ -323,8 +377,66 @@ it("requires each active custom accounts transport to prepare the selected proje
 		confirm.mockImplementation(async (_project, _settings, hostname) => {
 			if (hostname === managed) customHostnames = [custom];
 		});
-		await expect(verifyInternalProjectEngineReadiness(database, selected)).rejects.toThrow(
-			"The internal project accounts hostnames changed during readiness.",
+		await expect(verifyProjectEngineReadiness(database, selected, [id])).rejects.toThrow(
+			"The project accounts hostnames changed during readiness.",
+		);
+	} finally {
+		fixture.resolveHostedBinding.mockReset();
+		confirm.mockRestore();
+	}
+});
+
+it("prepares every selected production realm and rejects a hostname rebound to another selected realm", async () => {
+	const firstId = "0953c4f5-a783-4e91-9055-a05ead278cd0";
+	const secondId = "8d0da368-94b3-4897-988e-39c320a3e852";
+	const first: Project = {
+		...project(),
+		id: firstId,
+		slug: "fixture-first",
+		schemaName: `allauth_project_${firstId.replaceAll("-", "")}`,
+		projectEngineFenced: true,
+	};
+	const second: Project = {
+		...first,
+		id: secondId,
+		slug: "fixture-second",
+		schemaName: `allauth_project_${secondId.replaceAll("-", "")}`,
+		workspaceId: "c61c3ddc-de6c-4fc8-b307-bd8bf308d859",
+	};
+	const selected = {
+		...environment,
+		ALLAUTH_PROJECT_ENGINE_PRODUCTION_REVISIONS: JSON.stringify({ [firstId]: 0, [secondId]: 2 }),
+	};
+	const firstHostname = `${first.slug}-accounts.allauth.co`;
+	const secondHostname = `${second.slug}-accounts.allauth.co`;
+	const secondCustom = "accounts.fixture-second.example";
+	const query = vi.fn(async (sql: string, [id]: string[]) => {
+		if (sql.includes('"allauthCustomHostname"'))
+			return { rows: id === secondId ? [{ hostname: secondCustom }] : [] };
+		return { rows: [{ slug: id === firstId ? first.slug : second.slug, webhookGuardInstalled: true }] };
+	});
+	const database = { query } as unknown as Pick<Pool, "query">;
+	fixture.getProject.mockReset().mockImplementation(async (slug: string) => slug === first.slug ? first : second);
+	let customProject = second;
+	fixture.resolveHostedBinding.mockImplementation(async (hostname: string) => ({
+		kind: "accounts",
+		hostname,
+		project: hostname === firstHostname ? first : hostname === secondCustom ? customProject : second,
+	}));
+	const confirm = vi.spyOn(projectRuntime, "confirmProjectEngine").mockResolvedValue(undefined);
+	try {
+		await expect(verifyProjectEngineReadiness(database, selected, [firstId, secondId])).resolves.toBeUndefined();
+		expect(confirm.mock.calls).toEqual([
+			[first, selected], [first, selected, firstHostname],
+			[second, selected], [second, selected, secondHostname], [second, selected, secondCustom],
+		]);
+		customProject = first;
+		await expect(verifyProjectEngineReadiness(database, selected, [firstId, secondId])).rejects.toThrow(
+			"The project accounts hostname is unavailable.",
+		);
+		fixture.getProject.mockResolvedValueOnce({ ...second, projectEngineFenced: false });
+		await expect(verifyProjectEngineReadiness(database, selected, [secondId])).rejects.toThrow(
+			"The project is outside the allowed workspace or environment.",
 		);
 	} finally {
 		fixture.resolveHostedBinding.mockReset();
@@ -344,7 +456,7 @@ it("rechecks candidate compatibility at activation and checks legacy readiness a
 	const env = { ...environment, ALLAUTH_PROJECT_ENGINE_INTERNAL_ID: id };
 	fixture.getProject.mockResolvedValue(internal);
 	fixture.readAuthPolicy.mockResolvedValue(defaultStoredAuthPolicy());
-	await projectRuntime.confirmInternalProjectEngine(internal, env);
+	await projectRuntime.confirmProjectEngine(internal, env);
 	expect(fixture.createOwned).toHaveBeenCalledTimes(1);
 
 	fixture.admitted = { writer: "allauth", revision: 1 };
@@ -354,12 +466,12 @@ it("rechecks candidate compatibility at activation and checks legacy readiness a
 	expect(fixture.createOwned).toHaveBeenCalledTimes(2);
 
 	fixture.admitted = { writer: "legacy", revision: 2 };
-	await projectRuntime.confirmInternalProjectEngine(internal, env);
+	await projectRuntime.confirmProjectEngine(internal, env);
 	expect(fixture.createOwned).toHaveBeenCalledTimes(2);
 	expect(fixture.createAuth).toHaveBeenCalledOnce();
 
 	fixture.createOwned.mockRejectedValueOnce(new Error("Incompatible reactivation configuration."));
-	await expect(projectRuntime.confirmInternalProjectEngine(internal, {
+	await expect(projectRuntime.confirmProjectEngine(internal, {
 		...env, ALLAUTH_PROJECT_ENGINE_INTERNAL_PREPARE_REVISION: "2",
 	})).rejects.toThrow("Incompatible reactivation configuration.");
 	expect(fixture.createOwned).toHaveBeenCalledTimes(3);

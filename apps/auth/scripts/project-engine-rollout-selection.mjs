@@ -1,0 +1,32 @@
+export const productionProjectEngineRevisionsSetting =
+	"ALLAUTH_PROJECT_ENGINE_PRODUCTION_REVISIONS";
+export const projectEngineIdPattern =
+	/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/;
+
+/** @param {string | undefined} raw @returns {Map<string, number>} */
+export function readProductionProjectEngineRevisions(raw) {
+	const configured = raw?.trim();
+	if (!configured) return new Map();
+	const invalid = () =>
+		new Error("The production project preparation revisions are invalid.");
+	let revisions;
+	try {
+		revisions = JSON.parse(configured);
+	} catch {
+		throw invalid();
+	}
+	if (!revisions || typeof revisions !== "object" || Array.isArray(revisions))
+		throw invalid();
+	const entries = Object.entries(revisions);
+	for (const [id, revision] of entries) {
+		if (
+			!projectEngineIdPattern.test(id) ||
+			typeof revision !== "number" ||
+			!Number.isInteger(revision) ||
+			revision < 0 ||
+			revision > 2147483647
+		)
+			throw invalid();
+	}
+	return new Map(entries);
+}

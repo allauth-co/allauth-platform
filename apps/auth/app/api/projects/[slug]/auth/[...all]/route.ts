@@ -6,7 +6,7 @@ import { getAuthEnvironment } from "@/lib/auth";
 import { recordSdkVersionObservation } from "@/lib/notifications/repository";
 import { backendCredentialRepository } from "@/lib/projects/backend-credentials";
 import { ownedSCIMError } from "@/lib/projects/owned-project-scim-discovery";
-import { internalProjectEngineSelected } from "@/lib/projects/project-engine-internal-selection";
+import { projectEngineSelected } from "@/lib/projects/project-engine-internal-selection";
 import type { ProjectProtocolBody } from "@/lib/projects/project-protocol-body";
 import {
 	prepareProjectProtocolBody,
@@ -50,7 +50,7 @@ async function handle(
 		const project = await getProject(slug, environment);
 		if (
 			!request.headers.get("allauth-proxy-signature") &&
-			internalProjectEngineSelected(environment, project)
+			projectEngineSelected(environment, project)
 		)
 			protocol = projectProtocolBody(
 				request,

@@ -8,6 +8,7 @@ import {
 } from "@/lib/domains/hosted-sdk-response";
 import { hostedScimConsoleRequest } from "@/lib/domains/hosted-scim-console";
 import { withPortalAuthEngine } from "@/lib/domains/hosting";
+import { isProjectWriterUnavailable } from "@/lib/projects/project-engine-unavailable";
 import { scimConsoleRoute } from "@/lib/scim-management";
 
 async function handle(request: Request) {
@@ -102,6 +103,9 @@ async function handle(request: Request) {
 			url.origin,
 			binding.project.slug,
 		);
+	}).catch((error: unknown) => {
+		if (!isProjectWriterUnavailable(error)) throw error;
+		return hostedSdkFailure(503, "Authentication is temporarily unavailable.");
 	});
 }
 

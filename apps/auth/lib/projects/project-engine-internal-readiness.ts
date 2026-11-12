@@ -1,24 +1,26 @@
 import type { Pool } from "pg";
 import type { AuthEnvironment } from "../configuration";
-import { setting } from "../configuration";
 import { resolveHostedBinding } from "../domains/hosting";
 import { listStoredActiveProjectAccountsHostnames } from "../domains/repository";
 import { domainDefaults } from "../domains/validation";
-import {
-	internalProjectEngineIdSetting,
-	internalProjectEngineSelected,
-} from "./project-engine-internal-selection";
-import { protectedProjectWriterLease } from "./project-engine-internal-writer";
-import { getProject } from "./registry";
-import { confirmInternalProjectEngine } from "./runtime";
+import { projectEngineSelected } from "./project-engine-internal-selection";
+import { projectWriterLease } from "./project-engine-internal-writer";
+import { getProject, type Project } from "./registry";
+import { confirmProjectEngine } from "./runtime";
+
+function sameProject(expected: Project, current: Project) {
+	return expected.id === current.id && expected.slug === current.slug &&
+		expected.environment === current.environment &&
+		expected.workspaceId === current.workspaceId &&
+		expected.schemaName === current.schemaName;
+}
 
 /** Resolve the selected direct and active hosted transports under one writer lease. */
-export async function verifyInternalProjectEngineReadiness(
+async function verifyProjectTransports(
 	database: Pick<Pool, "query">,
 	env: AuthEnvironment,
+	id: string,
 ) {
-	const id = setting(env, internalProjectEngineIdSetting).trim();
-	if (!id) return;
 	const {
 		rows: [row],
 	} = await database.query<{ slug: string; webhookGuardInstalled: boolean }>(
@@ -30,16 +32,16 @@ export async function verifyInternalProjectEngineReadiness(
 		) AS "webhookGuardInstalled" FROM public."allauthProject" p WHERE p.id=$1`,
 		[id],
 	);
-	if (!row) throw new Error("The internal project is unavailable.");
+	if (!row) throw new Error("The selected project is unavailable.");
 	if (!row.webhookGuardInstalled)
 		throw new Error("The project webhook writer migration is unavailable.");
 	const project = await getProject(row.slug, env);
-	if (!internalProjectEngineSelected(env, project))
+	if (project.id !== id || !projectEngineSelected(env, project))
 		throw new Error(
-			"The internal project is outside the allowed workspace or environment.",
+			"The project is outside the allowed workspace or environment.",
 		);
-	const lease = protectedProjectWriterLease(project, env);
-	if (!lease) throw new Error("The internal project writer is unavailable.");
+	const lease = projectWriterLease(project, env);
+	if (!lease) throw new Error("The project writer is unavailable.");
 	await lease.withCurrent(async () => {
 		const managed = new URL(domainDefaults(project.slug, env).accounts)
 			.hostname;
@@ -53,25 +55,25 @@ export async function verifyInternalProjectEngineReadiness(
 				if (
 					binding?.kind !== "accounts" ||
 					binding.hostname !== hostname ||
-					!internalProjectEngineSelected(env, binding.project)
+					!sameProject(project, binding.project) ||
+					!projectEngineSelected(env, binding.project)
 				)
 					throw new Error(
-						"The internal project accounts hostname is unavailable.",
+						"The project accounts hostname is unavailable.",
 					);
 				return binding;
 			}),
 		);
 		await Promise.all([
-			confirmInternalProjectEngine(project, env),
+			confirmProjectEngine(project, env),
 			...bindings.map(({ project, hostname }) =>
-				confirmInternalProjectEngine(project, env, hostname),
+				confirmProjectEngine(project, env, hostname),
 			),
 		]);
-		if (
-			!internalProjectEngineSelected(env, await getProject(project.slug, env))
-		)
+		const currentProject = await getProject(project.slug, env);
+		if (!sameProject(project, currentProject) || !projectEngineSelected(env, currentProject))
 			throw new Error(
-				"The internal project selection changed during readiness.",
+				"The project selection changed during readiness.",
 			);
 		const current = await listStoredActiveProjectAccountsHostnames(
 			project.id,
@@ -82,7 +84,16 @@ export async function verifyInternalProjectEngineReadiness(
 			current.some((hostname, index) => hostname !== custom[index])
 		)
 			throw new Error(
-				"The internal project accounts hostnames changed during readiness.",
+				"The project accounts hostnames changed during readiness.",
 			);
 	});
+}
+
+/** Check each selected immutable realm separately so its writer lease cannot cross workspaces. */
+export async function verifyProjectEngineReadiness(
+	database: Pick<Pool, "query">,
+	env: AuthEnvironment,
+	projectIds: readonly string[],
+) {
+	for (const id of projectIds) await verifyProjectTransports(database, env, id);
 }
