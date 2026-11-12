@@ -15,7 +15,11 @@ import { hostedOrganizationPreview } from "@/lib/domains/hosted-organization-pre
 import { isProjectWriterUnavailable } from "@/lib/projects/project-engine-unavailable";
 
 export async function generateMetadata() {
-	return applicationMetadata(await portalBranding(await headers()));
+	const branding = await portalBranding(await headers()).catch((error: unknown) => {
+		if (!isProjectWriterUnavailable(error)) throw error;
+		return null;
+	});
+	return applicationMetadata(branding);
 }
 export default async function RootLayout({
 	children,
