@@ -1,4 +1,5 @@
 import { applicationMfaCallback } from "../mfa-continuation";
+import { oauthBrowserReturnPath } from "../oauth-browser";
 import {
 	isAuthenticExpiredProjectIssuerEmailContinuation,
 	readSignedProjectIssuerQuery,
@@ -7,6 +8,7 @@ import { projectOrigin } from "./validation";
 
 type CallbackFlow =
 	| "verification"
+	| "hosted-password-verification"
 	| "password-reset"
 	| "hosted-magic-link"
 	| "hosted-password-reset";
@@ -72,6 +74,13 @@ export function createOwnedProjectEmailCallbackPolicy(options: {
 
 	return (target, flow, phase) => {
 		if (flow === "verification") return local(target, phase);
+		if (flow === "hosted-password-verification") {
+			const path = target.pathname + target.search;
+			return target.href === origin + path &&
+				oauthBrowserReturnPath(path) === path
+				? local(target, phase, true)
+				: null;
+		}
 		if (flow === "hosted-magic-link") return local(target, phase, true);
 		if (
 			target.origin !== origin ||

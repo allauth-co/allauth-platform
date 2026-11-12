@@ -5,6 +5,10 @@ import type { AuthPolicy } from "../auth-policy/policy";
 import { authPolicySchema } from "../auth-policy/policy";
 import type { ApplicationBranding } from "../branding/types";
 import type { ControlEventInput } from "../control/types";
+import {
+	hostedPasswordSignInRequests,
+	hostedVerificationLinkRequests,
+} from "../domains/hosted-oauth-requests";
 import { authenticationEmail } from "../email/authentication";
 import type { EmailEnvironment } from "../email/send";
 import { emailConfigured, sendAuthEmail } from "../email/send";
@@ -33,13 +37,13 @@ const alphabet =
 	"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 const email = z.email().max(320);
 const maximumCallbackLength = 2048;
-const maximumHostedResetURLLength = 16_384;
-const maximumHostedResetBodyBytes = maximumHostedResetURLLength + 1024;
+const maximumHostedEmailURLLength = 16_384;
+const maximumHostedResetBodyBytes = maximumHostedEmailURLLength + 1024;
 const resetTokenLength = 24;
 const callback = z.string().max(maximumCallbackLength).optional();
 const resetRequest = z.object({ email, redirectTo: callback }).strict();
 const hostedResetRequest = resetRequest.extend({
-	redirectTo: z.string().max(maximumHostedResetURLLength).optional(),
+	redirectTo: z.string().max(maximumHostedEmailURLLength).optional(),
 });
 const verifyRequest = z.object({ email, callbackURL: callback }).strict();
 const resetInput = z
@@ -71,6 +75,7 @@ export interface RecoveryHttpOptions {
 	resetCallbackURLs: readonly string[];
 	verificationCallbackURLs: readonly string[];
 	callbackPolicy?: OwnedEmailCallbackPolicy;
+	verifyHostedVerificationContinuation?(target: URL): Promise<boolean>;
 	auditContext?(
 		request: Request,
 	): Pick<ControlEventInput, "ipAddress" | "userAgent">;
@@ -225,7 +230,7 @@ export function createOwnedRecoveryHttp(options: RecoveryHttpOptions) {
 		options.verificationCallbackURLs,
 		origins,
 	);
-	const hostedReset =
+	const hostedRecovery =
 		options.basePath === "/api/auth" &&
 		linkBase.origin === origin &&
 		Boolean(options.callbackPolicy);
@@ -255,15 +260,22 @@ export function createOwnedRecoveryHttp(options: RecoveryHttpOptions) {
 		flow: "verification" | "password-reset",
 		phase: Parameters<OwnedEmailCallbackPolicy>[2],
 		caller = linkBase.origin,
+		allowHostedVerification = false,
 	): ReturnType<OwnedEmailCallbackPolicy> {
 		const approved = flow === "verification" ? verifyCallbacks : resetCallbacks;
 		if (value === undefined) return { url: new URL(approved[0]) };
-		const extended =
-			flow === "password-reset" &&
-			hostedReset &&
+		let selectedFlow: Parameters<OwnedEmailCallbackPolicy>[1] = flow;
+		if (
+			hostedRecovery &&
 			caller === origin &&
-			value.length > maximumCallbackLength;
-		if (!validURL(value, extended ? maximumHostedResetURLLength : undefined))
+			value.length > maximumCallbackLength
+		) {
+			if (flow === "password-reset") selectedFlow = "hosted-password-reset";
+			else if (allowHostedVerification)
+				selectedFlow = "hosted-password-verification";
+		}
+		const extended = selectedFlow !== flow;
+		if (!validURL(value, extended ? maximumHostedEmailURLLength : undefined))
 			return null;
 		try {
 			const target = new URL(value, caller);
@@ -271,24 +283,20 @@ export function createOwnedRecoveryHttp(options: RecoveryHttpOptions) {
 			if (
 				extended &&
 				(target.origin !== origin ||
-					target.href.length > maximumHostedResetURLLength)
+					target.href.length > maximumHostedEmailURLLength)
 			)
 				return null;
 			return origins.has(target.origin)
-				? (options.callbackPolicy?.(
-						target,
-						extended ? "hosted-password-reset" : flow,
-						phase,
-					) ?? null)
+				? (options.callbackPolicy?.(target, selectedFlow, phase) ?? null)
 				: null;
 		} catch {
 			return null;
 		}
 	}
 
-	function emailURL(path: string, callbackURL: URL, token?: string) {
+	function emailURL(path: string, callbackURL: URL | string, token?: string) {
 		const link = new URL(`${linkBase.pathname}${path}`, linkBase.origin);
-		link.searchParams.set("callbackURL", callbackURL.href);
+		link.searchParams.set("callbackURL", callbackURL.toString());
 		if (token) link.searchParams.set("token", token);
 		return link.href;
 	}
@@ -332,20 +340,56 @@ export function createOwnedRecoveryHttp(options: RecoveryHttpOptions) {
 			: null;
 	}
 
-	async function deliverVerification(address: string, destination: URL) {
+	async function deliverVerification(
+		identity: ProjectEmailIdentity,
+		destination: URL | string,
+	) {
 		const user = await store.transaction(async (client) => {
 			const result = await client.query<Recipient>(
-				`${recipientQuery} AND "emailVerified" = false`,
-				[address],
+				`${recipientQuery} AND "emailVerified" = false AND ($2::text IS NULL OR id = $2)`,
+				[identity.email, identity.userId ?? null],
 			);
 			return result.rows[0];
 		});
 		if (!user) return;
 		const token = await verification.issue(user);
+		const link = emailURL("/verify-email", destination, token);
 		await deliver("send-verification-email", {
 			user,
-			link: emailURL("/verify-email", destination, token),
+			link:
+				link.length <= maximumHostedEmailURLLength
+					? link
+					: emailURL("/verify-email", verifyCallbacks[0], token),
 		});
+	}
+
+	function resendAfterPassword(
+		user: Pick<Recipient, "id" | "email">,
+		callbackURL: string | undefined,
+		request: Request,
+	) {
+		if (!emailConfigured(options.email.environment)) return;
+		const caller = request.headers.get("origin") ?? undefined;
+		const selected = selectCallback(
+			callbackURL ?? new URL("/", linkBase.origin).href,
+			"verification",
+			"issue",
+			caller,
+			hostedPasswordSignInRequests.has(request),
+		);
+		const destination = selected
+			? (callbackURL === undefined ? "/" : selected.url)
+			: verifyCallbacks[0];
+		const onFailure = () =>
+			options.onDeliveryFailure?.("send-verification-email");
+		void scheduleOwnedEmailDelivery(
+			(work) => options.defer(work),
+			async () => () =>
+				deliverVerification({ email: user.email, userId: user.id }, destination),
+			onFailure,
+		).then((scheduled) => {
+			if (!scheduled) onFailure();
+		}, onFailure);
 	}
 
 	async function deliver(
@@ -397,7 +441,7 @@ export function createOwnedRecoveryHttp(options: RecoveryHttpOptions) {
 	) {
 		const caller = request.headers.get("origin") ?? undefined;
 		const isReset = operation === "request-password-reset";
-		const hosted = isReset && hostedReset && caller === origin;
+		const hosted = isReset && hostedRecovery && caller === origin;
 		const raw = await boundedJson(
 			request,
 			hosted ? maximumHostedResetBodyBytes : undefined,
@@ -431,7 +475,7 @@ export function createOwnedRecoveryHttp(options: RecoveryHttpOptions) {
 			emailURL(
 				`/reset-password/${"a".repeat(resetTokenLength)}`,
 				destination.url,
-			).length > maximumHostedResetURLLength
+			).length > maximumHostedEmailURLLength
 		)
 			return forbidden();
 		const address = parsed.data.email.toLowerCase();
@@ -454,7 +498,7 @@ export function createOwnedRecoveryHttp(options: RecoveryHttpOptions) {
 			(work) => options.defer(work),
 			async () => {
 				if (!isReset)
-					return () => deliverVerification(address, destination.url);
+					return () => deliverVerification({ email: address }, destination.url);
 				const message = await prepareReset(request, identity, destination.url);
 				return message ? () => deliver(operation, message) : null;
 			},
@@ -539,7 +583,7 @@ export function createOwnedRecoveryHttp(options: RecoveryHttpOptions) {
 		}
 	}
 
-	return async function dispatch(request: Request): Promise<Response | null> {
+	async function dispatch(request: Request): Promise<Response | null> {
 		const url = new URL(request.url);
 		if (!url.pathname.startsWith(`${options.basePath}/`)) return null;
 		const path = url.pathname.slice(options.basePath.length);
@@ -617,6 +661,9 @@ export function createOwnedRecoveryHttp(options: RecoveryHttpOptions) {
 			candidates[0],
 			resetToken ? "password-reset" : "verification",
 			"consume",
+			undefined,
+			hostedVerificationLinkRequests.has(request) &&
+				url.href.length <= maximumHostedEmailURLLength,
 		);
 		if (!destination) return forbidden();
 		if (resetToken) {
@@ -641,6 +688,12 @@ export function createOwnedRecoveryHttp(options: RecoveryHttpOptions) {
 
 		const limited = await admission(request, "verify-email");
 		if (limited) return limited;
+		if (
+			(candidates[0]?.length ?? 0) > maximumCallbackLength &&
+			!destination.expiredContinuation &&
+			!(await options.verifyHostedVerificationContinuation?.(destination.url))
+		)
+			return forbidden();
 		const tokens = url.searchParams.getAll("token");
 		const result =
 			tokens.length === 1
@@ -665,5 +718,6 @@ export function createOwnedRecoveryHttp(options: RecoveryHttpOptions) {
 		return candidates[0] && !destination.expiredContinuation
 			? redirect(destination.url, "error", code)
 			: failure(401, code, "Invalid or expired verification token.");
-	};
+	}
+	return Object.assign(dispatch, { resendAfterPassword });
 }

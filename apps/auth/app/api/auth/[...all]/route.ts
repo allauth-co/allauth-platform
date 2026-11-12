@@ -1,6 +1,9 @@
 import { withPortalAuthEngine } from "@/lib/domains/hosting";
 import { authOrigin } from "@/lib/configuration";
-import { hostedOAuthBrowserActionRequests } from "@/lib/domains/hosted-oauth-requests";
+import {
+	hostedOAuthBrowserActionRequests,
+	hostedVerificationLinkRequests,
+} from "@/lib/domains/hosted-oauth-requests";
 import { localDevelopmentAuthRequest } from "@/lib/local-development";
 import { projectOpenApiPath } from "@/lib/projects/owned-project-openapi";
 import { isProjectWriterUnavailable } from "@/lib/projects/project-engine-unavailable";
@@ -29,6 +32,12 @@ async function handle(request: Request) {
 			(path === "/api/auth/oauth2/continue" || path === "/api/auth/oauth2/consent")
 		)
 			hostedOAuthBrowserActionRequests.add(bound);
+		if (
+			binding?.kind === "accounts" &&
+			bound.method === "GET" &&
+			path === "/api/auth/verify-email"
+		)
+			hostedVerificationLinkRequests.add(bound);
 		// The hosted gateway removes Authorization before the browser request reaches auth.
 		const mixedSchemaCredentials =
 			binding &&

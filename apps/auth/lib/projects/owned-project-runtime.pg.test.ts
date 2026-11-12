@@ -69,6 +69,7 @@ import {
 	runtimeFixtureAssetSecret,
 	runtimeFixtureGoogle,
 	runtimeFixtureMicrosoft,
+	runtimeFixtureVerificationMail,
 	runtimeProviderFixtureCode,
 } from "./owned-project-runtime-provider-fixture";
 import {
@@ -7059,6 +7060,311 @@ describe.skipIf(!existsSync(fixture))(
 					await service?.stop();
 				} finally {
 					try {
+						if (created) await dropClosedFixtureDatabase(admin, name);
+					} finally {
+						await admin.end();
+					}
+				}
+			}
+		}, 60_000);
+
+		it("resends hosted password verification across project writer cutover and rollback", async () => {
+			const local: { container: string; DATABASE_URL: string } = JSON.parse(
+				readFileSync(fixture, "utf8"),
+			);
+			const base = new URL(local.DATABASE_URL);
+			if (
+				local.container !== "allauth-production-test-20261007" ||
+				base.hostname !== "127.0.0.1" ||
+				base.port !== "55445"
+			)
+				throw new Error("Hosted verification requires isolated PostgreSQL.");
+			const admin = new Pool({ connectionString: base.href, max: 1 });
+			const name = `allauth_hosted_${randomUUID().replaceAll("-", "")}`;
+			const databaseURL = new URL(`/${name}`, base).href;
+			let created = false;
+			let database: Pool | undefined;
+			let service: Awaited<ReturnType<typeof openProcess>> | undefined;
+			try {
+				await admin.query(`CREATE DATABASE "${name}"`);
+				created = true;
+				const { alpha } = await seed(databaseURL);
+				database = new Pool({ connectionString: databaseURL, max: 1 });
+				const schema = `"${alpha.schemaName}"`;
+				const accounts = [
+					"native_email",
+					"native_username",
+					"owned_email",
+					"owned_username",
+					"verified",
+					"directory",
+					"disabled",
+					"delayed",
+					"rollback_delayed",
+				] as const;
+				type Account = (typeof accounts)[number];
+				const email = (account: Account) =>
+					`${account}@runtime.fixture.example`;
+				const hash = await clerkCompatiblePasswords.hash(credentials.password);
+				for (const account of accounts) {
+					await database.query(
+						`INSERT INTO ${schema}."user" (id, name, email, username, "emailVerified", "directoryManaged", "directoryDisabled")
+						 VALUES ($1,$1,$2,$1,$3,$4,$5)`,
+						[
+							account,
+							email(account),
+							account === "verified",
+							account === "directory" || account === "disabled",
+							account === "disabled",
+						],
+					);
+					await database.query(
+						`INSERT INTO ${schema}."account" (id,"accountId","providerId","userId",password,"updatedAt")
+						 VALUES ($1,$1,'credential',$1,$2,now())`,
+						[account, hash],
+					);
+				}
+				const host = `${alpha.slug}-accounts.allauth.co`;
+				const origin = `https://${host}`;
+				const rollout = {
+					ALLAUTH_PROJECT_HOSTED_UI_PROJECT_IDS: alpha.id,
+					EMAIL_PROVIDER: "cloudflare" as const,
+					EMAIL_FROM: runtimeFixtureVerificationMail.sender,
+					CLOUDFLARE_ACCOUNT_ID: runtimeFixtureVerificationMail.accountId,
+					CLOUDFLARE_EMAIL_API_TOKEN: runtimeFixtureVerificationMail.token,
+				};
+				const open = (owned: boolean) =>
+					openProcess(
+						databaseURL,
+						alpha,
+						owned,
+						alpha.slug,
+						undefined,
+						undefined,
+						rollout,
+					);
+				let nextClientIP = 170;
+				const transport = { host, accept: "application/json" };
+				function signIn(
+					field: "email" | "username",
+					account: Account,
+					callbackURL?: string,
+					password = credentials.password,
+				) {
+					return service!.request(`/api/auth/hosted-ui/sign-in/${field}`, {
+						...transport,
+						clientIP: `192.0.2.${nextClientIP++}`,
+						body: {
+							[field]: field === "email" ? email(account) : account,
+							password,
+							callbackURL,
+						},
+					});
+				}
+				async function requireMail(
+					field: "email" | "username",
+					account: Account,
+					callback?: string,
+				) {
+					const response = await signIn(field, account, callback);
+					expect(response.status, await response.clone().text()).toBe(403);
+					expect(await response.json()).toMatchObject({
+						code: "EMAIL_NOT_VERIFIED",
+					});
+					expect(cookie(response)).toBe("");
+					const link = await fixtureVerificationMail(
+						service!,
+						email(account),
+					).catch((error) => {
+						throw new Error(`Missing verification email for ${account}.`, {
+							cause: error,
+						});
+					});
+					expect(link.origin + link.pathname).toBe(
+						`${origin}/api/auth/verify-email`,
+					);
+					expect(link.searchParams.get("callbackURL")).toBe(callback ?? "/");
+					expect(link.searchParams.get("token")).toBeTruthy();
+					return link;
+				}
+				async function consume(
+					link: URL,
+					account: Account,
+					destination = link.searchParams.get("callbackURL"),
+				) {
+					const opened = await service!.request(link.pathname + link.search, {
+						host,
+						clientIP: `192.0.2.${nextClientIP++}`,
+					});
+					expect(opened.status, await opened.clone().text()).toBe(302);
+					expect(opened.headers.get("location")).toBe(destination);
+					const session = cookie(opened);
+					expect(session).toContain(".session_token=");
+					const current = await service!.request(
+						"/api/auth/hosted-ui/get-session",
+						{ ...transport, cookie: session },
+					);
+					expect(await current.json()).toMatchObject({
+						user: { id: account, emailVerified: true },
+					});
+				}
+				async function ordinaryChecks() {
+					for (const field of ["email", "username"] as const) {
+						const wrong = await signIn(
+							field,
+							"owned_email",
+							undefined,
+							"fixture-wrong-password",
+						);
+						expect(wrong.status).toBe(401);
+						expect(cookie(wrong)).toBe("");
+						const verified = await signIn(field, "verified");
+						expect(verified.status).toBe(200);
+						expect(cookie(verified)).toContain(".session_token=");
+					}
+				}
+				service = await open(false);
+				await ordinaryChecks();
+				const state = `${"signed-verification-state".repeat(340)}+one&two`;
+				const prompt = await fixtureRedirect(
+					await service.request(
+						`/api/auth/oauth2/authorize?${fixtureAuthorizationQuery(state)}`,
+						transport,
+					),
+				);
+				expect(prompt.pathname).toBe("/sign-in");
+				const continuation = `${origin}/oauth2/continue${prompt.search}`;
+				expect(continuation.length).toBeGreaterThan(8192);
+				const legacyLink = await requireMail(
+					"email",
+					"native_email",
+					continuation,
+				);
+				await requireMail("username", "native_username");
+				await requireMail("email", "directory");
+				await requireMail("username", "disabled");
+				await service.stop();
+				expect(service.mail.map(({ to }) => to).sort()).toEqual(
+					["native_email", "native_username", "directory", "disabled"]
+						.map((name) => `${name}@runtime.fixture.example`)
+						.sort(),
+				);
+				service = undefined;
+				service = await open(true);
+				await ordinaryChecks();
+				const ownedLink = await requireMail(
+					"email",
+					"owned_email",
+					continuation,
+				);
+				const rollbackLink = await requireMail(
+					"username",
+					"owned_username",
+					continuation,
+				);
+				await requireMail("username", "native_username");
+				for (const account of ["directory", "disabled"] as const) {
+					const response = await signIn("username", account);
+					expect(response.status).toBe(403);
+					expect(cookie(response)).toBe("");
+				}
+				const overlongOrdinary = new URL(ownedLink);
+				overlongOrdinary.searchParams.set(
+					"callbackURL",
+					`${origin}/account?return=${"a".repeat(2048)}`,
+				);
+				const rejectedLink = await service.request(
+					overlongOrdinary.pathname + overlongOrdinary.search,
+					{ host },
+				);
+				expect(rejectedLink.status).toBe(403);
+				expect(cookie(rejectedLink)).toBe("");
+				await database.query(
+					`UPDATE ${schema}."oauthClient" SET disabled=true WHERE "clientId"=$1`,
+					[oauthClientId],
+				);
+				const inactiveClient = await service.request(
+					ownedLink.pathname + ownedLink.search,
+					{ host },
+				);
+				expect(inactiveClient.status).toBe(403);
+				expect(cookie(inactiveClient)).toBe("");
+				await database.query(
+					`UPDATE ${schema}."oauthClient" SET disabled=false WHERE "clientId"=$1`,
+					[oauthClientId],
+				);
+				await consume(legacyLink, "native_email");
+				await consume(ownedLink, "owned_email");
+				const clock = vi
+					.spyOn(Date, "now")
+					.mockReturnValueOnce(Date.now() - 50_000);
+				const delayedQuery = signProjectIssuerQuery(
+					fixtureAuthorizationQuery(state),
+					versionedSigningSecret,
+				);
+				clock.mockRestore();
+				const delayedCallback = `${origin}/oauth2/continue?${delayedQuery}`;
+				const delayedLink = await requireMail(
+					"email",
+					"delayed",
+					delayedCallback,
+				);
+				const delayedRollback = await requireMail(
+					"username",
+					"rollback_delayed",
+					delayedCallback,
+				);
+				const expires = Number(delayedQuery.get("exp")) * 1000;
+				await vi.waitFor(() => expect(Date.now()).toBeGreaterThan(expires), {
+					timeout: 11_000,
+				});
+				await consume(delayedLink, "delayed", `${origin}/account`);
+				await service.stop();
+				expect(service.mail.map(({ to }) => to).sort()).toEqual(
+					[
+						"delayed",
+						"native_username",
+						"owned_email",
+						"owned_username",
+						"rollback_delayed",
+					].map((account) => `${account}@runtime.fixture.example`),
+				);
+				service = undefined;
+				service = await open(false);
+				await consume(rollbackLink, "owned_username");
+				await consume(delayedRollback, "rollback_delayed");
+				await service.stop();
+				service = undefined;
+				const disabledPolicy = authPolicyRepository(database);
+				const current = await disabledPolicy.read(alpha.id);
+				await disabledPolicy.update(
+					alpha.id,
+					current.version,
+					{ ...current.policy, emailAndPasswordEnabled: false },
+					credentials.platform.id,
+				);
+				for (const owned of [false, true]) {
+					service = await open(owned);
+					for (const field of ["email", "username"] as const) {
+						const response = await signIn(field, "native_username");
+						expect(response.status).toBe(owned ? 400 : 403);
+						expect(cookie(response)).toBe("");
+					}
+					await service.stop();
+					expect(service.mail).toEqual([]);
+					service = undefined;
+				}
+				const { rows } = await database.query(
+					`SELECT "userId" FROM ${schema}."session" WHERE "userId"=ANY($1::text[])`,
+					[["directory", "disabled", "native_username"]],
+				);
+				expect(rows).toEqual([]);
+			} finally {
+				try {
+					await service?.stop();
+				} finally {
+					try {
+						await database?.end();
 						if (created) await dropClosedFixtureDatabase(admin, name);
 					} finally {
 						await admin.end();

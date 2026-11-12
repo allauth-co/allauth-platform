@@ -222,6 +222,7 @@ async function boot(selection: ProjectRuntimeFixtureBoot) {
 						issuerKey: selection.appleIssuerKey,
 					}
 				: undefined,
+			(mail) => process.send?.({ mail }),
 		),
 		{
 			preconnect: outboundDisabled,

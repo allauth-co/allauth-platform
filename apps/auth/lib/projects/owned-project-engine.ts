@@ -331,6 +331,7 @@ interface OwnedProjectEngineOptions {
 		| "trustedOrigins"
 		| "auditContext"
 		| "completeVerification"
+		| "verifyHostedVerificationContinuation"
 	>;
 	emailAliases?: ProjectEmailAliasMap;
 	/** Only an already authenticated ingress may supply the client IP. */
@@ -1527,6 +1528,17 @@ export function createOwnedProjectEngine(
 				path,
 				callback,
 			);
+			if (
+				recoveryHttp &&
+				result.status === 403 &&
+				policy.requireEmailVerification &&
+				!current.emailVerified &&
+				activeUser(current) &&
+				!current.directoryManaged
+			)
+				afterOwnedProjectCommit(client, () =>
+					recoveryHttp.resendAfterPassword(current, callback, request),
+				);
 			if (result.status >= 400 && result.status < 500 && result.status !== 429)
 				await security.failed(client, request, path, identity);
 			return result;
@@ -2536,6 +2548,14 @@ export function createOwnedProjectEngine(
 			basePath: options.basePath,
 			trustedOrigins: options.trustedOrigins,
 			auditContext: browserEventContext,
+			verifyHostedVerificationContinuation: issuer
+				? (target) =>
+						verifiedHostedOAuthContinuation(
+							{ readOAuthContext: issuer.readContext },
+							target.hostname,
+							target.search.slice(1),
+						)
+				: undefined,
 			async admit(request, operation, email) {
 				if (
 					operation === "request-password-reset" ||

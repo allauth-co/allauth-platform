@@ -6,6 +6,11 @@ export const runtimeFixtureAssetOrigin =
 	"https://assets.runtime.fixture.example";
 export const runtimeFixtureAssetSecret =
 	"isolated-runtime-fixture-asset-signing-key";
+export const runtimeFixtureVerificationMail = {
+	accountId: "b".repeat(32),
+	token: "isolated-runtime-verification-mail-token",
+	sender: "verification@runtime.fixture.example",
+};
 
 export const runtimeFixtureGoogle = {
 	clientId: "fixture-runtime-google.apps.googleusercontent.com",
@@ -67,11 +72,11 @@ export function runtimeProviderFixtureCode(authorization: URL) {
 	).toString("base64url");
 }
 
-/** Exact in-process IdP endpoints. No other HTTP requests are sent. */
-export function runtimeProviderFixtureFetch(apple?: {
-	credentialKey: string;
-	issuerKey: string;
-}) {
+/** Handle the exact synthetic IdP and mail endpoints without outbound HTTP. */
+export function runtimeProviderFixtureFetch(
+	apple?: { credentialKey: string; issuerKey: string },
+	captureMail?: (mail: { to: string; subject: string; text: string }) => void,
+) {
 	const keys = generateKeyPair("RS256", { extractable: true });
 	const appleSigningKey = apple && createPrivateKey(apple.issuerKey);
 	const appleCredentialKey =
@@ -82,6 +87,36 @@ export function runtimeProviderFixtureFetch(apple?: {
 		init?: RequestInit,
 	) {
 		const request = new Request(input, init);
+		const mail = runtimeFixtureVerificationMail;
+		if (
+			captureMail &&
+			request.url === `https://api.cloudflare.com/client/v4/accounts/${mail.accountId}/email/sending/send` &&
+			request.method === "POST" &&
+			request.headers.get("authorization") === `Bearer ${mail.token}`
+		) {
+			const message = (await request.json()) as {
+				from?: { address?: string };
+				to?: string;
+				subject?: string;
+				text?: string;
+			};
+			if (
+				message.from?.address !== mail.sender ||
+				!message.to?.endsWith("@runtime.fixture.example") ||
+				!message.subject?.startsWith("Verify your ") ||
+				!message.text
+			)
+				throw new Error("Unexpected isolated verification email.");
+			captureMail({
+				to: message.to,
+				subject: message.subject,
+				text: message.text,
+			});
+			return Response.json({
+				success: true,
+				result: { queued: [message.to] },
+			});
+		}
 		if (new URL(request.url).origin === runtimeFixtureAssetOrigin) {
 			const data = await verifyAssetRequest(request, runtimeFixtureAssetSecret);
 			return data && request.headers.get("content-type") === "image/jpeg"
