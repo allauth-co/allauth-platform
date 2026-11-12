@@ -207,7 +207,7 @@ export function selectProjectEngine(
 			trustedIP(request) {
 				// Hosted auth and app proxies verify the forwarded client address.
 				if (hosted) return request.headers.get("x-real-ip");
-				if (request.headers.has("allauth-proxy-signature"))
+				if (request.headers.get("allauth-proxy-signature"))
 					return request.headers.get("allauth-proxy-ip");
 				// Direct workspace security calls use the same ingress address as the legacy console.
 				const path = new URL(request.url).pathname;

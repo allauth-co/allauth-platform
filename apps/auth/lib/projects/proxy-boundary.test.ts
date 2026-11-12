@@ -92,6 +92,18 @@ describe("signed project proxy input boundaries", () => {
 			),
 		).rejects.toMatchObject({ statusCode: 403 });
 	});
+	it("rejects a present but empty signature during explicit proxy verification", async () => {
+		const bytes = new TextEncoder().encode("fixture");
+		const headers = proxyHeaders(bytes);
+		headers.set("allauth-proxy-signature", "");
+		await expect(
+			verifiedProjectRequest(
+				new Request(address, { method: "POST", headers, body: bytes }),
+				project,
+				environment,
+			),
+		).rejects.toMatchObject({ statusCode: 403 });
+	});
 	it("rejects an oversized declared payload before reading its body", async () => {
 		const bytes = new TextEncoder().encode("fixture");
 		const headers = proxyHeaders(bytes);

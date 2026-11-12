@@ -7,6 +7,20 @@ import type { Project } from "./registry";
 
 const maximumProxyBodyBytes = 262144;
 const proxyBodyDeadlineMs = 5000;
+const proxyHeaders = [
+	"allauth-proxy-signature",
+	"allauth-proxy-timestamp",
+	"allauth-proxy-origin",
+	"allauth-proxy-ip",
+] as const;
+
+/** Ordinary project requests carry no app-proxy assertions. */
+export function withoutProjectProxyAssertions(request: Request): Request {
+	if (!proxyHeaders.some((name) => request.headers.has(name))) return request;
+	const headers = new Headers(request.headers);
+	for (const name of proxyHeaders) headers.delete(name);
+	return new Request(request, { headers });
+}
 
 async function readProxyBody(reader: ReadableStreamDefaultReader<Uint8Array>) {
 	const chunks: Uint8Array[] = [];
@@ -75,7 +89,7 @@ export async function verifiedProjectRequest(
 	{ consumeBody = false }: { consumeBody?: boolean } = {},
 ): Promise<Request> {
 	const signature = request.headers.get("allauth-proxy-signature");
-	if (!signature) return request;
+	if (signature === null) return withoutProjectProxyAssertions(request);
 	const timestamp = request.headers.get("allauth-proxy-timestamp") || "";
 	const origin = request.headers.get("allauth-proxy-origin") || "";
 	const ip = request.headers.get("allauth-proxy-ip") || "";

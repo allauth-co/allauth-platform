@@ -3,7 +3,7 @@ import { APIError } from "better-auth";
 import { getSessionCookie } from "better-auth/cookies";
 import type { AuthEnvironment } from "../configuration";
 import { verifyLegacySessionCookie } from "./legacy-session-cookie";
-import { verifiedProjectRequest } from "./proxy";
+import { verifiedProjectRequest, withoutProjectProxyAssertions } from "./proxy";
 import type { Project } from "./registry";
 import type { SessionCheckCoordinator } from "./session-check-coordinator";
 import { createSessionCheckCoordinator } from "./session-check-coordinator";
@@ -97,7 +97,7 @@ export async function prepareProjectAuthentication(
 	} = {},
 ) {
 	const signed = Boolean(request.headers.get("allauth-proxy-signature"));
-	let verified = request;
+	let verified = signed ? request : withoutProjectProxyAssertions(request);
 	if (signed) {
 		try {
 			verified = await verifiedProjectRequest(request, project, environment, {
