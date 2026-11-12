@@ -4,9 +4,11 @@ import * as oauth from "oauth4webapi";
 import type { Pool, PoolClient } from "pg";
 import * as z from "zod";
 import { validAvatarPath } from "../avatars/protocol";
+import { reservedProjectEmailError } from "../project-email-alias-config";
 import type { LegacyMfaKeys } from "./legacy-mfa-record";
 import { readLegacySessionCookie } from "./legacy-session-cookie";
 import { markOwnedCallbackFailure } from "./owned-project-callback-failure";
+import type { OwnedProjectEmailAliases } from "./owned-project-email-aliases";
 import type { ProjectUser } from "./owned-project-engine-store";
 import type { SsoFetch } from "./owned-project-sso-network";
 import {
@@ -98,6 +100,7 @@ export interface OwnedProjectSsoOptions {
 	tokenKeys?: LegacyMfaKeys;
 	defaultErrorURL: string;
 	signUpEnabled: boolean;
+	emailAliases?: Pick<OwnedProjectEmailAliases, "reserved">;
 	/** The generated SP subset uses the selected transport's ACS for every request. */
 	saml?: boolean | "generated-sp" | "encrypted-fixture";
 	customSamlTransport?: ProjectCustomSamlTransport;
@@ -178,6 +181,7 @@ export function createOwnedProjectSso(options: OwnedProjectSsoOptions) {
 		options.database,
 		options.project.schemaName,
 		options.tokenKeys ?? { secret: options.signingSecret },
+		options.emailAliases,
 	);
 	const saml =
 		options.saml &&
@@ -236,9 +240,16 @@ export function createOwnedProjectSso(options: OwnedProjectSsoOptions) {
 	) {
 		const target =
 			(flow?.errorURL && allowedReturn(flow.errorURL, origin, origins)) ||
-			(flow && allowedReturn(flow.callbackURL, origin, origins)) ||
+			(code !== reservedProjectEmailError.code &&
+				flow &&
+				allowedReturn(flow.callbackURL, origin, origins)) ||
 			new URL(defaultError!.href);
 		target.searchParams.set("error", code);
+		if (code === reservedProjectEmailError.code)
+			target.searchParams.set(
+				"error_description",
+				reservedProjectEmailError.message,
+			);
 		const response = new Response(null, {
 			status: 302,
 			headers: {

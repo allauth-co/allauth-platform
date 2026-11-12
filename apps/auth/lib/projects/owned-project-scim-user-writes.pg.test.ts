@@ -11,7 +11,9 @@ import {
 	revokeAuthenticationChallenges,
 	revokeUserGrants,
 } from "../enterprise";
+import { projectEmailAliases } from "../project-email-aliases";
 import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
+import { createOwnedProjectEmailAliases } from "./owned-project-email-aliases";
 import { ownedSCIMScopedKey } from "./owned-project-scim-authority";
 import {
 	ownedSCIMError,
@@ -32,6 +34,10 @@ const baseURL = `${origin}${basePath}`;
 const secret = "isolated-scim-user-writer-credential-pepper";
 const provisioningDomainId = "organization:fixture-org";
 const patchOp = "urn:ietf:params:scim:api:messages:2.0:PatchOp";
+const reservedAliases = {
+	"reserved-owned@scim.example": "scim-alias-owner",
+	"reserved-native@scim.example": "scim-alias-owner",
+};
 
 function request(path: string, token: string, method = "GET", body?: object) {
 	return new Request(`${baseURL}/scim/v2/${path}`, {
@@ -60,6 +66,10 @@ async function nativeFixture(
 				},
 			},
 			plugins: [
+				projectEmailAliases({
+					project: "scim-writer-fixture",
+					readConfiguration: () => JSON.stringify(reservedAliases),
+				}),
 				organization({ teams: { enabled: true } }),
 				{
 					id: "fixture-directory-ownership",
@@ -200,6 +210,11 @@ describe.skipIf(!existsSync(fixturePath))(
 			reader = createOwnedProjectSCIMResources(options);
 			writer = createOwnedProjectSCIMUserWrites({
 				...options,
+				emailAliases: createOwnedProjectEmailAliases(
+					database,
+					schema,
+					reservedAliases,
+				),
 				async admitProfile({ email }) {
 					return email === "denied@scim.example"
 						? ownedSCIMError(403, "Fixture profile admission denied")
@@ -239,6 +254,98 @@ describe.skipIf(!existsSync(fixturePath))(
 				)
 			).rows[0]!.userId;
 		}
+
+		it("rejects reserved aliases on new SCIM accounts while preserving existing directory identities", async () => {
+			await database.query(
+				`INSERT INTO "user" (id,email,name,"emailVerified") VALUES ('scim-alias-owner','canonical-owner@scim.example','Alias owner',TRUE)`,
+			);
+			const profile = (email: string, externalId: string) => ({
+				schemas: [scimUserSchema],
+				externalId,
+				userName: email,
+			});
+			const calls = [
+				{ dispatch: native.handler, alias: "reserved-native@scim.example" },
+				{ dispatch: writer, alias: "reserved-owned@scim.example" },
+			];
+			for (const { dispatch, alias } of calls) {
+				const denied = await dispatch(
+					request(
+						"Users",
+						token,
+						"POST",
+						profile(alias.toUpperCase(), "reserved-create"),
+					),
+				);
+				expect(denied?.status, await denied?.clone().text()).toBe(422);
+				expect(denied?.headers.get("content-type")).toContain(
+					"application/scim+json",
+				);
+				expect(await denied?.json()).toEqual({
+					schemas: ["urn:ietf:params:scim:api:messages:2.0:Error"],
+					status: "422",
+					detail: "User already exists. Use another email.",
+				});
+			}
+			expect(
+				(
+					await database.query(
+						`SELECT id FROM "user" WHERE email=ANY($1::text[])
+				 UNION ALL SELECT id FROM "scimUser" WHERE "externalId"='reserved-create'`,
+						[Object.keys(reservedAliases)],
+					)
+				).rows,
+			).toEqual([]);
+
+			for (const [index, { dispatch, alias }] of calls.entries()) {
+				const externalId = `existing-reserved-${index}`;
+				const other = calls[1 - index]!.dispatch;
+				const created = await resource(
+					await other(
+						request(
+							"Users",
+							token,
+							"POST",
+							profile(`normal-${index}@scim.example`, externalId),
+						),
+					),
+					201,
+				);
+				const owner = await userId(created.id);
+				const updated = await resource(
+					await dispatch(
+						request(
+							`Users/${created.id}`,
+							token,
+							"PUT",
+							profile(alias, externalId),
+						),
+					),
+					200,
+				);
+				expect(updated.id).toBe(created.id);
+				expect(await userId(updated.id)).toBe(owner);
+				expect(updated.body).toMatchObject({ userName: alias, externalId });
+				expect(
+					(
+						await database.query(`SELECT email FROM "user" WHERE id=$1`, [
+							owner,
+						])
+					).rows,
+				).toEqual([{ email: alias }]);
+				const removed = await writer(
+					request(`Users/${created.id}`, token, "DELETE"),
+				);
+				expect(removed?.status, await removed?.clone().text()).toBe(204);
+				const restored = await resource(
+					await dispatch(
+						request("Users", token, "POST", profile(alias, externalId)),
+					),
+					201,
+				);
+				expect(await userId(restored.id)).toBe(owner);
+			}
+		});
 
 		it("writes canonical owned creates and reads them with the legacy engine, then replaces a legacy row", async () => {
 			const profile = {

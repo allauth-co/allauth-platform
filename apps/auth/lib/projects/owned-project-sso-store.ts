@@ -1,8 +1,10 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { Pool, PoolClient } from "pg";
 import * as z from "zod";
+import { reservedProjectEmailError } from "../project-email-alias-config";
 import type { LegacyMfaKeys } from "./legacy-mfa-record";
 import { sealLegacyMfaRecord } from "./legacy-mfa-record";
+import type { OwnedProjectEmailAliases } from "./owned-project-email-aliases";
 import { createProjectEngineStore } from "./owned-project-engine-store";
 import { projectOrganizations } from "./owned-project-organization-store";
 import { checkedProjectSchema } from "./validation";
@@ -202,6 +204,7 @@ export function createProjectSsoStore(
 	database: Pool,
 	schemaName: string,
 	keys: LegacyMfaKeys,
+	emailAliases?: Pick<OwnedProjectEmailAliases, "reserved">,
 ) {
 	const schema = checkedProjectSchema(schemaName);
 	const engine = createProjectEngineStore(database, schema);
@@ -414,6 +417,8 @@ export function createProjectSsoStore(
 			} else {
 				if (!signUpEnabled || !trustedDomain)
 					return "account_not_linked" as const;
+				if (emailAliases?.reserved(identity.email))
+					return reservedProjectEmailError.code;
 				const created = await client.query<{ id: string }>(
 					`INSERT INTO "${schema}"."user" (id,email,name,image,"emailVerified","isAnonymous","twoFactorEnabled")
 					VALUES ($1,$2,$3,$4,FALSE,FALSE,FALSE) ON CONFLICT (email) DO NOTHING RETURNING id`,

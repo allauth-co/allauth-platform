@@ -20,6 +20,7 @@ import { freshFeatureSession, isServerTokenRequest } from "../features/helpers";
 import { applicationMfaCallback } from "../mfa-continuation";
 import { oauthBrowserReturnPath } from "../oauth-browser";
 import type { ProjectEmailAliasMap } from "../project-email-alias-config";
+import { reservedProjectEmailError } from "../project-email-alias-config";
 import type { NativePasskeyCapability } from "../project-native-passkeys";
 import type { LegacyMfaKeys } from "./legacy-mfa-record";
 import {
@@ -236,6 +237,7 @@ interface OwnedProjectEngineOptions {
 		| "trustedOrigins"
 		| "signingSecret"
 		| "signUpEnabled"
+	| "emailAliases"
 		| "complete"
 	>;
 	scim?: { credentialHashSecret: string };
@@ -2196,6 +2198,7 @@ export function createOwnedProjectEngine(
 		beforeGuestDelete &&
 		createOwnedProjectGuest({
 			store,
+			emailAliases,
 			beforeDelete: beforeGuestDelete,
 			async revoke(client, request, userId, path) {
 				const removed = await store.revoke(
@@ -2273,6 +2276,12 @@ export function createOwnedProjectEngine(
 				);
 			if (await security.admit(client, request)) return securityBlocked();
 			const user = await guest.create(client);
+			if (!user)
+				return failure(
+					reservedProjectEmailError.status,
+					reservedProjectEmailError.code,
+					reservedProjectEmailError.message,
+				);
 			const signedIn = await createSession(client, user, request, true, path);
 			return json(
 				{ token: signedIn.token, user: signedIn.user },
@@ -2286,6 +2295,7 @@ export function createOwnedProjectEngine(
 		options.walletOrigin &&
 		createOwnedProjectWallet({
 			store,
+			emailAliases,
 			schemaName: options.project.schemaName,
 			signingOrigin: options.walletOrigin,
 			signUpEnabled: policy.signUpEnabled,
@@ -2468,6 +2478,7 @@ export function createOwnedProjectEngine(
 		options.sso &&
 		createOwnedProjectSso({
 			...options.sso,
+			emailAliases,
 			database: options.database,
 			project: options.project,
 			baseURL: origin,
@@ -2528,6 +2539,7 @@ export function createOwnedProjectEngine(
 		scimAuthority &&
 		createOwnedProjectSCIMUserWrites({
 			...scimAuthority,
+			emailAliases,
 			async admitProfile({ client, request, email }) {
 				return (await security.admit(client, request, {
 					email,

@@ -1,6 +1,8 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import type { PoolClient } from "pg";
+import { reservedProjectEmailError } from "../project-email-alias-config";
+import type { OwnedProjectEmailAliases } from "./owned-project-email-aliases";
 import type { OwnedProjectSCIMConnection } from "./owned-project-scim-authority";
 import { ownedSCIMScopedKey } from "./owned-project-scim-authority";
 import {
@@ -382,6 +384,7 @@ export async function ownedSCIMDirectoryWriter(
 	connection: OwnedProjectSCIMConnection,
 	request: Request,
 	admitProfile: SCIMProfileAdmission,
+	emailAliases?: Pick<OwnedProjectEmailAliases, "reserved">,
 ) {
 	const domain = connection.provisioningDomainId;
 	const connectionId = connection.connectionId;
@@ -435,6 +438,11 @@ export async function ownedSCIMDirectoryWriter(
 				userId,
 			});
 			if (denial) throw denial;
+			if (emailAliases?.reserved(profile.primaryEmail))
+				throw ownedSCIMError(
+					reservedProjectEmailError.status,
+					reservedProjectEmailError.message,
+				);
 			await client.query(
 				`INSERT INTO "user" (id, email, name, "emailVerified", role) VALUES ($1, $2, $3, false, 'user')`,
 				[userId, profile.primaryEmail, profile.displayName],

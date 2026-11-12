@@ -1,6 +1,7 @@
 import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
 import type { PoolClient } from "pg";
 import * as z from "zod";
+import { reservedProjectEmailError } from "../project-email-alias-config";
 import { markOwnedCallbackFailure } from "./owned-project-callback-failure";
 import type { OwnedProjectSsoOptions } from "./owned-project-sso";
 import type { ProjectCustomSamlTransport } from "./owned-project-sso-saml-eligibility";
@@ -172,9 +173,15 @@ export function createOwnedProjectSaml(options: {
 	function failure(code: string, flow?: SsoState, receiver?: string) {
 		const destination =
 			returnURL(flow?.errorURL, receiver) ||
-			returnURL(flow?.callbackURL, receiver) ||
+			(code !== reservedProjectEmailError.code &&
+				returnURL(flow?.callbackURL, receiver)) ||
 			new URL(options.defaultError.href);
 		destination.searchParams.set("error", code);
+		if (code === reservedProjectEmailError.code)
+			destination.searchParams.set(
+				"error_description",
+				reservedProjectEmailError.message,
+			);
 		const response = finish(
 			new Response(null, {
 				status: 302,

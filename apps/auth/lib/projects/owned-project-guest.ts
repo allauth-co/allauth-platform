@@ -7,6 +7,7 @@ import {
 	lockProjectUserDeletion,
 	releaseProjectUserDeletion,
 } from "./owned-project-account-deletion";
+import type { OwnedProjectEmailAliases } from "./owned-project-email-aliases";
 import type { createProjectEngineStore } from "./owned-project-engine-store";
 
 type Store = ReturnType<typeof createProjectEngineStore>;
@@ -18,6 +19,7 @@ type Erasure =
 /** Read and retire guest records using the same deletion fence as other project accounts. */
 export function createOwnedProjectGuest(options: {
 	store: Store;
+	emailAliases?: Pick<OwnedProjectEmailAliases, "reserved">;
 	beforeDelete: OwnedProjectAccountDeletionOptions["beforeDelete"];
 	revoke(
 		client: PoolClient,
@@ -56,10 +58,12 @@ export function createOwnedProjectGuest(options: {
 	return {
 		async create(client: PoolClient) {
 			const id = randomUUID();
+			const email = `${id}@anonymous.placeholder.invalid`;
+			if (options.emailAliases?.reserved(email)) return null;
 			await client.query(
 				`INSERT INTO "user" (id,name,email,role,"emailVerified","isAnonymous")
 				 VALUES ($1,'Anonymous',$2,'guest',FALSE,TRUE)`,
-				[id, `${id}@anonymous.placeholder.invalid`],
+				[id, email],
 			);
 			const user = await store.lockUser(client, id);
 			if (!user)

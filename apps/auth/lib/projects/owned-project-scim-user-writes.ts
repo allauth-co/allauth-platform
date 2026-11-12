@@ -1,3 +1,4 @@
+import type { OwnedProjectEmailAliases } from "./owned-project-email-aliases";
 import { createOwnedProjectSCIMWriteAuthority } from "./owned-project-scim-authority";
 import type { SCIMProfileAdmission } from "./owned-project-scim-directory-writes";
 import { ownedSCIMDirectoryWriter } from "./owned-project-scim-directory-writes";
@@ -25,6 +26,7 @@ export function createOwnedProjectSCIMUserWrites(
 	options: Parameters<typeof createOwnedProjectSCIMWriteAuthority>[0] & {
 		baseURL: string;
 		admitProfile: SCIMProfileAdmission;
+		emailAliases?: Pick<OwnedProjectEmailAliases, "reserved">;
 	},
 ) {
 	if (typeof options.admitProfile !== "function")
@@ -65,6 +67,7 @@ export function createOwnedProjectSCIMUserWrites(
 							connection,
 							request,
 							options.admitProfile,
+							options.emailAliases,
 						);
 						if (id && method === "DELETE") {
 							await writer.remove(id);

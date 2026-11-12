@@ -10,6 +10,8 @@ import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { defaultAuthPolicy } from "../auth-policy/policy";
 import { resolveEnterpriseUser } from "../enterprise";
+import type { ProjectEmailAliasMap } from "../project-email-alias-config";
+import { projectEmailAliases } from "../project-email-aliases";
 import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
 import { createOwnedProjectEngine } from "./owned-project-engine";
 import { createProjectEngineStore } from "./owned-project-engine-store";
@@ -59,6 +61,7 @@ type LegacyDatabase = Kysely<Record<string, Record<string, unknown>>>;
 async function nativeSso(
 	db: LegacyDatabase,
 	resolvePrivateKey: NonNullable<OwnedProjectSsoOptions["resolvePrivateKey"]>,
+	aliases: ProjectEmailAliasMap = {},
 ) {
 	return (
 		await getTestInstance(
@@ -77,6 +80,10 @@ async function nativeSso(
 					accountLinking: { enabled: true, trustedProviders: [] },
 				},
 				plugins: [
+					projectEmailAliases({
+						project: slug,
+						readConfiguration: () => JSON.stringify(aliases),
+					}),
 					{
 						id: "fixture-allauth-directory",
 						schema: {
@@ -780,6 +787,106 @@ describe.skipIf(!existsSync(fixturePath))(
 					[organization, session?.user.id],
 				);
 				expect(membership.rows).toEqual(invited ? [] : [{ role: "member" }]);
+			}
+		});
+
+		it("preserves reserved OIDC email errors and an existing provider subject binding", async () => {
+			if (!nativeDatabase)
+				throw new Error("Expected the scoped fixture database.");
+			const alias = "oidc-reserved@corp.example";
+			const aliases = { [alias]: decoy };
+			const provider = "reserved-oidc-fixture";
+			const redirect = `${origin}/api/auth/sso/callback/${provider}`;
+			const defaultErrorURL = `${origin}/api/auth/error`;
+			const claimedSubject = randomUUID();
+			await database.query(
+				`INSERT INTO "${schema}"."ssoProvider"(id,"providerId",issuer,"oidcConfig","userId",domain,"domainVerified")
+				 VALUES ($1,$2,$3,$4,$5,'corp.example',TRUE)`,
+				[
+					randomUUID(),
+					provider,
+					issuer,
+					JSON.stringify({ ...config, userInfoEndpoint: undefined }),
+					decoy,
+				],
+			);
+			const legacy = await nativeSso(
+				nativeDatabase,
+				resolvePrivateKey,
+				aliases,
+			);
+			const candidate = createOwnedProjectEngine({
+				database,
+				project: { slug, schemaName: schema },
+				baseURL: origin,
+				basePath: "/api/auth",
+				trustedOrigins: [],
+				signingSecret: secret,
+				policy: defaultAuthPolicy,
+				trustedIP: () => "203.0.113.51",
+				emailAliases: aliases,
+				sso: { defaultErrorURL, fetch: network },
+			});
+			const callbackFor = async (
+				dispatch: (request: Request) => Promise<Response>,
+				subject: string,
+				errorCallbackURL?: string,
+			) => {
+				const callback = await authorize(
+					await dispatch(
+						startRequest({ ...body, providerId: provider, errorCallbackURL }),
+					),
+					redirect,
+					{ email: alias, subject },
+				);
+				return dispatch(callback);
+			};
+			for (const dispatch of [legacy.handler, candidate.dispatch]) {
+				for (const errorCallbackURL of [
+					undefined,
+					`${origin}/auth-error?from=oidc`,
+				]) {
+					const denied = await callbackFor(
+						dispatch,
+						claimedSubject,
+						errorCallbackURL,
+					);
+					expect(denied.status).toBe(302);
+					const target = new URL(denied.headers.get("location")!);
+					const expected = new URL(errorCallbackURL ?? defaultErrorURL);
+					expect(target.pathname).toBe(expected.pathname);
+					expect(Object.fromEntries(target.searchParams)).toEqual({
+						...Object.fromEntries(expected.searchParams),
+						error: "USER_ALREADY_EXISTS_USE_ANOTHER_EMAIL",
+						error_description: "User already exists. Use another email.",
+					});
+				}
+			}
+			expect(
+				(
+					await database.query(
+						`SELECT id FROM "${schema}"."user" WHERE email=$1
+				 UNION ALL SELECT id FROM "${schema}"."account" WHERE "providerId"=$2`,
+						[alias, provider],
+					)
+				).rows,
+			).toEqual([]);
+			await database.query(
+				`INSERT INTO "${schema}"."account"(id,"accountId","providerId","userId","updatedAt")
+				 VALUES ($1,$2,$3,$4,statement_timestamp())`,
+				[randomUUID(), claimedSubject, provider, decoy],
+			);
+			for (const dispatch of [legacy.handler, candidate.dispatch]) {
+				const response = await callbackFor(dispatch, claimedSubject);
+				expect(response.headers.get("location")).toBe(destination);
+				const session = await legacy.api.getSession({
+					headers: new Headers({ cookie: cookies(response) }),
+					query: { disableRefresh: true },
+				});
+				expect(session?.user).toMatchObject({
+					id: decoy,
+					email: providerEmail,
+				});
 			}
 		});
 

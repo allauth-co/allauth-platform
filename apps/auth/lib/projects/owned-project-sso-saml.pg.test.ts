@@ -23,6 +23,8 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { defaultAuthPolicy } from "../auth-policy/policy";
 import { allauthControl } from "../control";
 import { resolveEnterpriseUser } from "../enterprise";
+import type { ProjectEmailAliasMap } from "../project-email-alias-config";
+import { projectEmailAliases } from "../project-email-aliases";
 import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
 import { createOwnedProjectEngine } from "./owned-project-engine";
 import { createProjectEngineStore } from "./owned-project-engine-store";
@@ -84,6 +86,7 @@ const providerId = "fixture-saml";
 const secret = "synthetic-project-saml-fixture-signing-secret";
 const prefix = `allauth_project_${slug}`;
 const destination = `${origin}/account?enterprise=saml`;
+const defaultErrorURL = `${origin}/api/auth/error`;
 const acs = `${origin}/api/auth/sso/saml2/sp/acs/${providerId}`;
 const subject = "opaque-native-saml-directory-subject";
 const managedEmail = "directory-profile@corp.example";
@@ -110,7 +113,11 @@ const scopedKey = (parts: string[]) =>
 	createHash("sha256").update(JSON.stringify(parts)).digest("base64url");
 type LegacyDatabase = Kysely<Record<string, Record<string, unknown>>>;
 
-async function nativeSso(db: LegacyDatabase, withAudit = false) {
+async function nativeSso(
+	db: LegacyDatabase,
+	withAudit = false,
+	aliases: ProjectEmailAliasMap = {},
+) {
 	return (
 		await getTestInstance(
 			{
@@ -125,6 +132,10 @@ async function nativeSso(db: LegacyDatabase, withAudit = false) {
 					accountLinking: { enabled: true, trustedProviders: [] },
 				},
 				plugins: [
+					projectEmailAliases({
+						project: slug,
+						readConfiguration: () => JSON.stringify(aliases),
+					}),
 					...(withAudit
 						? [
 								allauthControl({
@@ -172,18 +183,18 @@ async function nativeSso(db: LegacyDatabase, withAudit = false) {
 	).auth;
 }
 
-function startRequest() {
+function startRequest(input = body) {
 	return new Request(`${origin}/api/auth/sign-in/sso`, {
 		method: "POST",
 		headers: { origin, "content-type": "application/json" },
-		body: JSON.stringify(body),
+		body: JSON.stringify(input),
 	});
 }
 
-function callback(samlResponse: string, relay?: string) {
+function callback(samlResponse: string, relay?: string, receiver = acs) {
 	const data = new URLSearchParams({ SAMLResponse: samlResponse });
 	if (relay) data.set("RelayState", relay);
-	return new Request(acs, {
+	return new Request(receiver, {
 		method: "POST",
 		headers: {
 			origin: idpOrigin,
@@ -203,7 +214,7 @@ function cookies(response: Response) {
 		.join("; ");
 }
 
-async function pending(response: Response) {
+async function pending(response: Response, receiver = acs) {
 	expect(response.status, await response.clone().text()).toBe(200);
 	const result = (await response.json()) as { url: string; redirect: boolean };
 	expect(result.redirect).toBe(true);
@@ -213,7 +224,7 @@ async function pending(response: Response) {
 	expect(raw).toBeTruthy();
 	const xml = inflateRawSync(Buffer.from(raw!, "base64")).toString("utf8");
 	const root = new DOMParser().parseFromString(xml, "text/xml").documentElement;
-	expect(root?.getAttribute("AssertionConsumerServiceURL")).toBe(acs);
+	expect(root?.getAttribute("AssertionConsumerServiceURL")).toBe(receiver);
 	const requestId = root?.getAttribute("ID");
 	const relay = redirect.searchParams.get("RelayState");
 	expect(requestId).toBeTruthy();
@@ -228,6 +239,8 @@ function signedResponse(
 		issuer?: string;
 		audience?: string;
 		recipient?: string;
+		receiver?: string;
+		email?: string;
 		expired?: boolean;
 		signature?: "assertion" | "response" | "both" | "none";
 	} = {},
@@ -239,15 +252,16 @@ function signedResponse(
 	const assertionId = options.assertionId ?? `_${randomUUID()}`;
 	const actualIssuer = options.issuer ?? issuer;
 	const signature = options.signature ?? "assertion";
-	let xml = `<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="_${randomUUID()}" Version="2.0" IssueInstant="${now}" Destination="${acs}" InResponseTo="${requestId}">
+	const receiver = options.receiver ?? acs;
+	let xml = `<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="_${randomUUID()}" Version="2.0" IssueInstant="${now}" Destination="${receiver}" InResponseTo="${requestId}">
 		<saml:Issuer>${actualIssuer}</saml:Issuer>
 		<samlp:Status><samlp:StatusCode Value="urn:oasis:names:tc:SAML:2.0:status:Success"/></samlp:Status>
 		<saml:Assertion ID="${assertionId}" Version="2.0" IssueInstant="${now}">
 			<saml:Issuer>${actualIssuer}</saml:Issuer>
-			<saml:Subject><saml:NameID>${subject}</saml:NameID><saml:SubjectConfirmation Method="urn:oasis:names:tc:SAML:2.0:cm:bearer"><saml:SubjectConfirmationData InResponseTo="${requestId}" Recipient="${options.recipient ?? acs}" NotOnOrAfter="${expires}"/></saml:SubjectConfirmation></saml:Subject>
+			<saml:Subject><saml:NameID>${subject}</saml:NameID><saml:SubjectConfirmation Method="urn:oasis:names:tc:SAML:2.0:cm:bearer"><saml:SubjectConfirmationData InResponseTo="${requestId}" Recipient="${options.recipient ?? receiver}" NotOnOrAfter="${expires}"/></saml:SubjectConfirmation></saml:Subject>
 			<saml:Conditions NotOnOrAfter="${expires}"><saml:AudienceRestriction><saml:Audience>${options.audience ?? sp}</saml:Audience></saml:AudienceRestriction></saml:Conditions>
 			<saml:AuthnStatement AuthnInstant="${now}" SessionIndex="_${randomUUID()}"><saml:AuthnContext><saml:AuthnContextClassRef>urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport</saml:AuthnContextClassRef></saml:AuthnContext></saml:AuthnStatement>
-			<saml:AttributeStatement><saml:Attribute Name="corpEmail"><saml:AttributeValue>${decoyEmail}</saml:AttributeValue></saml:Attribute></saml:AttributeStatement>
+			<saml:AttributeStatement><saml:Attribute Name="corpEmail"><saml:AttributeValue>${options.email ?? decoyEmail}</saml:AttributeValue></saml:Attribute></saml:AttributeStatement>
 		</saml:Assertion>
 	</samlp:Response>`;
 
@@ -928,6 +942,85 @@ describe.skipIf(!existsSync(fixturePath))(
 			await assertSession(
 				await native.handler(callback(signed.encoded, state.relay)),
 			);
+		});
+
+		it("preserves reserved SAML email errors and an existing provider subject binding", async () => {
+			if (!nativeDatabase)
+				throw new Error("Expected the scoped fixture database.");
+			const email = "saml-reserved@corp.example";
+			const aliases = { [email]: decoy };
+			const provider = "reserved-saml-fixture";
+			const receiver = `${origin}/api/auth/sso/saml2/sp/acs/${provider}`;
+			await database.query(
+				`INSERT INTO "${schema}"."ssoProvider"(id,"providerId",issuer,"samlConfig","userId",domain,"domainVerified")
+				 VALUES ($1,$2,$3,$4,$5,'corp.example',TRUE)`,
+				[randomUUID(), provider, sp, JSON.stringify(configuration()), decoy],
+			);
+			const legacy = await nativeSso(nativeDatabase, false, aliases);
+			const candidate = createOwnedProjectEngine({
+				database,
+				project: { slug, schemaName: schema },
+				baseURL: origin,
+				basePath: "/api/auth",
+				trustedOrigins: [],
+				signingSecret: secret,
+				policy: defaultAuthPolicy,
+				trustedIP: () => "203.0.113.82",
+				emailAliases: aliases,
+				sso: { defaultErrorURL, saml: true },
+			});
+			const complete = async (
+				dispatch: (request: Request) => Promise<Response>,
+				errorCallbackURL?: string,
+			) => {
+				const input = { ...body, providerId: provider, errorCallbackURL };
+				const state = await pending(
+					await dispatch(startRequest(input)),
+					receiver,
+				);
+				const signed = signedResponse(state.requestId, { email, receiver });
+				return dispatch(callback(signed.encoded, state.relay, receiver));
+			};
+			for (const dispatch of [legacy.handler, candidate.dispatch]) {
+				for (const errorCallbackURL of [
+					undefined,
+					`${origin}/saml-error?custom=1`,
+				]) {
+					const denied = await complete(dispatch, errorCallbackURL);
+					expect(denied.status).toBe(302);
+					const target = new URL(denied.headers.get("location")!);
+					const expected = new URL(errorCallbackURL ?? defaultErrorURL);
+					expect(target.pathname).toBe(expected.pathname);
+					expect(Object.fromEntries(target.searchParams)).toEqual({
+						...Object.fromEntries(expected.searchParams),
+						error: "USER_ALREADY_EXISTS_USE_ANOTHER_EMAIL",
+						error_description: "User already exists. Use another email.",
+					});
+				}
+			}
+			expect(
+				(
+					await database.query(
+						`SELECT id FROM "${schema}"."user" WHERE email=$1
+				 UNION ALL SELECT id FROM "${schema}"."account" WHERE "providerId"=$2`,
+						[email, provider],
+					)
+				).rows,
+			).toEqual([]);
+			await database.query(
+				`INSERT INTO "${schema}"."account"(id,"accountId","providerId","userId","updatedAt")
+				 VALUES ($1,$2,$3,$4,statement_timestamp())`,
+				[randomUUID(), subject, provider, decoy],
+			);
+			for (const dispatch of [legacy.handler, candidate.dispatch]) {
+				const response = await complete(dispatch);
+				expect(response.headers.get("location")).toBe(destination);
+				const session = await legacy.api.getSession({
+					headers: new Headers({ cookie: cookies(response) }),
+					query: { disableRefresh: true },
+				});
+				expect(session?.user).toMatchObject({ id: decoy, email: decoyEmail });
+			}
 		});
 
 		it("uses the configured private key for signed Redirect AuthnRequests", async () => {

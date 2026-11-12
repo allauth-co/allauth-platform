@@ -4,10 +4,12 @@ import { getAddress, verifyMessage } from "viem";
 import { parseSiweMessage, validateSiweMessage } from "viem/siwe";
 import * as z from "zod";
 import { walletMessageOriginMatches } from "../features/helpers";
+import { reservedProjectEmailError } from "../project-email-alias-config";
 import {
 	accountLinkError,
 	accountLinkJson,
 } from "./owned-project-account-links";
+import type { OwnedProjectEmailAliases } from "./owned-project-email-aliases";
 import type {
 	createProjectEngineStore,
 	ProjectUser,
@@ -52,6 +54,7 @@ export function createOwnedProjectWallet(options: {
 	schemaName: string;
 	signingOrigin: string;
 	signUpEnabled: boolean;
+	emailAliases?: Pick<OwnedProjectEmailAliases, "reserved">;
 	readBody(request: Request): Promise<unknown>;
 	admit(
 		client: PoolClient,
@@ -91,6 +94,23 @@ export function createOwnedProjectWallet(options: {
 			const id = randomUUID();
 			const placeholder = `${address.toLowerCase()}@siwe.placeholder.invalid`;
 			for (const candidate of new Set([email, placeholder])) {
+				if (options.emailAliases?.reserved(candidate)) {
+					// A claimed caller email falls back to the wallet address before user creation.
+					if (
+						candidate !== placeholder &&
+						(
+							await client.query('SELECT 1 FROM "user" WHERE email=$1', [
+								candidate,
+							])
+						).rowCount
+					)
+						continue;
+					return accountLinkError(
+						reservedProjectEmailError.status,
+						reservedProjectEmailError.code,
+						reservedProjectEmailError.message,
+					);
+				}
 				const result = await client.query(
 					`INSERT INTO "user" (id,name,email,image,role,"emailVerified","isAnonymous")
 					 VALUES ($1,$2,$3,'','user',FALSE,FALSE)
