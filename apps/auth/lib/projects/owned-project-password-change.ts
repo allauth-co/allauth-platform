@@ -8,6 +8,7 @@ import {
 import type { AuthPolicy } from "../auth-policy/policy";
 import { authPolicySchema } from "../auth-policy/policy";
 import { clerkCompatiblePasswords } from "../clerk-password";
+import type { ControlEventInput } from "../control/types";
 import type { ProjectSession, ProjectUser } from "./owned-project-engine-store";
 import {
 	createProjectEngineStore,
@@ -22,6 +23,21 @@ const changeInput = z.object({
 	revokeOtherSessions: z.boolean().optional(),
 });
 const enrollmentInput = changeInput.pick({ newPassword: true });
+const changePath = "/change-password";
+const changeFailures = {
+	UNAUTHORIZED: [401, "Unauthorized"],
+	PASSWORD_TOO_LONG: [400, "Password too long"],
+	CREDENTIAL_ACCOUNT_NOT_FOUND: [400, "Credential account not found"],
+	INVALID_PASSWORD: [400, "Invalid password"],
+	PASSWORD_COMPROMISED: [
+		400,
+		"The password you entered has been compromised. Please choose a different password.",
+	],
+	PASSWORD_CHANGE_UNAVAILABLE: [
+		503,
+		"Password changes are temporarily unavailable.",
+	],
+} as const;
 
 type PasswordSafety = "allowed" | "breached" | "unavailable";
 export interface ProjectPasswordAuthority {
@@ -33,6 +49,9 @@ export interface OwnedProjectPasswordChangeOptions {
 	project: Pick<Project, "schemaName">;
 	policy: AuthPolicy;
 	checkPasswordSafety(password: string): Promise<PasswordSafety>;
+	auditContext(
+		request: Request,
+	): Pick<ControlEventInput, "ipAddress" | "userAgent">;
 	/** Read the current realm's authoritative session, using the browser session cookie. */
 	readAuthority(request: Request): Promise<ProjectPasswordAuthority | null>;
 	/** Lock the current user and its live session in that order, then return fresh values. */
@@ -68,28 +87,9 @@ function failure(status: number, code: string, message: string) {
 	return json({ code, message }, status);
 }
 
-function unauthorized() {
-	return failure(401, "UNAUTHORIZED", "Unauthorized");
-}
-
-function unavailable() {
-	return failure(
-		503,
-		"PASSWORD_CHANGE_UNAVAILABLE",
-		"Password changes are temporarily unavailable.",
-	);
-}
-
-function invalidPassword() {
-	return failure(400, "INVALID_PASSWORD", "Invalid password");
-}
-
-function accountNotFound() {
-	return failure(
-		400,
-		"CREDENTIAL_ACCOUNT_NOT_FOUND",
-		"Credential account not found",
-	);
+function changeFailure(code: keyof typeof changeFailures) {
+	const [status, message] = changeFailures[code];
+	return failure(status, code, message);
 }
 
 function alreadyEnrolled() {
@@ -110,7 +110,7 @@ export function createOwnedProjectPasswordChange(
 
 	function admit(authority: ProjectPasswordAuthority | null): Response | null {
 		if (!authority || authority.user.id !== authority.session.userId)
-			return unauthorized();
+			return changeFailure("UNAUTHORIZED");
 		const { user, session } = authority;
 		if (session.impersonatedBy)
 			return failure(
@@ -119,7 +119,7 @@ export function createOwnedProjectPasswordChange(
 				"Authentication changes and account deletion are unavailable during impersonation.",
 			);
 		if (user.banned || user.directoryDisabled || user.isAnonymous)
-			return unauthorized();
+			return changeFailure("UNAUTHORIZED");
 		if (user.directoryManaged)
 			return failure(
 				403,
@@ -152,6 +152,22 @@ export function createOwnedProjectPasswordChange(
 		return rows[0] ?? null;
 	}
 
+	function recordChange(
+		client: PoolClient,
+		request: Request,
+		userId?: string,
+		errorCode?: string,
+	) {
+		return store.recordEvent(client, {
+			type: "user.password-changed",
+			outcome: errorCode ? "failure" : "success",
+			actorId: userId,
+			userId,
+			...options.auditContext(request),
+			metadata: { path: changePath, errorCode },
+		});
+	}
+
 	async function replace(
 		request: Request,
 		input: {
@@ -162,6 +178,27 @@ export function createOwnedProjectPasswordChange(
 	) {
 		const { newPassword, currentPassword, revokeOtherSessions } = input;
 		const enroll = currentPassword === undefined;
+		async function rejectChange(
+			code: keyof typeof changeFailures,
+			userId?: string,
+			client?: PoolClient,
+		) {
+			if (!enroll) {
+				const record = (current: PoolClient) =>
+					recordChange(
+						current,
+						request,
+						userId,
+						code === "PASSWORD_CHANGE_UNAVAILABLE"
+							? "AUTHENTICATION_FAILED"
+							: code,
+					);
+				if (client) await record(client);
+				else await store.transaction(record);
+			}
+			return changeFailure(code);
+		}
+
 		const rules = policy.passwordPolicy;
 		const policyError = passwordPolicyError(newPassword, rules);
 		if (policyError)
@@ -182,24 +219,27 @@ export function createOwnedProjectPasswordChange(
 			);
 
 		const authority = await options.readAuthority(request);
+		if (!authority) return rejectChange("UNAUTHORIZED");
 		const denied = admit(authority);
-		if (denied || !authority) return denied ?? unauthorized();
+		if (denied) return denied;
+		const userId = authority.user.id;
 		if (
 			currentPassword !== undefined &&
 			currentPassword.length > defaultPasswordPolicy.maxLength
 		)
-			return failure(400, "PASSWORD_TOO_LONG", "Password too long");
-		const snapshot = await credential(authority.user.id);
-		if (snapshot === false) return unavailable();
+			return rejectChange("PASSWORD_TOO_LONG", userId);
+		const snapshot = await credential(userId);
+		if (snapshot === false) return changeFailure("PASSWORD_CHANGE_UNAVAILABLE");
 		if (currentPassword !== undefined) {
-			if (!snapshot?.password) return accountNotFound();
+			if (!snapshot?.password)
+				return rejectChange("CREDENTIAL_ACCOUNT_NOT_FOUND", userId);
 			if (
 				!(await clerkCompatiblePasswords.verify({
 					hash: snapshot.password,
 					password: currentPassword,
 				}))
 			)
-				return invalidPassword();
+				return rejectChange("INVALID_PASSWORD", userId);
 		} else if (snapshot?.password) {
 			return alreadyEnrolled();
 		}
@@ -210,39 +250,36 @@ export function createOwnedProjectPasswordChange(
 			.checkPasswordSafety(newPassword)
 			.catch(() => "unavailable" as const);
 		if (safety === "breached")
-			return failure(
-				400,
-				"PASSWORD_COMPROMISED",
-				"The password you entered has been compromised. Please choose a different password.",
-			);
-		if (safety !== "allowed") return unavailable();
+			return rejectChange("PASSWORD_COMPROMISED", userId);
+		if (safety !== "allowed")
+			return rejectChange("PASSWORD_CHANGE_UNAVAILABLE", userId);
 		const hashed = await clerkCompatiblePasswords.hash(newPassword);
 
 		return store.transaction(async (client) => {
 			const current = await options.lockAuthority(client, request);
 			if (
 				!current ||
-				current.user.id !== authority.user.id ||
+				current.user.id !== userId ||
 				current.session.id !== authority.session.id
 			)
-				return unauthorized();
+				return rejectChange("UNAUTHORIZED", undefined, client);
 			const denied = admit(current);
 			if (denied) return denied;
-			const userId = current.user.id;
 			const account = await credential(userId, client);
-			if (account === false) return unavailable();
+			if (account === false)
+				return changeFailure("PASSWORD_CHANGE_UNAVAILABLE");
 			if (currentPassword === undefined && account?.password)
 				return alreadyEnrolled();
 			if (currentPassword !== undefined && !account?.password)
-				return accountNotFound();
+				return rejectChange("CREDENTIAL_ACCOUNT_NOT_FOUND", userId, client);
 			if (
 				currentPassword !== undefined &&
 				(account?.id !== snapshot?.id ||
 					account?.password !== snapshot?.password)
 			)
-				return invalidPassword();
+				return rejectChange("INVALID_PASSWORD", userId, client);
 
-			const path = enroll ? "/set-password" : "/change-password";
+			const path = enroll ? "/set-password" : changePath;
 			if (account) {
 				await client.query(
 					'UPDATE "account" SET password = $1, "updatedAt" = statement_timestamp() WHERE id = $2',
@@ -267,14 +304,17 @@ export function createOwnedProjectPasswordChange(
 			const rotation = revokeOtherSessions
 				? await options.rotateSession(client, request, current)
 				: undefined;
-			await store.record(
-				client,
-				enroll ? "user.password-set" : "user.password-changed",
-				"success",
-				path,
-				userId,
-			);
-			if (enroll) return json({ status: true });
+			if (enroll) {
+				await store.record(
+					client,
+					"user.password-set",
+					"success",
+					path,
+					userId,
+				);
+				return json({ status: true });
+			}
+			await recordChange(client, request, userId);
 			const { rows } = await client.query<PasswordUserFields>(
 				'SELECT "banReason", "banExpires" FROM "user" WHERE id = $1',
 				[userId],

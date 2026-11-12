@@ -190,6 +190,9 @@ describe.skipIf(!existsSync(fixturePath))(
 				async checkPasswordSafety() {
 					return "allowed";
 				},
+				auditContext: (request) => ({
+					userAgent: request.headers.get("user-agent") ?? undefined,
+				}),
 				async readAuthority(request) {
 					const token = sessionToken(request);
 					return token ? store.session(token, 0) : null;

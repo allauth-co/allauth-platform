@@ -2412,6 +2412,7 @@ export function createOwnedProjectEngine(
 			project: options.project,
 			policy,
 			checkPasswordSafety: passwordSafety,
+			auditContext: browserEventContext,
 			readAuthority(request) {
 				return currentSession(request.headers);
 			},

@@ -1,14 +1,15 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { runWithAdapter } from "@better-auth/core/context";
 import { oauthProvider } from "@better-auth/oauth-provider";
 import { APIError } from "better-auth";
 import { symmetricDecrypt } from "better-auth/crypto";
-import { admin, jwt, organization } from "better-auth/plugins";
+import { admin, haveIBeenPwned, jwt, organization } from "better-auth/plugins";
 import { getTestInstance } from "better-auth/test";
 import { Kysely, PostgresDialect } from "kysely";
 import { Pool } from "pg";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { authPolicyPlugin } from "../auth-policy/plugin";
 import { defaultAuthPolicy } from "../auth-policy/policy";
 import { clerkCompatiblePasswords } from "../clerk-password";
 import { allauthControl } from "../control";
@@ -32,8 +33,10 @@ import {
 	revokeAuthenticationChallenges,
 	revokeUserGrants,
 } from "../enterprise";
+import { featureBoundaries } from "../features/server";
 import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
 import { createOwnedProjectEngine } from "./owned-project-engine";
+import { createOwnedProjectPasswordSafety } from "./owned-project-password-safety";
 import { projectSecret } from "./runtime";
 
 const fixture = new URL(
@@ -150,6 +153,9 @@ async function native(
 				admin(),
 				...(realm
 					? [
+							featureBoundaries(),
+							haveIBeenPwned({ paths: ["/change-password"] }),
+							authPolicyPlugin(defaultAuthPolicy),
 							organization(),
 							jwt({ disableSettingJwtHeader: true }),
 							oauthProvider({
@@ -338,6 +344,9 @@ describe.skipIf(!existsSync(fixture))(
 						readWorkspacePrincipal: readRoot,
 					},
 					webhookManagement: { resolver },
+					passwordChange: {
+						checkPasswordSafety: createOwnedProjectPasswordSafety(),
+					},
 				});
 			owned = engine(alpha);
 			other = engine(beta);
@@ -1062,6 +1071,149 @@ describe.skipIf(!existsSync(fixture))(
 					});
 			}
 			expect(await exercise("owned")).toEqual(nativeEvents);
+		});
+
+		it("delivers native password-change results with safe request context to user subscribers", async () => {
+			const replacement = "Replacement-fixture-password-31!";
+			const compromised = "Compromised-fixture-password-31!";
+			const incorrect = "Incorrect-fixture-password-31!";
+			const offline = "Offline-fixture-password-31!";
+			const oversized = "Large-fixture-current-password-".repeat(5);
+			const digest = createHash("sha1")
+				.update(compromised)
+				.digest("hex")
+				.toUpperCase();
+			const offlinePrefix = createHash("sha1")
+				.update(offline)
+				.digest("hex")
+				.slice(0, 5)
+				.toUpperCase();
+			const table = `"${alpha.schemaName}"."account"`;
+			const match = `"userId"=$1 AND "providerId"='credential'`;
+			const { rows } = await database.query<{ password: string }>(
+				`SELECT password FROM ${table} WHERE ${match}`,
+				[eventUserId],
+			);
+			const originalHash = rows[0].password;
+			async function setHash(hash: string | null) {
+				await database.query(`UPDATE ${table} SET password=$2 WHERE ${match}`, [
+					eventUserId,
+					hash,
+				]);
+			}
+			const breachFetch = vi
+				.spyOn(globalThis, "fetch")
+				.mockImplementation(async (input) => {
+					const url = new URL(input instanceof Request ? input.url : input);
+					expect(url.origin).toBe("https://api.pwnedpasswords.com");
+					expect(url.pathname).toMatch(/^\/range\/[A-F0-9]{5}$/);
+					if (url.pathname.endsWith(offlinePrefix))
+						return new Response("Unavailable", { status: 503 });
+					return new Response(
+						url.pathname.endsWith(digest.slice(0, 5))
+							? `${digest.slice(5)}:7\r\n`
+							: `${"0".repeat(35)}:0\r\n`,
+					);
+				});
+			async function exercise(writer: "legacy" | "owned") {
+				const { cookie } = await browserSession(eventEmail);
+				const subscription = await endpoint(
+					"legacy",
+					`password-change-${writer}`,
+					["user.*"],
+				);
+				async function change(
+					currentPassword: string,
+					newPassword: string,
+					session = cookie,
+				) {
+					return send(
+						writer,
+						"/change-password",
+						{ currentPassword, newPassword },
+						session,
+					);
+				}
+				try {
+					expect((await change(password, replacement, "")).status).toBe(401);
+					expect((await change(password, "short")).status).toBe(400);
+					expect((await change(oversized, replacement)).status).toBe(400);
+					const beforeIncorrect = breachFetch.mock.calls.length;
+					expect((await change(incorrect, replacement)).status).toBe(400);
+					if (writer === "owned")
+						expect(breachFetch.mock.calls).toHaveLength(beforeIncorrect);
+					expect((await change(password, compromised)).status).toBe(400);
+					expect((await change(password, offline)).status).toBe(
+						writer === "legacy" ? 500 : 503,
+					);
+					await setHash(null);
+					expect((await change(password, replacement)).status).toBe(400);
+					await setHash(originalHash);
+					expect((await change(password, replacement)).status).toBe(200);
+					return await signedEvents(subscription, [
+						password,
+						incorrect,
+						compromised,
+						offline,
+						oversized,
+						replacement,
+						originalHash,
+						cookie,
+					]);
+				} finally {
+					await setHash(originalHash);
+					expect(
+						(
+							await send("legacy", `${base}/delete`, {
+								id: subscription.endpoint.id,
+							})
+						).status,
+					).toBe(200);
+				}
+			}
+			try {
+				const native = await exercise("legacy");
+				expect(
+					native
+						.map(({ event }) => event.metadata.errorCode ?? "success")
+						.sort(),
+				).toEqual([
+					"AUTHENTICATION_FAILED",
+					"CREDENTIAL_ACCOUNT_NOT_FOUND",
+					"INVALID_PASSWORD",
+					"PASSWORD_COMPROMISED",
+					"PASSWORD_TOO_LONG",
+					"UNAUTHORIZED",
+					"success",
+				]);
+				for (const { event, user } of native) {
+					expect(event).toMatchObject({
+						type: "user.password-changed",
+						ipAddress: "192.0.2.46",
+						userAgent: "webhook-management-fixture",
+						metadata: { path: "/change-password" },
+					});
+					if (event.metadata.errorCode === "UNAUTHORIZED") {
+						expect(event.userId).toBeUndefined();
+						expect(event.actorId).toBeUndefined();
+						expect(user).toBeUndefined();
+					} else {
+						expect(event.userId).toBe(eventUserId);
+						expect(event.actorId).toBe(eventUserId);
+						expect(user).toMatchObject({ id: eventUserId, email: eventEmail });
+					}
+				}
+				expect(await exercise("owned")).toEqual(native);
+				expect(
+					(
+						await database.query(
+							`SELECT id FROM "${beta.schemaName}"."allauthEvent" WHERE type='user.password-changed'`,
+						)
+					).rows,
+				).toEqual([]);
+			} finally {
+				breachFetch.mockRestore();
+			}
 		});
 
 		it("rolls back the profile and session mutations when their event cannot be recorded", async () => {
