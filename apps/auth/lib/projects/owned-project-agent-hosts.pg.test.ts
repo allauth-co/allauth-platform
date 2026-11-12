@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { oauthProvider } from "@better-auth/oauth-provider";
 import { admin, jwt } from "better-auth/plugins";
@@ -498,6 +498,224 @@ describe.skipIf(!existsSync(fixture))(
 				);
 				await database.query(`DROP FUNCTION ${schema}."rejectFixtureGrant"()`);
 			}
+		});
+
+		async function enrollmentKey(kid: string) {
+			return {
+				...(await exportJWK(
+					(
+						await generateKeyPair("EdDSA", { extractable: true })
+					).publicKey,
+				)),
+				kid,
+			};
+		}
+
+		function enrollRequest(
+			project: typeof alpha,
+			token: string,
+			public_key: Awaited<ReturnType<typeof enrollmentKey>>,
+			name?: string,
+		) {
+			const input = request(project, "/host/enroll", "", {
+				token,
+				public_key,
+				name,
+			});
+			input.headers.delete("origin");
+			return input;
+		}
+
+		async function issuedHost(engine: "native" | "owned", name: string) {
+			const input = request(alpha, "/host/create", ownerCookie, { name });
+			const response = await (engine === "native"
+				? legacy.handler(input)
+				: owned.dispatch(input));
+			expect(
+				response.status,
+				response.ok ? undefined : await response.clone().text(),
+			).toBe(200);
+			const row = (await response.json()) as {
+				hostId: string;
+				enrollmentToken: string;
+				enrollmentTokenExpiresAt: string;
+			};
+			expect(row).toMatchObject({
+				status: "pending_enrollment",
+				default_capabilities: [],
+			});
+			expect(row.enrollmentToken).toMatch(/^[A-Za-z0-9_-]{43}$/);
+			const pending = await database.query(
+				`SELECT "enrollmentTokenHash","enrollmentTokenExpiresAt","userId",status FROM "${alpha.schemaName}"."agentHost" WHERE id=$1`,
+				[row.hostId],
+			);
+			expect(pending.rows[0]).toMatchObject({
+				userId: owner.id,
+				status: "pending_enrollment",
+				enrollmentTokenHash: createHash("sha256")
+					.update(row.enrollmentToken)
+					.digest("base64url"),
+				enrollmentTokenExpiresAt: new Date(row.enrollmentTokenExpiresAt),
+			});
+			expect(
+				Date.parse(row.enrollmentTokenExpiresAt) - Date.now(),
+			).toBeGreaterThan(3_590_000);
+			return row;
+		}
+
+		it("resumes enrollment tokens across native and owned writers in both directions", async () => {
+			const previous = await issuedHost("native", "Native pending enrollment");
+			const next = await issuedHost("owned", "Owned pending enrollment");
+			const key = await enrollmentKey("native-owned-enrollment-fixture");
+			const secondKey = await enrollmentKey("concurrent-enrollment-fixture");
+			const other = await outside.dispatch(
+				enrollRequest(beta, previous.enrollmentToken, key),
+			);
+			expect(other.status).toBe(401);
+			const activate = (publicKey: typeof key) =>
+				owned.dispatch(
+					enrollRequest(
+						alpha,
+						previous.enrollmentToken,
+						publicKey,
+						"Enrolled by AllAuth",
+					),
+				);
+			const results = await Promise.all([activate(key), activate(secondKey)]);
+			expect(results.map(({ status }) => status).sort()).toEqual([200, 401]);
+			const applied = results.find(({ ok }) => ok);
+			expect(await applied?.json()).toEqual({
+				hostId: previous.hostId,
+				status: "active",
+				name: "Enrolled by AllAuth",
+				default_capabilities: [],
+			});
+			legacy = await native(nativePool);
+			const resumed = await legacy.handler(
+				enrollRequest(
+					alpha,
+					next.enrollmentToken,
+					await enrollmentKey("owned-native-enrollment-fixture"),
+				),
+			);
+			expect(
+				resumed.status,
+				resumed.ok ? undefined : await resumed.clone().text(),
+			).toBe(200);
+			expect(await resumed.json()).toEqual({
+				hostId: next.hostId,
+				status: "active",
+				name: "Owned pending enrollment",
+				default_capabilities: [],
+			});
+			for (const host of [previous, next]) {
+				const status = (await expectSame(
+					`/host/get?host_id=${host.hostId}`,
+					ownerCookie,
+					200,
+				)) as { expires_at: string; activated_at: string };
+				expect(
+					Date.parse(status.expires_at) - Date.parse(status.activated_at),
+				).toBe(900_000);
+				const cleared = await database.query(
+					`SELECT "enrollmentTokenHash","enrollmentTokenExpiresAt" FROM "${alpha.schemaName}"."agentHost" WHERE id=$1`,
+					[host.hostId],
+				);
+				expect(cleared.rows).toEqual([
+					{ enrollmentTokenHash: null, enrollmentTokenExpiresAt: null },
+				]);
+				const retry = await legacy.handler(
+					enrollRequest(alpha, host.enrollmentToken, key),
+				);
+				expect(retry.status).toBe(401);
+				expect(await retry.json()).toMatchObject({
+					error: "enrollment_token_invalid",
+				});
+			}
+		});
+
+		it("keeps the same-owner native host ID and rejects unavailable enrollment without consuming it", async () => {
+			const key = await enrollmentKey("same-owner-native-host-key-fixture");
+			const first = await owned.dispatch(
+				request(alpha, "/host/create", ownerCookie, {
+					public_key: key,
+					name: "Owned inline host",
+				}),
+			);
+			expect(
+				first.status,
+				first.ok ? undefined : await first.clone().text(),
+			).toBe(200);
+			const { hostId } = (await first.json()) as { hostId: string };
+			await expectSame("/host/create", ownerCookie, 200, {
+				public_key: key,
+				name: "Same-owner inline host",
+			});
+			await expectSame("/host/create", peerCookie, 409, { public_key: key });
+			await expectSame("/host/create", ownerCookie, 400, {
+				default_capabilities: ["fixture.unconfigured"],
+			});
+			await expectSame("/host/create", ownerCookie, 400, {
+				jwks_url: "https://disabled-key.fixture.invalid/jwks",
+			});
+			await expectSame("/host/create", "", 403, { name: "No browser session" });
+			const pending = await issuedHost("native", "Redundant enrollment");
+			const merged = await owned.dispatch(
+				enrollRequest(alpha, pending.enrollmentToken, key),
+			);
+			expect(merged.status).toBe(200);
+			expect(await merged.json()).toMatchObject({
+				hostId,
+				status: "active",
+				name: "Redundant enrollment",
+			});
+			const rejected = await expectSame(
+				`/host/get?host_id=${pending.hostId}`,
+				ownerCookie,
+				200,
+			);
+			expect(rejected).toMatchObject({ status: "rejected" });
+			const foreignKey = await enrollmentKey("other-owner-enrollment-fixture");
+			const otherHost = await legacy.handler(
+				request(alpha, "/host/create", peerCookie, { public_key: foreignKey }),
+			);
+			expect(otherHost.status).toBe(200);
+			const conflicted = await issuedHost(
+				"native",
+				"Owner enrollment after conflict",
+			);
+			await expectSame("/host/enroll", "", 409, {
+				token: conflicted.enrollmentToken,
+				public_key: foreignKey,
+			});
+			const recovered = await owned.dispatch(
+				enrollRequest(
+					alpha,
+					conflicted.enrollmentToken,
+					await enrollmentKey("recovered-owner-enrollment-fixture"),
+				),
+			);
+			expect(recovered.status).toBe(200);
+			expect(await recovered.json()).toMatchObject({
+				hostId: conflicted.hostId,
+				status: "active",
+			});
+			const expired = await issuedHost("native", "Expired enrollment");
+			await database.query(
+				`UPDATE "${alpha.schemaName}"."agentHost" SET "enrollmentTokenExpiresAt"=now()-interval '1 minute' WHERE id=$1`,
+				[expired.hostId],
+			);
+			await expectSame("/host/enroll", "", 401, {
+				token: expired.enrollmentToken,
+				public_key: key,
+			});
+			expect(
+				await expectSame(
+					`/host/get?host_id=${expired.hostId}`,
+					ownerCookie,
+					200,
+				),
+			).toMatchObject({ status: "pending_enrollment" });
 		});
 	},
 );

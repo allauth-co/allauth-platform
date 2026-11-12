@@ -1,5 +1,11 @@
 import type { PoolClient } from "pg";
 import * as z from "zod";
+import {
+	agentHostCapabilities,
+	agentHostJSON as json,
+	createOwnedAgentHost,
+	enrollOwnedAgentHost,
+} from "./owned-project-agent-enrollment";
 import type { createProjectEngineStore } from "./owned-project-engine-store";
 import { admitOwnedProjectNativeRoute } from "./owned-project-native-admission";
 
@@ -39,31 +45,11 @@ type BrowserHosts = {
 
 const columns = `id,name,"defaultCapabilities",status,"activatedAt","expiresAt","lastUsedAt","createdAt","updatedAt"`;
 
-function json(value: object, status = 200) {
-	return Response.json(value, {
-		status,
-		headers: { "Cache-Control": "no-store" },
-	});
-}
-
-function capabilities(value: string | null): string[] {
-	if (!value) return [];
-	try {
-		let decoded: unknown = JSON.parse(value);
-		if (typeof decoded === "string") decoded = JSON.parse(decoded);
-		return Array.isArray(decoded)
-			? decoded.filter((item): item is string => typeof item === "string")
-			: [];
-	} catch {
-		return [];
-	}
-}
-
 function publicHost(host: Host) {
 	return {
 		id: host.id,
 		name: host.name || `Device ${host.id.slice(0, 8)}`,
-		default_capabilities: capabilities(host.defaultCapabilities),
+		default_capabilities: agentHostCapabilities(host.defaultCapabilities),
 		status: host.status,
 		activated_at: host.activatedAt,
 		expires_at: host.expiresAt,
@@ -113,17 +99,20 @@ async function revoke(client: PoolClient, userId: string, hostId: string) {
 	});
 }
 
-/** Browser-only host management for the isolated candidate fixture. */
+/** Browser host management and token enrollment for the isolated candidate fixture. */
 export function createOwnedProjectAgentHosts(options: BrowserHosts) {
 	return async (
 		path: string,
 		request: Request,
 	): Promise<Response | undefined> => {
-		const write = path === "/host/revoke" && request.method === "POST";
+		const write =
+			request.method === "POST" &&
+			(path === "/host/revoke" || path === "/host/create");
+		const enroll = request.method === "POST" && path === "/host/enroll";
 		const read =
 			request.method === "GET" &&
 			(path === "/host/get" || path === "/host/list");
-		if (!write && !read) return;
+		if (!write && !read && !enroll) return;
 		const limited = await options.store.transaction((client) =>
 			admitOwnedProjectNativeRoute(client, options.trustedIP(request), path, {
 				max: 100,
@@ -132,7 +121,7 @@ export function createOwnedProjectAgentHosts(options: BrowserHosts) {
 		);
 		if (limited) return limited;
 		if (request.headers.has("authorization")) {
-			if (write && request.headers.get("authorization"))
+			if (path === "/host/revoke" && request.headers.get("authorization"))
 				return forbidden(
 					"Use your browser session or a valid signed host request.",
 				);
@@ -140,6 +129,11 @@ export function createOwnedProjectAgentHosts(options: BrowserHosts) {
 		}
 		if (!options.trustedRequest(request.headers, write))
 			return forbidden("This authentication request is not permitted.");
+		const body = write || enroll ? await options.readBody(request) : undefined;
+		if (enroll)
+			return options.store.transaction((client) =>
+				enrollOwnedAgentHost(client, body),
+			);
 		const params = new URL(request.url).searchParams;
 		const query = !read
 			? undefined
@@ -158,10 +152,6 @@ export function createOwnedProjectAgentHosts(options: BrowserHosts) {
 				400,
 			);
 		const input = query?.data ?? {};
-		const body = write
-			? revokeInput.safeParse(await options.readBody(request))
-			: undefined;
-		const hostId = body?.success ? body.data.host_id : undefined;
 		return options.store.transaction(async (client) => {
 			const userId = await options.authorizeBrowser(client, request, write);
 			if (!userId)
@@ -170,11 +160,15 @@ export function createOwnedProjectAgentHosts(options: BrowserHosts) {
 							"Sign in again with a verified account before approving access.",
 						)
 					: json({ code: "UNAUTHORIZED", message: "Unauthorized" }, 401);
-			// AllAuth's owner guard rejects missing IDs along with unknown and foreign hosts.
-			if (write)
-				return hostId
-					? revoke(client, userId, hostId)
+			if (write) {
+				if (path === "/host/create")
+					return createOwnedAgentHost(client, userId, body);
+				// AllAuth's owner guard rejects missing IDs along with unknown and foreign hosts.
+				const target = revokeInput.safeParse(body);
+				return target.success && target.data.host_id
+					? revoke(client, userId, target.data.host_id)
 					: forbidden(ownerRequired);
+			}
 			if ("host_id" in input) {
 				const host = (
 					await client.query<Host>(
