@@ -7,9 +7,19 @@ import { promisify } from "node:util";
 import { getCookies } from "better-auth/cookies";
 import { clerkCompatiblePasswords } from "../../lib/clerk-password";
 import { signEdgeRequest } from "../../lib/domains/edge";
+import { createRailwayProjectEngineTransport } from "./railway-project-engine-transport";
 
 const execute = promisify(execFile);
-const [releaseImage, rehearsalImage] = process.argv.slice(2);
+const [target, argument] = process.argv.slice(2);
+if (target === "--railway")
+	assert.ok(argument, "Pass the isolated Railway fixture profile.");
+const railway =
+	target === "--railway" && argument
+		? await createRailwayProjectEngineTransport(argument)
+		: undefined;
+const [releaseImage, rehearsalImage] = railway
+	? ["release", "candidate"]
+	: [target, argument];
 assert.ok(
 	releaseImage && rehearsalImage,
 	"Pass the normal release and project-engine-rehearsal Docker images.",
@@ -19,14 +29,21 @@ const run = randomUUID().replaceAll("-", "");
 const network = `allauth-engine-rehearsal-${run}`;
 const database = `${network}-db`;
 const application = `${network}-app`;
-const source = `allauth_engine_rehearsal_${run}`;
-const restored = `allauth_engine_rehearsal_${randomUUID().replaceAll("-", "")}`;
-const authSecret = randomBytes(32).toString("hex");
-const edgeSecret = randomBytes(32).toString("hex");
+const source = railway?.profile.source ?? `allauth_engine_rehearsal_${run}`;
+const restored =
+	railway?.profile.restored ??
+	`allauth_engine_rehearsal_${randomUUID().replaceAll("-", "")}`;
+const authSecret =
+	railway?.profile.authSecret ?? randomBytes(32).toString("hex");
+const edgeSecret =
+	railway?.profile.edgeSecret ?? randomBytes(32).toString("hex");
 const credentialSecret = randomBytes(32).toString("hex");
 const databasePassword = randomBytes(32).toString("hex");
-const databaseNonce = randomBytes(32).toString("hex");
-const platform = "https://project-engine-rehearsal.invalid";
+const databaseNonce =
+	railway?.profile.databaseNonce ?? randomBytes(32).toString("hex");
+const platform = railway
+	? `https://${railway.profile.domain}`
+	: "https://project-engine-rehearsal.invalid";
 const portalDomain = "allauth.example.com";
 const customDomain = "project-engine-rehearsal.example.com";
 const host = `accounts.${customDomain}`;
@@ -52,6 +69,7 @@ async function docker(...args: string[]) {
 }
 
 async function query(db: string, sql: string) {
+	if (railway) return railway.query(db, sql);
 	return docker(
 		"exec",
 		database,
@@ -151,8 +169,22 @@ async function request(
 				)
 				.digest("hex"),
 		);
-	} else {
+	} else if (!railway) {
 		ingress.set("x-real-ip", clientIP);
+	}
+	if (railway) {
+		const response = await fetch(`${platform}${path}`, {
+			method,
+			headers: ingress,
+			body: data || undefined,
+			redirect: "manual",
+			signal: AbortSignal.timeout(15_000),
+		});
+		return {
+			status: response.status,
+			cookies: response.headers.getSetCookie(),
+			body: await response.text(),
+		};
 	}
 	ingress.set("host", new URL(platform).hostname);
 	ingress.set("x-forwarded-proto", "https");
@@ -206,16 +238,18 @@ async function start(
 	db: string,
 	values: Record<string, string> = {},
 ) {
-	await docker(
-		"run",
-		"-d",
-		"--name",
-		application,
-		"--network",
-		network,
-		...environment(db, values),
-		image,
-	);
+	if (railway) await railway.start(image, db, values);
+	else
+		await docker(
+			"run",
+			"-d",
+			"--name",
+			application,
+			"--network",
+			network,
+			...environment(db, values),
+			image,
+		);
 	await until(
 		async () => (await request("/api/health")).status === 200,
 		"The compiled app did not report ready.",
@@ -223,16 +257,17 @@ async function start(
 }
 
 async function stop(db: string) {
-	await docker("stop", "--time", "10", application);
-	await docker("rm", application);
+	if (railway) await railway.stop();
+	else {
+		await docker("stop", "--time", "10", application);
+		await docker("rm", application);
+	}
 	await until(
 		async () =>
-			Number(
-				await query(
-					"postgres",
-					`SELECT count(*) FROM pg_stat_activity WHERE datname='${db}'`,
-				),
-			) === 0,
+			(await query(
+				"postgres",
+				`SELECT count(*) FROM pg_stat_activity WHERE datname='${db}'`,
+			)) === "0",
 		"The previous phase retained a PostgreSQL connection.",
 	);
 }
@@ -342,47 +377,49 @@ async function seed() {
 
 let networkCreated = false;
 try {
-	await docker("network", "create", "--internal", network);
-	networkCreated = true;
-	await docker(
-		"run",
-		"-d",
-		"--name",
-		database,
-		"--network",
-		network,
-		"-e",
-		`POSTGRES_PASSWORD=${databasePassword}`,
-		"-e",
-		`POSTGRES_DB=${source}`,
-		"postgres:18-alpine",
-	);
-	await until(
-		async () =>
-			(
-				await docker(
-					"exec",
-					database,
-					"pg_isready",
-					"-h",
-					"127.0.0.1",
-					"-d",
-					source,
-				)
-			).endsWith("accepting connections"),
-		"The isolated fixture database did not start.",
-	);
-	await docker(
-		"run",
-		"--rm",
-		"--network",
-		network,
-		...environment(source),
-		releaseImage,
-		"node",
-		"scripts/database.mjs",
-		"migrate",
-	);
+	if (!railway) {
+		await docker("network", "create", "--internal", network);
+		networkCreated = true;
+		await docker(
+			"run",
+			"-d",
+			"--name",
+			database,
+			"--network",
+			network,
+			"-e",
+			`POSTGRES_PASSWORD=${databasePassword}`,
+			"-e",
+			`POSTGRES_DB=${source}`,
+			"postgres:18-alpine",
+		);
+		await until(
+			async () =>
+				(
+					await docker(
+						"exec",
+						database,
+						"pg_isready",
+						"-h",
+						"127.0.0.1",
+						"-d",
+						source,
+					)
+				).endsWith("accepting connections"),
+			"The isolated fixture database did not start.",
+		);
+		await docker(
+			"run",
+			"--rm",
+			"--network",
+			network,
+			...environment(source),
+			releaseImage,
+			"node",
+			"scripts/database.mjs",
+			"migrate",
+		);
+	}
 	await start(releaseImage, source);
 	const { owned, control, rootCookie } = await seed();
 	const direct = `/api/projects/${owned.slug}/auth`;
@@ -431,32 +468,36 @@ try {
 	`,
 	);
 
-	await start(rehearsalImage, restored);
-	expectStatus(
-		await request(`${direct}/not-installed`, { realm: owned }),
-		404,
-		"The rehearsal image defaults to the legacy writer.",
-	);
-	await stop(restored);
-
-	await start(rehearsalImage, restored, {
-		...selected,
-		ALLAUTH_REHEARSAL_DATABASE_NONCE: randomBytes(32).toString("hex"),
-	});
-	expectStatus(
-		await request(`${direct}/get-session`, {
-			realm: owned,
-			cookie: originalCookie,
-		}),
-		503,
-		"The selected realm rejects an invalid database marker.",
-	);
-	expectStatus(
-		await request(`${controlPath}/not-installed`, { realm: control }),
-		404,
-		"A failed selection does not change its sibling.",
-	);
-	await stop(restored);
+	async function checkInvalidMarker() {
+		expectStatus(
+			await request(`${direct}/get-session`, {
+				realm: owned,
+				cookie: originalCookie,
+			}),
+			503,
+			"The selected realm rejects an invalid database marker.",
+		);
+		expectStatus(
+			await request(`${controlPath}/not-installed`, { realm: control }),
+			404,
+			"A failed selection does not change its sibling.",
+		);
+	}
+	if (!railway) {
+		await start(rehearsalImage, restored);
+		expectStatus(
+			await request(`${direct}/not-installed`, { realm: owned }),
+			404,
+			"The rehearsal image defaults to the legacy writer.",
+		);
+		await stop(restored);
+		await start(rehearsalImage, restored, {
+			...selected,
+			ALLAUTH_REHEARSAL_DATABASE_NONCE: randomBytes(32).toString("hex"),
+		});
+		await checkInvalidMarker();
+		await stop(restored);
+	}
 
 	async function currentSession(
 		path: string,
@@ -475,6 +516,21 @@ try {
 	}
 
 	await start(rehearsalImage, restored, selected);
+	if (railway) {
+		const marker = createHash("sha256").update(databaseNonce).digest("hex");
+		await query(
+			restored,
+			`UPDATE public."allauthEngineRehearsal" SET "nonceHash"='${randomBytes(32).toString("hex")}'`,
+		);
+		try {
+			await checkInvalidMarker();
+		} finally {
+			await query(
+				restored,
+				`UPDATE public."allauthEngineRehearsal" SET "nonceHash"='${marker}'`,
+			);
+		}
+	}
 	const ownedDispatch = await request(`${direct}/not-installed`, {
 		realm: owned,
 	});
@@ -648,6 +704,7 @@ try {
 		"Compiled project rehearsal passed from legacy to AllAuth and back.",
 	);
 } finally {
+	await railway?.stop();
 	if (networkCreated) {
 		await docker("rm", "-f", application, database).catch(() => undefined);
 		await docker("network", "rm", network);
