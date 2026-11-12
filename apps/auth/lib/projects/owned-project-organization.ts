@@ -2,6 +2,10 @@ import type { Pool, PoolClient } from "pg";
 import * as z from "zod";
 import type { AuthPolicy } from "../auth-policy/policy";
 import { isPlatformAdmin } from "../configuration";
+import {
+	activityOrganizationTarget,
+	isControlActivityMutation,
+} from "../control/analytics-activity";
 import type { ProjectSession, ProjectUser } from "./owned-project-engine-store";
 import { createProjectEngineStore } from "./owned-project-engine-store";
 import {
@@ -60,6 +64,10 @@ export interface OwnedProjectOrganizationOptions {
 	membershipLimit?(client: PoolClient): Promise<number | null>;
 	/** Deliver after the invitation transaction commits. A resend reuses the pending row. */
 	invitationEmail?: OwnedProjectInvitationEmail;
+	collectActivity?(
+		session: ProjectSession,
+		organizationId?: string,
+	): Promise<void>;
 	/** Reissue the existing token with its existing persistence on native cookie-refresh operations. */
 	sessionCookies?(request: Request, principal: OrganizationSession): Headers;
 }
@@ -430,6 +438,11 @@ export function createOwnedProjectOrganizationHttp(
 				? organizationMembersQuery(request)
 				: parseQuery(request);
 		try {
+			let activitySession: ProjectSession | undefined;
+			const captureActivity =
+				options.collectActivity &&
+				isControlActivityMutation(path, request.method) &&
+				!request.headers.has("authorization");
 			const runTransaction =
 				mutation &&
 				(isOrganizationLifecycleRoute(path) ||
@@ -468,6 +481,7 @@ export function createOwnedProjectOrganizationHttp(
 				if (!principal) return unauthorized();
 				const realm = projectOrganizations(client);
 				const { user, session } = principal;
+				if (captureActivity && !user.isAnonymous) activitySession = session;
 				if (isOrganizationLifecycleRoute(path))
 					return handleOrganizationLifecycle(path, realm, principal, input);
 				if (isOrganizationRoleRoute(path))
@@ -796,6 +810,17 @@ export function createOwnedProjectOrganizationHttp(
 					}
 				}
 			});
+			const response = result instanceof Response ? result : result.response;
+			if (activitySession && response.ok) {
+				const body: unknown = await response
+					.clone()
+					.json()
+					.catch(() => undefined);
+				await options.collectActivity?.(
+					activitySession,
+					activityOrganizationTarget(path, input, body),
+				);
+			}
 			if (result instanceof Response) return result;
 			try {
 				await options.invitationEmail?.send(result.notification);

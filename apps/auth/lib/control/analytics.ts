@@ -3,11 +3,13 @@ import { APIError } from "better-auth";
 import { createAuthEndpoint, createAuthMiddleware } from "better-auth/api";
 import { sql } from "kysely";
 import * as z from "zod";
-import { controlResponseFailure, isPrimaryAuthenticationPath, mutationEventType } from "./events";
+import { activityOrganizationTarget, createAuthenticatedActivityCollector, isControlActivityMutation } from "./analytics-activity";
+import { controlResponseFailure, isPrimaryAuthenticationPath } from "./events";
 import type { ControlDatabase, ControlPrincipal } from "./types";
 import type { AnalyticsCohort, AnalyticsCohortCounts, AnalyticsCoverage, AnalyticsEntitiesFilters, AnalyticsEntity, AnalyticsFilters, AnalyticsPoint, AnalyticsWindow, ControlAnalytics, ControlAnalyticsEntities } from "./analytics-types";
 
 export type * from "./analytics-types";
+export { createActivityRecorder } from "./analytics-activity";
 const DAY = 86_400_000;
 const cohorts = ["active", "new", "retained", "reactivated", "churned", "firstActive", "unknown"] as const;
 const utcDate = (value: Date) => value.toISOString().slice(0, 10);
@@ -167,39 +169,16 @@ export async function queryControlAnalyticsEntities(database: ControlDatabase, f
 	return { entity: filters.entity, cohort: filters.cohort, window, coverage, total: Number(total?.total || 0), limit: filters.limit, offset: filters.offset, entities: records.rows.map((row) => ({ id: String(row.id), name: typeof row.name === "string" ? row.name : null, ...(filters.entity === "users" ? { email: typeof row.email === "string" ? row.email : null } : { slug: typeof row.slug === "string" ? row.slug : null }), createdAt: new Date(row.createdAt as string | Date).toISOString(), deleted: row.deletedAt !== null, firstActivityDay: typeof row.firstActivityDay === "string" ? row.firstActivityDay : null, lastActivityDay: typeof row.lastActivityDay === "string" ? row.lastActivityDay : null, activeDays: Number(row.activeDays), previousActiveDays: Number(row.previousActiveDays), cohorts: cohorts.filter((cohort) => row[cohort] === true) })) };
 }
 
-/** Scope-local recorder caps memory and persisted writes, even under repeated session polling. */
-export function createActivityRecorder(database: ControlDatabase, maximumKeys = 10_000) {
-	if (!Number.isInteger(maximumKeys) || maximumKeys < 1 || maximumKeys > 10_000) throw new Error("Analytics cache must hold between 1 and 10000 keys.");
-	const remembered = new Map<string, Promise<boolean>>();
-	let rememberedDay = "";
-	const record = (entity: AnalyticsEntity, id: string, source: 1 | 2 | 4, recordedAt = new Date()): Promise<boolean> => {
-		const day = utcDate(recordedAt);
-		if (day !== rememberedDay) { remembered.clear(); rememberedDay = day; }
-		const key = `${entity}:${id}:${day}:${source}`;
-		const existing = remembered.get(key);
-		if (existing) return existing.then(() => false);
-		const operation = (async () => {
-			const result = await sql`INSERT INTO "allauthAnalyticsActivity" ("entityType","entityId",day,sources) SELECT ${entity},${id},${day}::date,${source} FROM "allauthAnalyticsEntity" WHERE "entityType"=${entity} AND "entityId"=${id} AND "deletedAt" IS NULL AND NOT anonymous ON CONFLICT ("entityType","entityId",day) DO UPDATE SET sources="allauthAnalyticsActivity".sources | EXCLUDED.sources WHERE ("allauthAnalyticsActivity".sources & EXCLUDED.sources) <> EXCLUDED.sources RETURNING day`.execute(database);
-			return result.rows.length > 0;
-		})();
-		if (remembered.size >= maximumKeys) remembered.delete(remembered.keys().next().value as string);
-		remembered.set(key, operation);
-		operation.catch(() => { if (remembered.get(key) === operation) remembered.delete(key); });
-		return operation;
-	};
-	return { record, cachedKeys: () => remembered.size, has: (entity: AnalyticsEntity, id: string, source: 1 | 2 | 4) => rememberedDay === today() && remembered.has(`${entity}:${id}:${today()}:${source}`) };
-}
-
 /** Native analytics endpoints and bounded activity hook; each project uses its own database. */
 export function createControlAnalytics(options: { database: ControlDatabase; requireAdmin: (ctx: GenericEndpointContext) => Promise<ControlPrincipal> }) {
-	const recorder = createActivityRecorder(options.database);
+	const activity = createAuthenticatedActivityCollector(options.database);
 	const noCache = (ctx: GenericEndpointContext) => { ctx.setHeader("cache-control", "no-store"); ctx.setHeader("pragma", "no-cache"); };
 	const endpoints = {
 		controlAnalytics: createAuthEndpoint("/control/analytics", { method: "GET", requireHeaders: true, query: analyticsQuery }, async (ctx) => { noCache(ctx); await options.requireAdmin(ctx); return ctx.json(await queryControlAnalytics(options.database, ctx.query)); }),
 		controlAnalyticsEntities: createAuthEndpoint("/control/analytics/entities", { method: "GET", requireHeaders: true, query: analyticsEntitiesQuery }, async (ctx) => { noCache(ctx); await options.requireAdmin(ctx); return ctx.json(await queryControlAnalyticsEntities(options.database, ctx.query)); }),
 	};
 	const hook = {
-		matcher: (ctx: HookEndpointContext) => Boolean(ctx.path && (ctx.path === "/get-session" || ctx.path === "/sign-up/email" || isPrimaryAuthenticationPath(ctx.path) || (ctx.method !== "GET" && (mutationEventType(ctx.path) || ctx.path === "/organization/set-active") && !/^\/(admin|project-admin|control)\//.test(ctx.path)))),
+		matcher: (ctx: HookEndpointContext) => Boolean(ctx.path && (ctx.path === "/get-session" || ctx.path === "/sign-up/email" || isPrimaryAuthenticationPath(ctx.path) || isControlActivityMutation(ctx.path, ctx.method))),
 		handler: createAuthMiddleware(async (ctx) => {
 			const outcome = controlResponseFailure(ctx.context.returned, ctx.context.responseHeaders);
 			if (outcome.failed || outcome.pendingMFA) return;
@@ -211,25 +190,15 @@ export function createControlAnalytics(options: { database: ControlDatabase; req
 			const principal = ctx.context.newSession || ctx.context.session;
 			if (!principal || principal.session.impersonatedBy) return;
 			const source = ctx.path === "/get-session" ? 2 : primary ? 1 : 4;
-			const requestedOrganization = typeof body?.organizationId === "string" ? body.organizationId : principal.session.activeOrganizationId;
-			// Repeated checks cannot add another daily fact. Skip both analytics reads and
-			// writes after the first proven identity/source/day; native auth still runs.
-			if (!ctx.path?.startsWith("/organization/") && recorder.has("users", principal.user.id, source) && (!requestedOrganization || recorder.has("organizations", String(requestedOrganization), source))) return;
-			// Cookie-cached sessions are not sufficient evidence of a surviving session.
-			const live = (await sql<{ userId: string; activeOrganizationId: string | null }>`SELECT s."userId",s."activeOrganizationId" FROM session s JOIN "user" u ON u.id=s."userId" WHERE s.id=${principal.session.id} AND s."expiresAt">CURRENT_TIMESTAMP AND NOT COALESCE(u.banned,false) AND NOT COALESCE(u."directoryDisabled",false) AND NOT COALESCE(u."isAnonymous",false) AND s."impersonatedBy" IS NULL`.execute(options.database)).rows[0];
-			if (!live) return;
-			await recorder.record("users", live.userId, source);
-			let organizationId = live.activeOrganizationId;
-			if (ctx.path?.startsWith("/organization/") && typeof body?.organizationId === "string") organizationId = body.organizationId;
-			if (ctx.path?.startsWith("/organization/") && ctx.context.returned && typeof ctx.context.returned === "object") {
-				const response = ctx.context.returned as Record<string, unknown>;
-				if (typeof response.organizationId === "string") organizationId = response.organizationId;
-				if (ctx.path === "/organization/create" && typeof response.id === "string") organizationId = response.id;
-			}
-			if (!organizationId) return;
-			const membership = (await sql`SELECT 1 FROM member m JOIN organization o ON o.id=m."organizationId" WHERE m."userId"=${live.userId} AND m."organizationId"=${organizationId} LIMIT 1`.execute(options.database)).rows[0];
-			if (membership) await recorder.record("organizations", organizationId, source);
+			const path = ctx.path || "";
+			const organizationAction = path.startsWith("/organization/");
+			await activity.session(
+				principal.session,
+				source,
+				organizationAction ? activityOrganizationTarget(path, body, ctx.context.returned) : undefined,
+				organizationAction,
+			);
 		}),
 	};
-	return { endpoints, hook, recorder };
+	return { endpoints, hook, recorder: activity.recorder };
 }

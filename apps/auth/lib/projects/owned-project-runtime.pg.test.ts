@@ -80,6 +80,14 @@ const catalogClientSecret = "synthetic-catalog-private-client-secret";
 const supportOrigin = "https://support.runtime.fixture.example";
 const supportCallback = `${supportOrigin}/api/allauth/support/callback`;
 const supportTarget = "fixture-support-target";
+const analyticsAccount = {
+	id: "fixture-analytics-account",
+	email: "analytics@runtime.fixture.example",
+};
+const analyticsOrganizations = [
+	"fixture-analytics-active-organization",
+	"fixture-analytics-requested-organization",
+] as const;
 const rejectedInvitationEmail =
 	"reject-console-invitation@runtime.fixture.example";
 const directoryOrg = "fixture-directory";
@@ -229,6 +237,28 @@ async function runtimeSecurity(
 	expect(response.headers.get("cache-control")).toBe("no-store");
 	expect(response.headers.get("pragma")).toBe("no-cache");
 	return response.json();
+}
+
+async function analyticsResponse(
+	service: Awaited<ReturnType<typeof openProcess>>,
+	path: string,
+	options: Parameters<Awaited<ReturnType<typeof openProcess>>["request"]>[1],
+	status = 200,
+): Promise<unknown> {
+	const response = await service.request(path, options);
+	expect(response.status, await response.clone().text()).toBe(status);
+	expect(response.headers.get("cache-control")).toBe("no-store");
+	expect(response.headers.get("pragma")).toBe("no-cache");
+	return response.json();
+}
+
+async function analyticsActivity(database: Pool, project: Project) {
+	const result = await database.query(
+		`SELECT "entityType","entityId",sources FROM "${project.schemaName}"."allauthAnalyticsActivity"
+		 WHERE "entityId"=ANY($1::text[]) ORDER BY "entityType","entityId"`,
+		[[analyticsAccount.id, ...analyticsOrganizations]],
+	);
+	return result.rows;
 }
 
 async function openProcess(
@@ -946,6 +976,8 @@ async function seed(databaseURL: string) {
 		const alpha = await provision("runtime-owned-fixture", [supportOrigin]);
 		const beta = await provision("runtime-control-fixture");
 		await insertAccount(alpha.schemaName, credentials.realmAdmin, "admin");
+		for (const project of [alpha, beta])
+			await insertAccount(project.schemaName, analyticsAccount);
 		const samlKeys = await createRuntimeSamlKeys();
 		await database.query(
 			`INSERT INTO "${alpha.schemaName}"."ssoProvider" (id,"providerId",issuer,domain,"domainVerified","userId","samlConfig")
@@ -1186,6 +1218,28 @@ describe.skipIf(!existsSync(fixture))(
 				});
 				expect(rootLogin.status).toBe(200);
 				const rootCookie = cookie(rootLogin);
+				const analyticsPath = `${alphaPath}/control/analytics`;
+				const analyticsSummaryPath = `${analyticsPath}?range=7d`;
+				const analyticsEntitiesPath = `${analyticsPath}/entities?cohort=active&q=${analyticsAccount.id}`;
+				const analyticsOrganizationPath = `${analyticsPath}/entities?entity=organizations&cohort=active&q=fixture-analytics-`;
+				const analyticsLogin = await service.request(
+					"/api/auth/sign-in/email",
+					{
+						host: alphaHost,
+						clientIP: "192.0.2.121",
+						body: {
+							email: analyticsAccount.email,
+							password: credentials.password,
+						},
+					},
+				);
+				expect(analyticsLogin.status).toBe(200);
+				const analyticsCookie = cookie(analyticsLogin);
+				const analyticsSession = {
+					cookie: analyticsCookie,
+					host: alphaHost,
+					clientIP: "192.0.2.121",
+				};
 				const securityPath = `${alphaPath}/control/security`;
 				const workspaceSession = { cookie: rootCookie };
 				const nativePolicy = {
@@ -1480,12 +1534,225 @@ describe.skipIf(!existsSync(fixture))(
 					(await service.request(management(alpha), { cookie: rootCookie }))
 						.status,
 				).toBe(200);
+				const nativeAnalytics = await analyticsResponse(
+					service,
+					analyticsSummaryPath,
+					workspaceSession,
+				);
+				const nativeAnalyticsEntity = await analyticsResponse(
+					service,
+					analyticsEntitiesPath,
+					workspaceSession,
+				);
+				const nativeAnalyticsInvalid = await analyticsResponse(
+					service,
+					`${analyticsPath}?from=2026-01-01`,
+					workspaceSession,
+					400,
+				);
+				const nativeAnalyticsInvalidSpan = await analyticsResponse(
+					service,
+					`${analyticsPath}?from=2026-01-02&to=2026-01-01`,
+					workspaceSession,
+					400,
+				);
+				const nativeAnalyticsDenied = await analyticsResponse(
+					service,
+					analyticsSummaryPath,
+					{},
+					403,
+				);
 				await service.stop();
 				service = undefined;
 				await admin.query(`CREATE DATABASE "${restored}" TEMPLATE "${source}"`);
 				created.push(restored);
 
 				service = await open(restored, true);
+				expect(
+					await analyticsResponse(
+						service,
+						analyticsSummaryPath,
+						workspaceSession,
+					),
+				).toEqual(nativeAnalytics);
+				expect(
+					await analyticsResponse(
+						service,
+						analyticsEntitiesPath,
+						workspaceSession,
+					),
+				).toEqual(nativeAnalyticsEntity);
+				expect(
+					await analyticsResponse(
+						service,
+						`${analyticsPath}?from=2026-01-01`,
+						workspaceSession,
+						400,
+					),
+				).toEqual(nativeAnalyticsInvalid);
+				expect(
+					await analyticsResponse(
+						service,
+						`${analyticsPath}?from=2026-01-02&to=2026-01-01`,
+						workspaceSession,
+						400,
+					),
+				).toEqual(nativeAnalyticsInvalidSpan);
+				for (const path of [analyticsSummaryPath, analyticsEntitiesPath])
+					expect(
+						await analyticsResponse(
+							service,
+							path,
+							{ cookie: realmAdminCookie },
+							403,
+						),
+					).toEqual(nativeAnalyticsDenied);
+				expect(
+					await analyticsResponse(
+						service,
+						"/api/auth/control/analytics",
+						{ ...workspaceSession, host: alphaHost },
+						403,
+					),
+				).toEqual(nativeAnalyticsDenied);
+				const activityDB = new Pool({
+					connectionString: url(restored),
+					max: 1,
+				});
+				try {
+					const schema = `"${alpha.schemaName}"`;
+					const activity = (sources: number) => ({
+						entityType: "users",
+						entityId: analyticsAccount.id,
+						sources,
+					});
+					expect(await analyticsActivity(activityDB, alpha)).toEqual([
+						activity(1),
+					]);
+					for (let read = 0; read < 2; read++) {
+						const session = await service.request(
+							"/api/auth/get-session",
+							analyticsSession,
+						);
+						expect(session.status).toBe(200);
+						expect(await session.json()).toMatchObject({
+							user: analyticsAccount,
+						});
+					}
+					expect(await analyticsActivity(activityDB, alpha)).toEqual([
+						activity(3),
+					]);
+					const reset = await service.request(
+						"/api/auth/request-password-reset",
+						{
+							...analyticsSession,
+							body: {
+								email: "missing-analytics-account@runtime.fixture.example",
+								redirectTo: `https://${alphaHost}/reset-password`,
+							},
+						},
+					);
+					expect(reset.status).toBe(200);
+					expect(await analyticsActivity(activityDB, alpha)).toEqual([
+						activity(3),
+					]);
+					const profile = await service.request("/api/auth/update-user", {
+						...analyticsSession,
+						body: { name: "Runtime Analytics Account" },
+					});
+					expect(profile.status, await profile.clone().text()).toBe(200);
+					expect(await analyticsActivity(activityDB, alpha)).toEqual([
+						activity(7),
+					]);
+					for (const id of analyticsOrganizations) {
+						await activityDB.query(
+							`INSERT INTO ${schema}.organization (id,name,slug,"createdAt") VALUES ($1,$1,$1,now())`,
+							[id],
+						);
+						await activityDB.query(
+							`INSERT INTO ${schema}.member (id,"organizationId","userId",role,"createdAt") VALUES ($1,$2,$3,'owner',now())`,
+							[randomUUID(), id, analyticsAccount.id],
+						);
+					}
+					const [active, requested] = analyticsOrganizations;
+					const selection = await service.request(
+						"/api/auth/organization/set-active",
+						{
+							...analyticsSession,
+							body: { organizationId: active },
+						},
+					);
+					expect(selection.status, await selection.clone().text()).toBe(200);
+					const session = await service.request(
+						"/api/auth/get-session",
+						analyticsSession,
+					);
+					expect(await session.json()).toMatchObject({
+						session: { activeOrganizationId: active },
+					});
+					const update = await service.request(
+						"/api/auth/organization/update",
+						{
+							...analyticsSession,
+							body: {
+								organizationId: requested,
+								data: { name: "Explicitly requested analytics organization" },
+							},
+						},
+					);
+					expect(update.status, await update.clone().text()).toBe(200);
+					expect(await analyticsActivity(activityDB, alpha)).toEqual([
+						{ entityType: "organizations", entityId: active, sources: 6 },
+						{ entityType: "organizations", entityId: requested, sources: 4 },
+						activity(7),
+					]);
+					const wrongRealm = await service.request("/api/auth/get-session", {
+						...analyticsSession,
+						host: betaHost,
+					});
+					expect(await wrongRealm.json()).toBeNull();
+					expect(await analyticsActivity(activityDB, beta)).toEqual([]);
+				} finally {
+					await activityDB
+						.query(
+							`DELETE FROM "${alpha.schemaName}".organization WHERE id=ANY($1::text[])`,
+							[analyticsOrganizations],
+						)
+						.finally(() => activityDB.end());
+				}
+				const ownedAnalyticsEntity = await analyticsResponse(
+					service,
+					analyticsEntitiesPath,
+					workspaceSession,
+				);
+				expect(ownedAnalyticsEntity).toMatchObject({
+					total: 1,
+					entities: [
+						{
+							id: analyticsAccount.id,
+							name: "Runtime Analytics Account",
+							activeDays: 1,
+						},
+					],
+				});
+				const ownedAnalyticsOrganizations = await analyticsResponse(
+					service,
+					analyticsOrganizationPath,
+					workspaceSession,
+				);
+				expect(ownedAnalyticsOrganizations).toMatchObject({
+					total: 2,
+					entities: expect.arrayContaining(
+						analyticsOrganizations.map((id) =>
+							expect.objectContaining({
+								id,
+								deleted: true,
+								name: null,
+								activeDays: 1,
+							}),
+						),
+					),
+				});
 				expect(
 					await runtimeSecurity(service, securityPath, workspaceSession),
 				).toMatchObject({
@@ -4172,6 +4439,20 @@ describe.skipIf(!existsSync(fixture))(
 				service = undefined;
 
 				service = await open(restored, false);
+				expect(
+					await analyticsResponse(
+						service,
+						analyticsEntitiesPath,
+						workspaceSession,
+					),
+				).toEqual(ownedAnalyticsEntity);
+				expect(
+					await analyticsResponse(
+						service,
+						analyticsOrganizationPath,
+						workspaceSession,
+					),
+				).toEqual(ownedAnalyticsOrganizations);
 				expect(
 					await runtimeSecurity(service, securityPath, workspaceSession),
 				).toMatchObject({

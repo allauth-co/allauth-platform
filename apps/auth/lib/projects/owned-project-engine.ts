@@ -9,6 +9,11 @@ import { authPolicySchema } from "../auth-policy/policy";
 import type { ApplicationBranding } from "../branding/types";
 import { clerkCompatiblePasswords } from "../clerk-password";
 import { isPlatformAdmin } from "../configuration";
+import type { ActivitySource } from "../control/analytics-activity";
+import {
+	controlResponseFailure,
+	isPrimaryAuthenticationPath,
+} from "../control/events";
 import { discoveryHeaders } from "../discovery";
 import { emailConfigured } from "../email/send";
 import { freshFeatureSession, isServerTokenRequest } from "../features/helpers";
@@ -29,6 +34,10 @@ import type { ProjectAccountLinkOptions } from "./owned-project-account-links";
 import type { OwnedProjectAdminDeletionOptions } from "./owned-project-admin-deletion";
 import { createOwnedProjectAdminDeletion } from "./owned-project-admin-deletion";
 import { createOwnedProjectAdminUsers } from "./owned-project-admin-users";
+import {
+	createOwnedProjectAnalytics,
+	isOwnedProjectActivityMutation,
+} from "./owned-project-analytics";
 import { createOwnedProjectControl } from "./owned-project-control";
 import { createOwnedProjectAgentHosts } from "./owned-project-agent-hosts";
 import type { ProjectBackchannelTarget } from "./owned-project-backchannel-logout";
@@ -259,6 +268,7 @@ interface OwnedProjectEngineOptions {
 	walletOrigin?: string;
 	agentHosts?: boolean;
 	openApi?: boolean;
+	analytics?: boolean;
 	webhookManagement?: Pick<
 		Parameters<typeof createOwnedProjectWebhookManagement>[0],
 		"resolver"
@@ -481,6 +491,10 @@ export function createOwnedProjectEngine(
 	});
 	const newDevice = options.security?.newDevice;
 	const notifications = new WeakMap<Request, () => Promise<void>>();
+	const analyticsSessions = new WeakMap<
+		Request,
+		{ session: ProjectSession; source: ActivitySource }
+	>();
 	const committedLogoutTargets = new WeakMap<
 		Request,
 		ProjectBackchannelTarget[]
@@ -703,6 +717,18 @@ export function createOwnedProjectEngine(
 				...(passwordMethod ? browserEventContext(request) : {}),
 				metadata: { path, method: passwordMethod },
 			});
+		}
+		// The audit trigger already records ordinary primary sign-ins. Rotation
+		// and organization attribution require the committed replacement session.
+		if (
+			analytics &&
+			!user.isAnonymous &&
+			(prior || session.activeOrganizationId)
+		) {
+			const source = !prior || isPrimaryAuthenticationPath(path) ? 1 : 4;
+			afterOwnedProjectCommit(client, () =>
+				analyticsSessions.set(request, { session, source }),
+			);
 		}
 		const maxAge = rememberMe ? policy.sessionExpiresInSeconds : undefined;
 		writeCookie(headers, sessionCookie, token, maxAge);
@@ -1279,6 +1305,14 @@ export function createOwnedProjectEngine(
 				}
 			}
 		}
+		if (
+			analytics &&
+			!current.user.isAnonymous &&
+			!request.headers.has("authorization") &&
+			request.method === "GET" &&
+			new URL(request.url).pathname === `${options.basePath}/get-session`
+		)
+			await analytics.session(current.session, 2);
 		return json(
 			{ session: current.session, user: projectUserResponse(current.user) },
 			200,
@@ -2061,6 +2095,19 @@ export function createOwnedProjectEngine(
 			readBody: requestBody,
 			newDeviceNotifications: Boolean(options.security.newDevice),
 		});
+	const analytics =
+		options.analytics &&
+		createOwnedProjectAnalytics({
+			database: options.database,
+			project: options.project,
+			workspace:
+				options.adminDeletion && adminProject
+					? { ...options.adminDeletion, project: adminProject }
+					: undefined,
+			origin,
+			basePath: options.basePath,
+			trustedIP: options.trustedIP,
+		});
 
 	const beforeGuestDelete = accountLinks?.beforeDelete;
 	const guest =
@@ -2507,6 +2554,10 @@ export function createOwnedProjectEngine(
 		currentSession,
 		trustedRequest,
 		readBody: requestBody,
+		collectActivity: analytics
+			? (session, organizationId) =>
+					analytics.session(session, 4, organizationId, true)
+			: undefined,
 		membershipLimit: options.organization?.membershipLimit,
 		invitationEmail: options.organization?.invitationEmail,
 		sessionCookies(request, principal) {
@@ -2641,6 +2692,8 @@ export function createOwnedProjectEngine(
 		const securityResult =
 			securityManagement && (await securityManagement(request, path));
 		if (securityResult) return securityResult;
+		const analyticsRead = analytics && (await analytics.read(request, path));
+		if (analyticsRead) return analyticsRead;
 		const agentHost = agentHosts && (await agentHosts(path, request));
 		if (agentHost) return agentHost;
 		const issuerResponse = issuer && (await issuer.dispatch(path, request));
@@ -2946,10 +2999,33 @@ export function createOwnedProjectEngine(
 		if (targets) await backchannel?.(targets);
 	}
 
+	async function recordAnalytics(request: Request, response: Response) {
+		if (
+			!analytics ||
+			response.status < 200 ||
+			response.status >= 400 ||
+			request.headers.has("authorization") ||
+			controlResponseFailure(undefined, response.headers).failed
+		)
+			return;
+		const session = analyticsSessions.get(request);
+		if (session) {
+			await analytics.session(session.session, session.source);
+			return;
+		}
+		if (request.method === "GET") return;
+		const path = new URL(request.url).pathname.slice(options.basePath.length);
+		if (isOwnedProjectActivityMutation(path, request.method)) {
+			const token = tokenFrom(request.headers);
+			if (token) await analytics.mutation(token);
+		}
+	}
+
 	return {
 		async dispatch(request) {
 			try {
 				const response = await route(request);
+				await recordAnalytics(request, response);
 				const upgradedGuest = completedGuestUpgrades.get(request);
 				if (response.status < 400 && guest && upgradedGuest)
 					await guest
@@ -2964,6 +3040,7 @@ export function createOwnedProjectEngine(
 				throw error;
 			} finally {
 				notifications.delete(request);
+				analyticsSessions.delete(request);
 				completedGuestUpgrades.delete(request);
 				await deliverCommittedLogout(request);
 			}
