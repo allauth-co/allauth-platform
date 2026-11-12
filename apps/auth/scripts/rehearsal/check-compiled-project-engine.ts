@@ -5,6 +5,7 @@ import { createRequire } from "node:module";
 import { setTimeout } from "node:timers/promises";
 import { promisify } from "node:util";
 import { getCookies } from "better-auth/cookies";
+import { createLocalJWKSet, jwtVerify, type JSONWebKeySet } from "jose";
 import { clerkCompatiblePasswords } from "../../lib/clerk-password";
 import { signEdgeRequest } from "../../lib/domains/edge";
 import { platformWorkspaceId } from "../../lib/workspaces/types";
@@ -125,20 +126,24 @@ async function request(
 		cookie,
 		realm,
 		host,
+		accept,
 		clientIP = "192.0.2.54",
 	}: {
 		body?: object;
 		cookie?: string;
 		realm?: Realm;
 		host?: string;
+		accept?: string;
 		clientIP?: string;
 	} = {},
 ) {
 	const method = body ? "POST" : "GET";
-	const data = body ? JSON.stringify(body) : "";
+	const form = body instanceof URLSearchParams;
+	const data = form ? body.toString() : body ? JSON.stringify(body) : "";
 	const headers = new Headers({
 		origin: host ? `https://${host}` : (realm?.primaryOrigin ?? platform),
-		...(body ? { "content-type": "application/json" } : {}),
+		...(body ? { "content-type": form ? "application/x-www-form-urlencoded" : "application/json" } : {}),
+		...(accept ? { accept } : {}),
 		...(cookie ? { cookie } : {}),
 	});
 	let ingress = headers;
@@ -186,6 +191,7 @@ async function request(
 		return {
 			status: response.status,
 			cookies: response.headers.getSetCookie(),
+			location: response.headers.get("location"),
 			body: await response.text(),
 		};
 	}
@@ -204,7 +210,9 @@ async function request(
 			method, headers, body, redirect: "manual", signal: AbortSignal.timeout(7000),
 		});
 		const cookies = response.headers.getSetCookie();
-		console.log(JSON.stringify({ status: response.status, cookies, body: await response.text() }));
+		console.log(JSON.stringify({
+			status: response.status, cookies, location: response.headers.get("location"), body: await response.text(),
+		}));
 	`,
 		JSON.stringify({
 			path,
@@ -216,7 +224,77 @@ async function request(
 	return JSON.parse(serialized) as {
 		status: number;
 		cookies: string[];
+		location: string | null;
 		body: string;
+	};
+}
+
+async function startConnectedApplication(realm: Realm, cookie: string) {
+	const schema = `allauth_project_${realm.id.replaceAll("-", "")}`;
+	const client = randomUUID();
+	const redirect = `${realm.primaryOrigin}/oauth/callback`;
+	const issuer = `https://${host}/api/auth`;
+	await query(source, `
+		INSERT INTO "${schema}"."oauthClient"
+		(id,"clientId","redirectUris","grantTypes",scopes,"tokenEndpointAuthMethod","skipConsent","requirePKCE","createdAt","updatedAt")
+		VALUES ('${client}','${client}','["${redirect}"]','["authorization_code","refresh_token"]',
+		'["openid","profile","offline_access"]','none',true,true,now(),now());
+	`);
+	const state = randomUUID();
+	const verifier = randomBytes(32).toString("base64url");
+	const queryString = new URLSearchParams({
+		client_id: client,
+		redirect_uri: redirect,
+		response_type: "code",
+		scope: "openid profile offline_access",
+		state,
+		code_challenge: createHash("sha256").update(verifier).digest("base64url"),
+		code_challenge_method: "S256",
+	});
+	const authorization = await request(`/api/auth/oauth2/authorize?${queryString}`, {
+		cookie, host, accept: "application/json",
+	});
+	assert.ok(authorization.status === 200 || authorization.status === 302,
+		"Native authorizes the connected fixture application.");
+	const location = authorization.location ?? (JSON.parse(authorization.body) as { url?: string }).url;
+	assert.ok(location);
+	const callback = new URL(location);
+	assert.equal(callback.origin + callback.pathname, redirect);
+	assert.equal(callback.searchParams.get("state"), state);
+	assert.equal(callback.searchParams.get("iss"), issuer);
+	const code = callback.searchParams.get("code");
+	assert.ok(code, "Native issues an authorization code.");
+
+	async function exchange(grant: Record<string, string>) {
+		const response = await request("/api/auth/oauth2/token", {
+			host, body: new URLSearchParams({ client_id: client, ...grant }),
+		});
+		expectStatus(response, 200, "The connected application exchanges its project grant.");
+		const tokens = JSON.parse(response.body) as { id_token: string; refresh_token: string };
+		assert.ok(tokens.id_token && tokens.refresh_token);
+		const jwks = await request("/api/auth/jwks", { host });
+		expectStatus(jwks, 200, "The same issuer publishes its signing keys.");
+		const signed = await jwtVerify(
+			tokens.id_token, createLocalJWKSet(JSON.parse(jwks.body) as JSONWebKeySet),
+			{ issuer, audience: client },
+		);
+		assert.equal(signed.payload.sub, accountId);
+		return { refresh: tokens.refresh_token, keyId: signed.protectedHeader.kid };
+	}
+	let grant = await exchange({
+		grant_type: "authorization_code",
+		redirect_uri: redirect,
+		code,
+		code_verifier: verifier,
+	});
+	assert.ok(grant.keyId);
+	return {
+		async rotate() {
+			const updated = await exchange({ grant_type: "refresh_token", refresh_token: grant.refresh });
+			assert.equal(updated.keyId, grant.keyId, "The project issuer retains the signing key.");
+			assert.ok(updated.refresh !== grant.refresh, "The issuer rotates the offline grant.");
+			grant = updated;
+		},
 	};
 }
 
@@ -458,6 +536,7 @@ try {
 		"Native sign-in through the verified hosted binding.",
 	);
 	const originalHostedCookie = sessionCookie(originalHosted);
+	const connected = internalSelection ? await startConnectedApplication(owned, originalHostedCookie) : undefined;
 	const managedHost = `${owned.slug}-accounts.${portalDomain}`;
 	const managedApi = `${owned.slug}-api.${portalDomain}`;
 	let nativeManagedCookie: string | undefined;
@@ -684,6 +763,7 @@ try {
 		}),
 		null,
 	);
+	await connected?.rotate();
 	const fixturePassword = internalSelection ? oldPassword : newPassword;
 	async function switchDirectSession() {
 		if (internalSelection) {
@@ -845,6 +925,7 @@ try {
 		accountId,
 	);
 	await checkKey("/api/auth", { host, cookie: ownedHostedCookie });
+	await connected?.rotate();
 	if (ownedManagedCookie)
 		assert.equal(
 			await currentSession("/api/auth/get-session", {

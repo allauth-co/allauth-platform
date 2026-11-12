@@ -73,7 +73,7 @@ The switch waits for admitted requests and guarded database transactions to fini
 
 For rollback, read the current revision and use it as the expected revision for the switch to `legacy`. For example, the first rollback uses `node scripts/project-engine-writer.mjs switch allauth 1 legacy`. Confirm the signed proxy, new hosted pages, existing sessions and all affected integrations after the switch. First-party forms already open retain their request transport while the pilot-capable release is running. Keep the same keys and leave the database migration installed. Switch the stored writer back to `legacy` before reverting to a release that predates the fence.
 
-Rehearse the release selector using the normal runtime image and an isolated Docker database. The harness checks both hosted sign-in views, the signed app proxy, persisted selection after restart, saved sessions and legacy-readable writes.
+Rehearse the release selector using the normal runtime image and an isolated Docker database. The harness checks both hosted sign-in views, the signed app proxy, persisted selection after restart, saved sessions and legacy-readable writes. A connected application exchanges an authorization code on the legacy writer and rotates the same offline grant through activation and rollback. Each ID token keeps the issuer, account subject and signing key.
 
 ```sh
 docker build --target runtime -f apps/auth/Dockerfile -t allauth-auth:internal-rehearsal .
