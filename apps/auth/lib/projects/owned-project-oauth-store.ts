@@ -158,10 +158,10 @@ export function createProjectOAuthStore(
 		link?: LinkAuthority,
 		path = `/callback/${identity.provider}`,
 	): Promise<Binding> {
-		// The legacy schema has no unique provider/subject constraint. Serialize this engine's writes to one identity.
-		await client.query(
-			"SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
-			[`${schema}\n${identity.provider}\n${identity.subject}`],
+		await realm.lockProviderIdentity(
+			client,
+			identity.provider,
+			identity.subject,
 		);
 		const binding = await client.query<{
 			id: string;

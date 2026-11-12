@@ -25,6 +25,15 @@ export function projectSsoDnsIdentifier(providerId: string) {
 	return `_better-auth-token-${providerId}`;
 }
 
+export function supportsProjectSsoDnsIdentifier(providerId: string) {
+	const identifier = projectSsoDnsIdentifier(providerId);
+	return (
+		ssoProviderId.safeParse(providerId).success &&
+		identifier.length <= 63 &&
+		identifier.split(".").every((part) => /^[a-zA-Z0-9_-]+$/.test(part))
+	);
+}
+
 export function projectSsoDomainNames(value: string) {
 	const domains = [
 		...new Set(
@@ -68,10 +77,7 @@ function verifyCandidate(provider: StoredProjectSsoProvider) {
 			"IDENTIFIER_TOO_LONG",
 			"Verification identifier exceeds the DNS label limit of 63 characters",
 		);
-	if (
-		!ssoProviderId.safeParse(provider.providerId).success ||
-		!/^[a-zA-Z0-9_-]+$/.test(provider.providerId)
-	)
+	if (!supportsProjectSsoDnsIdentifier(provider.providerId))
 		return failure(
 			400,
 			"INVALID_PROVIDER_ID",
@@ -88,9 +94,24 @@ export async function requestProjectSsoDomainProof(
 ) {
 	const candidate = verifyCandidate(provider);
 	if (candidate instanceof Response) return candidate;
-	const { identifier } = candidate;
+	return json(
+		{
+			domainVerificationToken: await issueProjectSsoDomainChallenge(
+				client,
+				candidate.identifier,
+			),
+		},
+		201,
+	);
+}
+
+/** Write the unchanged legacy verification row in the same transaction as a provider mutation. */
+export async function issueProjectSsoDomainChallenge(
+	client: PoolClient,
+	identifier: string,
+) {
 	const current = await currentChallenge(client, identifier);
-	if (current) return json({ domainVerificationToken: current.value }, 201);
+	if (current) return current.value;
 	const token = Array.from(
 		{ length: 24 },
 		() => alphabet[randomInt(alphabet.length)],
@@ -100,7 +121,7 @@ export async function requestProjectSsoDomainProof(
 		VALUES ($1,$2,$3,statement_timestamp()+interval '7 days')`,
 		[randomUUID(), identifier, token],
 	);
-	return json({ domainVerificationToken: token }, 201);
+	return token;
 }
 
 export async function readProjectSsoDomainProof(

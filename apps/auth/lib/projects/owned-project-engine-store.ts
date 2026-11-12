@@ -133,6 +133,18 @@ export function createProjectEngineStore(database: Pool, schemaName: string) {
 		return result.rows[0] ?? null;
 	}
 
+	async function lockProviderIdentity(
+		client: PoolClient,
+		provider: string,
+		subject: string,
+	) {
+		// The legacy account table has no unique provider/subject constraint.
+		await client.query(
+			"SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+			[`${schema}\n${provider}\n${subject}`],
+		);
+	}
+
 	async function lockSession(
 		client: PoolClient,
 		token: string,
@@ -366,6 +378,7 @@ export function createProjectEngineStore(database: Pool, schemaName: string) {
 		credential,
 		createSession,
 		list,
+		lockProviderIdentity,
 		lockSession,
 		lockUser,
 		record,

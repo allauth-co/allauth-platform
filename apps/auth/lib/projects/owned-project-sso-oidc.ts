@@ -135,6 +135,7 @@ export async function resolveProjectOidc(
 	provider: SsoProvider,
 	network: SsoFetch,
 	trustedOrigins: ReadonlySet<string>,
+	discover = false,
 ) {
 	const { config, issuer } = parseProjectOidc(provider);
 	let authorization = config.authorizationEndpoint;
@@ -143,7 +144,7 @@ export async function resolveProjectOidc(
 	let userInfo = config.userInfoEndpoint;
 	let auth = config.tokenEndpointAuthentication;
 	let callbackIssuer: boolean | undefined;
-	if (!authorization || !token || !jwks) {
+	if (discover || !authorization || !token || !jwks) {
 		const isTrusted = (url: URL) =>
 			url.origin === issuer.origin || trustedOrigins.has(url.origin);
 		const discovery = ssoHttpsUrl(

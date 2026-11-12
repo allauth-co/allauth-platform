@@ -13,7 +13,8 @@ import type { StoredProjectSsoProvider } from "./owned-project-sso-projection";
 import { readStoredSsoConfiguration } from "./owned-project-sso-projection";
 import { ssoProviderId } from "./owned-project-sso-store";
 
-const url = z.string().min(1).max(2048).url();
+export const projectSsoConfigURL = z.string().min(1).max(2048).url();
+const url = projectSsoConfigURL;
 const identityFields = [
 	"authorizationEndpoint",
 	"clientId",
@@ -23,6 +24,32 @@ const identityFields = [
 	"userInfoEndpoint",
 ] as const;
 
+export const projectSsoOidcInput = z.object({
+	clientId: z.string().min(1).max(512),
+	clientSecret: z.string().min(1).max(4096),
+	discoveryEndpoint: url.optional(),
+	authorizationEndpoint: url.optional(),
+	tokenEndpoint: url.optional(),
+	jwksEndpoint: url.optional(),
+	userInfoEndpoint: url.optional(),
+	tokenEndpointAuthentication: z
+		.enum(["client_secret_basic", "client_secret_post", "private_key_jwt"])
+		.optional(),
+	privateKeyId: z.string().min(1).max(512).optional(),
+	privateKeyAlgorithm: z.string().min(1).max(32).optional(),
+	skipDiscovery: z.boolean().optional(),
+	pkce: z.boolean().optional(),
+	scopes: z.array(ssoScope).max(24).optional(),
+	overrideUserInfo: z.boolean().optional(),
+	mapping: z
+		.strictObject({
+			email: z.string().min(1).max(128),
+			name: z.string().min(1).max(128),
+			image: z.string().min(1).max(128).optional(),
+		})
+		.optional(),
+});
+
 export const projectSsoUpdateInput = z.object({
 	providerId: z
 		.string()
@@ -31,33 +58,7 @@ export const projectSsoUpdateInput = z.object({
 	issuer: url.optional(),
 	domain: z.string().min(1).max(4096).optional(),
 	samlConfig: z.record(z.string(), z.unknown()).optional(),
-	oidcConfig: z
-		.object({
-			clientId: z.string().min(1).max(512).optional(),
-			clientSecret: z.string().min(1).max(4096).optional(),
-			discoveryEndpoint: url.optional(),
-			authorizationEndpoint: url.optional(),
-			tokenEndpoint: url.optional(),
-			jwksEndpoint: url.optional(),
-			userInfoEndpoint: url.optional(),
-			tokenEndpointAuthentication: z
-				.enum(["client_secret_basic", "client_secret_post", "private_key_jwt"])
-				.optional(),
-			privateKeyId: z.string().min(1).max(512).optional(),
-			privateKeyAlgorithm: z.string().min(1).max(32).optional(),
-			skipDiscovery: z.boolean().optional(),
-			pkce: z.boolean().optional(),
-			scopes: z.array(ssoScope).max(24).optional(),
-			overrideUserInfo: z.boolean().optional(),
-			mapping: z
-				.strictObject({
-					email: z.string().min(1).max(128),
-					name: z.string().min(1).max(128),
-					image: z.string().min(1).max(128).optional(),
-				})
-				.optional(),
-		})
-		.optional(),
+	oidcConfig: projectSsoOidcInput.partial().optional(),
 });
 
 type Update = z.infer<typeof projectSsoUpdateInput>;

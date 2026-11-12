@@ -36,6 +36,7 @@ import {
 	admitOwnedProjectBrokerMfa,
 	projectBrokerMfaPath,
 } from "./owned-project-broker-mfa-admission";
+import { createOwnedProjectClerkImport } from "./owned-project-clerk-import";
 import { createOwnedProjectEmailChange } from "./owned-project-email-change";
 import type { OwnedProjectEmailSignInOptions } from "./owned-project-email-sign-in";
 import { createOwnedProjectEmailSignIn } from "./owned-project-email-sign-in";
@@ -86,8 +87,8 @@ import {
 import { createOwnedProjectSsoManagement } from "./owned-project-sso-management";
 import type { OwnedProjectSupportOptions } from "./owned-project-support";
 import { createOwnedProjectSupportHttp } from "./owned-project-support";
-import { createOwnedRecoveryHttp } from "./owned-recovery-http";
 import { createOwnedProjectWallet } from "./owned-project-wallet";
+import { createOwnedRecoveryHttp } from "./owned-recovery-http";
 import {
 	createOwnedSignUpHttp,
 	scheduleOwnedSignUpVerification,
@@ -238,8 +239,8 @@ interface OwnedProjectEngineOptions {
 		};
 	};
 	passkeys?: Parameters<typeof createOwnedProjectPasskeyHttp>[0]["rp"];
-	recovery?: Omit<
 	walletOrigin?: string;
+	recovery?: Omit<
 		Parameters<typeof createOwnedRecoveryHttp>[0],
 		| "database"
 		| "project"
@@ -731,8 +732,8 @@ export function createOwnedProjectEngine(
 			managed?: boolean;
 			allowUnverifiedEmail: boolean;
 			anonymousUserId?: string;
-		},
 			wallet?: { address: string; chainId: number };
+		},
 	): Promise<Response> {
 		if (!activeUser(user) || (user.directoryManaged && !providerProof?.managed))
 			return forbidden();
@@ -813,7 +814,6 @@ export function createOwnedProjectEngine(
 			return json({ token, user: value }, 200, headers);
 		if (path === "/sign-in/social")
 			return json({ redirect: false, token, user: value }, 200, headers);
-		if (path === "/magic-link/verify")
 		if (providerProof?.wallet)
 			return json(
 				{
@@ -828,6 +828,7 @@ export function createOwnedProjectEngine(
 				200,
 				headers,
 			);
+		if (path === "/magic-link/verify")
 			return json(
 				{ token, user: value, session: { ...session, token } },
 				200,
@@ -1848,6 +1849,17 @@ export function createOwnedProjectEngine(
 				deliverLogoutAfterCommit(client, request, removed.targets);
 			},
 		});
+	const clerkImport =
+		options.adminDeletion &&
+		adminProject &&
+		createOwnedProjectClerkImport({
+			...options.adminDeletion,
+			project: adminProject,
+			store,
+			origin,
+			basePath: options.basePath,
+			readBody: (request) => requestBody(request, 1024 * 1024),
+		});
 
 	const beforeGuestDelete = accountLinks?.beforeDelete;
 	const guest =
@@ -1940,18 +1952,6 @@ export function createOwnedProjectEngine(
 		});
 	}
 
-	const oauth =
-		options.oauth &&
-		createOwnedProjectOAuth({
-			...options.oauth,
-			database: options.database,
-			project: options.project,
-			baseURL: origin,
-			basePath: options.basePath,
-			trustedOrigins: options.trustedOrigins,
-			async readGuestUserId(request) {
-				if (!guest) return undefined;
-				const current = await currentSession(request.headers);
 	const wallet =
 		options.walletOrigin &&
 		createOwnedProjectWallet({
@@ -1981,6 +1981,18 @@ export function createOwnedProjectEngine(
 			},
 		});
 
+	const oauth =
+		options.oauth &&
+		createOwnedProjectOAuth({
+			...options.oauth,
+			database: options.database,
+			project: options.project,
+			baseURL: origin,
+			basePath: options.basePath,
+			trustedOrigins: options.trustedOrigins,
+			async readGuestUserId(request) {
+				if (!guest) return undefined;
+				const current = await currentSession(request.headers);
 				return current?.user.isAnonymous ? current.user.id : undefined;
 			},
 			signingSecret: options.signingSecret,
@@ -2147,6 +2159,9 @@ export function createOwnedProjectEngine(
 			database: options.database,
 			schemaName: options.project.schemaName,
 			baseURL: `${origin}${options.basePath}`,
+			trustedOrigins: acceptedOrigins,
+			fetch: options.sso?.fetch,
+			saml: options.sso?.saml,
 			trustedRequest,
 			readBody: requestBody,
 			readSession: (request, client) => currentSession(request.headers, client),
@@ -2328,20 +2343,6 @@ export function createOwnedProjectEngine(
 			return forbidden();
 		const path = url.pathname.slice(options.basePath.length);
 		if (
-			request.method === "POST" &&
-			(path === "/sign-in/anonymous" || path === "/delete-anonymous-user")
-		)
-			return guestSession(request, path);
-		const administrative = await adminUsers?.(request, path);
-		if (administrative) return administrative;
-		const issuerResponse = issuer && (await issuer.dispatch(path, request));
-		if (issuerResponse) return issuerResponse;
-		if (
-			path === projectBrokerMfaPath &&
-			request.method === "POST" &&
-			options.brokerTwoFactor
-		)
-		if (
 			wallet &&
 			request.method === "POST" &&
 			["/siwe/nonce", "/siwe/get-nonce", "/siwe/verify"].includes(path)
@@ -2349,6 +2350,22 @@ export function createOwnedProjectEngine(
 			return trustedRequest(request.headers, true)
 				? wallet(path, request)
 				: forbidden();
+		if (
+			request.method === "POST" &&
+			(path === "/sign-in/anonymous" || path === "/delete-anonymous-user")
+		)
+			return guestSession(request, path);
+		const administrative = await adminUsers?.(request, path);
+		if (administrative) return administrative;
+		const imported = await clerkImport?.(request, path);
+		if (imported) return imported;
+		const issuerResponse = issuer && (await issuer.dispatch(path, request));
+		if (issuerResponse) return issuerResponse;
+		if (
+			path === projectBrokerMfaPath &&
+			request.method === "POST" &&
+			options.brokerTwoFactor
+		)
 			return verifyOwnedProjectBrokerMfa(request, {
 				authorize: options.brokerTwoFactor,
 				admit: (verified) =>

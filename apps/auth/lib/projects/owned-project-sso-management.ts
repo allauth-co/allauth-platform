@@ -14,8 +14,15 @@ import {
 	requestProjectSsoDomainProof,
 	verifyProjectSsoDomainProof,
 } from "./owned-project-sso-domain";
+import type { SsoFetch } from "./owned-project-sso-network";
 import type { StoredProjectSsoProvider } from "./owned-project-sso-projection";
 import { projectSsoProviderResponse } from "./owned-project-sso-projection";
+import {
+	authorizeProjectSsoRegistration,
+	prepareProjectSsoRegistration,
+	projectSsoRegistrationInput,
+	registerProjectSsoProvider,
+} from "./owned-project-sso-register";
 import { ssoProviderId } from "./owned-project-sso-store";
 import {
 	projectSsoUpdateInput,
@@ -24,6 +31,7 @@ import {
 
 const paths = {
 	"/sso/providers": "GET",
+	"/sso/register": "POST",
 	"/sso/get-provider": "GET",
 	"/sso/delete-provider": "POST",
 	"/sso/update-provider": "POST",
@@ -48,6 +56,8 @@ export interface OwnedProjectSsoManagementOptions {
 	schemaName: string;
 	/** Fully bound auth origin and prefix for the metadata URL returned to this transport. */
 	baseURL: string;
+	trustedOrigins: ReadonlySet<string>;
+	fetch?: SsoFetch;
 	trustedRequest(headers: Headers, mutation: boolean): boolean;
 	readBody(request: Request): Promise<unknown>;
 	readSession(
@@ -120,7 +130,11 @@ async function deleteProvider(
 
 async function auditProviderChange(
 	client: PoolClient,
-	path: "/sso/delete-provider" | "/sso/verify-domain" | "/sso/update-provider",
+	path:
+		| "/sso/delete-provider"
+		| "/sso/verify-domain"
+		| "/sso/update-provider"
+		| "/sso/register",
 	provider: StoredProjectSsoProvider,
 	actorId: string,
 ) {
@@ -149,6 +163,20 @@ export function createOwnedProjectSsoManagement(
 	options: OwnedProjectSsoManagementOptions,
 ) {
 	const store = createProjectEngineStore(options.database, options.schemaName);
+	const origin = new URL(options.baseURL).origin;
+
+	async function lockActor(
+		client: PoolClient,
+		request: Request,
+		session: NonNullable<Awaited<ReturnType<typeof options.readSession>>>,
+	) {
+		const user = await store.lockUser(client, session.user.id);
+		return user &&
+			(await store.lockSession(client, session.token, user.id, false)) &&
+			(await options.readSession(request, client))
+			? user
+			: null;
+	}
 
 	async function forProvider<T>(
 		request: Request,
@@ -167,16 +195,66 @@ export function createOwnedProjectSsoManagement(
 			// Match the SSO callback's provider → user → membership lock order.
 			const provider = await readProvider(client, providerId, mutation);
 			if (!provider) return noProvider();
-			if (
-				mutation &&
-				(!(await store.lockUser(client, userId)) ||
-					!(await store.lockSession(client, session.token, userId, false)) ||
-					!(await options.readSession(request, client)))
-			)
+			if (mutation && !(await lockActor(client, request, session)))
 				return failure(401, "UNAUTHORIZED", "Unauthorized");
 			if (!(await canManageProvider(client, provider, userId)))
 				return accessDenied();
 			return run(client, provider, userId);
+		});
+	}
+
+	async function register(request: Request) {
+		const parsed = projectSsoRegistrationInput.safeParse(
+			await options.readBody(request),
+		);
+		if (!parsed.success)
+			return failure(400, "BAD_REQUEST", "Invalid SSO provider request.");
+		const input = parsed.data;
+		async function registerWithAuthority<T>(
+			run: (client: PoolClient, actorId: string) => Promise<T>,
+		) {
+			return store.transaction(async (client) => {
+				const session = await options.readSession(request, client);
+				const user = session && (await lockActor(client, request, session));
+				if (!user) return failure(401, "UNAUTHORIZED", "Unauthorized");
+				const authorization = await authorizeProjectSsoRegistration(
+					client,
+					input,
+					user,
+				);
+				if (authorization) return authorization;
+				return run(client, user.id);
+			});
+		}
+
+		// Release database locks during bounded discovery and recheck authority before inserting.
+		const authorization = await registerWithAuthority(async () => undefined);
+		if (authorization instanceof Response) return authorization;
+		const configuration = await prepareProjectSsoRegistration(
+			input,
+			options.trustedOrigins,
+			options.fetch,
+		);
+		if (configuration instanceof Response) return configuration;
+		return registerWithAuthority(async (client, actorId) => {
+			const provider = await registerProjectSsoProvider(
+				client,
+				actorId,
+				input,
+				configuration,
+			);
+			if (provider instanceof Response) return provider;
+			await auditProviderChange(client, "/sso/register", provider, actorId);
+			const { oidcConfig: _stored, ...rest } = provider;
+			const { clientSecret, ...publicConfig } = configuration;
+			return json({
+				...rest,
+				oidcConfig:
+					request.headers.get("origin") === origin
+						? { ...publicConfig, clientSecret }
+						: publicConfig,
+				redirectURI: `${options.baseURL}/sso/callback/${encodeURIComponent(provider.providerId)}`,
+			});
 		});
 	}
 
@@ -194,6 +272,7 @@ export function createOwnedProjectSsoManagement(
 				"This authentication request is not permitted.",
 			);
 		try {
+			if (path === "/sso/register") return await register(request);
 			if (path === "/sso/update-provider") {
 				const input = projectSsoUpdateInput.safeParse(
 					await options.readBody(request),

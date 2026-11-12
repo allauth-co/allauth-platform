@@ -32,6 +32,9 @@ const slug = "sso-management-fixture";
 const prefix = `allauth_project_${slug}`;
 const secret = "isolated-project-sso-management-fixture-signing-secret";
 const issuer = "https://idp.sso-fixture.example";
+const applicationOrigin = "https://application.sso-fixture.example";
+const discovery =
+	vi.fn<(input: URL | RequestInfo, init?: RequestInit) => Promise<Response>>();
 const oidcConfig = {
 	issuer,
 	discoveryEndpoint: `${issuer}/.well-known/openid-configuration`,
@@ -157,11 +160,11 @@ describe.skipIf(!existsSync(fixture))(
 				project: { schemaName, slug },
 				baseURL: origin,
 				basePath: "/api/auth",
-				trustedOrigins: [],
+				trustedOrigins: [applicationOrigin],
 				trustedIP: () => "192.0.2.38",
 				signingSecret,
 				policy: defaultAuthPolicy,
-				sso: { defaultErrorURL: `${origin}/auth-error` },
+				sso: { defaultErrorURL: `${origin}/auth-error`, fetch: discovery },
 			});
 		}
 
@@ -727,6 +730,183 @@ describe.skipIf(!existsSync(fixture))(
 					)
 				).json(),
 			).toEqual(before);
+		});
+
+		it("registers native-format OIDC and DNS rows with the correct same-origin credential response", async () => {
+			const body = {
+				providerId: "registered-oidc",
+				issuer,
+				domain: "registered.corp.example",
+				organizationId,
+				oidcConfig: {
+					clientId: oidcConfig.clientId,
+					clientSecret: oidcConfig.clientSecret,
+					authorizationEndpoint: oidcConfig.authorizationEndpoint,
+					tokenEndpoint: oidcConfig.tokenEndpoint,
+					jwksEndpoint: oidcConfig.jwksEndpoint,
+					skipDiscovery: true,
+				},
+			};
+			expect(
+				(await owned.dispatch(request("register", orgMember, body))).status,
+			).toBe(403);
+			expect(
+				(
+					await owned.dispatch(
+						request("register", owner, { ...body, organizationId: undefined }),
+					)
+				).status,
+			).toBe(403);
+			expect(
+				(
+					await owned.dispatch(
+						request("register", orgAdmin, { ...body, providerId: "google" }),
+					)
+				).status,
+			).toBe(422);
+			const registered = await owned.dispatch(
+				request("register", orgAdmin, body),
+			);
+			expect(registered.status, await registered.clone().text()).toBe(200);
+			expect(registered.headers.get("cache-control")).toBe("no-store");
+			expect(await registered.json()).toMatchObject({
+				id: expect.any(String),
+				userId: orgAdmin.id,
+				providerId: body.providerId,
+				issuer,
+				domain: body.domain,
+				organizationId,
+				domainVerified: false,
+				domainVerificationToken: expect.stringMatching(/^[A-Za-z0-9]{24}$/),
+				redirectURI: `${origin}/api/auth/sso/callback/${body.providerId}`,
+				oidcConfig: {
+					issuer,
+					clientId: oidcConfig.clientId,
+					clientSecret: oidcConfig.clientSecret,
+					tokenEndpointAuthentication: "client_secret_basic",
+					pkce: true,
+					overrideUserInfo: false,
+				},
+				samlConfig: null,
+			});
+			const nativeDetail = await native(
+				request(`get-provider?providerId=${body.providerId}`, orgAdmin),
+			);
+			expect(nativeDetail.status).toBe(200);
+			expect(await nativeDetail.text()).not.toContain(oidcConfig.clientSecret);
+			const proof = await native(
+				request("request-domain-verification", orgAdmin, {
+					providerId: body.providerId,
+				}),
+			);
+			expect(proof.status).toBe(201);
+			expect(
+				(await owned.dispatch(request("register", orgAdmin, body))).status,
+			).toBe(422);
+
+			const nativeProviderId = "registered-native";
+			const nativeRegistered = await native(
+				request("register", orgAdmin, {
+					...body,
+					providerId: nativeProviderId,
+				}),
+			);
+			expect(
+				nativeRegistered.status,
+				await nativeRegistered.clone().text(),
+			).toBe(200);
+			expect(
+				await (
+					await owned.dispatch(
+						request(`get-provider?providerId=${nativeProviderId}`, orgAdmin),
+					)
+				).json(),
+			).toMatchObject({
+				providerId: nativeProviderId,
+				domainVerified: false,
+				oidcConfig: { clientIdLastFour: "****ABC9" },
+			});
+
+			const crossOrigin = await owned.dispatch(
+				request(
+					"register",
+					realmAdmin,
+					{
+						...body,
+						providerId: "registered-application",
+						organizationId: undefined,
+					},
+					applicationOrigin,
+				),
+			);
+			expect(crossOrigin.status, await crossOrigin.clone().text()).toBe(200);
+			expect(await crossOrigin.text()).not.toContain(oidcConfig.clientSecret);
+		});
+
+		it("hydrates an authorized provider via discovery and rechecks role before persistence", async () => {
+			const doc = {
+				issuer,
+				authorization_endpoint: oidcConfig.authorizationEndpoint,
+				token_endpoint: oidcConfig.tokenEndpoint,
+				jwks_uri: oidcConfig.jwksEndpoint,
+				userinfo_endpoint: oidcConfig.userInfoEndpoint,
+				token_endpoint_auth_methods_supported: ["client_secret_post"],
+			};
+			discovery.mockImplementationOnce(async (input) => {
+				expect(input.toString()).toBe(oidcConfig.discoveryEndpoint);
+				return Response.json(doc);
+			});
+			const body = {
+				providerId: "registered-discovery",
+				issuer,
+				domain: "discovery.corp.example",
+				organizationId,
+				oidcConfig: {
+					clientId: oidcConfig.clientId,
+					clientSecret: oidcConfig.clientSecret,
+				},
+			};
+			const registered = await owned.dispatch(
+				request("register", orgAdmin, body),
+			);
+			expect(registered.status, await registered.clone().text()).toBe(200);
+			expect(await registered.json()).toMatchObject({
+				oidcConfig: {
+					authorizationEndpoint: oidcConfig.authorizationEndpoint,
+					tokenEndpoint: oidcConfig.tokenEndpoint,
+					jwksEndpoint: oidcConfig.jwksEndpoint,
+					tokenEndpointAuthentication: "client_secret_post",
+				},
+			});
+			const losingRole = { ...body, providerId: "registration-lost-authority" };
+			discovery.mockImplementationOnce(async () => {
+				await database.query(
+					`UPDATE "${schema}"."member" SET role='member' WHERE "userId"=$1 AND "organizationId"=$2`,
+					[orgAdmin.id, organizationId],
+				);
+				return Response.json(doc);
+			});
+			try {
+				expect(
+					(await owned.dispatch(request("register", orgAdmin, losingRole)))
+						.status,
+				).toBe(403);
+			} finally {
+				await database.query(
+					`UPDATE "${schema}"."member" SET role='admin' WHERE "userId"=$1 AND "organizationId"=$2`,
+					[orgAdmin.id, organizationId],
+				);
+			}
+			expect(
+				(
+					await native(
+						request(
+							`get-provider?providerId=${losingRole.providerId}`,
+							orgAdmin,
+						),
+					)
+				).status,
+			).toBe(404);
 		});
 	},
 );

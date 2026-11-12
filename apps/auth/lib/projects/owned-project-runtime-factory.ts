@@ -195,12 +195,32 @@ async function readSupportedProviders(options: Options) {
 		 EXISTS (SELECT 1 FROM "${schema}"."agentHost") OR
 		 EXISTS (SELECT 1 FROM "${schema}"."allauthWebhookEndpoint") OR
 		 (NOT $2::boolean AND EXISTS (SELECT 1 FROM "${schema}"."allauthAvatarAsset" WHERE state <> 'deleted')) OR
-		 EXISTS (SELECT 1 FROM "${schema}"."account" WHERE "providerId" <> ALL($1::text[])) OR
+		 EXISTS (
+		  SELECT 1 FROM "${schema}"."account" a JOIN "${schema}"."user" u ON u.id=a."userId"
+		  CROSS JOIN LATERAL (SELECT u."privateMetadata"->'allauthClerkMigration' AS value) provenance
+		  WHERE a."providerId" <> ALL($1::text[]) AND NOT COALESCE((
+		   a."providerId" IN ('google','apple') AND a.password IS NULL AND a.scope IS NULL AND
+		   a."accessToken" IS NULL AND a."refreshToken" IS NULL AND a."idToken" IS NULL AND
+		   a."accessTokenExpiresAt" IS NULL AND a."refreshTokenExpiresAt" IS NULL AND
+		   provenance.value->'version' = '1'::jsonb AND
+		   jsonb_typeof(provenance.value->'sourceInstance') = 'string' AND
+		   jsonb_typeof(provenance.value->'sourceUserId') = 'string' AND
+		   jsonb_typeof(provenance.value->'fingerprint') = 'string' AND
+		   provenance.value->>'sourceInstance' ~ '^[A-Za-z0-9_.:-]{1,160}$' AND
+		   provenance.value->>'sourceUserId' ~ '^[A-Za-z0-9_.:-]{1,160}$' AND
+		   provenance.value->>'fingerprint' ~ '^[a-f0-9]{64}$' AND
+		   u.id = 'clerk_' || encode(sha256(convert_to('[' || to_json($3::text)::text || ',' ||
+		    to_json(provenance.value->>'sourceInstance')::text || ',' ||
+		    to_json(provenance.value->>'sourceUserId')::text || ']', 'UTF8')), 'hex') AND
+		   a.id = 'clerk_social_' || encode(sha256(convert_to('[' || to_json(a."providerId")::text ||
+		    ',' || to_json(a."accountId")::text || ']', 'UTF8')), 'hex')
+		  ), FALSE)
+		 ) OR
 		 EXISTS (SELECT 1 FROM "${schema}"."oauthClient" WHERE "grantTypes" IS NOT NULL AND (
 		  jsonb_typeof("grantTypes") <> 'array' OR NOT "grantTypes" <@ '["authorization_code","refresh_token","urn:ietf:params:oauth:grant-type:device_code"]'::jsonb
 		 ))
 		) AS incompatible`,
-		[providers, ownedAvatarSelected(env, project.id)],
+		[providers, ownedAvatarSelected(env, project.id), project.id],
 	);
 	if (!snapshot || snapshot.incompatible)
 		throw new Error(
@@ -473,6 +493,7 @@ export async function createOwnedProjectRuntimeCandidate(options: Options) {
 		manageSCIMConsole,
 		backchannelLogout: { defer, post: options.postBackchannelLogout },
 		support: projectSupport(options, platform),
+		walletOrigin: browserOrigin,
 		oauth: {
 			tokenKeys: encryptionKeys,
 			defaultErrorURL: `${platform}/auth-error`,
@@ -490,7 +511,6 @@ export async function createOwnedProjectRuntimeCandidate(options: Options) {
 			...(appleOAuth ? { apple: appleOAuth } : {}),
 			broker: {
 				clientId: project.brokerClientId,
-		walletOrigin: browserOrigin,
 				clientSecret,
 				issuer: platform,
 				discoveryURL: `${platform}/.well-known/openid-configuration`,
