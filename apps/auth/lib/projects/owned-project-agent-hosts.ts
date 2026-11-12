@@ -13,6 +13,7 @@ import {
 	revokeOwnedBrowserAgent,
 	revokeOwnedHostAgent,
 } from "./owned-project-agent-browser";
+import { readOwnedAgentCatalog } from "./owned-project-agent-catalog";
 import {
 	agentHostCapabilities,
 	agentHostJSON as json,
@@ -248,6 +249,9 @@ export function createOwnedProjectAgentHosts(options: BrowserHosts) {
 		const pending = request.method === "GET" && path === "/agent/ciba/pending";
 		const status = request.method === "GET" && path === "/agent/status";
 		const register = request.method === "POST" && path === "/agent/register";
+		const catalog =
+			request.method === "GET" &&
+			(path === "/capability/list" || path === "/capability/describe");
 		const agentRead =
 			request.method === "GET" &&
 			(path === "/agent/get" || path === "/agent/list");
@@ -271,6 +275,7 @@ export function createOwnedProjectAgentHosts(options: BrowserHosts) {
 			!pending &&
 			!status &&
 			!register &&
+			!catalog &&
 			!agentRead
 		)
 			return;
@@ -282,13 +287,17 @@ export function createOwnedProjectAgentHosts(options: BrowserHosts) {
 						? 5
 						: pending || status
 							? 300
-							: agentRead || agentRevoke
+							: agentRead || agentRevoke || catalog
 								? 60
 								: 100,
 				windowMs: 60_000,
 			}),
 		);
 		if (limited) return limited;
+		if (catalog)
+			return options.store.transaction((client) =>
+				readOwnedAgentCatalog(client, request, path),
+			);
 		if (status)
 			return options.store.transaction((client) =>
 				readOwnedAgentStatus(client, request),

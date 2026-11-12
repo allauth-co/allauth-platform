@@ -1778,6 +1778,91 @@ describe.skipIf(!existsSync(fixture))(
 			expect(after[loser]).toEqual(before[loser]);
 		});
 
+		it("keeps the configured empty capability catalog behind the same signed host and agent authority", async () => {
+			const list = "/capability/list?query=fixture&cursor=0&limit=3";
+			const describe = "/capability/describe?name=fixture.read";
+			const machine = await nativeMachine("Capability catalog");
+			const hostBearer = `Bearer ${await nativeClientHostProof(machine)}`;
+			const expected = { capabilities: [], has_more: false };
+			await expectSame(list, "", 401);
+			await expectSame(list, machineCookie, 401);
+			await expectSame(describe, "", 401);
+			expect(await expectSame(list, "", 200, undefined, hostBearer)).toEqual(
+				expected,
+			);
+			expect(
+				await expectSame(describe, "", 404, undefined, hostBearer),
+			).toEqual({
+				error: "capability_not_found",
+				message: 'Capability "fixture.read" does not exist.',
+			});
+			await expectSame("/capability/describe", "", 400, undefined, hostBearer);
+			await expectSame(
+				"/capability/list?limit=invalid",
+				"",
+				400,
+				undefined,
+				hostBearer,
+			);
+			expect(
+				(await outside.dispatch(request(beta, list, "", undefined, hostBearer)))
+					.status,
+			).toBe(401);
+			expect(
+				(
+					await disabled.dispatch(
+						request(alpha, list, "", undefined, hostBearer),
+					)
+				).status,
+			).toBe(501);
+			const clientProof = () =>
+				new SignJWT({})
+					.setProtectedHeader({ alg: "EdDSA", typ: "agent+jwt" })
+					.setSubject(machine.agentId)
+					.setAudience(agentAudience)
+					.setIssuedAt()
+					.setExpirationTime("60s")
+					.setJti(randomUUID())
+					.sign(machine.agentKey.privateKey);
+			const legacyProof = `Bearer ${await clientProof()}`;
+			const ownedProof = `Bearer ${await clientProof()}`;
+			const previous = await legacy.handler(
+				request(alpha, list, "", undefined, legacyProof),
+			);
+			const current = await owned.dispatch(
+				request(alpha, list, "", undefined, ownedProof),
+			);
+			expect(previous.status).toBe(200);
+			expect(current.status).toBe(200);
+			expect(await previous.json()).toEqual(expected);
+			expect(await current.json()).toEqual(expected);
+			const denied = await candidate(alpha, true).dispatch(
+				request(alpha, list, "", undefined, ownedProof),
+			);
+			const legacyDenied = await legacy.handler(
+				request(alpha, list, "", undefined, legacyProof),
+			);
+			expect(denied.status).toBe(401);
+			expect(legacyDenied.status).toBe(401);
+			expect(await denied.json()).toEqual(await legacyDenied.json());
+			expect(denied.headers.get("www-authenticate")).toBe(
+				legacyDenied.headers.get("www-authenticate"),
+			);
+			const acrossPaths = await owned.dispatch(
+				request(alpha, statusPath, "", undefined, ownedProof),
+			);
+			expect(acrossPaths.status).toBe(401);
+			expect(await acrossPaths.json()).toMatchObject({ error: "jti_replay" });
+			const wrongBinding = `Bearer ${await agentProof(machine, `${agentAudience}${statusPath}`)}`;
+			await expectSame(list, "", 401, undefined, wrongBinding);
+			legacy = await native(nativePool);
+			const resumed = await legacy.handler(
+				request(alpha, list, "", undefined, `Bearer ${await clientProof()}`),
+			);
+			expect(resumed.status).toBe(200);
+			expect(await resumed.json()).toEqual(expected);
+		});
+
 		it("validates native host status reads against its own inline host and projects legacy grants", async () => {
 			const machine = await nativeMachine("Status host");
 			const other = await nativeMachine("Other status host");

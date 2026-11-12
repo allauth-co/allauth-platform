@@ -106,7 +106,100 @@ function invalidStatusQuery() {
 	);
 }
 
-/** Validate a scoped inline machine credential for the status route only. */
+/** Lock and verify an active delegated agent for one of the enabled machine reads. */
+export async function authorizeOwnedAgentRead(
+	client: PoolClient,
+	request: Request,
+	url: URL,
+	audience: string[],
+	{
+		token,
+		typ,
+		claims,
+	}: Exclude<ReturnType<typeof decodeAgentMachineJWT>, false | null>,
+) {
+	if (typ !== "agent+jwt" || !validIdentifier(claims.sub))
+		return invalidJWT(url.origin);
+	const observed = (
+		await client.query<{ hostId: string }>(
+			'SELECT "hostId" FROM "agent" WHERE id=$1',
+			[claims.sub],
+		)
+	).rows[0];
+	if (!observed) return agentNotFound(401, url.origin);
+	if (claims.iss !== undefined && claims.iss !== observed.hostId)
+		return invalidJWT(url.origin);
+	const host = (
+		await client.query<{ userId: string | null }>(
+			`SELECT "userId" FROM "agentHost" WHERE id=$1 AND status='active' FOR SHARE`,
+			[observed.hostId],
+		)
+	).rows[0];
+	const agent = (
+		await client.query<Agent>(
+			`SELECT ${agentFields} FROM "agent" WHERE id=$1 AND "hostId"=$2 FOR UPDATE`,
+			[claims.sub, observed.hostId],
+		)
+	).rows[0];
+	if (
+		!agent ||
+		!host?.userId ||
+		agent.mode !== "delegated" ||
+		(agent.userId && agent.userId !== host.userId)
+	)
+		return agentNotFound(401, url.origin);
+	const verified = await verifyInline(token, agent, audience, url.origin);
+	if (verified instanceof Response) return verified;
+	if (
+		typeof verified.jti !== "string" ||
+		!verified.jti ||
+		verified.jti.length > 512
+	)
+		return invalidJWT(url.origin);
+	const inactive = inactiveAgent(agent, Date.now(), url.origin);
+	if (inactive) return inactive;
+	// Signed agent reads share the original status replay namespace.
+	if (
+		!(await consumeAgentMachineReplay(
+			client,
+			"agent-status",
+			agent.id,
+			verified.jti,
+		))
+	)
+		return problem(401, "jti_replay", "JWT has already been used", url.origin);
+	if (!matchesBinding(verified, request, url))
+		return problem(
+			401,
+			"request_binding_mismatch",
+			"Request binding does not match the JWT",
+			url.origin,
+		);
+	return agent;
+}
+
+/** Persist the native heartbeat without extending the configured hard lifetime. */
+export async function refreshOwnedAgentRead(
+	client: PoolClient,
+	agent: Agent,
+	origin: string,
+) {
+	const {
+		rows: [heartbeat],
+	} = await client.query<Pick<Agent, "lastUsedAt" | "expiresAt">>(
+		`UPDATE "agent" SET "lastUsedAt"=statement_timestamp(),"expiresAt"=LEAST(
+		 statement_timestamp()+$2::int*interval '1 second',COALESCE("activatedAt","createdAt")+$3::int*interval '1 second',"createdAt"+$4::int*interval '1 second')
+		 WHERE id=$1 AND ("expiresAt" IS NULL OR "expiresAt">statement_timestamp())
+		 AND COALESCE("activatedAt","createdAt")+$3::int*interval '1 second'>statement_timestamp()
+		 AND "createdAt"+$4::int*interval '1 second'>statement_timestamp() RETURNING "lastUsedAt","expiresAt"`,
+		[agent.id, heartbeatLifetime, activationLifetime, absoluteLifetime],
+	);
+	if (!heartbeat)
+		return problem(401, "agent_expired", "Agent session has expired", origin);
+	return { ...agent, ...heartbeat };
+}
+
+/** Read the status of an agent authorized by its own key or its signed host. */
 export async function readOwnedAgentStatus(
 	client: PoolClient,
 	request: Request,
@@ -155,79 +248,17 @@ export async function readOwnedAgentStatus(
 			);
 		return publicAgent(client, agent);
 	}
-	if (typ !== "agent+jwt" || !validIdentifier(claims.sub))
-		return invalidJWT(url.origin);
-	const observed = (
-		await client.query<{ hostId: string }>(
-			'SELECT "hostId" FROM "agent" WHERE id=$1',
-			[claims.sub],
-		)
-	).rows[0];
-	if (!observed) return agentNotFound(401, url.origin);
-	if (claims.iss !== undefined && claims.iss !== observed.hostId)
-		return invalidJWT(url.origin);
-	const host = (
-		await client.query<{ userId: string | null }>(
-			`SELECT "userId" FROM "agentHost" WHERE id=$1 AND status='active' FOR SHARE`,
-			[observed.hostId],
-		)
-	).rows[0];
-	const agent = (
-		await client.query<Agent>(
-			`SELECT ${agentFields} FROM "agent" WHERE id=$1 AND "hostId"=$2 FOR UPDATE`,
-			[claims.sub, observed.hostId],
-		)
-	).rows[0];
-	if (
-		!agent ||
-		!host?.userId ||
-		agent.mode !== "delegated" ||
-		(agent.userId && agent.userId !== host.userId)
-	)
-		return agentNotFound(401, url.origin);
-	const verified = await verifyInline(token, agent, audience, url.origin);
-	if (verified instanceof Response) return verified;
-	if (
-		typeof verified.jti !== "string" ||
-		!verified.jti ||
-		verified.jti.length > 512
-	)
-		return invalidJWT(url.origin);
-	const inactive = inactiveAgent(agent, Date.now(), url.origin);
-	if (inactive) return inactive;
-	if (
-		!(await consumeAgentMachineReplay(
-			client,
-			"agent-status",
-			agent.id,
-			verified.jti,
-		))
-	)
-		return problem(401, "jti_replay", "JWT has already been used", url.origin);
-	if (!matchesBinding(verified, request, url))
-		return problem(
-			401,
-			"request_binding_mismatch",
-			"Request binding does not match the JWT",
-			url.origin,
-		);
-	if (ids.length > 1) return invalidStatusQuery();
-	const {
-		rows: [heartbeat],
-	} = await client.query<Pick<Agent, "lastUsedAt" | "expiresAt">>(
-		`UPDATE "agent" SET "lastUsedAt"=statement_timestamp(),"expiresAt"=LEAST(
-		 statement_timestamp()+$2::int*interval '1 second',COALESCE("activatedAt","createdAt")+$3::int*interval '1 second',"createdAt"+$4::int*interval '1 second')
-		 WHERE id=$1 AND ("expiresAt" IS NULL OR "expiresAt">statement_timestamp())
-		 AND COALESCE("activatedAt","createdAt")+$3::int*interval '1 second'>statement_timestamp()
-		 AND "createdAt"+$4::int*interval '1 second'>statement_timestamp() RETURNING "lastUsedAt","expiresAt"`,
-		[agent.id, heartbeatLifetime, activationLifetime, absoluteLifetime],
+	const agent = await authorizeOwnedAgentRead(
+		client,
+		request,
+		url,
+		audience,
+		decoded,
 	);
-	if (!heartbeat)
-		return problem(
-			401,
-			"agent_expired",
-			"Agent session has expired",
-			url.origin,
-		);
-	return publicAgent(client, { ...agent, ...heartbeat });
+	if (agent instanceof Response) return agent;
+	if (ids.length > 1) return invalidStatusQuery();
+	const refreshed = await refreshOwnedAgentRead(client, agent, url.origin);
+	return refreshed instanceof Response
+		? refreshed
+		: publicAgent(client, refreshed);
 }
