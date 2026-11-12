@@ -4,12 +4,17 @@ import * as oauth from "oauth4webapi";
 import type { Pool, PoolClient } from "pg";
 import * as z from "zod";
 import { validAvatarPath } from "../avatars/protocol";
-import { reservedProjectEmailError } from "../project-email-alias-config";
 import type { LegacyMfaKeys } from "./legacy-mfa-record";
 import { readLegacySessionCookie } from "./legacy-session-cookie";
 import { markOwnedCallbackFailure } from "./owned-project-callback-failure";
 import type { OwnedProjectEmailAliases } from "./owned-project-email-aliases";
 import type { ProjectUser } from "./owned-project-engine-store";
+import type { ProjectSsoAdmission } from "./owned-project-sso-admission";
+import {
+	createSsoProfileAdmission,
+	ssoPolicyErrorDescription,
+	ssoSessionErrorCode,
+} from "./owned-project-sso-admission";
 import type { SsoFetch } from "./owned-project-sso-network";
 import {
 	fetchPublicSsoEndpoint,
@@ -90,7 +95,7 @@ export const ownedProjectSsoInput = z.strictObject({
 });
 export type OwnedProjectSsoInput = z.infer<typeof ownedProjectSsoInput>;
 
-export interface OwnedProjectSsoOptions {
+export interface OwnedProjectSsoOptions extends ProjectSsoAdmission {
 	database: Pool;
 	project: Pick<Project, "schemaName" | "slug">;
 	baseURL: string;
@@ -205,6 +210,7 @@ export function createOwnedProjectSso(options: OwnedProjectSsoOptions) {
 			store,
 			allowedReturn: (value) => allowedReturn(value, origin, origins),
 			complete: options.complete,
+			profilePolicy: options,
 		});
 	const network: SsoFetch = (input, init) =>
 		(options.fetch ?? fetchPublicSsoEndpoint)(input, {
@@ -238,18 +244,15 @@ export function createOwnedProjectSso(options: OwnedProjectSsoOptions) {
 		clear = false,
 		auditCode = code,
 	) {
+		const description = ssoPolicyErrorDescription(code);
 		const target =
 			(flow?.errorURL && allowedReturn(flow.errorURL, origin, origins)) ||
-			(code !== reservedProjectEmailError.code &&
+			(!description &&
 				flow &&
 				allowedReturn(flow.callbackURL, origin, origins)) ||
 			new URL(defaultError!.href);
 		target.searchParams.set("error", code);
-		if (code === reservedProjectEmailError.code)
-			target.searchParams.set(
-				"error_description",
-				reservedProjectEmailError.message,
-			);
+		if (description) target.searchParams.set("error_description", description);
 		const response = new Response(null, {
 			status: 302,
 			headers: {
@@ -603,20 +606,28 @@ export function createOwnedProjectSso(options: OwnedProjectSsoOptions) {
 			let rejection = "internal_server_error";
 			const abort = Symbol("project SSO admission rejected");
 			try {
-				return finish(
-					await store.transaction(async (client) => {
-						const current = await store.getProvider(providerId, client);
-						if (!current?.oidcConfig || !sameSsoProvider(current, reference)) {
-							rejection = "invalid_state";
-							throw abort;
-						}
+				const result = await store.transaction(async (client) => {
+					const current = await store.getProvider(providerId, client);
+					if (!current?.oidcConfig || !sameSsoProvider(current, reference)) {
+						rejection = "invalid_state";
+						throw abort;
+					}
+					const { state: admission, denyProfile } = createSsoProfileAdmission(
+						options,
+						client,
+						request,
+					);
+					try {
 						const linked = await store.bind(
 							client,
 							current,
 							identity,
 							options.signUpEnabled,
+							"oidc",
+							denyProfile,
 						);
 						if (typeof linked === "string") {
+							if (admission.commitDenial) return linked;
 							rejection = linked;
 							throw abort;
 						}
@@ -627,12 +638,19 @@ export function createOwnedProjectSso(options: OwnedProjectSsoOptions) {
 							destination: ((linked.registered && welcome) || destination).href,
 						});
 						if (response.status >= 400) {
-							rejection = "account_not_linked";
+							rejection = await ssoSessionErrorCode(response);
 							throw abort;
 						}
 						return response;
-					}),
-				);
+					} catch (error) {
+						if (!admission.rollback) throw error;
+						await admission.rollback();
+						return error === abort ? rejection : "internal_server_error";
+					}
+				});
+				return typeof result === "string"
+					? failure(result, flow, true)
+					: finish(result);
 			} catch (error) {
 				if (error !== abort) throw error;
 				return failure(rejection, flow, true);

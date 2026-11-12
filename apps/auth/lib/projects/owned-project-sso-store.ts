@@ -7,6 +7,7 @@ import { sealLegacyMfaRecord } from "./legacy-mfa-record";
 import type { OwnedProjectEmailAliases } from "./owned-project-email-aliases";
 import { createProjectEngineStore } from "./owned-project-engine-store";
 import { projectOrganizations } from "./owned-project-organization-store";
+import { ssoProfileRejected } from "./owned-project-sso-admission";
 import { checkedProjectSchema } from "./validation";
 
 const stateAge = 600;
@@ -366,6 +367,10 @@ export function createProjectSsoStore(
 		identity: SsoIdentity,
 		signUpEnabled: boolean,
 		protocol: "oidc" | "saml" = "oidc",
+		denyProfile?: (
+			email: string,
+			action: "existing" | "signup",
+		) => Promise<boolean>,
 	) {
 		const providerId = current.providerId;
 		// OAuth and OIDC provider accounts share the existing subject namespace.
@@ -417,6 +422,8 @@ export function createProjectSsoStore(
 			} else {
 				if (!signUpEnabled || !trustedDomain)
 					return "account_not_linked" as const;
+				if (await denyProfile?.(identity.email, "signup"))
+					return ssoProfileRejected;
 				if (emailAliases?.reserved(identity.email))
 					return reservedProjectEmailError.code;
 				const created = await client.query<{ id: string }>(
@@ -437,6 +444,8 @@ export function createProjectSsoStore(
 			(!directory && user.directoryManaged)
 		)
 			return "account_not_linked" as const;
+		if (!registered && (await denyProfile?.(identity.email, "existing")))
+			return ssoProfileRejected;
 		const path =
 			protocol === "saml"
 				? `/sso/saml2/sp/acs/${providerId}`

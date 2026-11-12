@@ -1,9 +1,14 @@
 import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
 import type { PoolClient } from "pg";
 import * as z from "zod";
-import { reservedProjectEmailError } from "../project-email-alias-config";
 import { markOwnedCallbackFailure } from "./owned-project-callback-failure";
 import type { OwnedProjectSsoOptions } from "./owned-project-sso";
+import type { ProjectSsoAdmission } from "./owned-project-sso-admission";
+import {
+	createSsoProfileAdmission,
+	ssoPolicyErrorDescription,
+	ssoSessionErrorCode,
+} from "./owned-project-sso-admission";
 import type { ProjectCustomSamlTransport } from "./owned-project-sso-saml-eligibility";
 import { configureProjectSamlTransport } from "./owned-project-sso-saml-eligibility";
 import {
@@ -134,6 +139,7 @@ export function createOwnedProjectSaml(options: {
 	store: SsoStore;
 	allowedReturn(value: string): URL | null;
 	complete: OwnedProjectSsoOptions["complete"];
+	profilePolicy: ProjectSsoAdmission;
 }) {
 	const { store } = options;
 	const acs = (providerId: string) =>
@@ -219,18 +225,22 @@ export function createOwnedProjectSaml(options: {
 		);
 	}
 
-	function failure(code: string, flow?: SsoState, receiver?: string) {
+	function failure(
+		code: string,
+		flow?: SsoState,
+		receiver?: string,
+		signedDestination?: string,
+	) {
+		const description = ssoPolicyErrorDescription(code);
 		const destination =
 			returnURL(flow?.errorURL, receiver) ||
-			(code !== reservedProjectEmailError.code &&
-				returnURL(flow?.callbackURL, receiver)) ||
+			(description
+				? !flow && returnURL(signedDestination, receiver)
+				: returnURL(flow?.callbackURL, receiver)) ||
 			new URL(options.defaultError.href);
 		destination.searchParams.set("error", code);
-		if (code === reservedProjectEmailError.code)
-			destination.searchParams.set(
-				"error_description",
-				reservedProjectEmailError.message,
-			);
+		if (description)
+			destination.searchParams.set("error_description", description);
 		const response = finish(
 			new Response(null, {
 				status: 302,
@@ -447,6 +457,7 @@ export function createOwnedProjectSaml(options: {
 				),
 			);
 		let flow: SsoState | undefined;
+		let signedDestination: string | undefined;
 		const abort = Symbol("SAML sign-in refused");
 		let rejection = "account_not_linked";
 		try {
@@ -467,22 +478,30 @@ export function createOwnedProjectSaml(options: {
 					(selected.custom ? options.origin : new URL(options.origin).href);
 			}
 			if (!destination) return failure("invalid_state", flow, receiver);
+			signedDestination = destination;
 			const absoluteDestination = new URL(destination, options.origin).href;
-			return finish(
-				await store.transaction(async (client) => {
-					const current = await store.getProvider(providerId, client);
-					if (!currentProviderMatches(current, consumed.reference)) {
-						rejection = "invalid_state";
-						throw abort;
-					}
+			const result = await store.transaction(async (client) => {
+				const current = await store.getProvider(providerId, client);
+				if (!currentProviderMatches(current, consumed.reference)) {
+					rejection = "invalid_state";
+					throw abort;
+				}
+				const { state: admission, denyProfile } = createSsoProfileAdmission(
+					options.profilePolicy,
+					client,
+					request,
+				);
+				try {
 					const linked = await store.bind(
 						client,
 						current,
 						proof.identity,
 						options.signUpEnabled,
 						"saml",
+						denyProfile,
 					);
 					if (typeof linked === "string") {
+						if (admission.commitDenial) return linked;
 						rejection = linked;
 						throw abort;
 					}
@@ -493,7 +512,10 @@ export function createOwnedProjectSaml(options: {
 						destination: absoluteDestination,
 						protocol: "saml",
 					});
-					if (response.status >= 400) throw abort;
+					if (response.status >= 400) {
+						rejection = await ssoSessionErrorCode(response);
+						throw abort;
+					}
 					if (
 						destination !== absoluteDestination &&
 						response.headers.get("location") === absoluteDestination
@@ -506,13 +528,21 @@ export function createOwnedProjectSaml(options: {
 						});
 					}
 					return response;
-				}),
-			);
+				} catch (error) {
+					if (!admission.rollback) throw error;
+					await admission.rollback();
+					return error === abort ? rejection : "internal_server_error";
+				}
+			});
+			return typeof result === "string"
+				? failure(result, flow, receiver, signedDestination)
+				: finish(result);
 		} catch (error) {
 			return failure(
 				error === abort ? rejection : "internal_server_error",
 				flow,
 				receiver,
+				signedDestination,
 			);
 		}
 	}

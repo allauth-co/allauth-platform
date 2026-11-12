@@ -9,6 +9,7 @@ import { Kysely, PostgresDialect } from "kysely";
 import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { defaultAuthPolicy } from "../auth-policy/policy";
+import { allauthControl } from "../control";
 import { resolveEnterpriseUser } from "../enterprise";
 import type { ProjectEmailAliasMap } from "../project-email-alias-config";
 import { projectEmailAliases } from "../project-email-aliases";
@@ -17,6 +18,7 @@ import { createOwnedProjectEngine } from "./owned-project-engine";
 import { createProjectEngineStore } from "./owned-project-engine-store";
 import type { OwnedProjectSsoOptions } from "./owned-project-sso";
 import { createOwnedProjectSso } from "./owned-project-sso";
+import { checkSsoPolicyFixture } from "./owned-project-sso-policy-fixture";
 
 const fixturePath = new URL(
 	"../../../../.secrets/local-postgres.json",
@@ -62,6 +64,7 @@ async function nativeSso(
 	db: LegacyDatabase,
 	resolvePrivateKey: NonNullable<OwnedProjectSsoOptions["resolvePrivateKey"]>,
 	aliases: ProjectEmailAliasMap = {},
+	control = false,
 ) {
 	return (
 		await getTestInstance(
@@ -80,6 +83,17 @@ async function nativeSso(
 					accountLinking: { enabled: true, trustedProviders: [] },
 				},
 				plugins: [
+					...(control
+						? [
+								allauthControl({
+									database: db,
+									baseURL: origin,
+									secret,
+									ipHeader: "x-real-ip",
+									requireTrustedIP: true,
+								}),
+							]
+						: []),
 					projectEmailAliases({
 						project: slug,
 						readConfiguration: () => JSON.stringify(aliases),
@@ -322,6 +336,7 @@ describe.skipIf(!existsSync(fixturePath))(
 						"001-initial-auth.sql",
 						"002-control-plane.sql",
 						"005-free-plugins.sql",
+						"006-analytics.sql",
 					]) {
 						await client.query(
 							readFileSync(
@@ -396,7 +411,7 @@ describe.skipIf(!existsSync(fixturePath))(
 				dialect: new PostgresDialect({
 					pool: new Pool({
 						connectionString: url.toString(),
-						max: 1,
+						max: 2,
 						options: `-c search_path=${schema}`,
 					}),
 				}),
@@ -887,6 +902,69 @@ describe.skipIf(!existsSync(fixturePath))(
 					id: decoy,
 					email: providerEmail,
 				});
+			}
+		});
+
+		it("applies native OIDC profile and stored-session rules with durable signup velocity", async () => {
+			if (!nativeDatabase)
+				throw new Error("Expected the scoped fixture database.");
+			const signupProvider = "policy-oidc-fixture";
+			const defaultErrorURL = `${origin}/api/auth/error`;
+			const mapped = { ...config, userInfoEndpoint: undefined };
+			await database.query(
+				`INSERT INTO "${schema}"."ssoProvider"(id,"providerId",issuer,"oidcConfig","userId",domain,"domainVerified")
+				 VALUES ($1,$2,$3,$4,$5,'corp.example',TRUE)`,
+				[randomUUID(), signupProvider, issuer, JSON.stringify(mapped), decoy],
+			);
+			await configure(mapped);
+			try {
+				const legacy = await nativeSso(
+					nativeDatabase,
+					resolvePrivateKey,
+					{},
+					true,
+				);
+				const owned = createOwnedProjectEngine({
+					database,
+					project: { slug, schemaName: schema },
+					baseURL: origin,
+					basePath: "/api/auth",
+					trustedOrigins: [],
+					signingSecret: secret,
+					policy: defaultAuthPolicy,
+					trustedIP: (request) => request.headers.get("x-real-ip"),
+					sso: { defaultErrorURL, fetch: network },
+				});
+				await checkSsoPolicyFixture({
+					database,
+					schema,
+					secret,
+					origin,
+					destination,
+					defaultErrorURL,
+					managedProvider: providerId,
+					managedSubject: subject,
+					signupProvider,
+					async signIn(writer, input) {
+						const dispatch =
+							writer === "native" ? legacy.handler : owned.dispatch;
+						const start = startRequest({
+							...body,
+							providerId: input.providerId,
+							errorCallbackURL: input.errorURL,
+						});
+						start.headers.set("x-real-ip", input.ip);
+						const pending = await authorize(
+							await dispatch(start),
+							`${origin}/api/auth/sso/callback/${input.providerId}`,
+							input,
+						);
+						pending.headers.set("x-real-ip", input.ip);
+						return dispatch(pending);
+					},
+				});
+			} finally {
+				await configure(config);
 			}
 		});
 

@@ -29,6 +29,7 @@ import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
 import { createOwnedProjectEngine } from "./owned-project-engine";
 import { createProjectEngineStore } from "./owned-project-engine-store";
 import { createOwnedProjectSso } from "./owned-project-sso";
+import { checkSsoPolicyFixture } from "./owned-project-sso-policy-fixture";
 import { checkProjectSamlConfiguration } from "./owned-project-sso-saml-eligibility";
 import {
 	configureOwnedSaml,
@@ -241,6 +242,7 @@ function signedResponse(
 		recipient?: string;
 		receiver?: string;
 		email?: string;
+		subject?: string;
 		expired?: boolean;
 		signature?: "assertion" | "response" | "both" | "none";
 	} = {},
@@ -259,7 +261,7 @@ function signedResponse(
 		<samlp:Status><samlp:StatusCode Value="urn:oasis:names:tc:SAML:2.0:status:Success"/></samlp:Status>
 		<saml:Assertion ID="${assertionId}" Version="2.0" IssueInstant="${now}">
 			<saml:Issuer>${actualIssuer}</saml:Issuer>
-			<saml:Subject><saml:NameID>${subject}</saml:NameID><saml:SubjectConfirmation Method="urn:oasis:names:tc:SAML:2.0:cm:bearer"><saml:SubjectConfirmationData${inResponseTo} Recipient="${options.recipient ?? receiver}" NotOnOrAfter="${expires}"/></saml:SubjectConfirmation></saml:Subject>
+			<saml:Subject><saml:NameID>${options.subject ?? subject}</saml:NameID><saml:SubjectConfirmation Method="urn:oasis:names:tc:SAML:2.0:cm:bearer"><saml:SubjectConfirmationData${inResponseTo} Recipient="${options.recipient ?? receiver}" NotOnOrAfter="${expires}"/></saml:SubjectConfirmation></saml:Subject>
 			<saml:Conditions NotOnOrAfter="${expires}"><saml:AudienceRestriction><saml:Audience>${options.audience ?? sp}</saml:Audience></saml:AudienceRestriction></saml:Conditions>
 			<saml:AuthnStatement AuthnInstant="${now}" SessionIndex="_${randomUUID()}"><saml:AuthnContext><saml:AuthnContextClassRef>urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport</saml:AuthnContextClassRef></saml:AuthnContext></saml:AuthnStatement>
 			<saml:AttributeStatement><saml:Attribute Name="corpEmail"><saml:AttributeValue>${options.email ?? decoyEmail}</saml:AttributeValue></saml:Attribute></saml:AttributeStatement>
@@ -424,6 +426,7 @@ describe.skipIf(!existsSync(fixturePath))(
 				"001-initial-auth.sql",
 				"002-control-plane.sql",
 				"005-free-plugins.sql",
+				"006-analytics.sql",
 			])
 				await nativePool.query(
 					readFileSync(
@@ -1286,6 +1289,66 @@ describe.skipIf(!existsSync(fixturePath))(
 			} finally {
 				await storeSamlConfiguration(configuration());
 			}
+		});
+
+		it("applies native SAML profile and stored-session rules with durable signup velocity", async () => {
+			if (!nativeDatabase)
+				throw new Error("Expected the scoped fixture database.");
+			const signupProvider = "policy-saml-fixture";
+			await database.query(
+				`INSERT INTO "${schema}"."ssoProvider"(id,"providerId",issuer,"samlConfig","userId",domain,"domainVerified")
+				 VALUES ($1,$2,$3,$4,$5,'corp.example',TRUE)`,
+				[
+					randomUUID(),
+					signupProvider,
+					sp,
+					JSON.stringify(configuration()),
+					decoy,
+				],
+			);
+			const legacy = await nativeSso(nativeDatabase, true);
+			const owned = createOwnedProjectEngine({
+				database,
+				project: { slug, schemaName: schema },
+				baseURL: origin,
+				basePath: "/api/auth",
+				trustedOrigins: [],
+				signingSecret: secret,
+				policy: defaultAuthPolicy,
+				trustedIP: (request) => request.headers.get("x-real-ip"),
+				sso: { defaultErrorURL, saml: true },
+			});
+			await checkSsoPolicyFixture({
+				database,
+				schema,
+				secret,
+				origin,
+				destination,
+				defaultErrorURL,
+				managedProvider: providerId,
+				managedSubject: subject,
+				signupProvider,
+				async signIn(writer, input) {
+					const dispatch =
+						writer === "native" ? legacy.handler : owned.dispatch;
+					const start = {
+						...body,
+						providerId: input.providerId,
+						errorCallbackURL: input.errorURL,
+					};
+					const request = startRequest(start);
+					request.headers.set("x-real-ip", input.ip);
+					const receiver = `${origin}/api/auth/sso/saml2/sp/acs/${input.providerId}`;
+					const state = await pending(await dispatch(request), receiver);
+					const signed = signedResponse(state.requestId, {
+						...input,
+						receiver,
+					});
+					const received = callback(signed.encoded, state.relay, receiver);
+					received.headers.set("x-real-ip", input.ip);
+					return dispatch(received);
+				},
+			});
 		});
 
 		it("preserves saved IdP callback precedence while both writers refuse IdP-initiated login", async () => {

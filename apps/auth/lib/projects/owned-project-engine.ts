@@ -244,7 +244,9 @@ interface OwnedProjectEngineOptions {
 		| "trustedOrigins"
 		| "signingSecret"
 		| "signUpEnabled"
-	| "emailAliases"
+		| "emailAliases"
+		| "denyProviderProfile"
+		| "prepareProviderSignup"
 		| "complete"
 	>;
 	scim?: { credentialHashSecret: string };
@@ -2579,6 +2581,8 @@ export function createOwnedProjectEngine(
 			trustedOrigins: options.trustedOrigins,
 			signingSecret: options.signingSecret,
 			signUpEnabled: policy.signUpEnabled,
+			denyProviderProfile: security.denyProvisioning,
+			prepareProviderSignup: security.prepareProviderSignup,
 			async complete(
 				client,
 				{ user, request, providerId, destination, managed, protocol },
