@@ -52,6 +52,7 @@ import {
 } from "./owned-project-runtime-provider-fixture";
 import {
 	createRuntimeSamlKeys,
+	renewRuntimeSamlCertificate,
 	runtimeSamlAuthnRequest,
 	runtimeSamlConfiguration,
 	runtimeSamlEntity,
@@ -6001,7 +6002,7 @@ describe.skipIf(!existsSync(fixture))(
 			}
 		}, 90_000);
 
-		it("rehearses native-stored GCM configuration at the verified custom SAML receiver", async () => {
+		it("rehearses native-stored GCM configuration and certificate renewal at the verified custom SAML receiver", async () => {
 			const local: { container: string; DATABASE_URL: string } = JSON.parse(
 				readFileSync(fixture, "utf8"),
 			);
@@ -6023,6 +6024,10 @@ describe.skipIf(!existsSync(fixture))(
 				created = true;
 				const { alpha, samlKeys } = await seed(databaseURL);
 				const encryption = await createRuntimeSamlKeys();
+				const renewedCertificate = await renewRuntimeSamlCertificate(
+					encryption.privateKey,
+				);
+				expect(renewedCertificate).not.toBe(encryption.certificate);
 				const passphrase = "synthetic-persisted-saml-key-passphrase";
 				const encryptedKey = createPrivateKey(encryption.privateKey).export({
 					type: "pkcs8",
@@ -6056,7 +6061,10 @@ describe.skipIf(!existsSync(fixture))(
 				await database.query(`DELETE FROM ${scope} WHERE "providerId"=$1`, [
 					runtimeSamlProvider,
 				]);
-				const metadata = runtimeSamlSPMetadata(acs, encryption.certificate);
+				const metadata = runtimeSamlSPMetadata(acs, [
+					encryption.certificate,
+					renewedCertificate,
+				]);
 				const { issuer, ...signing } = runtimeSamlConfiguration(samlKeys);
 				const algorithmHints = {
 					dataEncryptionAlgorithm: "http://www.w3.org/2009/xmlenc11#aes256-gcm",
@@ -6202,7 +6210,9 @@ describe.skipIf(!existsSync(fixture))(
 						pending.flow,
 						credentials.project.email,
 						{
-							certificate: encryption.certificate,
+							certificate: pending.transport.host
+								? renewedCertificate
+								: encryption.certificate,
 							dataAlgorithm: pending.transport.host
 								? algorithmHints.dataEncryptionAlgorithm
 								: "http://www.w3.org/2009/xmlenc11#aes128-gcm",
@@ -6248,7 +6258,10 @@ describe.skipIf(!existsSync(fixture))(
 					...provider.samlConfig,
 					spMetadata: {
 						...provider.samlConfig.spMetadata,
-						metadata: runtimeSamlSPMetadata(acs, samlKeys.certificate),
+						metadata: runtimeSamlSPMetadata(acs, [
+							encryption.certificate,
+							samlKeys.certificate,
+						]),
 					},
 				};
 				const setConfiguration = (value: object) =>

@@ -28,6 +28,7 @@ import { projectEmailAliases } from "../project-email-aliases";
 import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
 import { createOwnedProjectEngine } from "./owned-project-engine";
 import { createProjectEngineStore } from "./owned-project-engine-store";
+import { renewRuntimeSamlCertificate } from "./owned-project-runtime-saml-fixture";
 import { createOwnedProjectSso } from "./owned-project-sso";
 import { checkSsoPolicyFixture } from "./owned-project-sso-policy-fixture";
 import { checkProjectSamlConfiguration } from "./owned-project-sso-saml-eligibility";
@@ -852,6 +853,78 @@ describe.skipIf(!existsSync(fixturePath))(
 						providerId,
 					),
 				);
+			} finally {
+				await storeSamlConfiguration(configuration());
+			}
+		});
+
+		it("preserves encrypted sign-in across same-key certificate renewal and rollback", async () => {
+			const original = fixtureEncryptionKeys.certificate;
+			const renewed = await renewRuntimeSamlCertificate(
+				fixtureEncryptionKeys.privateKey,
+			);
+			expect(renewed).not.toBe(original);
+			const generated = encryptedConfiguration();
+			const withCertificates = (certificates: string[]) => ({
+				...generated,
+				authnRequestsSigned: true,
+				spMetadata: {
+					...generated.spMetadata,
+					privateKey: fixtureKeys.privateKey,
+					metadata: saml
+						.SPMetadata({
+							entityID: sp,
+							assertionConsumerService: [
+								{
+									Binding: "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST",
+									Location: acs,
+								},
+							],
+							wantAssertionsSigned: true,
+							authnRequestsSigned: true,
+							encryptCert: certificates,
+						})
+						.getMetadata(),
+				},
+			});
+			const engine = owned("encrypted-fixture");
+			try {
+				await storeSamlConfiguration(withCertificates([original, renewed]));
+				const legacy = await pending(await native.handler(startRequest()));
+				await assertSession(
+					await engine.samlCallback(
+						callback(
+							await encryptedFixtureResponse(legacy.requestId, "assertion", {
+								certificate: original,
+							}),
+							legacy.relay,
+						),
+						providerId,
+					),
+				);
+				const ownedPending = await pending(
+					await engine.start(startRequest(), body),
+				);
+				await assertSession(
+					await native.handler(
+						callback(
+							await encryptedFixtureResponse(
+								ownedPending.requestId,
+								"assertion",
+								{
+									certificate: renewed,
+								},
+							),
+							ownedPending.relay,
+						),
+					),
+				);
+				await storeSamlConfiguration(
+					withCertificates([original, fixtureKeys.certificate]),
+				);
+				const rejected = await engine.start(startRequest(), body);
+				expect(rejected.status).toBe(400);
+				expect(cookies(rejected)).toBe("");
 			} finally {
 				await storeSamlConfiguration(configuration());
 			}

@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -54,6 +54,35 @@ export async function createRuntimeSamlKeys() {
 	}
 }
 
+export async function renewRuntimeSamlCertificate(privateKey: string) {
+	const directory = await mkdtemp(
+		join(tmpdir(), "allauth-runtime-saml-renew-"),
+	);
+	try {
+		const key = join(directory, "key.pem");
+		await writeFile(key, privateKey, { mode: 0o600 });
+		const { stdout } = await promisify(execFile)(
+			"openssl",
+			[
+				"req",
+				"-x509",
+				"-new",
+				"-key",
+				key,
+				"-sha256",
+				"-days",
+				"2",
+				"-subj",
+				"/CN=allauth-runtime-saml-renewed",
+			],
+			{ timeout: 5000 },
+		);
+		return stdout;
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+}
+
 export function runtimeSamlConfiguration(
 	keys: Awaited<ReturnType<typeof createRuntimeSamlKeys>>,
 ) {
@@ -82,7 +111,7 @@ export function runtimeSamlAuthnRequest(location: URL) {
 
 export function runtimeSamlSPMetadata(
 	acs: string,
-	encryptCert?: string,
+	encryptCert?: string | string[],
 	logout?: string,
 ) {
 	const binding = "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST";

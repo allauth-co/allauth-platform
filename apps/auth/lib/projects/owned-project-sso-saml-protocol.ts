@@ -246,7 +246,7 @@ function decryptionKey(
 	return privateKey;
 }
 
-function validateCustomEncryptionCertificate(
+function validateCustomEncryptionCertificates(
 	descriptor: XmlElement,
 	serviceCertificate: string | string[] | null,
 	privateKey: KeyObject,
@@ -254,20 +254,25 @@ function validateCustomEncryptionCertificate(
 	const keys = children(descriptor, metadataNS, "KeyDescriptor").filter(
 		(item) => item.getAttribute("use") === "encryption",
 	);
-	if (keys.length !== 1 || typeof serviceCertificate !== "string") invalid();
-	const info = child(keys[0]!, signatureNS, "KeyInfo");
-	const data = child(info, signatureNS, "X509Data");
-	const certificate = text(child(data, signatureNS, "X509Certificate")).replace(
-		/\s/g,
-		"",
-	);
-	if (certificate !== serviceCertificate.replace(/\s/g, "")) invalid();
-	if (
-		!new X509Certificate(
-			`-----BEGIN CERTIFICATE-----\n${certificate}\n-----END CERTIFICATE-----`,
-		).checkPrivateKey(privateKey)
-	)
+	const advertised = serviceCertificate ? [serviceCertificate].flat() : [];
+	if (!keys.length || keys.length > 16 || keys.length !== advertised.length)
 		invalid();
+	// Certificate renewal can keep a key. Every advertised certificate must
+	// resolve to that key because the saved provider has a single decryption key.
+	for (const [index, key] of keys.entries()) {
+		const info = child(key, signatureNS, "KeyInfo");
+		const data = child(info, signatureNS, "X509Data");
+		const certificate = text(
+			child(data, signatureNS, "X509Certificate"),
+		).replace(/\s/g, "");
+		if (
+			certificate !== advertised[index]!.replace(/\s/g, "") ||
+			!new X509Certificate(
+				`-----BEGIN CERTIFICATE-----\n${certificate}\n-----END CERTIFICATE-----`,
+			).checkPrivateKey(privateKey)
+		)
+			invalid();
+	}
 }
 
 /** The configured SP/IdP pair, built with the same library as legacy SSO. */
@@ -343,7 +348,7 @@ export function configureOwnedSaml(
 	)
 		invalid();
 	if (custom && encryptionKey)
-		validateCustomEncryptionCertificate(
+		validateCustomEncryptionCertificates(
 			custom.descriptor,
 			service.entityMeta.getX509Certificate("encryption"),
 			encryptionKey,
