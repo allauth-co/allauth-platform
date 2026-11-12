@@ -71,11 +71,10 @@ export async function writeOwnedAgentDeviceCode(
 	};
 }
 
-/** Issue a native device proof under the already-verified owner and locked active host. */
-export async function issueOwnedPendingAgentDeviceCode(
+/** Lock and bind a pending delegated agent before issuing proof for its verified host owner. */
+export async function prepareOwnedPendingAgentApproval(
 	client: PoolClient,
-	request: Request,
-	target: DeviceOwner,
+	target: Pick<DeviceOwner, "agentId" | "hostId" | "ownerId">,
 ) {
 	const { agentId: id, hostId, ownerId } = target;
 	const notFound = () => problem(404, "agent_not_found", "Agent not found");
@@ -141,13 +140,17 @@ export async function issueOwnedPendingAgentDeviceCode(
 		`SELECT EXISTS (SELECT 1 FROM "agentCapabilityGrant" WHERE "agentId"=$1) OR EXISTS (
 			SELECT 1 FROM "approvalRequest" WHERE "agentId"=$1 AND status='pending' AND (
 				"hostId" IS DISTINCT FROM $2 OR ("userId" IS DISTINCT FROM $3 AND ($4::boolean OR "userId" IS NOT NULL)) OR (
-					"expiresAt">statement_timestamp() AND (method<>'device_authorization' OR "userCodeHash" IS NULL
+					"expiresAt">statement_timestamp() AND (
+						method NOT IN ('device_authorization','ciba')
+						OR (method='device_authorization' AND "userCodeHash" IS NULL)
+						OR (method='ciba' AND ("userCodeHash" IS NOT NULL OR "userId" IS NULL))
 						OR coalesce(trim(capabilities),'')<>'' OR "clientNotificationEndpoint" IS NOT NULL
-						OR "clientNotificationToken" IS NOT NULL OR coalesce("deliveryMode",'poll')<>'poll')
+						OR "clientNotificationToken" IS NOT NULL OR coalesce("deliveryMode",'poll')<>'poll'
+					)
 				)
 			)
 		) AS incompatible`,
-		[id, hostId, ownerId, Boolean(agent.userId)],
+		[id, hostId, ownerId, agent.userId !== null],
 	);
 	if (readiness.incompatible)
 		return json(
@@ -159,7 +162,7 @@ export async function issueOwnedPendingAgentDeviceCode(
 		);
 
 	// Native rollback checks the agent's stored owner. Bind any legacy unowned
-	// pending row to this signed host's owner before returning a newly issued code.
+	// pending row to this signed host's owner before returning a new proof.
 	if (agent.userId === null)
 		await client.query(
 			'UPDATE "agent" SET "userId"=$2,"updatedAt"=statement_timestamp() WHERE id=$1',
@@ -172,7 +175,17 @@ export async function issueOwnedPendingAgentDeviceCode(
 		 AND ("userId" IS NULL OR "expiresAt"<=statement_timestamp())`,
 		[id, hostId, ownerId],
 	);
-	return writeOwnedAgentDeviceCode(client, request, target);
+	return null;
+}
+
+/** Issue a native device proof under the already-verified owner and locked active host. */
+export async function issueOwnedPendingAgentDeviceCode(
+	client: PoolClient,
+	request: Request,
+	target: DeviceOwner,
+) {
+	const denied = await prepareOwnedPendingAgentApproval(client, target);
+	return denied ?? writeOwnedAgentDeviceCode(client, request, target);
 }
 
 export async function issueOwnedAgentDeviceCode(

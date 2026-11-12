@@ -4596,6 +4596,287 @@ describe.skipIf(!existsSync(fixture))(
 			);
 		});
 
+		it("exchanges owner-bound delegated CIBA approval across writers and preserves signed host polling", async () => {
+			const path = "/agent/ciba/authorize";
+			const scope = `"${alpha.schemaName}"`;
+			const host = await nativeMachineHost(
+				"CIBA approval host",
+				registrationCookie,
+			);
+			const auth = `Bearer ${await hostProof(host)}`;
+			const bindingMessage = "Approve fixture agent";
+			async function register(label: string) {
+				const key = await generateKeyPair("EdDSA", { extractable: true });
+				const response = await legacy.handler(
+					machineRegistration(
+						await registerProof(host, key),
+						label,
+						{ force_approval: true },
+						"192.0.2.116",
+					),
+				);
+				expect(response.status).toBe(200);
+				const value = (await response.json()) as {
+					agent_id: string;
+					approval: { device_code: string };
+				};
+				expect(value).toMatchObject({
+					status: "pending",
+					host_id: host.hostId,
+					approval: { method: "device_authorization" },
+				});
+				return { id: value.agent_id, deviceId: value.approval.device_code };
+			}
+			function start(
+				agentId: string,
+				body: object = {},
+				authorization = auth,
+				ip = "192.0.2.116",
+			) {
+				const result = request(
+					alpha,
+					path,
+					"",
+					{
+						login_hint: registrationOwner.email,
+						agent_id: agentId,
+						binding_message: `<b>${bindingMessage}</b>`,
+						...body,
+					},
+					authorization,
+				);
+				result.headers.set("x-real-ip", ip);
+				return result;
+			}
+			async function record(id: string) {
+				return (
+					await database.query(
+						`SELECT method,"agentId","hostId","userId",status,capabilities,"userCodeHash","loginHint","bindingMessage","deliveryMode",
+				interval,"lastPolledAt","clientNotificationToken","clientNotificationEndpoint",extract(epoch FROM "expiresAt"-"createdAt")::int AS lifetime
+				FROM ${scope}."approvalRequest" WHERE id=$1`,
+						[id],
+					)
+				).rows;
+			}
+			async function verifyReceipt(response: Response, agentId: string) {
+				expect(response.status).toBe(200);
+				const receipt = (await response.json()) as {
+					auth_req_id: string;
+					expires_in: number;
+					interval: number;
+				};
+				expect(receipt).toEqual({
+					auth_req_id: expect.any(String),
+					expires_in: 300,
+					interval: 5,
+				});
+				expect(await record(receipt.auth_req_id)).toEqual([
+					{
+						method: "ciba",
+						agentId,
+						hostId: host.hostId,
+						userId: registrationOwner.id,
+						status: "pending",
+						capabilities: null,
+						userCodeHash: null,
+						loginHint: registrationOwner.email,
+						bindingMessage,
+						deliveryMode: "poll",
+						interval: 5,
+						lastPolledAt: null,
+						clientNotificationToken: null,
+						clientNotificationEndpoint: null,
+						lifetime: 300,
+					},
+				]);
+				return receipt.auth_req_id;
+			}
+			async function verifyListed(
+				agentId: string,
+				proofId: string,
+				writer: "native" | "owned",
+			) {
+				const input = request(alpha, "/agent/ciba/pending", registrationCookie);
+				const response =
+					writer === "native"
+						? await legacy.handler(input)
+						: await owned.dispatch(input);
+				expect(response.status).toBe(200);
+				expect(await response.json()).toMatchObject({
+					requests: expect.arrayContaining([
+						expect.objectContaining({
+							approval_id: proofId,
+							agent_id: agentId,
+							method: "ciba",
+							capabilities: [],
+							binding_message: bindingMessage,
+						}),
+					]),
+				});
+			}
+			function decide(id: string, cookie: string, ip: string) {
+				return approvalDecision(
+					cookie,
+					{ action: "approve", approval_id: id },
+					ip,
+				);
+			}
+			async function poll(
+				agentId: string,
+				status: string,
+				userId: string | null,
+			) {
+				const result = await expectSame(
+					`${statusPath}?agent_id=${agentId}`,
+					"",
+					200,
+					undefined,
+					auth,
+				);
+				expect(result).toMatchObject({
+					host_id: host.hostId,
+					agent_id: agentId,
+					status,
+					user_id: userId,
+					agent_capability_grants: [],
+				});
+			}
+			async function verifyDecision(
+				response: Response,
+				agentId: string,
+				proofId: string,
+			) {
+				expect(response.status).toBe(200);
+				expect(await response.json()).toEqual({
+					status: "approved",
+					agentId,
+					added: [],
+				});
+				expect(await record(proofId)).toMatchObject([{ status: "approved" }]);
+				await poll(agentId, "active", registrationOwner.id);
+				const replay = await owned.dispatch(
+					decide(proofId, registrationCookie, "192.0.2.124"),
+				);
+				expect(replay.status).toBe(412);
+				expect(
+					(
+						await owned.dispatch(
+							request(alpha, "/agent/revoke", "", { agent_id: agentId }, auth),
+						)
+					).status,
+				).toBe(200);
+			}
+
+			const first = await register("Native CIBA pending agent");
+			await poll(first.id, "pending", null);
+			const nativeProof = await verifyReceipt(
+				await legacy.handler(start(first.id)),
+				first.id,
+			);
+			await verifyListed(first.id, nativeProof, "owned");
+			const foreignBrowser = await owned.dispatch(
+				decide(nativeProof, peerCookie, "192.0.2.117"),
+			);
+			expect(foreignBrowser.status).toBe(403);
+			expect(await record(nativeProof)).toMatchObject([{ status: "pending" }]);
+			await verifyDecision(
+				await owned.dispatch(
+					decide(nativeProof, registrationCookie, "192.0.2.118"),
+				),
+				first.id,
+				nativeProof,
+			);
+
+			const next = await register("Native pending agent with owned CIBA proof");
+			const unsigned = request(alpha, path, registrationCookie, {
+				login_hint: registrationOwner.email,
+				agent_id: next.id,
+			});
+			unsigned.headers.set("x-real-ip", "192.0.2.123");
+			expect((await owned.dispatch(unsigned)).status).toBe(401);
+			const otherRealm = request(
+				beta,
+				path,
+				"",
+				{ login_hint: registrationOwner.email, agent_id: next.id },
+				auth,
+			);
+			expect((await outside.dispatch(otherRealm)).status).toBe(401);
+			const alternate = await nativeMachineHost(
+				"Unrelated CIBA host",
+				peerCookie,
+			);
+			const alternateProof = `Bearer ${await hostProof(alternate)}`;
+			for (const hint of [peer.email, "unknown@agent-hosts.fixture.example"]) {
+				const ignored = await owned.dispatch(
+					start(next.id, { login_hint: hint }, auth, "192.0.2.119"),
+				);
+				expect(ignored.status).toBe(200);
+				const { auth_req_id: id } = (await ignored.json()) as {
+					auth_req_id: string;
+				};
+				expect(await record(id)).toEqual([]);
+			}
+			const unrelated = await owned.dispatch(
+				start(
+					next.id,
+					{ login_hint: peer.email },
+					alternateProof,
+					"192.0.2.119",
+				),
+			);
+			expect(unrelated.status).toBe(403);
+			const unsupported = await owned.dispatch(
+				start(
+					next.id,
+					{ capabilities: ["fixture.unconfigured"] },
+					auth,
+					"192.0.2.119",
+				),
+			);
+			expect(unsupported.status).toBe(400);
+			expect(await unsupported.json()).toMatchObject({
+				error: "invalid_capabilities",
+			});
+			expect(
+				(
+					await database.query(
+						`SELECT id FROM ${scope}."approvalRequest" WHERE "agentId"=$1`,
+						[next.id],
+					)
+				).rows,
+			).toEqual([{ id: next.deviceId }]);
+			await poll(next.id, "pending", null);
+			const ownedProof = await verifyReceipt(
+				await owned.dispatch(
+					start(
+						next.id,
+						{ login_hint: registrationOwner.email.toUpperCase() },
+						auth,
+						"192.0.2.120",
+					),
+				),
+				next.id,
+			);
+			await poll(next.id, "pending", registrationOwner.id);
+			expect(await record(next.deviceId)).toMatchObject([
+				{ userId: registrationOwner.id, status: "pending" },
+			]);
+			legacy = await native(nativePool);
+			await verifyListed(next.id, ownedProof, "native");
+			const legacyForeign = await legacy.handler(
+				decide(ownedProof, peerCookie, "192.0.2.121"),
+			);
+			expect(legacyForeign.status).toBe(403);
+			await verifyDecision(
+				await legacy.handler(
+					decide(ownedProof, registrationCookie, "192.0.2.122"),
+				),
+				next.id,
+				ownedProof,
+			);
+		});
+
 		it("serializes the native five-active-agent limit across hosts for the same owner", async () => {
 			const first = await nativeMachineHost(
 				"Limit host one",

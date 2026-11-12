@@ -20,6 +20,10 @@ import {
 } from "./owned-project-agent-browser";
 import { readOwnedAgentCatalog } from "./owned-project-agent-catalog";
 import {
+	agentCibaAuthorizePath,
+	authorizeOwnedAgentCiba,
+} from "./owned-project-agent-ciba";
+import {
 	agentDeviceCodePath,
 	issueOwnedAgentDeviceCode,
 } from "./owned-project-agent-device-code";
@@ -303,6 +307,7 @@ export function createOwnedProjectAgentHosts(options: BrowserHosts) {
 		const register = request.method === "POST" && path === "/agent/register";
 		const deviceCode =
 			request.method === "POST" && path === agentDeviceCodePath;
+		const ciba = request.method === "POST" && path === agentCibaAuthorizePath;
 		const catalog =
 			request.method === "GET" &&
 			(path === "/capability/list" || path === "/capability/describe");
@@ -348,6 +353,7 @@ export function createOwnedProjectAgentHosts(options: BrowserHosts) {
 			!session &&
 			!register &&
 			!deviceCode &&
+			!ciba &&
 			!catalog &&
 			!introspect &&
 			!hostRotation &&
@@ -360,7 +366,7 @@ export function createOwnedProjectAgentHosts(options: BrowserHosts) {
 			admitOwnedProjectNativeRoute(client, options.trustedIP(request), path, {
 				max: register
 					? 10
-					: decision || agentCleanup || agentRotation
+					: decision || agentCleanup || agentRotation || ciba
 						? 5
 						: pending || status
 							? 300
@@ -425,6 +431,12 @@ export function createOwnedProjectAgentHosts(options: BrowserHosts) {
 			const body = await options.readBody(request);
 			return options.store.transaction((client) =>
 				issueOwnedAgentDeviceCode(client, request, body),
+			);
+		}
+		if (ciba) {
+			const body = await options.readBody(request);
+			return options.store.transaction((client) =>
+				authorizeOwnedAgentCiba(client, request, body),
 			);
 		}
 		if (request.headers.has("authorization")) {

@@ -102,8 +102,16 @@ export async function listOwnedAgentApprovals(
 		createdAt: Date;
 	}>(
 		`SELECT r.id,r.method,r."agentId",a.name AS "agentName",r."bindingMessage",r.capabilities,r."expiresAt",r."createdAt"
-		 FROM "approvalRequest" r LEFT JOIN "agent" a ON a.id=r."agentId" AND a."userId"=$1
+		 FROM "approvalRequest" r LEFT JOIN "agent" a ON a.id=r."agentId"
 		   AND (r."hostId" IS NULL OR r."hostId"=a."hostId")
+		   AND (a."userId"=$1 OR (
+		     a."userId" IS NULL AND a.mode='delegated' AND a.status='pending'
+		     AND r.method='ciba' AND r."hostId"=a."hostId"
+		     AND coalesce(trim(r.capabilities),'')='' AND r."userCodeHash" IS NULL
+		     AND r."clientNotificationEndpoint" IS NULL AND r."clientNotificationToken" IS NULL
+		     AND coalesce(r."deliveryMode",'poll')='poll'
+		     AND EXISTS(SELECT 1 FROM "agentHost" h WHERE h.id=a."hostId" AND h."userId"=$1 AND h.status='active')
+		   ))
 		 WHERE r."userId"=$1 AND r.status='pending' AND r."expiresAt">statement_timestamp()
 		   AND (r."agentId" IS NULL OR a.id IS NOT NULL) ORDER BY r."createdAt" DESC`,
 		[userId],
@@ -278,11 +286,14 @@ export async function decideOwnedAgentApproval(
 	const now = Date.now();
 	if (selectedPending && selectedPending.expiresAt.getTime() <= now)
 		return expired();
+	const explicitCiba =
+		selectedPending?.method === "ciba" && selectedPending.userId === userId;
+	const explicitDevice = selectedPending?.method === "device_authorization";
 	const live =
-		selectedPending?.method === "device_authorization"
+		explicitCiba || explicitDevice
 			? pending.filter((row) => row.expiresAt.getTime() > now)
 			: pending;
-	const method = live[0].method;
+	const method = selectedPending?.method ?? live[0].method;
 	const grants = await client.query(
 		`SELECT id FROM "agentCapabilityGrant" WHERE "agentId"=$1 LIMIT 1`,
 		[agentId],
@@ -290,17 +301,19 @@ export async function decideOwnedAgentApproval(
 	if (
 		capabilities?.length ||
 		grants.rowCount ||
-		(unbound && method !== "device_authorization") ||
+		(unbound && method !== "device_authorization" && !explicitCiba) ||
 		live.some(
 			(row) =>
-				row.method !== method ||
+				(!explicitCiba && !explicitDevice && row.method !== method) ||
 				row.capabilities?.trim() ||
 				row.clientNotificationEndpoint ||
 				row.clientNotificationToken ||
 				(row.deliveryMode !== null && row.deliveryMode !== "poll") ||
 				(row.method === "device_authorization"
 					? !row.userCodeHash
-					: row.method !== "ciba" || !!row.userCodeHash),
+					: row.method !== "ciba" ||
+						!!row.userCodeHash ||
+						row.userId !== userId),
 		)
 	)
 		return unsupported();
