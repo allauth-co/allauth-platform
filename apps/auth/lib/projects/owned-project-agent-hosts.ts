@@ -24,6 +24,10 @@ import {
 	updateOwnedAgentHost,
 } from "./owned-project-agent-enrollment";
 import {
+	agentIntrospectionPath,
+	introspectOwnedProjectAgent,
+} from "./owned-project-agent-introspection";
+import {
 	agentMachineAudience,
 	agentMachineProblem,
 	decodeAgentMachineJWT,
@@ -252,6 +256,8 @@ export function createOwnedProjectAgentHosts(options: BrowserHosts) {
 		const catalog =
 			request.method === "GET" &&
 			(path === "/capability/list" || path === "/capability/describe");
+		const introspect =
+			request.method === "POST" && path === agentIntrospectionPath;
 		const agentRead =
 			request.method === "GET" &&
 			(path === "/agent/get" || path === "/agent/list");
@@ -276,6 +282,7 @@ export function createOwnedProjectAgentHosts(options: BrowserHosts) {
 			!status &&
 			!register &&
 			!catalog &&
+			!introspect &&
 			!agentRead
 		)
 			return;
@@ -287,13 +294,19 @@ export function createOwnedProjectAgentHosts(options: BrowserHosts) {
 						? 5
 						: pending || status
 							? 300
-							: agentRead || agentRevoke || catalog
+							: agentRead || agentRevoke || catalog || introspect
 								? 60
 								: 100,
 				windowMs: 60_000,
 			}),
 		);
 		if (limited) return limited;
+		if (introspect) {
+			const body = await options.readBody(request);
+			return options.store.transaction((client) =>
+				introspectOwnedProjectAgent(client, request, body),
+			);
+		}
 		if (catalog)
 			return options.store.transaction((client) =>
 				readOwnedAgentCatalog(client, request, path),

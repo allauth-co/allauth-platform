@@ -34,7 +34,12 @@ export function decodeAgentMachineJWT(request: Request) {
 	const token = /^Bearer\s+(\S+)$/i.exec(
 		request.headers.get("authorization") ?? "",
 	)?.[1];
-	if (!token || token.split(".").length !== 3) return null;
+	return token ? decodeAgentMachineToken(token) : null;
+}
+
+/** Decode an agent protocol token for local key selection. */
+export function decodeAgentMachineToken(token: string) {
+	if (token.split(".").length !== 3) return null;
 	if (token.length > 8192) return false;
 	try {
 		const header = decodeProtectedHeader(token);
@@ -96,7 +101,7 @@ export function validAgentIdentifier(value: unknown): value is string {
 export async function verifyAgentMachineJWT(
 	token: string,
 	row: Pick<AgentMachineHost, "publicKey" | "jwksUrl">,
-	audience: string[],
+	audience: string[] | undefined,
 	origin?: string,
 ) {
 	let key: Awaited<ReturnType<typeof importJWK>>;

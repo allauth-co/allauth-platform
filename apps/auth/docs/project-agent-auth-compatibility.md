@@ -11,7 +11,8 @@ The platform installs `@better-auth/agent-auth` 0.6.2. The endpoint inventory be
 | Host update | `POST /host/update` | Fresh verified browser owner can edit the host and replace its inline key under the existing ID. |
 | Other host maintenance | `POST /host/rotate-key`, `POST /host/switch-account` | Pending |
 | Delegated registration | `POST /agent/register` | Existing active owned host with a verified inline Ed25519 JWT and one-time JWT ID. The agent starts active with an empty capability budget. |
-| Agent identity and transfer | `POST /agent/claim`, `GET /agent/session`, `POST /agent/introspect` | Pending |
+| Agent identity and transfer | `POST /agent/claim`, `GET /agent/session` | Pending. Session compatibility requires a redacted public user projection. |
+| Agent introspection | `POST /agent/introspect` | Inline delegated agent JWT in the `token` body field, with the native compact public claims and replay checks. |
 | Signed agent status | `GET /agent/status` | Known inline Ed25519 host or active delegated agent. Keeps native status and grant fields and the normal active-agent heartbeat. |
 | Agent listing and detail | `GET /agent/list`, `GET /agent/get` | Current owner’s signed browser session. |
 | Agent revocation | `POST /agent/revoke` | Signed browser session of the agent or host owner, or an active signed host selecting an agent on that host. Direct agent JWT revocation is pending. |
@@ -49,3 +50,7 @@ Signed host self-revocation verifies the active host’s existing inline key, ac
 Browser host update replaces the inline Ed25519 key under the original host ID and preserves existing agent and approval links. The candidate rejects a key ID already assigned to another host or matching another host ID. The native and owned engines accept each other’s replacement keys and reject the previous key after a successful write. The separate signed rotation endpoints still require compatibility proof.
 
 Capability catalog reads preserve the native empty list and unknown-capability response. Both require a live signed host or delegated agent in the selected realm. Agent credentials share the same single-use proof records and bounded heartbeat as signed status. Host credentials remain reusable for catalog reads within their existing lifetime.
+
+Introspection validates the body token against the active agent’s stored inline key and returns the native identity, stored expiry and currently active grants. It preserves legacy body tokens with optional audience and JTI claims. A supplied audience must match a native audience for the selected realm, and a supplied JTI shares the persisted replay check with status and catalog reads. The fixture accepts a single credential in the request body.
+
+The installed session endpoint returns its adapter user object inside the Agent Auth session. AllAuth marks private metadata and directory management fields as `returned: false` for public output. A replacement session endpoint must explicitly select the public user fields and verify that projection against supported callers before enablement.

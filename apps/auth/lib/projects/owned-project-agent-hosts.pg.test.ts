@@ -1863,6 +1863,148 @@ describe.skipIf(!existsSync(fixture))(
 			expect(await resumed.json()).toEqual(expected);
 		});
 
+		it("introspects an inline body proof with native public grants, replay and expiry rules", async () => {
+			const path = "/agent/introspect";
+			const machine = await nativeMachine("Agent introspection");
+			const schema = `"${alpha.schemaName}"`;
+			await database.query(
+				`INSERT INTO ${schema}."agentCapabilityGrant"
+				(id,"agentId",capability,status,"expiresAt","createdAt","updatedAt") VALUES
+				($1,$5,'fixture.read','active',NULL,now(),now()),
+				($2,$5,'fixture.other','active',now()+interval '10 minutes',now(),now()),
+				($3,$5,'fixture.expired','active',now()-interval '1 minute',now(),now()),
+				($4,$5,'fixture.revoked','revoked',NULL,now(),now())`,
+				[
+					randomUUID(),
+					randomUUID(),
+					randomUUID(),
+					randomUUID(),
+					machine.agentId,
+				],
+			);
+			const projection = () =>
+				database.query(
+					`SELECT "lastUsedAt","expiresAt" FROM ${schema}."agent" WHERE id=$1`,
+					[machine.agentId],
+				);
+			const before = (await projection()).rows;
+			const proof = ({
+				audience,
+				replay = true,
+				capabilities,
+			}: {
+				audience?: string;
+				replay?: boolean;
+				capabilities?: string[];
+			}) => {
+				const signer = new SignJWT(capabilities ? { capabilities } : {})
+					.setProtectedHeader({ alg: "EdDSA", typ: "agent+jwt" })
+					.setSubject(machine.agentId)
+					.setIssuedAt()
+					.setExpirationTime("45s");
+				if (audience) signer.setAudience(audience);
+				if (replay) signer.setJti(randomUUID());
+				return signer.sign(machine.agentKey.privateKey);
+			};
+			const expected = {
+				active: true,
+				agent_id: machine.agentId,
+				host_id: machine.hostId,
+				user_id: machineOwner.id,
+				agent_capability_grants: [
+					{ capability: "fixture.read", status: "active" },
+				],
+				mode: "delegated",
+				expires_at: before[0].expiresAt.toISOString(),
+			};
+			const previousBody = {
+				token: await proof({
+					audience: agentAudience,
+					capabilities: ["fixture.read", "fixture.expired", "fixture.revoked"],
+				}),
+			};
+			const currentBody = {
+				token: await proof({
+					audience: agentAudience,
+					capabilities: ["fixture.read", "fixture.expired", "fixture.revoked"],
+				}),
+			};
+			const previous = await legacy.handler(
+				request(alpha, path, "", previousBody),
+			);
+			const current = await owned.dispatch(
+				request(alpha, path, "", currentBody),
+			);
+			expect([previous.status, current.status]).toEqual([200, 200]);
+			expect(await previous.json()).toEqual(expected);
+			expect(await current.json()).toEqual(expected);
+			const oldReplay = await legacy.handler(
+				request(alpha, path, "", previousBody),
+			);
+			const newReplay = await candidate(alpha, true).dispatch(
+				request(alpha, path, "", currentBody),
+			);
+			expect(await oldReplay.json()).toEqual({ active: false });
+			expect(await newReplay.json()).toEqual({ active: false });
+			const optionalClaims = {
+				token: await proof({ replay: false, capabilities: [] }),
+			};
+			const readable = await expectSame(path, "", 200, optionalClaims);
+			expect(readable).toMatchObject({
+				active: true,
+				agent_capability_grants: [
+					{ capability: "fixture.read", status: "active" },
+					{ capability: "fixture.other", status: "active" },
+				],
+			});
+			expect(
+				await expectSame(path, "", 200, {
+					token: await proof({ audience: "https://elsewhere.fixture.example" }),
+				}),
+			).toEqual({ active: false });
+			expect(
+				await expectSame(path, "", 200, { token: await hostProof(machine) }),
+			).toEqual({ active: false });
+			await expectSame(path, "", 400, {});
+			expect(
+				await (
+					await outside.dispatch(request(beta, path, "", optionalClaims))
+				).json(),
+			).toEqual({ active: false });
+			expect(
+				(await disabled.dispatch(request(alpha, path, "", optionalClaims)))
+					.status,
+			).toBe(501);
+			expect((await projection()).rows).toEqual(before);
+			const bound = await agentProof(machine);
+			const inspected = await owned.dispatch(
+				request(alpha, path, "", { token: bound }),
+			);
+			expect(await inspected.json()).toMatchObject({ active: true });
+			const statusReplay = await owned.dispatch(
+				request(alpha, statusPath, "", undefined, `Bearer ${bound}`),
+			);
+			expect(statusReplay.status).toBe(401);
+			expect(await statusReplay.json()).toMatchObject({ error: "jti_replay" });
+			legacy = await native(nativePool);
+			const resumed = await legacy.handler(
+				request(alpha, path, "", {
+					token: await proof({ audience: agentAudience }),
+				}),
+			);
+			expect(await resumed.json()).toMatchObject({
+				active: true,
+				agent_id: machine.agentId,
+			});
+			await database.query(
+				`UPDATE ${schema}."agent" SET "expiresAt"=now()-interval '1 minute' WHERE id=$1`,
+				[machine.agentId],
+			);
+			expect(await expectSame(path, "", 200, optionalClaims)).toEqual({
+				active: false,
+			});
+		});
+
 		it("validates native host status reads against its own inline host and projects legacy grants", async () => {
 			const machine = await nativeMachine("Status host");
 			const other = await nativeMachine("Other status host");
