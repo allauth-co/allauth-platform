@@ -24,8 +24,7 @@ jobs:
           POSTGRES_USER: allauth
           POSTGRES_DB: allauth
           POSTGRES_PASSWORD: allauth-ci-only
-        ports: ["55445:5432"]
-        ports: ["55447:5432"]
+        ports: ["55445:5432", "55447:5432"]
         options: >-
           --health-cmd "pg_isready -U allauth -d allauth"
           --health-interval 5s --health-timeout 5s --health-retries 20
