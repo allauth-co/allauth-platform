@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef } from "react";
-import type { HostedPasswordResetStatus } from "@/lib/domains/hosted-sdk-policy";
+import type { HostedAuthCallbackStatus, HostedPasswordResetStatus } from "@/lib/domains/hosted-sdk-policy";
 import { useAllAuth, withAuthReturnTo } from "@/sdk/react";
 import { HostedProjectCard } from "./hosted-project-forms";
 
@@ -27,15 +27,28 @@ export function HostedProjectSignOut({ destination }: { destination: string }) {
 	);
 }
 
-/** Present the established result for the query-free callback status page. */
-export function HostedProjectAuthCallback() {
+const callbackMessages = {
+	accountLinked: { title: "Account linked", description: "You can use this account to sign in." },
+	emailVerified: { title: "Email verified", description: "Your email address is confirmed." },
+	passwordReset: { title: "Password reset", description: "You can sign in with your new password." },
+	signupComplete: { title: "Account created", description: "Your account is ready." },
+} satisfies Record<HostedAuthCallbackStatus, { title: string; description: string }>;
+
+export function HostedProjectAuthCallback({
+	status,
+	destination,
+}: {
+	status?: HostedAuthCallbackStatus;
+	destination: string;
+}) {
+	const message = status
+		? callbackMessages[status]
+		: { title: "All set", description: "Authentication completed successfully." };
+	const label = destination === "/sign-in" ? "Sign in" : "Continue";
 	return (
-		<HostedProjectCard
-			title="All set"
-			subtitle="Authentication completed successfully."
-		>
-			<a className="allauth-primary" href="/sign-in">
-				Sign in
+		<HostedProjectCard title={message.title} subtitle={message.description}>
+			<a className="allauth-primary" href={destination}>
+				{label}
 			</a>
 		</HostedProjectCard>
 	);

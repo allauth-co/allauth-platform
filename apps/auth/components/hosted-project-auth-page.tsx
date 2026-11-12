@@ -130,6 +130,7 @@ export async function HostedProjectAuthPage({
 			destination={request.destination}
 			legacyPath={request.legacyPath}
 			resetStatus={request.resetStatus}
+			callbackStatus={request.callbackStatus}
 			{...project}
 		/>
 	);

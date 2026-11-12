@@ -11,6 +11,7 @@ import {
 	withAuthReturnTo,
 } from "@/sdk/react";
 import type {
+	HostedAuthCallbackStatus,
 	HostedPasswordResetStatus,
 	HostedSdkForm,
 } from "@/lib/domains/hosted-sdk-policy";
@@ -35,6 +36,7 @@ type HostedProjectAuthProps = {
 	destination: string;
 	legacyPath: string;
 	resetStatus?: HostedPasswordResetStatus;
+	callbackStatus?: HostedAuthCallbackStatus;
 	showRecovery: boolean;
 	showBroker: boolean;
 	showPassword: boolean;
@@ -243,6 +245,7 @@ export function HostedProjectAuth({
 	destination,
 	legacyPath,
 	resetStatus,
+	callbackStatus,
 	showRecovery,
 	showBroker,
 	showPassword,
@@ -305,7 +308,9 @@ export function HostedProjectAuth({
 				{view === "signOut" && (
 					<HostedProjectSignOut destination={destination} />
 				)}
-				{view === "authCallback" && <HostedProjectAuthCallback />}
+				{view === "authCallback" && (
+					<HostedProjectAuthCallback status={callbackStatus} destination={destination} />
+				)}
 				{(view === "verifyEmail" ||
 					view === "resetLinkSent" ||
 					view === "magicLinkSent") && (

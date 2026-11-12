@@ -26,6 +26,11 @@ const views = {
 export type HostedSdkView = keyof typeof views;
 export type HostedSdkForm = Exclude<HostedSdkView, "authRedirect"> | "username";
 export type HostedPasswordResetStatus = "missing" | "invalid";
+export type HostedAuthCallbackStatus =
+	| "accountLinked"
+	| "emailVerified"
+	| "passwordReset"
+	| "signupComplete";
 export type HostedSdkSearchParams = Record<
 	string,
 	string | string[] | undefined
@@ -36,6 +41,7 @@ type HostedViewRequest = {
 	legacyPath: string;
 	oauthQuery?: string;
 	resetStatus?: HostedPasswordResetStatus;
+	callbackStatus?: HostedAuthCallbackStatus;
 	username?: boolean;
 };
 
@@ -117,12 +123,57 @@ function hostedOAuthRequest(
 	};
 }
 
+const callbackStatuses = new Map<string, HostedAuthCallbackStatus>([
+	["account_linked", "accountLinked"],
+	["email_verified", "emailVerified"],
+	["verified", "emailVerified"],
+	["password_reset", "passwordReset"],
+	["signup_complete", "signupComplete"],
+	["signed_up", "signupComplete"],
+]);
+const callbackSuccessFlows = new Map<string, HostedAuthCallbackStatus>([
+	["account_link", "accountLinked"],
+	["account_linking", "accountLinked"],
+	["link_account", "accountLinked"],
+	["email", "emailVerified"],
+	["email_verification", "emailVerified"],
+	["verify_email", "emailVerified"],
+	["password", "passwordReset"],
+	["password_reset", "passwordReset"],
+	["reset_password", "passwordReset"],
+]);
+const callbackParameters = new Set(["result", "status", "flow", "source", "redirectTo", "returnTo"]);
+
+function normalizedCallbackValue(value: string | string[] | undefined) {
+	return typeof value === "string" ? value.trim().toLowerCase().replace(/[\s-]+/g, "_") : "";
+}
+
+function hostedCallbackRequest(params: HostedSdkSearchParams): HostedViewRequest | null {
+	if (Object.entries(params).some(([name, value]) =>
+		value !== undefined && (!callbackParameters.has(name) || typeof value !== "string")))
+		return null;
+	const result = normalizedCallbackValue(params.result) || normalizedCallbackValue(params.status);
+	const flow = normalizedCallbackValue(params.flow ?? params.source);
+	const callbackStatus = result === "success" ? callbackSuccessFlows.get(flow) : callbackStatuses.get(result);
+	const raw = params.redirectTo ?? params.returnTo;
+	if (!callbackStatus && (result || flow || raw !== undefined)) return null;
+	const continuation = typeof raw === "string" && raw.startsWith("/") && !raw.startsWith("//")
+		? applicationMfaCallback(raw, localOrigin, hostedSdkBasePath)
+		: undefined;
+	if (raw !== undefined && !continuation) return null;
+	const destination = callbackStatus === "passwordReset"
+		? "/sign-in"
+		: continuation ?? (callbackStatus === "accountLinked" ? "/account/security" : "/sign-in");
+	return { destination, legacyPath: "/auth-callback?interface=legacy", callbackStatus };
+}
+
 /** Signed project continuations are verified against the selected issuer before rendering. */
 export function hostedSdkViewRequest(
 	view: HostedSdkView,
 	params: HostedSdkSearchParams,
 ): HostedViewRequest | null {
-	if (view === "authCallback" || view === "authRedirect") {
+	if (view === "authCallback") return hostedCallbackRequest(params);
+	if (view === "authRedirect") {
 		if (Object.values(params).some((value) => value !== undefined)) return null;
 		return {
 			destination: "/sign-in",

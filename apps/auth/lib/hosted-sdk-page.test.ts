@@ -115,7 +115,7 @@ it("preserves exact sign-out destinations, verifies a direct OAuth query, and de
 	expect((await read(Promise.resolve(signed))).type).toBe(AllAuthAuth);
 });
 
-it("ports query-free result and redirect views while retaining the parameterized native pages", async () => {
+it("shows supported callback results with verified local destinations and keeps redirect compatibility", async () => {
 	runtime.headers.mockResolvedValue(
 		new Headers({ [portalHeader]: "fixture-proof" }),
 	);
@@ -131,9 +131,23 @@ it("ports query-free result and redirect views while retaining the parameterized
 		searchParams: Promise.resolve({}),
 	});
 	expect(bare.type).toBe(HostedProjectAuth);
-	expect(bare.props).toMatchObject({ view: "authCallback" });
+	expect(bare.props).toMatchObject({ view: "authCallback", destination: "/sign-in" });
+	for (const [searchParams, status, destination] of [
+		[{ result: "email_verified", returnTo: "/account?tab=profile#email" }, "emailVerified", "/account?tab=profile#email"],
+		[{ status: "success", source: "link account" }, "accountLinked", "/account/security"],
+		[{ result: "password_reset", returnTo: "/account" }, "passwordReset", "/sign-in"],
+		[{ result: "signed-up" }, "signupComplete", "/sign-in"],
+	] as const) {
+		const result = await HostedProjectAuthPage({
+			view: "authCallback", searchParams: Promise.resolve(searchParams),
+		});
+		expect(result.type).toBe(HostedProjectAuth);
+		expect(result.props).toMatchObject({ callbackStatus: status, destination });
+	}
 	for (const [view, query] of [
-		["authCallback", { result: "email_verified" }],
+		["authCallback", { result: "email_verified", returnTo: "//other.example/path" }],
+		["authCallback", { result: "email_verified", returnTo: "/api/auth/callback" }],
+		["authCallback", { result: "email_verified", code: "opaque" }],
 		["authRedirect", { redirectTo: "/account/security" }],
 	] as const) {
 		const fallback = await HostedProjectAuthPage({

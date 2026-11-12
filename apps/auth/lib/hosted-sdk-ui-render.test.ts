@@ -6,6 +6,7 @@ import { createRoot } from "react-dom/client";
 import { afterEach, expect, it, vi } from "vitest";
 import { HostedProjectAuth } from "@/components/hosted-project-auth";
 import type {
+	HostedAuthCallbackStatus,
 	HostedPasswordResetStatus,
 	HostedSdkForm,
 } from "./domains/hosted-sdk-policy";
@@ -248,6 +249,7 @@ async function renderHostedAuth(
 	strict = false,
 	resetStatus?: HostedPasswordResetStatus,
 	showRecovery = true,
+	callbackStatus?: HostedAuthCallbackStatus,
 ) {
 	const container = document.createElement("div");
 	document.body.appendChild(container);
@@ -270,12 +272,23 @@ async function renderHostedAuth(
 		showEmail: true,
 		showSso: true,
 		resetStatus,
+		callbackStatus,
 	});
 	await act(async () =>
 		root.render(strict ? createElement(StrictMode, null, auth) : auth),
 	);
 	return container;
 }
+
+it("renders an email-verification callback with its vetted continuation", async () => {
+	vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+	vi.stubGlobal("fetch", vi.fn(async () => Response.json({ emailPassword: true })));
+	const container = await renderHostedAuth("authCallback", destination, false, undefined, true, "emailVerified");
+	expect(container.textContent).toContain("Email verified");
+	const continuation = container.querySelector("a");
+	expect(continuation?.textContent).toBe("Continue");
+	expect(continuation?.getAttribute("href")).toBe(destination);
+});
 
 it.each([
 	["missing", "Open the reset link from your email"],
