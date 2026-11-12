@@ -893,6 +893,9 @@ try {
 		assert.deepEqual(await internalWriter("switch", "allauth", "1", "legacy"), {
 			writer: "legacy", revision: 2,
 		});
+		await assert.rejects(internalWriter("switch", "legacy", "2", "allauth"));
+		assert.deepEqual(await internalWriter("status"), { writer: "legacy", revision: 2 });
+		expectStatus(await request("/api/health"), 200, "The restored writer remains ready.");
 		await hostedPage(managedHost, false);
 		expectStatus(
 			await request("/api/auth/hosted-ui/sdk/config", { host: managedHost }),
