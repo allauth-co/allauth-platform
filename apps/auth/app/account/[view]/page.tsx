@@ -3,6 +3,7 @@ import { notFound, redirect } from "next/navigation";
 import { Settings } from "@/components/better-auth-ui/settings/settings";
 import { portalSession } from "@/lib/domains/hosting";
 import { PageHeading } from "@/components/console/common";
+import { HostedAccountOrganizations } from "@/components/hosted-account-settings";
 export default async function Page({
 	params,
 }: {
@@ -13,6 +14,7 @@ export default async function Page({
 	const session = await portalSession(await headers());
 	if (!session)
 		redirect(`/sign-in?callbackUrl=${encodeURIComponent(`/account/${view}`)}`);
+	const legacy = <Settings view={view} className="account-settings" />;
 	return (
 		<div className="account-page account-surface">
 			<PageHeading
@@ -23,7 +25,11 @@ export default async function Page({
 						: "Manage your organizations and invitations."
 				}
 			/>
-			<Settings view={view} className="account-settings" />
+			{view === "organizations" ? (
+				<HostedAccountOrganizations>{legacy}</HostedAccountOrganizations>
+			) : (
+				legacy
+			)}
 		</div>
 	);
 }

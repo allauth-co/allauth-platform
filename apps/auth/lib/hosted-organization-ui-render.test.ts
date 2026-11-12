@@ -17,6 +17,7 @@ import {
 import { HostedProjectInvitation } from "@/components/hosted-project-invitation";
 import { OrganizationManager } from "@/components/organization-manager";
 import { HostedOrganizationDetail } from "@/components/hosted-organization-detail";
+import { HostedAccountOrganizations } from "@/components/hosted-account-settings";
 
 const legacy = vi.hoisted(() => ({ useSession: vi.fn(), list: vi.fn() }));
 const navigation = vi.hoisted(() => ({ replace: vi.fn() }));
@@ -112,6 +113,7 @@ afterEach(async () => {
 });
 
 type View =
+	| "account-organizations"
 	| "invitation"
 	| "list"
 	| "switch"
@@ -123,6 +125,10 @@ type View =
 
 function Preview({ view }: { view: View }) {
 	const client = useHostedOrganizationClient();
+	if (view === "account-organizations")
+		return createElement(HostedAccountOrganizations, {
+			children: createElement("p", null, "Legacy account organizations"),
+		});
 	if (view === "manager") return createElement(OrganizationManager);
 	if (
 		view === "settings" ||
@@ -946,5 +952,31 @@ it("manages hosted people, multi-role membership and invitation actions in the s
 		role: ["member"],
 		teamId: team.id,
 	});
+	expect(legacy.useSession).not.toHaveBeenCalled();
+});
+
+it("opens account organizations with the first-party settings navigation in the preview", async () => {
+	const requests = network((path) => {
+		if (path === "get-session") return session;
+		if (path === "organization/list") return [organization];
+		expect(path).toBe("organization/list-user-invitations");
+		return [invitation];
+	});
+	const standard = await render("account-organizations", false);
+	expect(standard.textContent).toBe("Legacy account organizations");
+	expect(requests).not.toHaveBeenCalled();
+	await disposal?.();
+	const preview = await render("account-organizations");
+	expect(preview.textContent).not.toContain("Legacy account organizations");
+	const nav = preview.querySelector("nav")!;
+	expect(
+		[...nav.querySelectorAll("a")].map((link) => link.getAttribute("href")),
+	).toEqual(["/account", "/account/security", "/account/organizations"]);
+	expect(nav.querySelector('[aria-current="page"]')?.getAttribute("href")).toBe(
+		"/account/organizations",
+	);
+	expect(
+		preview.querySelector(`a[href="/accept-invitation/${invitationId}"]`),
+	).not.toBeNull();
 	expect(legacy.useSession).not.toHaveBeenCalled();
 });
