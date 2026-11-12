@@ -1696,7 +1696,7 @@ export function createOwnedProjectEngine(
 
 	async function renewAuthorizedSession(
 		request: Request,
-		current: NonNullable<Awaited<ReturnType<typeof eligibleSession>>>,
+		current: { token: string; refreshDue: boolean },
 		client: PoolClient,
 		headers: Headers,
 		allowServerToken = true,
@@ -3332,6 +3332,11 @@ export function createOwnedProjectEngine(
 			: undefined,
 		membershipLimit: options.organization?.membershipLimit,
 		invitationEmail: options.organization?.invitationEmail,
+		async renewInvitationSession(request, client, principal) {
+			const headers = new Headers();
+			await renewAuthorizedSession(request, principal, client, headers, false);
+			return headers.has("set-cookie") ? headers : undefined;
+		},
 		sessionCookies(request, principal) {
 			const headers = new Headers();
 			const remember = !tokenFrom(request.headers, rememberCookie);

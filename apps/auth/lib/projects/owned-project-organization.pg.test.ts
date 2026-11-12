@@ -1,5 +1,6 @@
 import { createHash, createHmac, randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
+import { betterAuth } from "better-auth";
 import { organization } from "better-auth/plugins";
 import { createAccessControl } from "better-auth/plugins/access";
 import type { Statements } from "better-auth/plugins/access";
@@ -11,9 +12,14 @@ import { getTestInstance } from "better-auth/test";
 import { Kysely, PostgresDialect } from "kysely";
 import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { createAuthOptions } from "../auth";
 import { defaultAuthPolicy } from "../auth-policy/policy";
 import { defaultApplicationBranding } from "../branding/validation";
 import { allauthControl } from "../control";
+import { newWebhookSigningSecret, webhookSignature } from "../control/webhook-contract";
+import type { ControlWebhookEnvelope } from "../control/webhook-delivery";
+import { deliverPendingWebhooks } from "../control/webhook-delivery";
+import { sealLegacyUnversionedRecord } from "../legacy-encrypted-record";
 import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
 import { readLegacySessionCookie } from "./legacy-session-cookie";
 import { createProjectEngineStore } from "./owned-project-engine-store";
@@ -301,6 +307,326 @@ describe.skipIf(!existsSync(fixturePath))(
 			);
 			return id;
 		}
+
+		it("preserves signed invitation events, team context and session renewal across writers", async () => {
+			const previous = betterAuth({
+				...createAuthOptions(
+					{ db: legacyDatabase!, type: "postgres", transaction: true },
+					{
+						ALLAUTH_AUTH_URL: origin,
+						ALLAUTH_AUTH_SECRET: secret,
+						AUTH_RUNTIME: "node",
+						SCIM_CREDENTIAL_HASH_SECRET:
+							"synthetic-organization-webhook-fixture-key",
+						EMAIL_FROM: "organization@fixture.example",
+						EMAIL: { async send() {} },
+					},
+					{
+						name: "Organization webhook fixture",
+						basePath,
+						cookiePrefix: "allauth_project_organization-fixture",
+						primaryOrigin: appOrigin,
+						publicOrigin: origin,
+						origins: [appOrigin],
+						broker: {
+							clientId: "fixture-broker",
+							clientSecret: "synthetic-broker-secret",
+						},
+						async authorizeAdmin() {
+							return null;
+						},
+						management: { id: "organization-webhook-fixture" },
+					},
+				),
+				logger: { disabled: true },
+			});
+			const candidate = createOwnedProjectEngine({
+				database,
+				project: { schemaName: schema, slug: "organization-fixture" },
+				baseURL: origin,
+				basePath,
+				trustedOrigins: [appOrigin],
+				signingSecret: secret,
+				policy: defaultAuthPolicy,
+				trustedIP: (request) => request.headers.get("x-real-ip"),
+			});
+			const writers = { native: previous.handler, owned: candidate.dispatch };
+			const owner = await account();
+			const outsider = await account();
+			const selected = await organizationFixture(owner);
+			const teamId = selected.teams[0]!.id;
+			const secondTeam = await candidate.dispatch(
+				request("create-team", owner.cookie, {
+					organizationId: selected.id,
+					name: "Second signed fixture team",
+				}),
+			);
+			expect(secondTeam.status).toBe(200);
+			const { id: secondTeamId } = (await secondTeam.json()) as { id: string };
+			const cases = [
+				{ teams: [], session: "fresh" },
+				{ teams: [teamId], session: "fresh" },
+				{ teams: [teamId, secondTeamId], session: "fresh" },
+				{ teams: [], session: "due" },
+				{ teams: [teamId], session: "due" },
+				{ teams: [], session: "dont-remember" },
+				{ teams: [teamId], session: "dont-remember" },
+				{ teams: [], session: "disable-refresh" },
+				{ teams: [teamId], session: "disable-refresh" },
+			] as const;
+			const attempts: {
+				writer: keyof typeof writers;
+				scenario: (typeof cases)[number];
+				recipient: Account;
+				id: string;
+			}[] = [];
+			for (const writer of ["native", "owned"] as const) {
+				for (const scenario of cases) {
+					const { teams } = scenario;
+					const recipient = await account();
+					const issue = writers[writer === "native" ? "owned" : "native"];
+					const invited = await issue(
+						request("invite-member", owner.cookie, {
+							organizationId: selected.id,
+							email: recipient.email,
+							role: "member",
+							...(teams.length && { teamId: teams }),
+						}),
+					);
+					expect(invited.status, await invited.clone().text()).toBe(200);
+					const { id } = (await invited.json()) as { id: string };
+					attempts.push({ writer, scenario, recipient, id });
+				}
+			}
+			// Keep fixture sessions before their ordinary refresh window so the
+			// endpoint's single-team cookie reissue is observable on its own.
+			await database.query(
+				`UPDATE "${schema}"."session" SET "expiresAt"=statement_timestamp() + $2 * interval '1 second' WHERE id=ANY($1::text[])`,
+				[
+					[
+						outsider.sessionId,
+						...attempts
+							.filter(({ scenario }) => scenario.session === "fresh")
+							.map(({ recipient }) => recipient.sessionId),
+					],
+					defaultAuthPolicy.sessionExpiresInSeconds,
+				],
+			);
+			const endpointId = randomUUID();
+			const destination =
+				"https://organization-webhooks.fixture.example/receive";
+			const signingKey = newWebhookSigningSecret();
+			for (const namespace of [schema, other])
+				await database.query(
+					`INSERT INTO "${namespace}"."allauthWebhookEndpoint" (id,url,"eventTypes","encryptedSecret")
+					 VALUES ($1,$2,'["organization.*"]',$3)`,
+					[
+						endpointId,
+						destination,
+						sealLegacyUnversionedRecord(signingKey, secret),
+					],
+				);
+			try {
+				const dontRemember = `${cookieName.replace(".session_token", ".dont_remember")}=${encodeURIComponent(
+					`true.${createHmac("sha256", secret).update("true").digest("base64")}`,
+				)}`;
+				for (const { writer, scenario, recipient, id } of attempts) {
+					const { teams, session } = scenario;
+					const dispatch = writers[writer];
+					if (teams.length === 1 && session === "fresh") {
+						const denied = await dispatch(
+							request("accept-invitation", outsider.cookie, {
+								invitationId: id,
+							}),
+						);
+						expect(denied.status).toBe(403);
+						expect(await denied.json()).toMatchObject({
+							code: "YOU_ARE_NOT_THE_RECIPIENT_OF_THE_INVITATION",
+						});
+						expect(denied.headers.getSetCookie()).toEqual([]);
+					}
+					const {
+						rows: [before],
+					} = await database.query<{ token: string; expiresAt: Date }>(
+						`SELECT token,"expiresAt" FROM "${schema}"."session" WHERE id=$1`,
+						[recipient.sessionId],
+					);
+					const acceptPath =
+						session === "disable-refresh"
+							? "accept-invitation?disableRefresh=true"
+							: "accept-invitation";
+					const cookies =
+						session === "dont-remember"
+							? `${recipient.cookie}; ${dontRemember}`
+							: recipient.cookie;
+					const accepted = await dispatch(
+						request(acceptPath, cookies, { invitationId: id }),
+					);
+					expect(accepted.status, await accepted.clone().text()).toBe(200);
+					expect(await accepted.json()).toMatchObject({
+						invitation: { id, status: "accepted" },
+						member: {
+							userId: recipient.id,
+							role: "member",
+							organizationId: selected.id,
+						},
+					});
+					const sessionCookies = accepted.headers
+						.getSetCookie()
+						.filter((entry) => entry.startsWith(`${cookieName}=`));
+					const reissued = teams.length === 1 || session === "due";
+					expect(
+						sessionCookies.length > 0,
+						`${writer}: ${session}, ${teams.length} invited teams`,
+					).toBe(reissued);
+					for (const entry of sessionCookies) {
+						expect(
+							readLegacySessionCookie(
+								new Headers({ cookie: entry.split(";", 1)[0] }),
+								cookieName,
+								secret,
+							),
+						).toBe(before!.token);
+						if (session === "dont-remember")
+							expect(entry).not.toContain("Max-Age=");
+						else
+							expect(entry).toContain(
+								`Max-Age=${defaultAuthPolicy.sessionExpiresInSeconds}`,
+							);
+					}
+					expect(accepted.headers.has("set-auth-token")).toBe(false);
+					const {
+						rows: [after],
+					} = await database.query<{
+						token: string;
+						expiresAt: Date;
+						activeOrganizationId: string;
+						activeTeamId: string | null;
+					}>(
+						`SELECT token,"expiresAt","activeOrganizationId","activeTeamId" FROM "${schema}"."session" WHERE id=$1`,
+						[recipient.sessionId],
+					);
+					expect(after).toMatchObject({
+						token: before!.token,
+						activeOrganizationId: selected.id,
+						activeTeamId: teams.length === 1 ? teamId : null,
+					});
+					if (session === "due") {
+						expect(after!.expiresAt.getTime()).toBeGreaterThan(
+							before!.expiresAt.getTime(),
+						);
+						expect(
+							Math.abs(
+								after!.expiresAt.getTime() -
+									Date.now() -
+									defaultAuthPolicy.sessionExpiresInSeconds * 1000,
+							),
+						).toBeLessThan(5000);
+					} else {
+						expect(after!.expiresAt).toEqual(before!.expiresAt);
+					}
+				}
+				const received: { body: string; headers: Record<string, string> }[] =
+					[];
+				const delivered = await deliverPendingWebhooks({
+					database: legacyDatabase!,
+					secret,
+					maxDeliveries: 20,
+					now: () => new Date(Date.now() + 1000),
+					resolver: async () => [{ address: "93.184.216.34", family: 4 }],
+					async transport({ destination: target, body, headers }) {
+						expect(target.url.href).toBe(destination);
+						received.push({ body, headers });
+						return 204;
+					},
+				});
+				const expectedDeliveries =
+					attempts.length +
+					attempts.filter(
+						({ scenario }) =>
+							scenario.teams.length === 1 && scenario.session === "fresh",
+					).length;
+				expect(delivered).toEqual({
+					claimed: expectedDeliveries,
+					delivered: expectedDeliveries,
+					retried: 0,
+					failed: 0,
+				});
+				const envelopes = [];
+				for (const { body, headers } of received) {
+					expect(headers["webhook-signature"]).toBe(
+						await webhookSignature(
+							signingKey,
+							headers["webhook-id"],
+							headers["webhook-timestamp"],
+							body,
+						),
+					);
+					const envelope = JSON.parse(body) as ControlWebhookEnvelope;
+					expect(envelope.data.event).toMatchObject({
+						id: envelope.id,
+						type: envelope.type,
+						createdAt: envelope.timestamp,
+					});
+					expect(envelope.data.user).toBeUndefined();
+					expect(body).not.toContain(signingKey);
+					envelopes.push(envelope);
+				}
+				expect(new Set(envelopes.map(({ id }) => id)).size).toBe(
+					expectedDeliveries,
+				);
+				for (const {
+					writer,
+					scenario: { teams, session },
+					id,
+				} of attempts) {
+					const matching = envelopes
+						.map(({ data }) => data.event)
+						.filter(({ targetId }) => targetId === id);
+					const common = {
+						type: "organization.invitation.accepted",
+						organizationId: selected.id,
+						targetId: id,
+						ipAddress: "192.0.2.38",
+						userAgent: "organization-rehearsal",
+					};
+					const success = matching.find(({ outcome }) => outcome === "success");
+					expect(success, writer).toEqual({
+						...common,
+						id: expect.any(String),
+						createdAt: expect.any(String),
+						outcome: "success",
+						metadata: { path: "/organization/accept-invitation" },
+					});
+					const rejected = matching.find(
+						({ outcome }) => outcome === "failure",
+					);
+					if (teams.length === 1 && session === "fresh")
+						expect(rejected, writer).toEqual({
+							...common,
+							id: expect.any(String),
+							createdAt: expect.any(String),
+							outcome: "failure",
+							metadata: {
+								path: "/organization/accept-invitation",
+								errorCode: "YOU_ARE_NOT_THE_RECIPIENT_OF_THE_INVITATION",
+							},
+						});
+					else expect(rejected).toBeUndefined();
+				}
+				const sibling = await database.query(
+					`SELECT 1 FROM "${other}"."allauthWebhookDelivery" WHERE "endpointId"=$1`,
+					[endpointId],
+				);
+				expect(sibling.rows).toEqual([]);
+			} finally {
+				for (const namespace of [schema, other])
+					await database.query(
+						`DELETE FROM "${namespace}"."allauthWebhookEndpoint" WHERE id=$1`,
+						[endpointId],
+					);
+			}
+		});
 
 		it("delivers the same organization mutation outbox as the native writer", async () => {
 			const owner = await account();

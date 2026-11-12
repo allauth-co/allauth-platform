@@ -50,6 +50,7 @@ export interface OrganizationSession {
 	token: string;
 	user: ProjectUser;
 	session: ProjectSession;
+	refreshDue: boolean;
 }
 
 export interface OwnedProjectOrganizationOptions {
@@ -75,6 +76,12 @@ export interface OwnedProjectOrganizationOptions {
 	): Promise<void>;
 	/** Reissue the existing token with its existing persistence on native cookie-refresh operations. */
 	sessionCookies?(request: Request, principal: OrganizationSession): Headers;
+	/** Renew the locked browser session within the successful invitation transaction. */
+	renewInvitationSession?(
+		request: Request,
+		client: PoolClient,
+		principal: OrganizationSession,
+	): Promise<Headers | undefined>;
 }
 
 const field = z
@@ -875,13 +882,16 @@ export function createOwnedProjectOrganizationHttp(
 							))
 						)
 							throw unauthorized();
-						return json(
-							{ invitation: accepted, member },
-							200,
-							activeTeam
+						const headers =
+							(await options.renewInvitationSession?.(
+								request,
+								client,
+								principal,
+							)) ??
+							(activeTeam
 								? options.sessionCookies?.(request, principal)
-								: undefined,
-						);
+								: undefined);
+						return json({ invitation: accepted, member }, 200, headers);
 					}
 				}
 				throw new Error(`Missing project organization handler for ${path}`);
@@ -948,7 +958,7 @@ export function createOwnedProjectOrganizationHttp(
 				return failure(
 					403,
 					"ORGANIZATION_MEMBER_LIMIT_REACHED",
-					"Free organisations include up to 20 members. Upgrade this workspace to Pro to add more.",
+					"Free organisations include up to 20 members. Upgrade this workspace to Pro to add more.", // cspell:ignore organisations
 				);
 			throw error;
 		}
