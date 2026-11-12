@@ -1,0 +1,156 @@
+import type { PoolClient } from "pg";
+import * as z from "zod";
+import { organizationFailure as failure } from "./owned-project-organization-response";
+import {
+	projectSsoDnsIdentifier,
+	projectSsoDomainNames,
+} from "./owned-project-sso-domain";
+import {
+	checkProjectOidcConfiguration,
+	ssoScope,
+} from "./owned-project-sso-oidc";
+import type { StoredProjectSsoProvider } from "./owned-project-sso-projection";
+import { readStoredSsoConfiguration } from "./owned-project-sso-projection";
+import { ssoProviderId } from "./owned-project-sso-store";
+
+const url = z.string().min(1).max(2048).url();
+const identityFields = [
+	"authorizationEndpoint",
+	"clientId",
+	"discoveryEndpoint",
+	"jwksEndpoint",
+	"tokenEndpoint",
+	"userInfoEndpoint",
+] as const;
+
+export const projectSsoUpdateInput = z.object({
+	providerId: z
+		.string()
+		.max(2048)
+		.refine((value) => !value.includes("\0")),
+	issuer: url.optional(),
+	domain: z.string().min(1).max(4096).optional(),
+	samlConfig: z.record(z.string(), z.unknown()).optional(),
+	oidcConfig: z
+		.object({
+			clientId: z.string().min(1).max(512).optional(),
+			clientSecret: z.string().min(1).max(4096).optional(),
+			discoveryEndpoint: url.optional(),
+			authorizationEndpoint: url.optional(),
+			tokenEndpoint: url.optional(),
+			jwksEndpoint: url.optional(),
+			userInfoEndpoint: url.optional(),
+			tokenEndpointAuthentication: z
+				.enum(["client_secret_basic", "client_secret_post", "private_key_jwt"])
+				.optional(),
+			privateKeyId: z.string().min(1).max(512).optional(),
+			privateKeyAlgorithm: z.string().min(1).max(32).optional(),
+			skipDiscovery: z.boolean().optional(),
+			pkce: z.boolean().optional(),
+			scopes: z.array(ssoScope).max(24).optional(),
+			overrideUserInfo: z.boolean().optional(),
+			mapping: z
+				.strictObject({
+					email: z.string().min(1).max(128),
+					name: z.string().min(1).max(128),
+					image: z.string().min(1).max(128).optional(),
+				})
+				.optional(),
+		})
+		.optional(),
+});
+
+type Update = z.infer<typeof projectSsoUpdateInput>;
+
+/** Update native OIDC records under the same provider lock used by sign-in and SCIM binding. */
+export async function updateProjectSsoProvider(
+	client: PoolClient,
+	provider: StoredProjectSsoProvider,
+	input: Update,
+) {
+	if (!ssoProviderId.safeParse(provider.providerId).success)
+		return failure(
+			409,
+			"SSO_PROVIDER_MUTATION_REJECTED",
+			"SSO provider mutation is not allowed",
+		);
+	if (provider.samlConfig || input.samlConfig)
+		return failure(
+			400,
+			"SSO_CONFIGURATION_UNSUPPORTED",
+			"This SSO provider update requires a supported OIDC configuration.",
+		);
+	if (!input.issuer && !input.domain && !input.oidcConfig)
+		return failure(400, "BAD_REQUEST", "No fields provided for update");
+	const current = readStoredSsoConfiguration(provider.oidcConfig);
+	if (!current)
+		return failure(
+			400,
+			"BAD_REQUEST",
+			"Cannot update OIDC config for a provider that doesn't have OIDC configured",
+		);
+	if (input.domain && !projectSsoDomainNames(input.domain))
+		return failure(400, "INVALID_DOMAIN", "Invalid domain");
+	const issuer = input.issuer ?? provider.issuer;
+	const domain = input.domain ?? provider.domain;
+	const oidcConfig =
+		input.oidcConfig || issuer !== provider.issuer
+			? {
+					...current,
+					...input.oidcConfig,
+					issuer,
+					pkce: input.oidcConfig?.pkce ?? current.pkce ?? true,
+				}
+			: current;
+	try {
+		checkProjectOidcConfiguration({ issuer, oidcConfig });
+	} catch {
+		return failure(
+			400,
+			"SSO_CONFIGURATION_UNSUPPORTED",
+			"This SSO provider update requires a supported OIDC configuration.",
+		);
+	}
+	const boundaryChanged =
+		issuer !== provider.issuer ||
+		identityFields.some((field) => current[field] !== oidcConfig[field]);
+	if (boundaryChanged) {
+		const boundary = await client.query<{ bound: boolean; linked: boolean }>(
+			`SELECT EXISTS(SELECT 1 FROM "allauthDirectory" WHERE "providerId"=$1) AS bound,
+			 EXISTS(SELECT 1 FROM "account" WHERE "providerId"=$1) AS linked`,
+			[provider.providerId],
+		);
+		if (boundary.rows[0].bound)
+			return failure(
+				409,
+				"SSO_PROVIDER_MUTATION_REJECTED",
+				"SSO provider mutation is not allowed",
+			);
+		if (boundary.rows[0].linked)
+			return failure(
+				409,
+				"CONFLICT",
+				"Cannot change SSO provider identity fields while linked accounts exist",
+			);
+	}
+	const domainChanged = domain !== provider.domain;
+	const domainVerified = domainChanged ? false : provider.domainVerified;
+	if (domainChanged) {
+		await client.query('DELETE FROM "verification" WHERE identifier=$1', [
+			projectSsoDnsIdentifier(provider.providerId),
+		]);
+	}
+	const serialized =
+		oidcConfig === current ? provider.oidcConfig : JSON.stringify(oidcConfig);
+	await client.query(
+		`UPDATE "ssoProvider" SET issuer=$1,domain=$2,"domainVerified"=$3,"oidcConfig"=$4 WHERE id=$5`,
+		[issuer, domain, domainVerified, serialized, provider.id],
+	);
+	return {
+		...provider,
+		issuer,
+		domain,
+		domainVerified,
+		oidcConfig: serialized,
+	};
+}

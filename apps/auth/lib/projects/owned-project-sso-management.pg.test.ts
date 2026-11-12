@@ -9,6 +9,8 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { defaultAuthPolicy } from "../auth-policy/policy";
 import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
 import { createOwnedProjectEngine } from "./owned-project-engine";
+import type { SsoProvider } from "./owned-project-sso-store";
+import { ssoProviderReference } from "./owned-project-sso-store";
 
 const { resolveTxt } = vi.hoisted(() => ({
 	resolveTxt: vi.fn<(name: string) => Promise<string[][]>>(),
@@ -31,6 +33,7 @@ const prefix = `allauth_project_${slug}`;
 const secret = "isolated-project-sso-management-fixture-signing-secret";
 const issuer = "https://idp.sso-fixture.example";
 const oidcConfig = {
+	issuer,
 	discoveryEndpoint: `${issuer}/.well-known/openid-configuration`,
 	clientId: "private-client-ABC9",
 	clientSecret: "synthetic-private-client-secret",
@@ -584,6 +587,146 @@ describe.skipIf(!existsSync(fixture))(
 					)
 				).json(),
 			).toMatchObject({ domainVerified: true });
+		});
+
+		it("updates native OIDC settings, preserves secret-only fingerprints and clears old domain proofs", async () => {
+			const providerId = "editable-oidc";
+			const detail = `get-provider?providerId=${providerId}`;
+			await provider(providerId, orgMember, {
+				org: organizationId,
+				verified: true,
+			});
+			async function readProvider() {
+				const { rows } = await database.query<SsoProvider>(
+					`SELECT id,"providerId",issuer,domain,"domainVerified","organizationId","oidcConfig"::jsonb AS "oidcConfig" FROM "${schema}"."ssoProvider" WHERE "providerId"=$1`,
+					[providerId],
+				);
+				return rows[0];
+			}
+			const original = ssoProviderReference(await readProvider());
+			const nextSecret = "synthetic-rotated-provider-secret";
+			const rotated = await owned.dispatch(
+				request("update-provider", orgAdmin, {
+					providerId,
+					oidcConfig: { clientSecret: nextSecret },
+				}),
+			);
+			expect(rotated.status, await rotated.clone().text()).toBe(200);
+			expect(await rotated.clone().json()).toEqual(
+				await (await native(request(detail, orgAdmin))).json(),
+			);
+			expect(await rotated.text()).not.toContain(nextSecret);
+			const persisted = await readProvider();
+			expect(persisted.oidcConfig?.clientSecret).toBe(nextSecret);
+			expect(ssoProviderReference(persisted)).toEqual(original);
+
+			const nativeUpdated = await native(
+				request("update-provider", orgAdmin, {
+					providerId,
+					oidcConfig: { scopes: ["openid", "email"] },
+				}),
+			);
+			expect(nativeUpdated.status, await nativeUpdated.clone().text()).toBe(
+				200,
+			);
+			expect(await nativeUpdated.json()).toEqual(
+				await (await owned.dispatch(request(detail, orgAdmin))).json(),
+			);
+			expect(ssoProviderReference(await readProvider())).not.toEqual(original);
+
+			await database.query(
+				`INSERT INTO "${schema}"."verification" (id,identifier,value,"expiresAt") VALUES ($1,$2,'stale-dns-proof',now()+interval '1 day')`,
+				[randomUUID(), `_better-auth-token-${providerId}`],
+			);
+			const changedDomain = await owned.dispatch(
+				request("update-provider", orgAdmin, {
+					providerId,
+					domain: "new.corp.example",
+				}),
+			);
+			expect(changedDomain.status, await changedDomain.clone().text()).toBe(
+				200,
+			);
+			expect(await changedDomain.json()).toMatchObject({
+				domain: "new.corp.example",
+				domainVerified: false,
+			});
+			const renewed = await native(
+				request("request-domain-verification", orgAdmin, { providerId }),
+			);
+			expect(renewed.status).toBe(201);
+			expect(await renewed.json()).not.toEqual({
+				domainVerificationToken: "stale-dns-proof",
+			});
+		});
+
+		it("protects linked provider identities, bound SCIM directories, and supported OIDC settings", async () => {
+			const providerId = "linked-oidc";
+			await provider(providerId, orgMember, {
+				org: organizationId,
+				verified: true,
+			});
+			await database.query(
+				`INSERT INTO "${schema}"."account" (id,"accountId","providerId","userId","updatedAt") VALUES ($1,$2,$3,$2,now())`,
+				[randomUUID(), orgMember.id, providerId],
+			);
+			const changeId = {
+				providerId,
+				oidcConfig: { clientId: "replacement-client" },
+			};
+			const blocked = await owned.dispatch(
+				request("update-provider", orgAdmin, changeId),
+			);
+			expect(blocked.status, await blocked.clone().text()).toBe(409);
+			expect(await blocked.json()).toMatchObject({
+				message:
+					"Cannot change SSO provider identity fields while linked accounts exist",
+			});
+			expect(
+				(await native(request("update-provider", orgAdmin, changeId))).status,
+			).toBe(409);
+			const before = await (
+				await owned.dispatch(
+					request(`get-provider?providerId=${providerId}`, orgAdmin),
+				)
+			).json();
+			await database.query(
+				`INSERT INTO "${schema}"."allauthDirectory" (id,"providerId","organizationId","connectionId","createdAt") VALUES ($1,$2,$3,$4,now())`,
+				[randomUUID(), providerId, organizationId, randomUUID()],
+			);
+			const bound = await owned.dispatch(
+				request("update-provider", orgAdmin, changeId),
+			);
+			expect(bound.status).toBe(409);
+			expect(await bound.json()).toMatchObject({
+				code: "SSO_PROVIDER_MUTATION_REJECTED",
+			});
+			for (const oidcConfig of [
+				{ tokenEndpoint: "http://idp.sso-fixture.example/token" },
+				{ tokenEndpointAuthentication: "private_key_jwt" },
+			]) {
+				const invalid = await owned.dispatch(
+					request("update-provider", orgAdmin, { providerId, oidcConfig }),
+				);
+				expect(invalid.status, await invalid.clone().text()).toBe(400);
+			}
+			expect(
+				(
+					await owned.dispatch(
+						request("update-provider", orgMember, {
+							providerId,
+							domain: "new.corp.example",
+						}),
+					)
+				).status,
+			).toBe(403);
+			expect(
+				await (
+					await native(
+						request(`get-provider?providerId=${providerId}`, orgAdmin),
+					)
+				).json(),
+			).toEqual(before);
 		});
 	},
 );

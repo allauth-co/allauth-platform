@@ -25,7 +25,7 @@ export function projectSsoDnsIdentifier(providerId: string) {
 	return `_better-auth-token-${providerId}`;
 }
 
-function domainNames(value: string) {
+export function projectSsoDomainNames(value: string) {
 	const domains = [
 		...new Set(
 			value
@@ -77,7 +77,7 @@ function verifyCandidate(provider: StoredProjectSsoProvider) {
 			"INVALID_PROVIDER_ID",
 			"Invalid DNS verification provider identifier.",
 		);
-	const domains = domainNames(provider.domain);
+	const domains = projectSsoDomainNames(provider.domain);
 	if (!domains) return failure(400, "INVALID_DOMAIN", "Invalid domain");
 	return { identifier, domains };
 }

@@ -17,11 +17,16 @@ import {
 import type { StoredProjectSsoProvider } from "./owned-project-sso-projection";
 import { projectSsoProviderResponse } from "./owned-project-sso-projection";
 import { ssoProviderId } from "./owned-project-sso-store";
+import {
+	projectSsoUpdateInput,
+	updateProjectSsoProvider,
+} from "./owned-project-sso-update";
 
 const paths = {
 	"/sso/providers": "GET",
 	"/sso/get-provider": "GET",
 	"/sso/delete-provider": "POST",
+	"/sso/update-provider": "POST",
 	"/sso/request-domain-verification": "POST",
 	"/sso/verify-domain": "POST",
 } as const;
@@ -115,14 +120,11 @@ async function deleteProvider(
 
 async function auditProviderChange(
 	client: PoolClient,
-	path: "/sso/delete-provider" | "/sso/verify-domain",
+	path: "/sso/delete-provider" | "/sso/verify-domain" | "/sso/update-provider",
 	provider: StoredProjectSsoProvider,
 	actorId: string,
 ) {
-	const type =
-		path === "/sso/delete-provider"
-			? "sso.delete-provider"
-			: "sso.verify-domain";
+	const type = `sso.${path.slice("/sso/".length)}`;
 	await client.query(
 		`INSERT INTO "allauthEvent" (id,type,outcome,"actorId","userId","organizationId","targetId","createdAt",metadata)
 		VALUES ($1,$2,'success',$3,$3,$4,$5,statement_timestamp(),jsonb_build_object('path',$6::text))`,
@@ -191,22 +193,39 @@ export function createOwnedProjectSsoManagement(
 				"FORBIDDEN",
 				"This authentication request is not permitted.",
 			);
-		const input =
-			path === "/sso/providers"
-				? null
-				: providerInput.safeParse(
-						mutation
-							? await options.readBody(request)
-							: {
-									providerId: new URL(request.url).searchParams.get(
-										"providerId",
-									),
-								},
-					);
-		if (input && !input.success)
-			return failure(400, "BAD_REQUEST", "Invalid SSO provider request.");
 		try {
-			if (input) {
+			if (path === "/sso/update-provider") {
+				const input = projectSsoUpdateInput.safeParse(
+					await options.readBody(request),
+				);
+				if (!input.success)
+					return failure(400, "BAD_REQUEST", "Invalid SSO provider request.");
+				return await forProvider(
+					request,
+					input.data.providerId,
+					true,
+					async (client, provider, actorId) => {
+						const updated = await updateProjectSsoProvider(
+							client,
+							provider,
+							input.data,
+						);
+						if (updated instanceof Response) return updated;
+						await auditProviderChange(client, path, updated, actorId);
+						return json(projectSsoProviderResponse(updated, options.baseURL));
+					},
+				);
+			}
+			if (path !== "/sso/providers") {
+				const input = providerInput.safeParse(
+					mutation
+						? await options.readBody(request)
+						: {
+								providerId: new URL(request.url).searchParams.get("providerId"),
+							},
+				);
+				if (!input.success)
+					return failure(400, "BAD_REQUEST", "Invalid SSO provider request.");
 				const { providerId } = input.data;
 				if (path === "/sso/request-domain-verification")
 					return await forProvider(
