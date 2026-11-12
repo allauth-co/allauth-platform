@@ -9,6 +9,8 @@ import { createProjectEngineStore } from "./owned-project-engine-store";
 import { checkedProjectSchema } from "./validation";
 
 export const oauthStateAge = 600;
+export const standardProjectOAuthReturnLength = 2048;
+export const maximumProjectOAuthReturnLength = 16_384;
 export const projectOAuthProvider = z.enum([
 	"allauth",
 	"google",
@@ -17,9 +19,9 @@ export const projectOAuthProvider = z.enum([
 ]);
 export type ProjectOAuthProvider = z.infer<typeof projectOAuthProvider>;
 const stateData = z.object({
-	callbackURL: z.string().max(2048),
-	newUserURL: z.string().max(2048).optional(),
-	errorURL: z.string().max(2048).optional(),
+	callbackURL: z.string().max(maximumProjectOAuthReturnLength),
+	newUserURL: z.string().max(maximumProjectOAuthReturnLength).optional(),
+	errorURL: z.string().max(standardProjectOAuthReturnLength).optional(),
 	codeVerifier: z.string().regex(/^[A-Za-z0-9._~-]{43,128}$/),
 	expiresAt: z.number().int().positive(),
 	oauthState: z.string().optional(),
@@ -103,6 +105,7 @@ export function createProjectOAuthStore(
 		state: string,
 		provider: ProjectOAuthProvider,
 		sessionToken: string | null,
+		allowLongReturn: (value: string) => boolean,
 	) {
 		return realm.transaction(async (client) => {
 			const result = await client.query<{
@@ -130,7 +133,13 @@ export function createProjectOAuthStore(
 				(data.data.oauthState !== undefined &&
 					data.data.oauthState !== state) ||
 				(data.data.serverContext?.ownedProjectProvider &&
-					data.data.serverContext.ownedProjectProvider !== provider)
+					data.data.serverContext.ownedProjectProvider !== provider) ||
+				[data.data.callbackURL, data.data.newUserURL].some(
+					(value) =>
+						value !== undefined &&
+						value.length > standardProjectOAuthReturnLength &&
+						!allowLongReturn(value),
+				)
 			)
 				return null;
 			if (data.data.link) {

@@ -10,6 +10,7 @@ import * as oauth from "oauth4webapi";
 import type { Pool, PoolClient } from "pg";
 import * as z from "zod";
 import { validAvatarPath } from "../avatars/protocol";
+import { hostedSocialSignInRequests } from "../domains/hosted-oauth-requests";
 import { reservedProjectEmailError } from "../project-email-alias-config";
 import type { LegacyMfaKeys } from "./legacy-mfa-record";
 import { sealLegacyMfaRecord } from "./legacy-mfa-record";
@@ -35,6 +36,10 @@ import {
 export { ownedProjectOAuthUnlinkInput } from "./owned-project-linked-accounts";
 
 import type { ProjectUser } from "./owned-project-engine-store";
+import {
+	isAuthenticExpiredProjectIssuerEmailContinuation,
+	readSignedProjectIssuerQuery,
+} from "./owned-project-issuer-authorization-query";
 import type {
 	ProjectOAuthIdentity,
 	ProjectOAuthProvider,
@@ -42,8 +47,10 @@ import type {
 } from "./owned-project-oauth-store";
 import {
 	createProjectOAuthStore,
+	maximumProjectOAuthReturnLength,
 	oauthStateAge,
 	projectOAuthProvider,
+	standardProjectOAuthReturnLength,
 } from "./owned-project-oauth-store";
 import {
 	appleCallbackForm,
@@ -111,9 +118,9 @@ const googleMetadata: oauth.AuthorizationServer = {
 
 export const ownedProjectOAuthStartInput = z.strictObject({
 	provider: projectOAuthProvider,
-	callbackURL: z.string().max(2048).optional(),
-	newUserCallbackURL: z.string().max(2048).optional(),
-	errorCallbackURL: z.string().max(2048).optional(),
+	callbackURL: z.string().max(standardProjectOAuthReturnLength).optional(),
+	newUserCallbackURL: z.string().max(standardProjectOAuthReturnLength).optional(),
+	errorCallbackURL: z.string().max(standardProjectOAuthReturnLength).optional(),
 	disableRedirect: z.boolean().optional(),
 	requestSignUp: z.boolean().optional(),
 	loginHint: z.string().max(320).optional(),
@@ -148,6 +155,22 @@ export const ownedProjectOAuthStartInput = z.strictObject({
 		.max(24)
 		.optional(),
 });
+
+const hostedContinuation = z.string().max(maximumProjectOAuthReturnLength);
+export const ownedProjectHostedSocialContinuationInput = z
+	.strictObject({
+		provider: projectOAuthProvider,
+		callbackURL: hostedContinuation,
+		newUserCallbackURL: hostedContinuation.optional(),
+		disableRedirect: z.boolean().optional(),
+	})
+	.refine(
+		({ callbackURL, newUserCallbackURL }) =>
+			callbackURL.length > standardProjectOAuthReturnLength &&
+			(newUserCallbackURL === undefined || newUserCallbackURL === callbackURL),
+	);
+export const maximumHostedSocialContinuationBodyBytes =
+	maximumProjectOAuthReturnLength * 2 + 1024;
 
 export type OwnedProjectOAuthStart = z.infer<
 	typeof ownedProjectOAuthStartInput
@@ -476,6 +499,29 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 		);
 	}
 
+	function signedHostedContinuation(target: URL, allowExpired: boolean) {
+		if (
+			options.basePath !== "/api/auth" ||
+			target.href.length > maximumProjectOAuthReturnLength ||
+			target.origin !== origin ||
+			target.pathname !== "/oauth2/continue" ||
+			target.hash ||
+			target.searchParams.has("token") ||
+			target.searchParams.has("error") ||
+			target.searchParams.getAll("client_id").length !== 1
+		)
+			return false;
+		const query = target.searchParams.toString();
+		const signed = readSignedProjectIssuerQuery(query, options.signingSecret);
+		if (signed) return !signed.consentSessionId;
+		// A completed provider round trip may outlast the issuer's continuation.
+		// Preserve its exact redirect to the issuer's existing expiry handling.
+		return (
+			allowExpired &&
+			isAuthenticExpiredProjectIssuerEmailContinuation(query, options.signingSecret)
+		);
+	}
+
 	function errorRedirect(
 		code: string,
 		state?: ProjectOAuthState,
@@ -517,13 +563,21 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 		const linkToken = linking ? browserToken(request) : null;
 		if (linking && !linkToken)
 			return publicFailure("UNAUTHORIZED", "Unauthorized", 401);
-		const parsed = ownedProjectOAuthStartInput.safeParse(input);
+		const regular = ownedProjectOAuthStartInput.safeParse(input);
+		const hosted =
+			!linking &&
+			requestOrigin === origin &&
+			hostedSocialSignInRequests.has(request);
+		const parsed =
+			!regular.success && hosted
+				? ownedProjectHostedSocialContinuationInput.safeParse(input)
+				: regular;
 		if (!parsed.success)
 			return publicJSON(
 				{ code: "INVALID_BODY", message: "Invalid provider sign-in request." },
 				400,
 			);
-		const body = parsed.data;
+		const body: OwnedProjectOAuthStart = parsed.data;
 		const client = credentials(body.provider);
 		if (!client)
 			return publicJSON(
@@ -543,7 +597,12 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 			body.errorCallbackURL === undefined
 				? undefined
 				: safeURL(body.errorCallbackURL, requestOrigin, origins);
-		if (!destination || newUser === null || error === null)
+		if (
+			!destination ||
+			newUser === null ||
+			error === null ||
+			(!regular.success && !signedHostedContinuation(destination, false))
+		)
 			return publicJSON(
 				{
 					code: "FORBIDDEN",
@@ -1480,7 +1539,10 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 					);
 		try {
 			const linkSession = browserToken(request);
-			flow = await store.consume(state, provider, linkSession);
+			flow = await store.consume(state, provider, linkSession, (value) => {
+				const target = safeURL(value, origin, origins);
+				return target !== null && signedHostedContinuation(target, true);
+			});
 			if (!flow) return errorRedirect("state_mismatch", undefined, true);
 			const destination = safeURL(flow.callbackURL, origin, origins);
 			const newUser =

@@ -15,6 +15,7 @@ import {
 	isPrimaryAuthenticationPath,
 } from "../control/event-contract";
 import { discoveryHeaders } from "../discovery";
+import { hostedSocialSignInRequests } from "../domains/hosted-oauth-requests";
 import { emailConfigured } from "../email/send";
 import { freshFeatureSession, isServerTokenRequest } from "../features/helpers";
 import { applicationMfaCallback } from "../mfa-continuation";
@@ -74,6 +75,8 @@ import { admitOwnedProjectNativeRoute } from "./owned-project-native-admission";
 import type { OwnedProjectOAuthOptions } from "./owned-project-oauth";
 import {
 	createOwnedProjectOAuth,
+	maximumHostedSocialContinuationBodyBytes,
+	ownedProjectHostedSocialContinuationInput,
 	ownedProjectOAuthStartInput,
 	ownedProjectOAuthUnlinkInput,
 	projectOAuthProvider,
@@ -346,7 +349,7 @@ function forbidden() {
 }
 
 async function requestBody(
-	request: Request,
+	request: Pick<Request, "headers" | "body">,
 	limit = maximumBodyBytes,
 ): Promise<unknown> {
 	if (!request.body) return {};
@@ -3611,9 +3614,21 @@ export function createOwnedProjectEngine(
 			request.method === "POST"
 		) {
 			if (!trustedRequest(request.headers, true)) return forbidden();
-			const body = ownedProjectOAuthStartInput.safeParse(
-				await requestBody(request),
-			);
+			const hosted =
+				path === "/sign-in/social" && hostedSocialSignInRequests.has(request);
+			const input = await requestBody(hosted ? request.clone() : request);
+			const regular = ownedProjectOAuthStartInput.safeParse(input);
+			const body =
+				hosted && !regular.success
+					? ownedProjectHostedSocialContinuationInput.safeParse(
+							input === undefined
+								? await requestBody(
+										request,
+										maximumHostedSocialContinuationBodyBytes,
+									)
+								: input,
+						)
+					: regular;
 			if (!body.success)
 				return failure(
 					400,

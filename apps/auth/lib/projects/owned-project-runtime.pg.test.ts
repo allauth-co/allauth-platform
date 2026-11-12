@@ -6274,6 +6274,141 @@ describe.skipIf(!existsSync(fixture))(
 			}
 		}, 60_000);
 
+		it("carries long signed hosted social returns across the project writer switch", async () => {
+			const local: { container: string; DATABASE_URL: string } = JSON.parse(
+				readFileSync(fixture, "utf8"),
+			);
+			const base = new URL(local.DATABASE_URL);
+			if (
+				local.container !== "allauth-production-test-20261007" ||
+				base.hostname !== "127.0.0.1" ||
+				base.port !== "55445"
+			)
+				throw new Error("Hosted social OAuth requires the isolated PostgreSQL fixture.");
+			const admin = new Pool({ connectionString: base.href, max: 1 });
+			const name = `allauth_hosted_${randomUUID().replaceAll("-", "")}`;
+			const databaseURL = new URL(`/${name}`, base).href;
+			let created = false;
+			let service: Awaited<ReturnType<typeof openProcess>> | undefined;
+			try {
+				await admin.query(`CREATE DATABASE "${name}"`);
+				created = true;
+				const { alpha } = await seed(databaseURL);
+				const host = `${alpha.slug}-accounts.allauth.co`;
+				const origin = `https://${host}`;
+				const hostedPath = "/api/auth/hosted-ui/sign-in/social";
+				const rollout = { ALLAUTH_PROJECT_HOSTED_UI_PROJECT_IDS: alpha.id };
+				const state = `${"long-synthetic-application-state".repeat(129)}+one&two`;
+				const signedReturn = () =>
+					`${origin}/oauth2/continue?${signProjectIssuerQuery(
+						fixtureAuthorizationQuery(state),
+						versionedSigningSecret,
+					)}`;
+				const callbackURL = signedReturn();
+				const clock = vi.spyOn(Date, "now").mockReturnValueOnce(Date.now() - 90_000);
+				const expiredReturn = signedReturn();
+				clock.mockRestore();
+				const body = {
+					provider: "google",
+					callbackURL,
+					newUserCallbackURL: callbackURL,
+				};
+				expect(callbackURL.length).toBeGreaterThan(2048);
+				expect(Buffer.byteLength(JSON.stringify(body))).toBeGreaterThan(8192);
+				const transport = { host, accept: "application/json" };
+				async function start(clientIP: string, target = callbackURL) {
+					const response = await service!.request(hostedPath, {
+						...transport,
+						clientIP,
+						body: { ...body, callbackURL: target, newUserCallbackURL: target },
+					});
+					expect(response.status, await response.clone().text()).toBe(200);
+					const authorization = await fixtureRedirect(response);
+					expect(authorization.origin).toBe("https://accounts.google.com");
+					expect(authorization.searchParams.get("redirect_uri")).toBe(
+						`${origin}/api/auth/callback/google`,
+					);
+					return {
+						clientIP,
+						cookie: cookie(response),
+						target,
+						path: `/api/auth/callback/google?${new URLSearchParams({
+							state: authorization.searchParams.get("state")!,
+							code: runtimeProviderFixtureCode(authorization),
+						})}`,
+					};
+				}
+				async function finish(attempt: Awaited<ReturnType<typeof start>>) {
+					const { path, target, ...options } = attempt;
+					const response = await service!.request(path, { ...transport, ...options });
+					expect(response.status).toBe(302);
+					expect(response.headers.get("location")).toBe(target);
+					expect(cookie(response)).toContain(".session_token=");
+					const signedIn = await service!.request("/api/auth/get-session", {
+						...transport,
+						cookie: cookie(response),
+					});
+					const { user } = (await signedIn.json()) as {
+						user: { id: string; email: string };
+					};
+					return { id: user.id, email: user.email };
+				}
+				service = await openProcess(databaseURL, alpha, false, alpha.slug, undefined, undefined, rollout);
+				const legacyAttempt = await start("192.0.2.105");
+				const legacyExpired = await start("192.0.2.108", expiredReturn);
+				await service.stop();
+				service = undefined;
+				service = await openProcess(databaseURL, alpha, true, alpha.slug, undefined, undefined, rollout);
+				const established = await finish(legacyAttempt);
+				expect(established.email).toBe(runtimeFixtureGoogle.email);
+				expect(await finish(legacyExpired)).toEqual(established);
+				const replay = await service.request(legacyAttempt.path, {
+					...transport,
+					cookie: legacyAttempt.cookie,
+				});
+				expect(new URL(replay.headers.get("location")!).searchParams.get("error"))
+					.toBe("state_mismatch");
+				expect(cookie(replay)).not.toContain(".session_token=");
+				const standard = await service.request("/api/auth/sign-in/social", {
+					...transport,
+					body,
+				});
+				expect(standard.status).toBe(400);
+				const direct = await service.request(`/api/projects/${alpha.slug}/auth/sign-in/social`, { body });
+				expect(direct.status).toBe(400);
+				const wrong = new URL(callbackURL);
+				wrong.searchParams.set("state", `${state}-changed`);
+				const refused = await service.request(hostedPath, {
+					...transport,
+					clientIP: "192.0.2.106",
+					body: { ...body, callbackURL: wrong.href, newUserCallbackURL: wrong.href },
+				});
+				expect(refused.status).toBe(403);
+				expect(cookie(refused)).toBe("");
+				const expired = await service.request(hostedPath, {
+					...transport,
+					clientIP: "192.0.2.109",
+					body: { ...body, callbackURL: expiredReturn, newUserCallbackURL: expiredReturn },
+				});
+				expect(expired.status).toBe(403);
+				const ownedAttempt = await start("192.0.2.107");
+				await service.stop();
+				service = undefined;
+				service = await openProcess(databaseURL, alpha, false, alpha.slug, undefined, undefined, rollout);
+				expect(await finish(ownedAttempt)).toEqual(established);
+			} finally {
+				try {
+					await service?.stop();
+				} finally {
+					try {
+						if (created) await dropClosedFixtureDatabase(admin, name);
+					} finally {
+						await admin.end();
+					}
+				}
+			}
+		}, 60_000);
+
 		it("preserves signed custom SAML metadata at its exact verified accounts receiver across process restarts", async () => {
 			const local: { container: string; DATABASE_URL: string } = JSON.parse(
 				readFileSync(fixture, "utf8"),
