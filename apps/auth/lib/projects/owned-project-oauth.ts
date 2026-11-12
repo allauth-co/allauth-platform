@@ -190,14 +190,14 @@ export interface OwnedProjectOAuthOptions {
 	apple?: AppleCredentials;
 	/** Bind a live guest from this project to an authoritative OAuth state record. */
 	readGuestUserId?(request: Request): Promise<string | undefined>;
-	/** Apply project rules to a cryptographically verified browser-provider profile. */
-	denyBrowserProfile?(
+	/** Apply project rules after verifying a provider profile. */
+	denyProviderProfile?(
 		client: PoolClient,
 		request: Request,
 		email: string,
 	): Promise<boolean>;
 	/** Commit signup admission even when provisional account writes are discarded. */
-	prepareBrowserSignup?(
+	prepareProviderSignup?(
 		client: PoolClient,
 		request: Request,
 		email: string,
@@ -731,6 +731,36 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 		};
 	}
 
+	const rejectedSignupProfile = Symbol("project OAuth signup profile rejected");
+
+	function profileAdmission(client: PoolClient, request: Request) {
+		const state: {
+			denied?: "existing" | "signup";
+			rollback?: () => Promise<void>;
+		} = {};
+		return {
+			state,
+			async denyProfile(email: string, action: "existing" | "signup") {
+				if (action === "signup" && options.prepareProviderSignup) {
+					const rollback = await options.prepareProviderSignup(
+						client,
+						request,
+						email,
+					);
+					if (!rollback) state.denied = action;
+					else state.rollback = rollback;
+					return !rollback;
+				}
+				if (!(await options.denyProviderProfile?.(client, request, email)))
+					return false;
+				// Native signup discards profile audit events when its provisional identity is refused.
+				if (action === "signup") throw rejectedSignupProfile;
+				state.denied = action;
+				return true;
+			},
+		};
+	}
+
 	async function directApple(
 		request: Request,
 		input: OwnedProjectOAuthStart,
@@ -827,63 +857,80 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 						sessionToken,
 					}
 				: undefined;
+		const profileFailure = () =>
+			publicFailure("validation_failed", "User validation failed", 403);
+		const directFailure = (error: unknown) =>
+			error === rejectedSignupProfile
+				? profileFailure()
+				: error instanceof Response
+					? error
+					: publicFailure(
+							"PROVIDER_UNAVAILABLE",
+							"Provider sign-in is temporarily unavailable.",
+							503,
+						);
 		try {
 			return await store.transaction(async (client) => {
-				const account = await store.bind(
-					client,
-					identity,
-					{
-						signUpEnabled: options.signUpEnabled,
-						requireEmailVerification: false,
-					},
-					link,
-					`/${operation}`,
-				);
-				if (!account)
-					return publicFailure("OAUTH_LINK_ERROR", "Account not linked", 401);
-				if ("error" in account) {
-					const [message, status] = appleBindingFailures[account.error];
-					return publicFailure(
-						account.error === "SIGN_UP_DISABLED" ? "FORBIDDEN" : account.error,
-						message,
-						status,
+				const { state, denyProfile } = profileAdmission(client, request);
+				try {
+					const account = await store.bind(
+						client,
+						identity,
+						{
+							signUpEnabled: options.signUpEnabled,
+							requireEmailVerification: false,
+							denyProfile: linking ? undefined : denyProfile,
+						},
+						link,
+						`/${operation}`,
 					);
-				}
-				if (link) {
-					if (
-						options.authorizeLinkedAccounts &&
-						!(await options.authorizeLinkedAccounts(client, {
-							request,
-							user: account.user,
-							operation: "link-callback",
-						}))
-					)
+					if (state.denied) return profileFailure();
+					if (!account)
+						throw publicFailure("OAUTH_LINK_ERROR", "Account not linked", 401);
+					if ("error" in account) {
+						const [message, status] = appleBindingFailures[account.error];
 						throw publicFailure(
-							"FORBIDDEN",
-							"This authentication request is not permitted.",
-							403,
+							account.error === "SIGN_UP_DISABLED"
+								? "FORBIDDEN"
+								: account.error,
+							message,
+							status,
 						);
-					return publicJSON({ url: "", status: true, redirect: false }, 200);
+					}
+					if (link) {
+						if (
+							options.authorizeLinkedAccounts &&
+							!(await options.authorizeLinkedAccounts(client, {
+								request,
+								user: account.user,
+								operation: "link-callback",
+							}))
+						)
+							throw publicFailure(
+								"FORBIDDEN",
+								"This authentication request is not permitted.",
+								403,
+							);
+						return publicJSON({ url: "", status: true, redirect: false }, 200);
+					}
+					const response = await options.complete(client, {
+						request,
+						user: account.user,
+						provider: "apple",
+						destination: destination.href,
+						registered: account.registered,
+						transport: "id-token",
+					});
+					if (response.status >= 400) throw response;
+					return response;
+				} catch (error) {
+					if (!state.rollback) throw error;
+					await state.rollback();
+					return directFailure(error);
 				}
-				const response = await options.complete(client, {
-					request,
-					user: account.user,
-					provider: "apple",
-					destination: destination.href,
-					registered: account.registered,
-					transport: "id-token",
-				});
-				if (response.status >= 400) throw response;
-				return response;
 			});
 		} catch (error) {
-			return error instanceof Response
-				? error
-				: publicFailure(
-						"PROVIDER_UNAVAILABLE",
-						"Provider sign-in is temporarily unavailable.",
-						503,
-					);
+			return directFailure(error);
 		}
 	}
 
@@ -1416,9 +1463,6 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 			return errorRedirect("state_mismatch");
 		let flow: ProjectOAuthState | null = null;
 		const rejected = Symbol("project OAuth session rejected");
-		const rejectedSignupProfile = Symbol(
-			"project OAuth signup profile rejected",
-		);
 		const profileFailure = (clearState = false) =>
 			errorRedirect(
 				"validation_failed",
@@ -1457,8 +1501,10 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 					: undefined;
 			const anonymousUserId = flow.serverContext?.anonymousUserId;
 			const response = await store.transaction(async (client) => {
-				let rejectedProfile = false;
-				const signup: { denied?: boolean; rollback?: () => Promise<void> } = {};
+				const { state: admission, denyProfile } = profileAdmission(
+					client,
+					request,
+				);
 				try {
 					const account = await store.bind(
 						client,
@@ -1469,42 +1515,18 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 								options.requireEmailVerification &&
 								provider !== "microsoft" &&
 								provider !== "apple",
-							async denyProfile(email, operation) {
-								if (operation === "signup" && options.prepareBrowserSignup) {
-									const rollback = await options.prepareBrowserSignup(
-										client,
-										request,
-										email,
-									);
-									if (!rollback) {
-										signup.denied = true;
-										return true;
-									}
-									signup.rollback = rollback;
-									return false;
-								}
-								rejectedProfile =
-									(await options.denyBrowserProfile?.(
-										client,
-										request,
-										email,
-									)) === true;
-								// Native signup rolls its policy event back with the provisional identity.
-								if (rejectedProfile && operation === "signup")
-									throw rejectedSignupProfile;
-								return rejectedProfile;
-							},
+							denyProfile,
 						},
 						link,
 					);
-					if (signup.denied) return profileFailure(true);
-					if (rejectedProfile) return profileFailure();
+					if (admission.denied)
+						return profileFailure(admission.denied === "signup");
 					if (
 						account &&
 						"error" in account &&
 						account.error === reservedProjectEmailError.code
 					) {
-						await signup.rollback?.();
+						await admission.rollback?.();
 						return errorRedirect(
 							account.error,
 							flow ?? undefined,
@@ -1538,7 +1560,7 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 					if (response.status >= 400) {
 						// The native session gate follows token rotation for a verified, already-linked profile.
 						if (
-							options.denyBrowserProfile &&
+							options.denyProviderProfile &&
 							account.existingBinding &&
 							identity.email &&
 							identity.email.toLowerCase() !==
@@ -1555,8 +1577,8 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 					}
 					return response;
 				} catch (error) {
-					if (!signup.rollback) throw error;
-					await signup.rollback();
+					if (!admission.rollback) throw error;
+					await admission.rollback();
 					return callbackFailure(error);
 				}
 			});

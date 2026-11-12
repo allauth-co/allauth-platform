@@ -9,6 +9,11 @@ import { Kysely, PostgresDialect } from "kysely";
 import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { defaultAuthPolicy } from "../auth-policy/policy";
+import { allauthControl } from "../control";
+import {
+	defaultSecurityPolicy,
+	securitySubject,
+} from "../control/security-policy";
 import { discoveryDocument } from "../discovery";
 import { productionTwoFactor } from "../mfa";
 import { appleIntegrity } from "../project-providers/apple";
@@ -107,6 +112,7 @@ async function legacyProject(
 	settings?: {
 		policy: typeof defaultAuthPolicy;
 		brokerOnly: boolean;
+		controlSecurity?: boolean;
 	},
 ) {
 	return (
@@ -115,7 +121,11 @@ async function legacyProject(
 				baseURL: origin,
 				secret: key,
 				logger: { disabled: true },
-				database: { db, type: "postgres" },
+				database: {
+					db,
+					type: "postgres",
+					transaction: settings?.controlSecurity,
+				},
 				...(settings
 					? {
 							emailAndPassword: {
@@ -156,6 +166,17 @@ async function legacyProject(
 					},
 				},
 				plugins: [
+					...(settings?.controlSecurity
+						? [
+								allauthControl({
+									database: db,
+									baseURL: origin,
+									secret: key,
+									ipHeader: "x-real-ip",
+									requireTrustedIP: true,
+								}),
+							]
+						: []),
 					...(settings
 						? [
 								projectManagement({
@@ -258,6 +279,7 @@ describe.skipIf(!existsSync(fixturePath))(
 						"001-initial-auth.sql",
 						"002-control-plane.sql",
 						"005-free-plugins.sql",
+						"006-analytics.sql",
 						"016-invitation-import-provenance.sql",
 					]) {
 						await client.query(
@@ -276,7 +298,7 @@ describe.skipIf(!existsSync(fixturePath))(
 				dialect: new PostgresDialect({
 					pool: new Pool({
 						connectionString: url.toString(),
-						max: 1,
+						max: 2,
 						options: `-c search_path=${schema}`,
 					}),
 				}),
@@ -563,7 +585,8 @@ describe.skipIf(!existsSync(fixturePath))(
 				basePath: "/api/auth",
 				signingSecret: key,
 				trustedOrigins: [],
-				trustedIP: () => "203.0.113.16",
+				trustedIP: (request) =>
+					request.headers.get("x-real-ip") ?? "203.0.113.16",
 				policy,
 				oauth: {
 					broker: config,
@@ -1224,6 +1247,208 @@ describe.skipIf(!existsSync(fixturePath))(
 				expect(await readGrant()).toEqual(savedGrant);
 			} finally {
 				externalNetwork = undefined;
+			}
+		});
+
+		it("shares verified direct Apple signup rules and counters across the native and owned writers", async () => {
+			if (!nativeDatabase)
+				throw new Error("Expected the scoped PostgreSQL fixture.");
+			const legacy = await legacyProject(nativeDatabase, config, {
+				policy: defaultAuthPolicy,
+				brokerOnly: false,
+				controlSecurity: true,
+			});
+			const owned = ownedProviderEngine();
+			const writers = [legacy.handler, owned.dispatch];
+			const ruleId = randomUUID();
+			const ownerRule = randomUUID();
+			const deniedDomain = "denied-apple.fixture.example";
+			const ownerDomain = "verified-apple.fixture.example";
+			const scope = `"${schema}"`;
+			const request = async (
+				ip: string,
+				subject: string,
+				email?: string,
+				accessToken?: string,
+			) => {
+				const token = await appleFixtureToken(
+					subject,
+					apple.appBundleIdentifier,
+					email ? { email, email_verified: "true" } : {},
+				);
+				const input = post(origin, "/sign-in/social", {
+					provider: "apple",
+					idToken: { token, accessToken },
+				});
+				input.headers.set("x-real-ip", ip);
+				return input;
+			};
+			const count = async (ip: string, counter = "signup-ip") =>
+				(
+					await database.query<{ count: number }>(
+						`SELECT count FROM ${scope}."allauthSecurityCounter" WHERE key=$1`,
+						[await securitySubject(key, counter, ip)],
+					)
+				).rows[0]?.count ?? 0;
+			const grant = async (subject: string) =>
+				(
+					await database.query(
+						`SELECT id,"userId","idToken","accessToken","refreshToken","updatedAt"
+					 FROM ${scope}."account" WHERE "providerId"='apple' AND "accountId"=$1`,
+						[subject],
+					)
+				).rows[0];
+			const blockedEvents = async (ip: string) =>
+				(
+					await database.query(
+						`SELECT outcome,metadata FROM ${scope}."allauthEvent"
+					 WHERE type='security.blocked' AND "ipAddress"=$1 ORDER BY metadata->>'ruleId'`,
+						[ip],
+					)
+				).rows;
+			const ruleEvent = (id: string) => ({
+				outcome: "blocked",
+				metadata: {
+					signal: "explicit-rule",
+					monitor: false,
+					ruleId: id,
+					ruleType: "email-domain",
+				},
+			});
+			const noProvisioning = async (subject: string, email: string) => {
+				expect(await grant(subject)).toBeUndefined();
+				expect(
+					(
+						await database.query(
+							`SELECT id FROM ${scope}."user" WHERE email=$1`,
+							[email],
+						)
+					).rows,
+				).toEqual([]);
+			};
+			const denied = async (response: Response) => {
+				expect(response.status, await response.clone().text()).toBe(403);
+				expect(await response.json()).toEqual({
+					code: "validation_failed",
+					message: "User validation failed",
+				});
+				expect(response.headers.getSetCookie()).toEqual([]);
+			};
+			try {
+				appleDirectFixture();
+				await database.query(
+					`INSERT INTO ${scope}."allauthSecurityPolicy" (id,policy) VALUES ('default',$1)`,
+					[{ ...defaultSecurityPolicy, maxSignUpsPerIp: 1 }],
+				);
+				await database.query(
+					`INSERT INTO ${scope}."allauthSecurityRule" (id,type,value,reason) VALUES ($1,'email-domain',$2,'Synthetic Apple signup fixture')`,
+					[ruleId, deniedDomain],
+				);
+				const owners: string[] = [];
+				for (const [index, writer] of writers.entries()) {
+					const other = writers[1 - index]!;
+					const ip = `203.0.113.${31 + index}`;
+					const blockedEmail = `blocked-${index}@${deniedDomain}`;
+					const blockedSubject = `direct-apple-domain-denial-${index}`;
+					await denied(
+						await writer(await request(ip, blockedSubject, blockedEmail)),
+					);
+					await noProvisioning(blockedSubject, blockedEmail);
+					expect(await count(ip)).toBe(0);
+					expect(await blockedEvents(ip)).toEqual([]);
+
+					const subject = `direct-apple-signed-owner-${index}`;
+					const email = `owner-${index}@${ownerDomain}`;
+					const signedIn = await writer(
+						await request(ip, subject, email, "synthetic-first-access"),
+					);
+					expect(signedIn.status, await signedIn.clone().text()).toBe(200);
+					const user = (
+						(await signedIn.json()) as { user: { id: string; email: string } }
+					).user;
+					expect(user.email).toBe(email);
+					expect(await count(ip)).toBe(1);
+					expect(
+						await legacy.api.getSession({
+							headers: new Headers({ cookie: cookiePairs(signedIn) }),
+							query: { disableRefresh: true },
+						}),
+					).toMatchObject({ user: { id: user.id } });
+
+					const existing = await other(await request(ip, subject, email));
+					expect(existing.status, await existing.clone().text()).toBe(200);
+					expect(await existing.json()).toMatchObject({
+						user: { id: user.id },
+					});
+					expect(await count(ip)).toBe(1);
+					await database.query(
+						`UPDATE ${scope}."account" SET "refreshToken"=$1
+						 WHERE "providerId"='apple' AND "accountId"=$2`,
+						[
+							await symmetricEncrypt({ key, data: "synthetic-prior-refresh" }),
+							subject,
+						],
+					);
+					const saved = await grant(subject);
+					await denied(
+						await writer(
+							await request(
+								ip,
+								subject,
+								blockedEmail,
+								"synthetic-blocked-rotation",
+							),
+						),
+					);
+					expect(await grant(subject)).toEqual(saved);
+					owners.push(subject);
+
+					for (const [attempt, nextWriter] of [other, writer].entries()) {
+						const refusedSubject = `direct-apple-velocity-${index}-${attempt}`;
+						const refusedEmail = `velocity-${index}-${attempt}@${ownerDomain}`;
+						await denied(
+							await nextWriter(await request(ip, refusedSubject, refusedEmail)),
+						);
+						await noProvisioning(refusedSubject, refusedEmail);
+						expect(await count(ip)).toBe(2 + attempt);
+					}
+					expect(await count(ip, "fail-ip")).toBe(0);
+					expect(await blockedEvents(ip)).toEqual([ruleEvent(ruleId)]);
+				}
+				await database.query(
+					`INSERT INTO ${scope}."allauthSecurityRule" (id,type,value,reason) VALUES ($1,'email-domain',$2,'Synthetic stored Apple owner fixture')`,
+					[ownerRule, ownerDomain],
+				);
+				for (const [index, writer] of writers.entries()) {
+					const subject = owners[index]!;
+					const saved = await grant(subject);
+					const ip = `203.0.113.${31 + index}`;
+					await denied(
+						await writer(
+							await request(
+								ip,
+								subject,
+								undefined,
+								"synthetic-blocked-rotation",
+							),
+						),
+					);
+					expect(await grant(subject)).toEqual(saved);
+					expect(await count(ip)).toBe(3);
+					expect(await count(ip, "fail-ip")).toBe(0);
+					expect(await blockedEvents(ip)).toEqual(
+						[ruleId, ownerRule].sort().map(ruleEvent),
+					);
+				}
+			} finally {
+				externalNetwork = undefined;
+				await database.query(
+					`DELETE FROM ${scope}."allauthSecurityRule" WHERE id=ANY($1::text[])`,
+					[[ruleId, ownerRule]],
+				);
+				await database.query(
+					`DELETE FROM ${scope}."allauthSecurityPolicy" WHERE id='default'`,
+				);
 			}
 		});
 

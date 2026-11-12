@@ -231,8 +231,8 @@ interface OwnedProjectEngineOptions {
 		| "passkeySignIn"
 		| "otherLinkedSignIn"
 		| "readGuestUserId"
-		| "denyBrowserProfile"
-	| "prepareBrowserSignup"
+		| "denyProviderProfile"
+	| "prepareProviderSignup"
 		| "complete"
 	>;
 	sso?: Omit<
@@ -2402,8 +2402,8 @@ export function createOwnedProjectEngine(
 			baseURL: origin,
 			basePath: options.basePath,
 			trustedOrigins: options.trustedOrigins,
-			denyBrowserProfile: security.denyProvisioning,
-			prepareBrowserSignup: security.prepareProviderSignup,
+			denyProviderProfile: security.denyProvisioning,
+			prepareProviderSignup: security.prepareProviderSignup,
 			async readGuestUserId(request) {
 				if (!guest) return undefined;
 				const current = await currentSession(request.headers);

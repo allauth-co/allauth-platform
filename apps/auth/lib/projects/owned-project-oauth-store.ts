@@ -199,12 +199,14 @@ export function createProjectOAuthStore(
 			return directSignIn || directLink
 				? { error: "USER_EMAIL_NOT_FOUND" }
 				: null;
+		const profileEmail =
+			identity.email ?? (directSignIn ? persistedOwner?.email : undefined);
 		let checkedProfile = false;
 		async function profileDenied(operation: "existing" | "signup") {
-			if (checkedProfile || !identity.email || !policy.denyProfile)
+			if (checkedProfile || !profileEmail || !policy.denyProfile)
 				return false;
 			checkedProfile = true;
-			return policy.denyProfile(identity.email.toLowerCase(), operation);
+			return policy.denyProfile(profileEmail.toLowerCase(), operation);
 		}
 		const emailVerified = identity.email
 			? identity.emailVerified
