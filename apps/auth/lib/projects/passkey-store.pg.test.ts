@@ -30,6 +30,7 @@ const other = checkedProjectSchema(`allauth_project_${randomUUID().replaceAll("-
 const ownerEmail = "owner@passkey-storage.fixture.example";
 const foreignEmail = "other@passkey-storage.fixture.example";
 const fixtureSecret = "synthetic-passkey-storage-fixture-signing-secret";
+const fixturePassword = "synthetic-passkey-fixture-password";
 const publicKey = new Uint8Array([0xfb, 0xff, 0x04, 0x00, 0x99]);
 const hash = (value: string | Uint8Array) => createHash("sha256").update(value).digest();
 
@@ -99,6 +100,25 @@ function legacyFixture(database: ReturnType<typeof postgresDatabase>, audit = fa
 			...(audit ? [allauthControl({ database: database.db, secret: fixtureSecret, baseURL: origin, ipHeader: "x-real-ip", requireTrustedIP: true }), featureBoundaries()] : []),
 		],
 	}, { disableTestUser: true });
+}
+
+function ownedHttpFixture(database: Pool) {
+	return createOwnedProjectEngine({
+		database,
+		project: { slug: projectSlug, schemaName: primary },
+		baseURL: origin,
+		basePath: "/api/auth",
+		trustedOrigins: [],
+		signingSecret: fixtureSecret,
+		policy: defaultAuthPolicy,
+		trustedIP: (request) => request.headers.get("x-real-ip"),
+		passkeys: {
+			id: rpId,
+			name: "Passkey fixture",
+			origins: [origin],
+			requireUserVerification: true,
+		},
+	});
 }
 
 /** @see https://www.w3.org/TR/webauthn-3/#sctn-sign-counter */
@@ -248,7 +268,7 @@ describe.skipIf(!existsSync(fixturePath))("project passkey PostgreSQL interopera
 		});
 		nativeDatabase = postgresDatabase(nativePool);
 		legacy = await legacyFixture(nativeDatabase);
-		const password = "synthetic-passkey-fixture-password";
+		const password = fixturePassword;
 		const owner = await legacy.auth.api.signUpEmail({ body: { name: "Owner", email: ownerEmail, password } });
 		const foreign = await legacy.auth.api.signUpEmail({ body: { name: "Other", email: foreignEmail, password } });
 		ownerId = owner.user.id;
@@ -290,22 +310,7 @@ describe.skipIf(!existsSync(fixturePath))("project passkey PostgreSQL interopera
 				ipAddress: "192.0.2.65",
 				userAgent: "Synthetic passkey audit browser",
 			};
-			const candidate = createOwnedProjectEngine({
-				database: pool,
-				project: { slug: projectSlug, schemaName: primary },
-				baseURL: origin,
-				basePath: "/api/auth",
-				trustedOrigins: [],
-				signingSecret: fixtureSecret,
-				policy: defaultAuthPolicy,
-				trustedIP: (request) => request.headers.get("x-real-ip"),
-				passkeys: {
-					id: rpId,
-					name: "Passkey fixture",
-					origins: [origin],
-					requireUserVerification: true,
-				},
-			});
+			const candidate = ownedHttpFixture(pool);
 			const endpoint = "https://passkey-webhook.fixture.example/receive";
 			const endpointId = randomUUID();
 			const signingKey = newWebhookSigningSecret();
@@ -318,6 +323,23 @@ describe.skipIf(!existsSync(fixturePath))("project passkey PostgreSQL interopera
 				],
 			);
 			const cookie = headers.get("cookie")!;
+			async function agedSession(kind: "stale" | "expired") {
+				const login = await legacy.auth.api.signInEmail({
+					body: { email: ownerEmail, password: fixturePassword },
+					asResponse: true,
+				});
+				expect(login.status).toBe(200);
+				const cookie = login.headers.getSetCookie().map((value) => value.split(";", 1)[0]).join("; ");
+				const session = await legacy.auth.api.getSession({ headers: new Headers({ cookie }) });
+				if (!session || !pool) throw new Error("Missing fixture session.");
+				await pool.query(kind === "stale"
+					? `UPDATE "${primary}"."session" SET "createdAt"=now()-interval '25 hours' WHERE id=$1`
+					: `UPDATE "${primary}"."session" SET "expiresAt"=now()-interval '1 hour' WHERE id=$1`,
+					[session.session.id],
+				);
+				return cookie;
+			}
+			const staleCookie = await agedSession("stale");
 			const absent = "synthetic-missing-passkey";
 			const label = "Synthetic passkey label";
 			async function exercise(
@@ -350,6 +372,22 @@ describe.skipIf(!existsSync(fixturePath))("project passkey PostgreSQL interopera
 					.getSetCookie()
 					.map((value) => value.split(";", 1)[0])
 					.join("; ");
+				const stale = { code: "SESSION_NOT_FRESH", message: "Session is not fresh" };
+				const unauthenticated = { code: "UNAUTHORIZED", message: "Unauthorized" };
+				const expiredCookie = await agedSession("expired");
+				for (const [session, status, expected] of [
+					[staleCookie, 403, stale],
+					[expiredCookie, 401, unauthenticated],
+					["", 401, unauthenticated],
+				] as const) {
+					const refused = await send("generate-register-options", undefined, session);
+					expect(refused.status).toBe(status);
+					expect(await refused.json()).toEqual(expected);
+					expect(refused.headers.getSetCookie().some((value) => value.includes("better-auth-passkey="))).toBe(false);
+					const verification = await send("verify-registration", request, [session, challengeCookie].filter(Boolean).join("; "));
+					expect(verification.status).toBe(status);
+					expect(await verification.json()).toEqual(expected);
+				}
 				const registered = await send(
 					"verify-registration",
 					request,
@@ -459,10 +497,18 @@ describe.skipIf(!existsSync(fixturePath))("project passkey PostgreSQL interopera
 					"passkey.deleted:failure",
 					"passkey.deleted:success",
 					"passkey.registered:failure",
+					"passkey.registered:failure",
+					"passkey.registered:failure",
+					"passkey.registered:failure",
 					"passkey.registered:success",
 					"passkey.updated:failure",
 					"passkey.updated:success",
 				]);
+				expect(expected).toContainEqual({
+					...browser,
+					type: "passkey.registered", outcome: "failure", actorId: ownerId, userId: ownerId,
+					metadata: { path: "/passkey/verify-registration", errorCode: "SESSION_NOT_FRESH" },
+				});
 				expect(
 					await exercise((request) => candidate.dispatch(request), true),
 				).toEqual(expected);
@@ -500,7 +546,7 @@ describe.skipIf(!existsSync(fixturePath))("project passkey PostgreSQL interopera
 			}
 		});
 
-		it("reads the exact native row format and preserves owner-scoped rename and delete", async () => {
+	it("reads the exact native row format and preserves owner-scoped rename and delete", async () => {
 		const adapter = (await legacy.auth.$context).adapter;
 		const created = await adapter.create<Omit<StoredProjectPasskey, "id">, StoredProjectPasskey>({
 			model: "passkey",
@@ -515,6 +561,25 @@ describe.skipIf(!existsSync(fixturePath))("project passkey PostgreSQL interopera
 		expect(await store.listForUser(foreignId)).toEqual([]);
 		expect(await store.renameForUser(foreignId, created.id, "Wrong owner")).toBeNull();
 		expect(await store.removeForUser(foreignId, created.id)).toBe(false);
+		if (!pool) throw new Error("Missing PostgreSQL fixture.");
+		const candidate = ownedHttpFixture(pool);
+		const foreign = await legacy.auth.api.signInEmail({
+			body: { email: foreignEmail, password: fixturePassword },
+			asResponse: true,
+		});
+		expect(foreign.status).toBe(200);
+		const foreignCookie = foreign.headers.getSetCookie().map((value) => value.split(";", 1)[0]).join("; ");
+		for (const operation of ["update-passkey", "delete-passkey"])
+			for (const id of [created.id, "synthetic-missing-passkey"]) {
+				const rejected = await candidate.dispatch(new Request(`${origin}/api/auth/passkey/${operation}`, {
+					method: "POST",
+					headers: { origin, cookie: foreignCookie, "content-type": "application/json", "x-real-ip": "192.0.2.82" },
+					body: JSON.stringify({ id, ...(operation === "update-passkey" ? { name: "Wrong owner" } : {}) }),
+				}));
+				expect(rejected.status).toBe(404);
+				expect(await rejected.json()).toEqual({ code: "PASSKEY_NOT_FOUND", message: "Passkey not found" });
+			}
+		expect(await store.findCredential(created.credentialID)).toEqual(created);
 		expect(await store.renameForUser(ownerId, created.id, " New name ")).toMatchObject({
 			name: "New name", publicKey: created.publicKey,
 		});

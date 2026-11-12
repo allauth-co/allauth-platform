@@ -87,6 +87,7 @@ const eventError = z.object({ code: z.string().regex(/^[A-Z0-9_-]{1,100}$/) });
 interface PasskeySession {
 	userId: string;
 	email: string;
+	fresh: boolean;
 }
 
 interface Options {
@@ -110,10 +111,7 @@ interface Options {
 		value: string,
 		maxAge?: number,
 	) => void;
-	readSession: (
-		request: Request,
-		fresh: boolean,
-	) => Promise<PasskeySession | null>;
+	readSession: (request: Request) => Promise<PasskeySession | null>;
 	withSession: <T>(
 		request: Request,
 		userId: string,
@@ -145,7 +143,9 @@ function json(value: unknown, status = 200, headers = new Headers()) {
 const invalid = () =>
 	json({ code: "INVALID_BODY", message: "Invalid passkey request." }, 400);
 const unauthorized = () =>
-	json({ code: "UNAUTHORIZED", message: "Authentication required." }, 401);
+	json({ code: "UNAUTHORIZED", message: "Unauthorized" }, 401);
+const staleSession = () =>
+	json({ code: "SESSION_NOT_FRESH", message: "Session is not fresh" }, 403);
 const notFound = () =>
 	json({ code: "PASSKEY_NOT_FOUND", message: "Passkey not found" }, 404);
 const challengeNotFound = () =>
@@ -306,8 +306,9 @@ export function createOwnedProjectPasskeyHttp(options: Options) {
 	}
 
 	async function generateRegistration(request: Request) {
-		const session = await options.readSession(request, true);
+		const session = await options.readSession(request);
 		if (!session) return unauthorized();
+		if (!session.fresh) return staleSession();
 		const refused = await options.admit(request, "options");
 		if (refused) return refused;
 		const query = new URL(request.url).searchParams;
@@ -366,7 +367,7 @@ export function createOwnedProjectPasskeyHttp(options: Options) {
 	async function generateAuthentication(request: Request) {
 		const refused = await options.admit(request, "options");
 		if (refused) return refused;
-		const session = await options.readSession(request, false);
+		const session = await options.readSession(request);
 		const existing = session ? await store.listForUser(session.userId) : [];
 		const ceremony = await generateAuthenticationOptions({
 			rpID: options.rp.id,
@@ -428,8 +429,10 @@ export function createOwnedProjectPasskeyHttp(options: Options) {
 
 	async function verifyRegistration(request: Request) {
 		const path = "/passkey/verify-registration";
-		const session = await options.readSession(request, true);
+		const session = await options.readSession(request);
 		if (!session) return failedMutation(request, path, unauthorized());
+		if (!session.fresh)
+			return failedMutation(request, path, staleSession(), session.userId);
 		const refused = await options.admit(request, "verification");
 		if (refused) return refused;
 		const body = await options.readBody(request, webAuthnBytes);
@@ -531,7 +534,7 @@ export function createOwnedProjectPasskeyHttp(options: Options) {
 			if (path === "/passkey/generate-authenticate-options")
 				return generateAuthentication(request);
 			if (path === "/passkey/list-user-passkeys") {
-				const current = await options.readSession(request, false);
+				const current = await options.readSession(request);
 				return current
 					? json(await store.listForUser(current.userId))
 					: unauthorized();
@@ -557,7 +560,7 @@ export function createOwnedProjectPasskeyHttp(options: Options) {
 				path !== "/passkey/update-passkey"
 			)
 				return null;
-			const current = await options.readSession(request, false);
+			const current = await options.readSession(request);
 			if (!current)
 				return failedMutation(
 					request,

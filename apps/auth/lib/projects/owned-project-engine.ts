@@ -1783,16 +1783,15 @@ export function createOwnedProjectEngine(
 			readBody: requestBody,
 			auditContext: browserEventContext,
 			writeCookie,
-			async readSession(request, fresh) {
+			async readSession(request) {
 				const current = await currentSession(request.headers);
-				if (
-					!current ||
-					(fresh &&
-						Date.now() - new Date(current.session.createdAt).getTime() >=
-							86400000)
-				)
-					return null;
-				return { userId: current.user.id, email: current.user.email };
+				if (!current) return null;
+				return {
+					userId: current.user.id,
+					email: current.user.email,
+					fresh:
+						Date.now() - new Date(current.session.createdAt).getTime() < 86_400_000,
+				};
 			},
 			async withSession(request, userId, fresh, work) {
 				const token = tokenFrom(request.headers);
