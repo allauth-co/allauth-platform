@@ -74,7 +74,9 @@ export const GET = proxy;
 export const POST = proxy;
 ```
 
-Use the documented catch-all route and matching provider/components. The browser talks to your application’s same-origin proxy. The [SDK quickstart](https://allauth.co/sdk/quickstart) supplies the route and component structure; substitute your instance URL. Changing the auth origin requires reviewing callbacks, cookies and passkey RP IDs and does not transfer accounts or sessions automatically.
+Use the documented catch-all route and matching provider and components. The browser talks to your application’s same-origin proxy. Follow the SDK v2 route and component examples with your instance URL. [React SDK quickstart](https://allauth.co/sdk/quickstart) · [Upgrade from v1](https://allauth.co/sdk/quickstart#upgrade)
+
+Changing the auth origin requires reviewing callbacks, cookies and passkey RP IDs and does not transfer accounts or sessions automatically.
 
 ## Backups and recovery
 
@@ -118,7 +120,7 @@ pnpm build
 pnpm --dir apps/auth install --frozen-lockfile
 ```
 
-Copy `apps/auth/.env.example` to its ignored `.env.local`. Set an isolated PostgreSQL URL, independent secrets, `ALLAUTH_DEPLOYMENT_MODE=self-hosted`, `AUTH_RUNTIME=node`, and an exact loopback `BETTER_AUTH_URL`, such as `http://localhost:3002`. Use the same trusted origin and `localhost` passkey RP ID. HTTP is loopback development only; deployed authentication requires HTTPS.
+Copy `apps/auth/.env.example` to its ignored `.env.local`. Set an isolated PostgreSQL URL, independent secrets, `ALLAUTH_DEPLOYMENT_MODE=self-hosted`, `AUTH_RUNTIME=node`, and an exact loopback `ALLAUTH_AUTH_URL`, such as `http://localhost:3002`. Set `ALLAUTH_AUTH_SECRET` to a new random value for the local instance. Existing deployments can keep the `BETTER_AUTH_URL` and `BETTER_AUTH_SECRET` aliases and their existing values. Use the same trusted origin and `localhost` passkey RP ID. HTTP is loopback development only; deployed authentication requires HTTPS.
 
 ```sh
 pnpm --dir apps/auth run db:migrate

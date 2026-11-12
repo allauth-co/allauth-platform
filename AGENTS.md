@@ -1,6 +1,12 @@
-# Better Auth Development Guide
+# AllAuth Platform Development Guide
 
-This is the Better Auth repository - a comprehensive authentication framework for TypeScript, designed to be runtime and framework-agnostic.
+`apps/auth` contains the AllAuth service and the source of the separately released React SDK. Start with its scoped [AGENTS.md](apps/auth/AGENTS.md) and [service overview](apps/auth/README.md). Self-hosted deployments use the Docker and Compose files described in the [self-hosting guide](docs/SELF_HOSTING.md). AllAuth integration documentation lives under `docs/content/docs/integrations/allauth-*.mdx`.
+
+Use pnpm and the repository's Node version. The root workspace builds the vendored packages. Install the service workspace with its own frozen lockfile. For AllAuth changes, run the relevant focused tests and service typecheck. For changes to SDK source, archives or release metadata, follow the [release pathway](apps/auth/RELEASING.md).
+
+# Vendored Better Auth development guide
+
+The following guidance applies to the Better Auth framework under `packages/` and its associated upstream tests, demos and reference documentation.
 
 ## Project Structure
 

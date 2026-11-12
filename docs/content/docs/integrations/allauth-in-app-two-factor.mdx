@@ -5,7 +5,7 @@ description: Optional application-side verification for shared AllAuth sign-in, 
 
 AllAuth's shared sign-in can require a second factor on the central account even when the application account has no second factor of its own. The optional in-app broker challenge lets an application collect the authenticator or backup code on its own sign-in screen. AllAuth remains responsible for checking it.
 
-This capability requires SDK 1.4.6 or newer and the matching AllAuth service release. Existing SDK archives and integrations retain the hosted `/two-factor` screen. An older service ignores the optional capability and continues using hosted verification.
+The [current AllAuth React SDK](https://allauth.co/sdk/quickstart) supports this option. It was introduced in SDK 1.4.6 and requires a compatible AllAuth service. Hosted verification remains the default until the app enables the option. An older service continues using hosted verification.
 
 ## Enable in a Next.js application
 
@@ -41,7 +41,7 @@ export default function SignInPage() {
 
 `signInUrl` must be a local public page without a query or fragment. Keep `/api/allauth/broker-two-factor/accept` and `/api/allauth/broker-two-factor/verify` reachable through the proxy. Neither the sign-in page nor these routes may require an authenticated application session.
 
-Do not enable this option for an older SDK, a custom form which does not handle the broker challenge, a custom proxy base path, or the optional Better Auth UI registry wrapper. These integrations can continue using hosted MFA. Hosted application portals, unrelated OAuth clients and direct application-owned Google providers retain their existing flows.
+Enable this option with a compatible SDK, the standard proxy base path, and a sign-in form that handles the broker challenge. Apps still using the SDK v1 Better Auth UI registry wrapper can continue using hosted MFA or follow the [SDK v2 upgrade guide](https://allauth.co/sdk/quickstart#upgrade) to adopt the first-party sign-in component. Hosted application portals, unrelated OAuth clients and direct application-owned Google providers retain their existing flows.
 
 ## Sign-in behaviour
 

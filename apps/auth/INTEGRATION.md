@@ -63,31 +63,32 @@ It is not an OAuth client secret and must never be put in `NEXT_PUBLIC_*`.
 
 Project auth base path: `https://allauth.co/api/projects/<slug>/auth`.
 
-Published default SDK: **1.4.3**, including automatic Google, Apple and Microsoft
-sign-in, signup, organization and connected-support components. The versioned archive includes the native account dialog and profile-save refinements.
-The prior 1.4.1 archive remains available with SHA-256
-`4e473030ceebebd3273cb200d374587f9478ccc8bafd1bf0c07845a54b10701d`.
-Older published archives remain immutable.
-
-Open the selected environment's `/admin/setup-guide` for populated server
-variables, integration snippets and the SDK download. This release ships a
-direct tarball at
-[/sdk/allauth-react-1.4.3.tgz](https://allauth.co/sdk/allauth-react-1.4.3.tgz).
-This is a direct download; the package is not published to npm. Older SDK
-archives remain available so existing integrations can upgrade deliberately.
-
-For a Next.js application, install the direct tarball and its pinned peers:
+Open the selected environment's `/admin/setup-guide` for server variables,
+integration snippets and the SDK download. For a new Next.js application,
+install the [AllAuth React SDK 2.0.0 archive](https://allauth.co/sdk/allauth-react-2.0.0.tgz)
+and its icon peer.
 
 ```sh
-pnpm add https://allauth.co/sdk/allauth-react-1.4.3.tgz better-auth@1.7.7 @better-auth/passkey@1.7.7 lucide-react@^0.575.0
+pnpm add https://allauth.co/sdk/allauth-react-2.0.0.tgz lucide-react@0.575.0
 ```
 
-Alternatively, run `pnpm --dir apps/auth/sdk pack` from the AllAuth repository
-and install the generated local tarball. The source package is `apps/auth/sdk`.
-Use `transpilePackages: ["@allauth/react"]`
-in the consuming Next.js configuration because this private package exports
-TypeScript source. Import `@allauth/react/styles.css` from the app layout;
-appearance uses CSS variables and component `className`/`style` props.
+Use compatible React and React DOM versions from the
+[SDK package manifest](https://github.com/allauth-co/allauth-sdk/blob/v2.0.0/packages/react/package.json)
+and Next.js 15 or later for the Next.js adapter. The SDK uses a first-party AllAuth
+client and UI with no Better Auth package dependencies. Add
+`transpilePackages: ["@allauth/react"]` to the consuming Next.js configuration
+because the package exports TypeScript source. Import `@allauth/react/styles.css`
+from the app layout. Theme the components with CSS variables or their
+`className` and `style` props.
+
+The [SDK quickstart](https://allauth.co/sdk/quickstart) has the full setup.
+To package from source, check out the [v2.0.0 SDK tag](https://github.com/allauth-co/allauth-sdk/tree/v2.0.0)
+and run `pnpm --dir packages/react pack` from the SDK repository.
+Existing portable components keep their imports and signed proxy configuration.
+If you use the v1 registry provider or custom client methods, follow the
+[SDK v2 upgrade guide](./sdk/UI_UPGRADE.md). Review the
+[v2.0.0 release and checksum](https://github.com/allauth-co/allauth-sdk/releases/tag/v2.0.0).
+[Earlier SDK archives](https://allauth.co/sdk) remain available to existing apps.
 
 Create `app/api/allauth/[...all]/route.ts` in the consuming app:
 
@@ -133,7 +134,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 }
 ```
 
-SDK **1.3.4** loads the selected application's public branding and enabled sign-in
+The SDK loads the selected application's public branding and enabled sign-in
 options automatically through `/api/allauth/sdk/config`. The server proxy binds
 that request to the configured project. The default provider does not need a
 hardcoded name, logo or capability list. Leave `capabilities` unset to use this
@@ -169,7 +170,7 @@ whether and how to use that URL in its own metadata.
 footer and accessible password visibility controls. Sign-in asks for email
 before showing the password; this first step validates locally and does not
 check whether an account exists. Sign-up combines first and last name into
-the native Better Auth `name` field. The components preserve native Google,
+the account's `name` field. The components preserve native Google,
 verification, recovery and two-factor flows.
 
 Theme the same component using `--allauth-background`, `--allauth-surface`,
@@ -205,14 +206,14 @@ use independent configuration; provider credentials never enter app browser code
 The environment's setup guide displays the exact app return URLs. See
 [Apple setup](../../docs/content/docs/integrations/allauth-tenant-apple.mdx) and
 [Microsoft setup](../../docs/content/docs/integrations/allauth-tenant-microsoft.mdx)
-for registration, private-relay email and tenant-audience requirements. Upgrade
-existing apps to SDK 1.4.2, then verify each configured provider with a real account.
+for registration, private-relay email and tenant-audience requirements. Verify each
+configured provider with a real account.
 
-## Native header menus and account dialogs (SDK 1.3.4)
+## Native header menus and account dialogs
 
 The portable SDK provides native account and organisation menus for app headers.
-Their default page/card behaviour remains compatible with SDK 1.1.1. Opt in to
-compact menus and modals with these props:
+Full pages and cards remain available by default. Opt in to compact menus and
+modals with these props:
 
 ```tsx
 <UserButton
@@ -241,9 +242,9 @@ another one. The host remains responsible for its application tenant records
 and authorisation. Menu rows never invent memberships or platform-admin tenant
 access.
 
-SDK 1.4.2 keeps account management in the native responsive dialog. The optional
-`UserButton.onProfileUpdated` callback runs after native profile save and session
-refresh, so a connected application can refresh its own member data without
+The native responsive dialog keeps account management in the current app view.
+The optional `UserButton.onProfileUpdated` callback runs after native profile save
+and session refresh, so a connected application can refresh its own member data without
 replacing the standard profile or security controls. Existing page mode remains
 available.
 
@@ -463,7 +464,7 @@ level from it or assume an `amr` claim is present.
 
 ## Identity, organizations and impersonation
 
-The SDK 1.4.0 candidate supports opt-in connected-application support sessions.
+The SDK supports opt-in connected-application support sessions.
 Enable `supportAccess: { enabled: true }` on `createAllAuthProxy`, enable
 `supportAccess` on the shared `AllAuthProvider`, then
 register the exact application proxy `/support/callback` URL in the selected
@@ -545,10 +546,9 @@ transfer Clerk sessions or MFA/passkeys and does not change any connected app au
    SSO and impersonation in staging. Plan forced reauthentication for old Clerk
    sessions and then cut over the first app.
 
-Clerk components and sessions are not compatible with Better Auth automatically.
-This repository supplies the identity service; each application's migration is
-a separate implementation step. SMS, billing and unrelated demo integrations
-are not enabled by installing authentication plugins.
+Each application must replace its Clerk components and establish new AllAuth
+sessions. SMS, billing and unrelated demo integrations are not enabled by
+installing authentication plugins.
 
 No existing application's Clerk SDK, users, organizations or sessions have been
 migrated by the hosting setup.
@@ -558,11 +558,11 @@ Official references: [Generic OAuth](https://www.better-auth.com/docs/plugins/ge
 [Clerk migration](https://www.better-auth.com/docs/guides/clerk-migration-guide).
 
 
-### Account-page invitation intent (SDK 1.3.4)
+### Account-page invitation intent
 
 Mount `AccountSettings` on the native invitation email's account destination.
 The component reads validated `?invitation=` or an explicit `invitationId` prop
-and opens Organisations for review. SDK 1.3.4 preserves a checked relative
+and opens Organisations for review. The SDK preserves a checked relative
 `returnTo` through its native sign-in, sign-up, recovery and MFA flows. Custom
 authentication pages must carry the checked destination themselves. Explicit
 component callback props take precedence over query intent. Joining requires the invited verified account to choose

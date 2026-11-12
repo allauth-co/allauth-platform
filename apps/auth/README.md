@@ -1,12 +1,12 @@
 # AllAuth platform service
 
-AllAuth provides hosted or self-hosted authentication, account security and organization management. The service lives in `apps/auth` and uses the Better Auth packages in this repository, with a React SDK and separate application environments.
+AllAuth provides managed and self-hosted authentication, account security and organization management. The service lives in `apps/auth` and supports separate development and production environments.
 
-The complete [platform source](https://github.com/allauth-co/allauth-platform) is available under the [MIT license](../../LICENSE.md). Better Auth, Better Auth UI and other third-party notices remain intact. Publishing source does not publish the SDK to a package registry or change retained release artifacts.
+The platform source is available under the MIT license. The React SDK is published separately as versioned GitHub releases and downloadable archives. [MIT license](../../LICENSE.md) · [Third-party notices](../../THIRD_PARTY_NOTICES.md) · [SDK releases](https://github.com/allauth-co/allauth-sdk/releases)
 
 - [Self-hosting and recovery](../../docs/SELF_HOSTING.md)
 - [Hosted plans](https://allauth.co/pricing)
-- [React SDK quickstart](https://allauth.co/sdk/quickstart)
+- [React SDK v2 quickstart](https://allauth.co/sdk/quickstart) and [upgrade guide](https://allauth.co/sdk/quickstart#upgrade)
 - [Release requirements](RELEASING.md)
 - [Contributing](../../CONTRIBUTING.md) and [security reporting](../../SECURITY.md)
 
@@ -17,6 +17,12 @@ The included Docker Compose stack supplies PostgreSQL, a Node service and option
 ## Hosted plans
 
 Free includes AllAuth attribution, up to 20 members per application end-user organization and five support impersonations per workspace per UTC calendar month. Pro is $9.99 USD per workspace per month plus applicable tax and removes attribution and those quotas, subject to fair use. A workspace covers its applications and Development/Production environments. Console teammates and application end-user organizations are different memberships.
+
+## Authentication architecture
+
+AllAuth React SDK 2.0.0 owns the client, components and signed proxy integration. Its package has zero Better Auth dependencies and works with the existing platform endpoints. Customers choose when to upgrade their applications. [Integration guide](INTEGRATION.md) · [SDK 2.0.0 release notes](https://allauth.co/releases/sdk-2-0-0)
+
+The server dispatches authentication and session operations through an AllAuth interface backed by Better Auth. The project engine, hosted sign-in UI and shared OAuth/OIDC issuer still use Better Auth. [Engine interface](lib/auth-engine.ts) · [Server adapter](lib/legacy-auth-engine.ts) · [Provider inventory](PLUGINS.md)
 
 ## Source development
 
