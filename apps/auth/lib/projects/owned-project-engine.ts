@@ -11,7 +11,7 @@ import { clerkCompatiblePasswords } from "../clerk-password";
 import { isPlatformAdmin } from "../configuration";
 import { discoveryHeaders } from "../discovery";
 import { emailConfigured } from "../email/send";
-import { isServerTokenRequest } from "../features/helpers";
+import { freshFeatureSession, isServerTokenRequest } from "../features/helpers";
 import { applicationMfaCallback } from "../mfa-continuation";
 import { oauthBrowserReturnPath } from "../oauth-browser";
 import type { NativePasskeyCapability } from "../project-native-passkeys";
@@ -29,6 +29,7 @@ import type { ProjectAccountLinkOptions } from "./owned-project-account-links";
 import type { OwnedProjectAdminDeletionOptions } from "./owned-project-admin-deletion";
 import { createOwnedProjectAdminDeletion } from "./owned-project-admin-deletion";
 import { createOwnedProjectAdminUsers } from "./owned-project-admin-users";
+import { createOwnedProjectAgentHosts } from "./owned-project-agent-hosts";
 import type { ProjectBackchannelTarget } from "./owned-project-backchannel-logout";
 import { createOwnedProjectBackchannelLogout } from "./owned-project-backchannel-logout";
 import type { AuthorizeProjectBrokerMfa } from "./owned-project-broker-mfa";
@@ -253,6 +254,7 @@ interface OwnedProjectEngineOptions {
 	};
 	passkeys?: Parameters<typeof createOwnedProjectPasskeyHttp>[0]["rp"];
 	walletOrigin?: string;
+	agentHosts?: boolean;
 	openApi?: boolean;
 	webhookManagement?: Pick<
 		Parameters<typeof createOwnedProjectWebhookManagement>[0],
@@ -1593,6 +1595,30 @@ export function createOwnedProjectEngine(
 		return json({ success: true }, 200, responseHeaders);
 	}
 
+	const agentHosts =
+		options.agentHosts &&
+		createOwnedProjectAgentHosts({
+			store,
+			trustedRequest,
+			trustedIP: options.trustedIP,
+			readBody: requestBody,
+			async authorizeBrowser(client, request, fresh) {
+				const current = await currentSession(request.headers, client);
+				if (!fresh) return current?.user.id ?? null;
+				if (!current || !freshFeatureSession(current)) return null;
+				const user = await store.lockUser(client, current.user.id);
+				if (
+					!user ||
+					!(await store.lockSession(client, current.token, user.id, false))
+				)
+					return null;
+				const locked = await eligibleSession(current.token, client);
+				return locked?.user.id === user.id && freshFeatureSession(locked)
+					? user.id
+					: null;
+			},
+		});
+
 	const passkeyHttp =
 		options.passkeys &&
 		createOwnedProjectPasskeyHttp({
@@ -2571,6 +2597,8 @@ export function createOwnedProjectEngine(
 		if (importedInvitations) return importedInvitations;
 		const webhook = await webhookManagement?.(request, path);
 		if (webhook) return webhook;
+		const agentHost = agentHosts && (await agentHosts(path, request));
+		if (agentHost) return agentHost;
 		const issuerResponse = issuer && (await issuer.dispatch(path, request));
 		if (issuerResponse) return issuerResponse;
 		if (
