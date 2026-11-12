@@ -27,6 +27,7 @@ import { createOwnedProjectAccountDeletion } from "./owned-project-account-delet
 import type { ProjectAccountLinkOptions } from "./owned-project-account-links";
 import type { OwnedProjectAdminDeletionOptions } from "./owned-project-admin-deletion";
 import { createOwnedProjectAdminDeletion } from "./owned-project-admin-deletion";
+import { createOwnedProjectAdminUsers } from "./owned-project-admin-users";
 import type { ProjectBackchannelTarget } from "./owned-project-backchannel-logout";
 import { createOwnedProjectBackchannelLogout } from "./owned-project-backchannel-logout";
 import type { AuthorizeProjectBrokerMfa } from "./owned-project-broker-mfa";
@@ -83,7 +84,10 @@ import {
 import type { OwnedProjectSupportOptions } from "./owned-project-support";
 import { createOwnedProjectSupportHttp } from "./owned-project-support";
 import { createOwnedRecoveryHttp } from "./owned-recovery-http";
-import { createOwnedSignUpHttp } from "./owned-sign-up";
+import {
+	createOwnedSignUpHttp,
+	scheduleOwnedSignUpVerification,
+} from "./owned-sign-up";
 import type { ProjectAvatarStorage } from "./project-avatar-upload";
 import { uploadProjectAvatar } from "./project-avatar-upload";
 import type { Project } from "./registry";
@@ -1728,17 +1732,19 @@ export function createOwnedProjectEngine(
 				return headers;
 			},
 		});
+	const adminProject = options.adminDeletion && {
+		id: options.adminDeletion.id,
+		workspaceId: options.adminDeletion.workspaceId,
+		schemaName: options.project.schemaName,
+		slug: options.project.slug,
+	};
 	const adminDeletion =
 		options.adminDeletion &&
+		adminProject &&
 		accountLinks?.beforeDelete &&
 		createOwnedProjectAdminDeletion({
 			...options.adminDeletion,
-			project: {
-				id: options.adminDeletion.id,
-				workspaceId: options.adminDeletion.workspaceId,
-				schemaName: options.project.schemaName,
-				slug: options.project.slug,
-			},
+			project: adminProject,
 			database: options.database,
 			baseURL: origin,
 			basePath: options.basePath,
@@ -1756,6 +1762,44 @@ export function createOwnedProjectEngine(
 					actorId,
 				);
 				if (!removed) throw unavailableLogout;
+				deliverLogoutAfterCommit(client, request, removed.targets);
+			},
+		});
+	const adminUsers =
+		options.adminDeletion &&
+		adminProject &&
+		createOwnedProjectAdminUsers({
+			...options.adminDeletion,
+			project: adminProject,
+			store,
+			origin,
+			basePath: options.basePath,
+			policy,
+			readBody: requestBody,
+			checkPasswordSafety: options.passwordChange?.checkPasswordSafety,
+			blockCreation: (client, request, email) =>
+				security.admit(client, request, { email }),
+			async revoke(client, request, userId, path, actorId) {
+				const removed = await store.revoke(
+					{ userId },
+					path,
+					Boolean(backchannel),
+					client,
+					actorId,
+				);
+				if (!removed) throw unavailableLogout;
+				await client.query('DELETE FROM "oauthAccessToken" WHERE "userId"=$1', [
+					userId,
+				]);
+				await client.query(
+					'DELETE FROM "oauthRefreshToken" WHERE "userId"=$1',
+					[userId],
+				);
+				await client.query(
+					`DELETE FROM "verification" WHERE value=$1
+					 AND (starts_with(identifier,'trust-device-') OR starts_with(identifier,'2fa-'))`,
+					[userId],
+				);
 				deliverLogoutAfterCommit(client, request, removed.targets);
 			},
 		});
@@ -1778,7 +1822,15 @@ export function createOwnedProjectEngine(
 			},
 			async complete(
 				client,
-				{ user, request, provider, destination, transport },
+				{
+					user,
+					request,
+					provider,
+					destination,
+					verificationDestination,
+					registered,
+					transport,
+				},
 			) {
 				const browser = transport === "browser";
 				const result = await primaryResult(
@@ -1793,6 +1845,27 @@ export function createOwnedProjectEngine(
 							provider === "microsoft" || provider === "apple",
 					},
 				);
+				if (
+					result.status < 400 &&
+					provider === "apple" &&
+					registered &&
+					!user.emailVerified &&
+					policy.requireEmailVerification
+				) {
+					const verification = signUp?.verification;
+					const target = verificationDestination ?? destination;
+					const callback = verification?.callbackURLs.includes(target)
+						? target
+						: (verification?.callbackPolicy?.(
+								new URL(target),
+								"verification",
+								"issue",
+							)?.url.href ?? verification?.callbackURLs[0]);
+					if (!verification || !callback) return unsupported();
+					afterOwnedProjectCommit(client, () =>
+						scheduleOwnedSignUpVerification(verification, user, callback),
+					);
+				}
 				return browser && result.status === 200
 					? redirect(new Headers(result.headers), destination)
 					: result;
@@ -2016,7 +2089,8 @@ export function createOwnedProjectEngine(
 		store,
 		readBody: requestBody,
 		trustedIP: options.trustedIP,
-		sessionToken: (headers) => serverSessionBearer(headers) ?? tokenFrom(headers),
+		sessionToken: (headers) =>
+			serverSessionBearer(headers) ?? tokenFrom(headers),
 		eligible: (token, client) => eligibleSession(token, client),
 	});
 
@@ -2071,6 +2145,8 @@ export function createOwnedProjectEngine(
 		)
 			return forbidden();
 		const path = url.pathname.slice(options.basePath.length);
+		const administrative = await adminUsers?.(request, path);
+		if (administrative) return administrative;
 		const issuerResponse = issuer && (await issuer.dispatch(path, request));
 		if (issuerResponse) return issuerResponse;
 		if (

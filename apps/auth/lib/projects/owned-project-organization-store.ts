@@ -43,11 +43,11 @@ export function projectOrganizations(client: PoolClient) {
 	async function organization(
 		value: string,
 		by: "id" | "slug",
-		lock: boolean | "write" = false,
+		lock: boolean | "write" | "exclusive" = false,
 	) {
 		const result = await client.query<OrganizationRecord>(
 			`SELECT id, name, slug, logo, metadata, "createdAt" FROM "organization"
-			 WHERE ${by === "id" ? "id" : "slug"} = $1${lock === "write" ? " FOR NO KEY UPDATE" : lock ? " FOR KEY SHARE" : ""}`,
+			 WHERE ${by === "id" ? "id" : "slug"} = $1${lock === "exclusive" ? " FOR UPDATE" : lock === "write" ? " FOR NO KEY UPDATE" : lock ? " FOR KEY SHARE" : ""}`,
 			[value],
 		);
 		return result.rows[0] ?? null;

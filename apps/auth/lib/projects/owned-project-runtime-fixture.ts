@@ -10,6 +10,7 @@ import * as projectAuth from "../../app/api/projects/[slug]/auth/[...all]/route"
 import { GET as brokerLogin } from "../../app/oauth/login/route";
 import { authOrigin } from "../configuration";
 import { resolveHostedBinding } from "../domains/hosting";
+import { readProjectAppleProvider } from "../project-providers/apple";
 import { createOwnedProjectRuntimeCandidate } from "./owned-project-runtime-factory";
 import { runtimeProviderFixtureFetch } from "./owned-project-runtime-provider-fixture";
 import { getProject, projectRegistryPool } from "./registry";
@@ -26,6 +27,7 @@ export interface ProjectRuntimeFixtureBoot {
 	projectSlug: string;
 	schemaName: string;
 	owned: boolean;
+	appleIssuerKey?: string;
 }
 
 const trustedFixtureIP = "192.0.2.55";
@@ -110,9 +112,20 @@ async function boot(selection: ProjectRuntimeFixtureBoot) {
 			"This project HTTP fixture does not perform outbound HTTP.",
 		);
 	};
-	globalThis.fetch = Object.assign(runtimeProviderFixtureFetch(), {
-		preconnect: outboundDisabled,
-	});
+	const apple = readProjectAppleProvider(process.env, selection.projectSlug);
+	globalThis.fetch = Object.assign(
+		runtimeProviderFixtureFetch(
+			apple && selection.appleIssuerKey
+				? {
+						credentialKey: apple.privateKey,
+						issuerKey: selection.appleIssuerKey,
+					}
+				: undefined,
+		),
+		{
+			preconnect: outboundDisabled,
+		},
+	);
 	const pending = new Set<Promise<void>>();
 	if (selection.owned) {
 		const env = {

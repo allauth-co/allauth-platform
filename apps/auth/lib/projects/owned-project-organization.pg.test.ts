@@ -863,6 +863,421 @@ describe.skipIf(!existsSync(fixturePath))(
 			code: false,
 		};
 
+		it("lists only authorized organization members with native pagination, filters and projection", async () => {
+			const engine = owned();
+			const owner = await account();
+			const editor = await account();
+			const reader = await account();
+			const outsider = await account();
+			const selected = await organizationFixture(owner, engine);
+			const foreign = await organizationFixture(outsider, engine);
+			await member(selected.id, editor.id, "admin,member");
+			await member(selected.id, reader.id, "member");
+			await engine("set-active", reader.cookie, {
+				organizationId: selected.id,
+			});
+			const filtered = `list-members?organizationId=${foreign.id}&organizationSlug=${selected.slug}&filterField=role&filterOperator=contains&filterValue=member&sortBy=role&sortDirection=desc&limit=1&offset=1`;
+			const legacy = await native(request(filtered, reader.cookie));
+			expect(legacy.status).toBe(200);
+			const result = await engine(filtered, reader.cookie);
+			expect(result.status).toBe(200);
+			const page = (await result.json()) as { members: { user: object }[] };
+			expect(page).toEqual(await legacy.json());
+			expect(page).toMatchObject({
+				total: 2,
+				members: [
+					{
+						userId: editor.id,
+						user: { id: editor.id, email: editor.email, image: null },
+					},
+				],
+			});
+			expect(Object.keys(page.members[0]!.user).sort()).toEqual([
+				"email",
+				"id",
+				"image",
+				"name",
+			]);
+			const active = await engine(
+				`list-members?filterField=userId&filterValue=${reader.id}`,
+				reader.cookie,
+			);
+			expect(await active.json()).toMatchObject({
+				total: 1,
+				members: [{ userId: reader.id }],
+			});
+			const date = new URLSearchParams({
+				filterField: "createdAt",
+				filterOperator: "gte",
+				filterValue: "2000-01-01T00:00:00Z",
+			});
+			expect(
+				await (await engine(`list-members?${date}`, reader.cookie)).json(),
+			).toMatchObject({ total: 3 });
+			const values = new URLSearchParams({
+				filterField: "role",
+				filterOperator: "in",
+			});
+			values.append("filterValue", "owner");
+			values.append("filterValue", "member");
+			expect(
+				await (await engine(`list-members?${values}`, reader.cookie)).json(),
+			).toMatchObject({ total: 2 });
+			const denied = await engine(
+				`list-members?organizationId=${selected.id}`,
+				outsider.cookie,
+			);
+			expect(denied.status).toBe(403);
+			expect(await denied.json()).toEqual(
+				await (
+					await native(
+						request(
+							`list-members?organizationId=${selected.id}`,
+							outsider.cookie,
+						),
+					)
+				).json(),
+			);
+			expect(
+				(
+					await owned({}, other)(
+						`list-members?organizationId=${selected.id}`,
+						owner.cookie,
+					)
+				).status,
+			).toBe(401);
+			expect(
+				(await engine("list-members?sortBy=privateMetadata", reader.cookie))
+					.status,
+			).toBe(400);
+		});
+
+		it("interchanges native and owned team CRUD, role predicates and scoped team selection", async () => {
+			const engine = owned();
+			const owner = await account();
+			const manager = await account();
+			const reader = await account();
+			const outsider = await account();
+			const selected = await organizationFixture(owner, engine);
+			const foreign = await organizationFixture(outsider, engine);
+			await role(selected.id, "team-manager", {
+				team: ["create", "update"],
+				member: ["update"],
+			});
+			await member(selected.id, manager.id, "team-manager");
+			await member(selected.id, reader.id, "member");
+			const deniedCreate = { organizationId: selected.id, name: "Denied team" };
+			const denied = await engine("create-team", reader.cookie, deniedCreate);
+			expect(denied.status).toBe(403);
+			expect(await denied.json()).toEqual(
+				await (
+					await native(request("create-team", reader.cookie, deniedCreate))
+				).json(),
+			);
+			const created = await engine("create-team", manager.cookie, {
+				organizationId: selected.id,
+				name: "Owned team",
+			});
+			expect(created.status).toBe(200);
+			const first = (await created.json()) as { id: string };
+			expect(Object.keys(first).sort()).toEqual([
+				"createdAt",
+				"id",
+				"name",
+				"organizationId",
+				"updatedAt",
+			]);
+			const createdNative = await native(
+				request("create-team", owner.cookie, { name: "Native team" }),
+			);
+			expect(createdNative.status).toBe(200);
+			const second = (await createdNative.json()) as { id: string };
+			const changed = await engine("update-team", manager.cookie, {
+				teamId: second.id,
+				data: { organizationId: selected.id, name: "Shared team" },
+			});
+			expect(changed.status).toBe(200);
+			expect(await changed.json()).toEqual({ ...second, name: "Shared team" });
+			const legacyChanged = await native(
+				request("update-team", owner.cookie, {
+					teamId: first.id,
+					data: { name: "Legacy update" },
+				}),
+			);
+			expect(legacyChanged.status).toBe(200);
+			const list = `list-teams?organizationId=${selected.id}`;
+			const currentList = await (await engine(list, reader.cookie)).json();
+			const legacyList = (await (
+				await native(request(list, reader.cookie))
+			).json()) as unknown[];
+			expect(currentList).toHaveLength(3);
+			expect(currentList).toEqual(expect.arrayContaining(legacyList));
+			expect(currentList).toContainEqual(await legacyChanged.json());
+			const wrongOrg = await engine("update-team", owner.cookie, {
+				teamId: foreign.teams[0]!.id,
+				data: { organizationId: selected.id, name: "Wrong scope" },
+			});
+			expect(await wrongOrg.json()).toMatchObject({ code: "TEAM_NOT_FOUND" });
+			const noRoster = await engine(
+				`list-team-members?teamId=${first.id}`,
+				owner.cookie,
+			);
+			expect(noRoster.status).toBe(400);
+			expect(await noRoster.json()).toMatchObject({
+				code: "USER_IS_NOT_A_MEMBER_OF_THE_TEAM",
+			});
+			const body = {
+				organizationId: selected.id,
+				teamId: first.id,
+				userId: reader.id,
+			};
+			const nativeAdded = await native(
+				request("add-team-member", owner.cookie, body),
+			);
+			expect(nativeAdded.status).toBe(200);
+			const nativeMembership = (await nativeAdded.json()) as object;
+			const duplicate = await engine("add-team-member", manager.cookie, body);
+			expect(duplicate.status).toBe(200);
+			expect(await duplicate.json()).toEqual(nativeMembership);
+			expect(Object.keys(nativeMembership).sort()).toEqual([
+				"createdAt",
+				"id",
+				"teamId",
+				"userId",
+			]);
+			const added = await engine("add-team-member", manager.cookie, {
+				...body,
+				userId: manager.id,
+			});
+			expect(added.status).toBe(200);
+			const rosterPath = `list-team-members?teamId=${first.id}`;
+			const roster = (await (
+				await engine(rosterPath, reader.cookie)
+			).json()) as unknown[];
+			const nativeRoster = (await (
+				await native(request(rosterPath, reader.cookie))
+			).json()) as unknown[];
+			expect(roster).toHaveLength(2);
+			expect(roster).toEqual(expect.arrayContaining(nativeRoster));
+			expect(roster).toContainEqual(await added.json());
+			const lookup = `list-user-teams?userId=${reader.id}&organizationId=${selected.id}`;
+			const lookupOwned = await engine(lookup, manager.cookie);
+			expect(lookupOwned.status).toBe(200);
+			expect(await lookupOwned.json()).toEqual(
+				await (await native(request(lookup, manager.cookie))).json(),
+			);
+			const forbiddenLookup = await engine(
+				`list-user-teams?userId=${manager.id}&organizationId=${selected.id}`,
+				reader.cookie,
+			);
+			expect(forbiddenLookup.status).toBe(403);
+			expect(await forbiddenLookup.json()).toMatchObject({
+				code: "YOU_ARE_NOT_ALLOWED_TO_UPDATE_THIS_MEMBER",
+			});
+			const removeDenied = await engine(
+				"remove-team-member",
+				manager.cookie,
+				body,
+			);
+			expect(removeDenied.status).toBe(403);
+			expect(await removeDenied.json()).toEqual(
+				await (
+					await native(request("remove-team-member", manager.cookie, body))
+				).json(),
+			);
+			await engine("set-active", reader.cookie, {
+				organizationId: selected.id,
+			});
+			const select = await engine("set-active-team", reader.cookie, {
+				teamId: first.id,
+			});
+			expect(select.status).toBe(200);
+			expect(select.headers.get("set-cookie")).toContain(reader.cookie);
+			expect(await select.json()).toMatchObject({ id: first.id });
+			const nativeActiveRoster = await native(
+				request("list-team-members", reader.cookie),
+			);
+			expect(nativeActiveRoster.status).toBe(200);
+			expect(await nativeActiveRoster.json()).toEqual(
+				expect.arrayContaining(roster),
+			);
+			const foreignSelection = await engine("set-active-team", reader.cookie, {
+				teamId: foreign.teams[0]!.id,
+			});
+			expect(foreignSelection.status).toBe(400);
+			expect(await foreignSelection.json()).toMatchObject({
+				code: "TEAM_NOT_FOUND",
+			});
+			const clear = await engine("set-active-team", reader.cookie, {
+				teamId: null,
+			});
+			expect(clear.headers.get("set-cookie")).toContain(reader.cookie);
+			expect(await clear.json()).toBeNull();
+			const empty = await engine("set-active-team", reader.cookie, {
+				teamId: null,
+			});
+			expect(empty.headers.has("set-cookie")).toBe(false);
+			expect(await empty.json()).toBeNull();
+		});
+
+		it("revokes exact team selections and preserves live organization grants and pending invitations", async () => {
+			const engine = owned();
+			const owner = await account();
+			const target = await account();
+			const otherMember = await account();
+			const firstInvite = await account();
+			const secondInvite = await account();
+			const selected = await organizationFixture(owner, engine);
+			const retained = selected.teams[0]!.id;
+			await member(selected.id, target.id, "member");
+			await member(selected.id, otherMember.id, "member");
+			const created = await native(
+				request("create-team", owner.cookie, { name: "To remove" }),
+			);
+			expect(created.status).toBe(200);
+			const { id: teamId } = (await created.json()) as { id: string };
+			const grant = await organizationGrant(selected.id, target);
+			for (const user of [owner, target, otherMember]) {
+				expect(
+					(
+						await engine("add-team-member", owner.cookie, {
+							teamId,
+							userId: user.id,
+						})
+					).status,
+				).toBe(200);
+				await engine("set-active", user.cookie, {
+					organizationId: selected.id,
+				});
+				expect(
+					(await engine("set-active-team", user.cookie, { teamId })).status,
+				).toBe(200);
+			}
+			const activeTeam = async (account: Account) =>
+				(
+					await database.query(
+						`SELECT "activeOrganizationId", "activeTeamId" FROM "${schema}".session WHERE id=$1`,
+						[account.sessionId],
+					)
+				).rows[0];
+			const activeDeletion = await engine("remove-team", owner.cookie, {
+				teamId,
+			});
+			expect(activeDeletion.status).toBe(403);
+			expect(await activeDeletion.json()).toMatchObject({
+				code: "YOU_ARE_NOT_ALLOWED_TO_DELETE_THIS_TEAM",
+			});
+			await engine("set-active-team", owner.cookie, { teamId: retained });
+			const removed = await engine("remove-team-member", owner.cookie, {
+				teamId,
+				userId: target.id,
+			});
+			expect(await removed.json()).toEqual({
+				message: "Team member removed successfully.",
+			});
+			expect(await activeTeam(target)).toEqual({
+				activeOrganizationId: selected.id,
+				activeTeamId: null,
+			});
+			expect(await activeTeam(otherMember)).toEqual({
+				activeOrganizationId: selected.id,
+				activeTeamId: teamId,
+			});
+			expect(await grantState(grant)).toEqual(activeGrant);
+			const tally = await database.query(
+				`SELECT "memberCount" FROM "${schema}".team WHERE id=$1`,
+				[teamId],
+			);
+			expect(tally.rows).toEqual([{ memberCount: 2 }]);
+			const combined = await invite(selected.id, owner, firstInvite, {
+				teams: `${teamId},${retained}`,
+			});
+			const single = await invite(selected.id, owner, secondInvite, {
+				teams: teamId,
+			});
+			const expired = await invite(selected.id, owner, secondInvite, {
+				teams: teamId,
+				expired: true,
+			});
+			const deletion = await engine("remove-team", owner.cookie, { teamId });
+			expect(await deletion.json()).toEqual({
+				message: "Team removed successfully.",
+			});
+			expect(await activeTeam(owner)).toEqual({
+				activeOrganizationId: selected.id,
+				activeTeamId: retained,
+			});
+			expect(await activeTeam(otherMember)).toEqual({
+				activeOrganizationId: selected.id,
+				activeTeamId: null,
+			});
+			expect(await grantState(grant)).toEqual(activeGrant);
+			const invites = await database.query(
+				`SELECT id,"teamId" FROM "${schema}".invitation WHERE id=ANY($1::text[])`,
+				[[combined, single, expired]],
+			);
+			expect(
+				Object.fromEntries(invites.rows.map((row) => [row.id, row.teamId])),
+			).toEqual({ [combined]: retained, [single]: null, [expired]: teamId });
+			const legacyAcceptance = await native(
+				request("accept-invitation", firstInvite.cookie, {
+					invitationId: combined,
+				}),
+			);
+			expect(legacyAcceptance.status).toBe(200);
+			const ownedAcceptance = await engine(
+				"accept-invitation",
+				secondInvite.cookie,
+				{ invitationId: single },
+			);
+			expect(ownedAcceptance.status).toBe(200);
+			const events = await database.query(
+				`SELECT type,"targetId" FROM "${schema}"."allauthEvent" WHERE "organizationId"=$1 AND type IN ('organization.team.member-removed','organization.team.removed')`,
+				[selected.id],
+			);
+			expect(events.rows).toEqual(
+				expect.arrayContaining([
+					{ type: "organization.team.member-removed", targetId: target.id },
+					{ type: "organization.team.removed", targetId: teamId },
+				]),
+			);
+		});
+
+		it("serializes same-organization deletions and preserves the last team", async () => {
+			const engine = owned();
+			const owner = await account();
+			const administrator = await account();
+			const selected = await organizationFixture(owner, engine);
+			await member(selected.id, administrator.id, "admin");
+			const retained = selected.teams[0]!.id;
+			const created = await engine("create-team", owner.cookie, {
+				name: "Concurrent deletion",
+			});
+			expect(created.status).toBe(200);
+			const { id } = (await created.json()) as { id: string };
+			await engine("set-active-team", owner.cookie, { teamId: null });
+			const results = await Promise.all([
+				engine("remove-team", owner.cookie, {
+					organizationId: selected.id,
+					teamId: retained,
+				}),
+				engine("remove-team", administrator.cookie, {
+					organizationId: selected.id,
+					teamId: id,
+				}),
+			]);
+			expect(results.map((response) => response.status).sort()).toEqual([
+				200, 400,
+			]);
+			expect(
+				await results.find((response) => !response.ok)!.json(),
+			).toMatchObject({ code: "UNABLE_TO_REMOVE_LAST_TEAM" });
+			const remaining = await (
+				await native(request("list-teams", owner.cookie))
+			).json();
+			expect(remaining).toHaveLength(1);
+		});
+
 		it("updates organization data with the native dynamic permissions and duplicate-slug response", async () => {
 			const engine = owned();
 			const owner = await account();

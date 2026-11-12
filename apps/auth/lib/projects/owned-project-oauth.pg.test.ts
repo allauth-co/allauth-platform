@@ -827,6 +827,49 @@ describe.skipIf(!existsSync(fixturePath))(
 			}
 		});
 
+		it("preserves native additional authorization parameters for Apple browser sign-in and linking", async () => {
+			const owner = await accountOwner();
+			const candidate = ownedProviderEngine();
+			for (const path of ["/sign-in/social", "/link-social"]) {
+				const build = (additionalParams: Record<string, string>) =>
+					accountRequest(path, owner.cookie, {
+						provider: "apple",
+						callbackURL: destination,
+						disableRedirect: true,
+						additionalParams,
+					});
+				for (const dispatch of [
+					(request: Request) => native.handler(request),
+					(request: Request) => candidate.dispatch(request),
+				]) {
+					const allowed = await dispatch(
+						build({ locale: "en_US", prompt: "login" }),
+					);
+					expect(allowed.status, await allowed.clone().text()).toBe(200);
+					const { url } = (await allowed.json()) as { url: string };
+					const search = new URL(url).searchParams;
+					expect(search.get("locale")).toBe("en_US");
+					expect(search.get("prompt")).toBe("login");
+					for (const reserved of [
+						"state",
+						"client_id",
+						"redirect_uri",
+						"response_type",
+						"code_challenge",
+						"code_challenge_method",
+						"nonce",
+						"scope",
+					]) {
+						const denied = await dispatch(
+							build({ [reserved]: "reserved-fixture-value" }),
+						);
+						expect(denied.status, reserved).toBe(400);
+						expect(denied.headers.get("location")).toBeNull();
+					}
+				}
+			}
+		});
+
 		it("switches Apple form callbacks both ways and reuses the exact relay account when email is omitted", async () => {
 			const provider = "apple";
 			const email = "stable-relay@privaterelay.appleid.com";

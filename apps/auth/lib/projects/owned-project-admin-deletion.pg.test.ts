@@ -160,6 +160,7 @@ describe.skipIf(!existsSync(fixturePath))(
 				trustedIP: () => "192.0.2.9",
 				signingSecret: realm.secret,
 				policy: defaultAuthPolicy,
+				passwordChange: { checkPasswordSafety: async () => "allowed" },
 				accountLinks: {
 					publicLinkBaseURL: `${origin}${realm.path}`,
 					defer() {},
@@ -414,6 +415,161 @@ describe.skipIf(!existsSync(fixturePath))(
 					headers: new Headers({ cookie: realmCookie }),
 				}),
 			).toMatchObject({ user: { id: realmAdmin } });
+		});
+
+		it("preserves workspace user administration and live revocation across the selected writers", async () => {
+			const candidate = engine();
+			const other = engine(beta);
+			const call = (operation: string, body?: unknown, session = rootCookie) =>
+				request(`${alpha.path}/project-admin/${operation}`, session, body);
+			const nativeCreated = await native.handler(
+				call("create-user", {
+					email: "native-management-target@fixture.example",
+					name: "Native Management Target",
+					password,
+				}),
+			);
+			expect(nativeCreated.status, await nativeCreated.clone().text()).toBe(
+				200,
+			);
+			const ownedCreated = await candidate.dispatch(
+				call("create-user", {
+					email: "OWNED-MANAGEMENT-TARGET@fixture.example",
+					name: " Owned Management Target ",
+					password,
+				}),
+			);
+			expect(ownedCreated.status, await ownedCreated.clone().text()).toBe(200);
+			const { user } = (await ownedCreated.json()) as {
+				user: { id: string; email: string };
+			};
+			expect(user).toMatchObject({
+				email: "owned-management-target@fixture.example",
+				name: "Owned Management Target",
+				role: "user",
+				emailVerified: false,
+			});
+			expect(user).not.toHaveProperty("password");
+			expect(
+				(
+					await candidate.dispatch(
+						call("create-user", { email: user.email, name: "Duplicate" }),
+					)
+				).status,
+			).toBe(400);
+			await seedUser(beta.schemaName, "fixture-other-management-target");
+			const list =
+				"list-users?searchValue=management-target&searchOperator=contains&sortBy=email&sortDirection=asc&limit=1&offset=1";
+			const legacyList = await native.handler(call(list));
+			const ownedList = await candidate.dispatch(call(list));
+			expect(legacyList.status).toBe(200);
+			expect(ownedList.status, await ownedList.clone().text()).toBe(200);
+			const expected = {
+				total: 2,
+				limit: 1,
+				offset: 1,
+				users: [expect.objectContaining({ id: user.id, email: user.email })],
+			};
+			expect(await legacyList.json()).toMatchObject(expected);
+			expect(await ownedList.json()).toMatchObject(expected);
+			expect(
+				(await candidate.dispatch(call(list, undefined, realmCookie))).status,
+			).toBe(403);
+			expect(
+				(
+					await other.dispatch(
+						request(`${beta.path}/project-admin/${list}`, rootCookie),
+					)
+				).status,
+			).toBe(403);
+
+			const targetSignIn = () =>
+				native.handler(
+					request(`${alpha.path}/sign-in/email`, undefined, {
+						email: user.email,
+						password,
+					}),
+				);
+			const original = await targetSignIn();
+			expect(original.status).toBe(200);
+			const originalCookie = cookie(original);
+			const ban = await candidate.dispatch(
+				call("ban-user", {
+					userId: user.id,
+					banReason: "Fixture policy",
+					banExpiresIn: 60,
+				}),
+			);
+			expect(ban.status).toBe(200);
+			expect(await ban.json()).toMatchObject({
+				user: { banned: true, banReason: "Fixture policy" },
+			});
+			expect(
+				await native.api.getSession({
+					headers: new Headers({ cookie: originalCookie }),
+				}),
+			).toBeNull();
+			const unban = await candidate.dispatch(
+				call("unban-user", { userId: user.id }),
+			);
+			expect(await unban.json()).toMatchObject({
+				user: { banned: false, banReason: null, banExpires: null },
+			});
+			const newCookie = cookie(await targetSignIn());
+			const active = await native.api.getSession({
+				headers: new Headers({ cookie: newCookie }),
+			});
+			await database.query(
+				`INSERT INTO "${alpha.schemaName}"."oauthClient" (id,"clientId","redirectUris") VALUES ('workspace-role-change-client','workspace-role-change-client','[]')`,
+			);
+			await database.query(
+				`INSERT INTO "${alpha.schemaName}"."oauthRefreshToken"
+				(id,token,"clientId","sessionId","userId","expiresAt","createdAt",scopes)
+				VALUES ('workspace-role-change-grant','synthetic-role-change-grant','workspace-role-change-client',$1,$2,now()+interval '1 hour',now(),'["offline_access"]')`,
+				[active!.session.id, user.id],
+			);
+			const role = await candidate.dispatch(
+				call("set-role", { userId: user.id, role: "admin" }),
+			);
+			expect(await role.json()).toMatchObject({ user: { role: "admin" } });
+			expect(
+				await native.api.getSession({
+					headers: new Headers({ cookie: newCookie }),
+				}),
+			).toBeNull();
+			expect(
+				(
+					await database.query(
+						`SELECT id FROM "${alpha.schemaName}"."oauthRefreshToken" WHERE "userId"=$1`,
+						[user.id],
+					)
+				).rowCount,
+			).toBe(0);
+			const lastCookie = cookie(await targetSignIn());
+			const revoke = await candidate.dispatch(
+				call("revoke-user-sessions", { userId: user.id }),
+			);
+			expect(await revoke.json()).toEqual({ success: true });
+			expect(
+				await native.api.getSession({
+					headers: new Headers({ cookie: lastCookie }),
+				}),
+			).toBeNull();
+			const events = await database.query(
+				`SELECT type,"actorId","userId" FROM "${alpha.schemaName}"."allauthEvent"
+				 WHERE "userId"=$1 AND metadata->>'signal'='platform-project-management'
+				 ORDER BY type`,
+				[user.id],
+			);
+			expect(events.rows).toEqual(
+				[
+					"session.revoked-all",
+					"user.banned",
+					"user.created",
+					"user.role-changed",
+					"user.unbanned",
+				].map((type) => ({ type, actorId: rootId, userId: user.id })),
+			);
 		});
 
 		it("keeps the account and grants until Apple acknowledges the scoped revocation", async () => {

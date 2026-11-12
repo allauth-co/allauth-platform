@@ -5,7 +5,13 @@ import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import type { JSONWebKeySet } from "jose";
-import { createLocalJWKSet, jwtVerify } from "jose";
+import {
+	createLocalJWKSet,
+	exportPKCS8,
+	generateKeyPair,
+	jwtVerify,
+	SignJWT,
+} from "jose";
 import { Pool } from "pg";
 import { describe, expect, it, vi } from "vitest";
 import { clerkCompatiblePasswords } from "../clerk-password";
@@ -18,6 +24,8 @@ import { createWorkspace } from "../workspaces/repository";
 import { signProjectIssuerQuery } from "./owned-project-issuer-authorization-query";
 import type { ProjectRuntimeFixtureBoot } from "./owned-project-runtime-fixture";
 import {
+	runtimeFixtureApple,
+	runtimeFixtureAppleOrigin,
 	runtimeFixtureAssetOrigin,
 	runtimeFixtureAssetSecret,
 	runtimeFixtureGoogle,
@@ -53,7 +61,16 @@ const credentials = {
 	updated: "Fixture-rotated-password-73!",
 };
 
-function childEnvironment(microsoftProject?: string): NodeJS.ProcessEnv {
+type AppleFixture = {
+	credentialKey: string;
+	issuerKey: string;
+	project: string;
+};
+
+function childEnvironment(
+	microsoftProject?: string,
+	apple?: AppleFixture,
+): NodeJS.ProcessEnv {
 	const { clientId, clientSecret, tenantId } = runtimeFixtureMicrosoft;
 	return {
 		PATH: process.env.PATH,
@@ -80,6 +97,19 @@ function childEnvironment(microsoftProject?: string): NodeJS.ProcessEnv {
 					}),
 				}
 			: {}),
+		...(apple
+			? {
+					ALLAUTH_PROJECT_APPLE_PROVIDERS: JSON.stringify({
+						[apple.project]: {
+							clientId: runtimeFixtureApple.clientId,
+							appBundleIdentifier: runtimeFixtureApple.appBundleIdentifier,
+							teamId: runtimeFixtureApple.teamId,
+							keyId: runtimeFixtureApple.keyId,
+							privateKey: apple.credentialKey,
+						},
+					}),
+				}
+			: {}),
 	};
 }
 
@@ -96,10 +126,11 @@ async function openProcess(
 	project: Project,
 	owned: boolean,
 	microsoftProject = project.slug,
+	apple?: AppleFixture,
 ) {
 	const child = fork(worker, [], {
 		cwd: appRoot,
-		env: childEnvironment(microsoftProject),
+		env: childEnvironment(microsoftProject, apple),
 		execArgv: ["--import", "tsx"],
 		stdio: ["ignore", "ignore", "pipe", "ipc"],
 	});
@@ -124,6 +155,7 @@ async function openProcess(
 		projectSlug: project.slug,
 		schemaName: project.schemaName,
 		owned,
+		appleIssuerKey: apple?.issuerKey,
 	};
 	child.send(boot);
 	try {
@@ -236,7 +268,9 @@ async function fixtureVerificationMail(
 	email: string,
 ) {
 	return vi.waitFor(() => {
-		const verification = service.mail.find(({ to }) => to === email);
+		const verification = service.mail.find(
+			({ to, subject }) => to === email && subject.startsWith("Verify "),
+		);
 		expect(verification?.subject).toContain("Verify your");
 		const match = verification?.text.match(
 			/https:\/\/[^\s<>\]]+\/verify-email\?[^\s<>\]]+/,
@@ -298,6 +332,82 @@ async function startFixtureProvider(
 		path: `${transport.prefix}/callback/${provider}?${query}`,
 		cookie: cookie(started),
 	};
+}
+
+async function startFixtureApple(
+	service: Awaited<ReturnType<typeof openProcess>>,
+	transport: {
+		prefix: string;
+		callback: string;
+		destination: string;
+		host?: string;
+		clientIP?: string;
+	},
+) {
+	const started = await service.request(`${transport.prefix}/sign-in/social`, {
+		host: transport.host,
+		clientIP: transport.clientIP,
+		body: {
+			provider: "apple",
+			callbackURL: transport.destination,
+			disableRedirect: true,
+			additionalParams: { locale: "en_US" },
+		},
+	});
+	expect(
+		started.status,
+		started.ok ? undefined : await started.clone().text(),
+	).toBe(200);
+	const authorization = await fixtureRedirect(started);
+	expect(authorization.origin).toBe(runtimeFixtureAppleOrigin);
+	expect(authorization.pathname).toBe("/auth/authorize");
+	for (const [key, value] of Object.entries({
+		client_id: runtimeFixtureApple.clientId,
+		redirect_uri: transport.callback,
+		response_mode: "form_post",
+		response_type: "code id_token",
+		locale: "en_US",
+	}))
+		expect(authorization.searchParams.get(key)).toBe(value);
+	const state = authorization.searchParams.get("state");
+	expect(state).toBeTruthy();
+	expect(authorization.searchParams.get("nonce")).toBeTruthy();
+	expect(started.headers.getSetCookie()).toEqual(
+		expect.arrayContaining([expect.stringMatching(/SameSite=None/i)]),
+	);
+	return {
+		path: `${transport.prefix}/callback/apple`,
+		cookie: cookie(started),
+		host: transport.host,
+		clientIP: transport.clientIP,
+		body: new URLSearchParams({
+			state: state!,
+			code: runtimeProviderFixtureCode(authorization),
+			id_token: "synthetic-front-channel-value",
+		}),
+	};
+}
+
+async function finishFixtureApple(
+	service: Awaited<ReturnType<typeof openProcess>>,
+	attempt: Awaited<ReturnType<typeof startFixtureApple>>,
+) {
+	const { path, cookie, host, clientIP, body } = attempt;
+	const continued = await service.request(path, {
+		cookie,
+		host,
+		clientIP,
+		body,
+		origin: runtimeFixtureAppleOrigin,
+	});
+	expect(continued.status).toBe(302);
+	const next = await fixtureRedirect(continued);
+	expect(next.pathname).toBe(path);
+	return service.request(next.pathname + next.search, {
+		cookie,
+		host,
+		clientIP,
+	});
 }
 
 async function issueFixtureTokens(
@@ -596,6 +706,27 @@ describe.skipIf(!existsSync(fixture))(
 				await admin.query(`CREATE DATABASE "${source}"`);
 				created.push(source);
 				const { alpha, beta } = await seed(url(source));
+				const [appleCredentialKeys, appleIssuerKeys] = await Promise.all([
+					generateKeyPair("ES256", { extractable: true }),
+					generateKeyPair("RS256", { extractable: true }),
+				]);
+				const appleFixture = {
+					credentialKey: await exportPKCS8(appleCredentialKeys.privateKey),
+					issuerKey: await exportPKCS8(appleIssuerKeys.privateKey),
+				};
+				const open = (
+					name: string,
+					owned: boolean,
+					microsoftProject = alpha.slug,
+					appleProject = alpha.slug,
+				) =>
+					openProcess(url(name), alpha, owned, microsoftProject, {
+						...appleFixture,
+						project: appleProject,
+					});
+				const appleDirectEmail =
+					"apple-native-unverified@runtime.fixture.example";
+				const appleDirectSubject = "fixture-runtime-apple-direct-subject";
 				const alphaPath = `/api/projects/${alpha.slug}/auth`;
 				const betaPath = `/api/projects/${beta.slug}/auth`;
 				const alphaHost = `${alpha.slug}-accounts.allauth.co`;
@@ -618,7 +749,7 @@ describe.skipIf(!existsSync(fixture))(
 				};
 				const management = (project: Project) =>
 					`/api/admin/organizations?project=${project.slug}`;
-				service = await openProcess(url(source), alpha, false);
+				service = await open(source, false);
 				expect((await service.request("/api/health")).status).toBe(200);
 				const rootLogin = await service.request("/api/auth/sign-in/email", {
 					body: {
@@ -671,6 +802,11 @@ describe.skipIf(!existsSync(fixture))(
 					...hostedProvider,
 					callback: `${hostedIssuer}/callback/google`,
 				});
+				const nativeApple = await startFixtureApple(service, {
+					...hostedProvider,
+					clientIP: "192.0.2.64",
+					callback: `${hostedIssuer}/callback/apple`,
+				});
 				const legacyContinuation = await fixtureRedirect(
 					await service.request(
 						`/api/auth/oauth2/authorize?${fixtureAuthorizationQuery()}`,
@@ -692,8 +828,103 @@ describe.skipIf(!existsSync(fixture))(
 				await admin.query(`CREATE DATABASE "${restored}" TEMPLATE "${source}"`);
 				created.push(restored);
 
-				service = await openProcess(url(restored), alpha, true);
+				service = await open(restored, true);
 				expect((await service.request("/api/health")).status).toBe(200);
+				const switchedApple = await finishFixtureApple(service, nativeApple);
+				expect(switchedApple.headers.get("location")).toBe(
+					hostedProvider.destination,
+				);
+				const appleBrowserSession = await service.request(
+					"/api/auth/get-session",
+					{ host: alphaHost, cookie: cookie(switchedApple) },
+				);
+				const appleBrowserUser = (
+					(await appleBrowserSession.json()) as {
+						user: { id: string; email: string; emailVerified: boolean };
+					}
+				).user;
+				expect(appleBrowserUser).toMatchObject({
+					id: expect.any(String),
+					email: runtimeFixtureApple.email,
+					emailVerified: true,
+				});
+				const ownedApple = await startFixtureApple(service, {
+					...directProvider,
+					callback: `${alpha.primaryOrigin}/api/allauth/callback/apple`,
+				});
+				const reservedApple = await service.request(
+					`${alphaPath}/sign-in/social`,
+					{
+						body: {
+							provider: "apple",
+							additionalParams: {
+								redirect_uri: "https://unregistered.fixture.example/callback",
+							},
+						},
+					},
+				);
+				expect(reservedApple.status).toBe(400);
+				const nativeAppleToken = await new SignJWT({
+					email: appleDirectEmail,
+					email_verified: false,
+				})
+					.setProtectedHeader({
+						alg: "RS256",
+						kid: "runtime-provider-fixture-key",
+					})
+					.setIssuer(runtimeFixtureAppleOrigin)
+					.setAudience(runtimeFixtureApple.appBundleIdentifier)
+					.setSubject(appleDirectSubject)
+					.setIssuedAt()
+					.setExpirationTime("5m")
+					.sign(appleIssuerKeys.privateKey);
+				const appleVerificationCallback = `https://${alphaHost}/account/security?from=apple`;
+				const appleSignUp = await service.request("/api/auth/sign-in/social", {
+					host: alphaHost,
+					clientIP: "192.0.2.65",
+					body: {
+						provider: "apple",
+						callbackURL: appleVerificationCallback,
+						idToken: { token: nativeAppleToken },
+					},
+				});
+				expect(
+					appleSignUp.status,
+					appleSignUp.ok ? undefined : await appleSignUp.clone().text(),
+				).toBe(200);
+				expect(await appleSignUp.json()).toMatchObject({
+					redirect: false,
+					user: { email: appleDirectEmail, emailVerified: false },
+				});
+				const appleVerification = await fixtureVerificationMail(
+					service,
+					appleDirectEmail,
+				);
+				expect(appleVerification.origin).toBe(`https://${alphaHost}`);
+				expect(appleVerification.searchParams.get("callbackURL")).toBe(
+					appleVerificationCallback,
+				);
+				const verifiedApple = await service.request(
+					appleVerification.pathname + appleVerification.search,
+					{
+						host: alphaHost,
+						cookie: cookie(appleSignUp),
+						clientIP: "192.0.2.65",
+					},
+				);
+				expect(verifiedApple.headers.get("location")).toBe(
+					appleVerificationCallback,
+				);
+				expect(
+					await (
+						await service.request("/api/auth/get-session", {
+							host: alphaHost,
+							cookie: cookie(appleSignUp),
+						})
+					).json(),
+				).toMatchObject({
+					user: { email: appleDirectEmail, emailVerified: true },
+				});
 				const switchedGoogle = await service.request(nativeGoogle.path, {
 					host: alphaHost,
 					cookie: nativeGoogle.cookie,
@@ -732,6 +963,8 @@ describe.skipIf(!existsSync(fixture))(
 					apiKeys: true,
 					googleProvider: "google",
 					microsoftProvider: "microsoft",
+					apple: true,
+					appleProvider: "apple",
 					profileImageUpload: true,
 					profileImageOwnershipAndDeletion: false,
 				});
@@ -872,6 +1105,8 @@ describe.skipIf(!existsSync(fixture))(
 					signUpEnabled: true,
 					googleProvider: "google",
 					microsoftProvider: "microsoft",
+					apple: true,
+					appleProvider: "apple",
 				});
 				const legacyConfig = await service.request("/api/config", {
 					host: betaHost,
@@ -883,6 +1118,7 @@ describe.skipIf(!existsSync(fixture))(
 					scim: true,
 					google: false,
 					microsoft: false,
+					apple: false,
 				});
 				const ownedDirectKey = await exerciseOwnedApiKeys(
 					service,
@@ -1150,8 +1386,21 @@ describe.skipIf(!existsSync(fixture))(
 				await service.stop();
 				service = undefined;
 
-				service = await openProcess(url(restored), alpha, false);
+				service = await open(restored, false);
 				expect((await service.request("/api/health")).status).toBe(200);
+				const rolledBackApple = await finishFixtureApple(service, ownedApple);
+				expect(rolledBackApple.headers.get("location")).toBe(
+					directProvider.destination,
+				);
+				expect(
+					await (
+						await service.request(`${alphaPath}/get-session`, {
+							cookie: cookie(rolledBackApple),
+						})
+					).json(),
+				).toMatchObject({
+					user: { id: appleBrowserUser.id, email: runtimeFixtureApple.email },
+				});
 				const rolledBackMicrosoft = await service.request(ownedMicrosoft.path, {
 					cookie: ownedMicrosoft.cookie,
 				});
@@ -1262,15 +1511,20 @@ describe.skipIf(!existsSync(fixture))(
 				});
 				await service.stop();
 				service = undefined;
+				await expect(open(restored, true, beta.slug)).rejects.toThrow(
+					"stored features outside the candidate scope",
+				);
 				await expect(
-					openProcess(url(restored), alpha, true, beta.slug),
+					open(restored, true, alpha.slug, beta.slug),
 				).rejects.toThrow("stored features outside the candidate scope");
 				const changed = new Pool({ connectionString: url(restored), max: 1 });
 				try {
 					const stored = await changed.query(
-						`SELECT "providerId", "accountId" FROM "${alpha.schemaName}"."account" WHERE "providerId" IN ('google','microsoft') ORDER BY "providerId"`,
+						`SELECT "providerId", "accountId" FROM "${alpha.schemaName}"."account" WHERE "providerId" IN ('apple','google','microsoft') ORDER BY "providerId", "accountId"`,
 					);
 					expect(stored.rows).toEqual([
+						{ providerId: "apple", accountId: appleDirectSubject },
+						{ providerId: "apple", accountId: runtimeFixtureApple.subject },
 						{ providerId: "google", accountId: runtimeFixtureGoogle.subject },
 						{
 							providerId: "microsoft",
@@ -1280,15 +1534,37 @@ describe.skipIf(!existsSync(fixture))(
 					expect(
 						(
 							await changed.query(
-								`SELECT 1 FROM "${beta.schemaName}"."account" WHERE "providerId" IN ('google','microsoft')`,
+								`SELECT 1 FROM "${beta.schemaName}"."account" WHERE "providerId" IN ('apple','google','microsoft')`,
 							)
 						).rowCount,
 					).toBe(0);
+					service = await open(restored, true);
+					const removedApple = await service.request(
+						`${alphaPath}/project-admin/remove-user`,
+						{
+							cookie: rootCookie,
+							body: { userId: appleBrowserUser.id },
+						},
+					);
+					expect(
+						removedApple.status,
+						removedApple.ok ? undefined : await removedApple.clone().text(),
+					).toBe(200);
+					expect(await removedApple.json()).toEqual({ success: true });
+					expect(
+						await (
+							await service.request(`${alphaPath}/get-session`, {
+								cookie: cookie(rolledBackApple),
+							})
+						).json(),
+					).toBeNull();
+					await service.stop();
+					service = undefined;
 					await changed.query(
 						`UPDATE "${alpha.schemaName}"."apikey" SET "rateLimitMax"=101 WHERE id=$1`,
 						[ownedDirectKey.id],
 					);
-					await expect(openProcess(url(restored), alpha, true)).rejects.toThrow(
+					await expect(open(restored, true)).rejects.toThrow(
 						"stored features outside the candidate scope",
 					);
 					await changed.query(
@@ -1303,7 +1579,7 @@ describe.skipIf(!existsSync(fixture))(
 				} finally {
 					await changed.end();
 				}
-				await expect(openProcess(url(restored), alpha, true)).rejects.toThrow(
+				await expect(open(restored, true)).rejects.toThrow(
 					"stored features outside the candidate scope",
 				);
 			} finally {

@@ -19,10 +19,19 @@ import {
 	organizationLifecycleRoutes,
 } from "./owned-project-organization-lifecycle";
 import {
+	listProjectOrganizationMembers,
+	organizationMembersQuery,
+} from "./owned-project-organization-members";
+import {
 	organizationFailure as failure,
 	organizationJson as json,
 } from "./owned-project-organization-response";
 import { projectOrganizations } from "./owned-project-organization-store";
+import {
+	handleProjectOrganizationTeam,
+	isOrganizationTeamRoute,
+	organizationTeamRoutes,
+} from "./owned-project-organization-teams";
 import type { Project } from "./registry";
 
 export interface OrganizationSession {
@@ -94,9 +103,11 @@ const inviteInput = z.object({
 
 const routeMethods = {
 	...organizationLifecycleRoutes,
+	...organizationTeamRoutes,
 	"/organization/check-slug": "POST",
 	"/organization/create": "POST",
 	"/organization/list": "GET",
+	"/organization/list-members": "GET",
 	"/organization/get-full-organization": "GET",
 	"/organization/get-active-member": "GET",
 	"/organization/get-active-member-role": "GET",
@@ -427,11 +438,15 @@ export function createOwnedProjectOrganizationHttp(
 			);
 		const input = mutation
 			? await options.readBody(request)
-			: parseQuery(request);
+			: path === "/organization/list-members"
+				? organizationMembersQuery(request)
+				: parseQuery(request);
 		try {
-			const runTransaction = isOrganizationLifecycleRoute(path)
-				? retryTransaction
-				: store.transaction;
+			const runTransaction =
+				mutation &&
+				(isOrganizationLifecycleRoute(path) || isOrganizationTeamRoute(path))
+					? retryTransaction
+					: store.transaction;
 			const result = await runTransaction<RouteResult>(async (client) => {
 				if (
 					path === "/organization/list-user-invitations" &&
@@ -464,6 +479,15 @@ export function createOwnedProjectOrganizationHttp(
 				const { user, session } = principal;
 				if (isOrganizationLifecycleRoute(path))
 					return handleOrganizationLifecycle(path, realm, principal, input);
+				if (isOrganizationTeamRoute(path))
+					return handleProjectOrganizationTeam(
+						path,
+						client,
+						realm,
+						principal,
+						input,
+						() => options.sessionCookies?.(request, principal),
+					);
 
 				switch (path) {
 					case "/organization/has-permission":
@@ -474,6 +498,13 @@ export function createOwnedProjectOrganizationHttp(
 						return cancelInvitation(realm, input, principal);
 					case "/organization/list":
 						return json(await realm.list(user.id));
+					case "/organization/list-members":
+						return listProjectOrganizationMembers(
+							client,
+							realm,
+							principal,
+							input,
+						);
 					case "/organization/check-slug": {
 						const body = checkSlugInput.safeParse(input);
 						if (!body.success) return invalidBody();

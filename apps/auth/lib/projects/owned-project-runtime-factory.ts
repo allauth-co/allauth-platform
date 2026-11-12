@@ -25,7 +25,11 @@ import {
 	realmPasskeyOptions,
 	selectedNativePasskeys,
 } from "../project-native-passkeys";
-import { readProjectAppleProvider } from "../project-providers/apple";
+import {
+	appleCallbackURL,
+	readProjectAppleProvider,
+} from "../project-providers/apple";
+import { generateAppleClientSecret } from "../project-providers/apple-client-secret";
 import {
 	googleCallbackURL,
 	googleClientId,
@@ -96,8 +100,7 @@ async function readSupportedProviders(options: Options) {
 		!/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(project.id) ||
 		project.schemaName !==
 			`allauth_project_${project.id.replaceAll("-", "")}` ||
-		policy.supportAccess?.enabled ||
-		readProjectAppleProvider(env, project.slug)
+		policy.supportAccess?.enabled
 	)
 		throw new Error(
 			"This development project's configuration requires adapters outside the candidate scope.",
@@ -113,6 +116,7 @@ async function readSupportedProviders(options: Options) {
 			"The selected development project does not match its registry binding.",
 		);
 	const microsoft = readProjectMicrosoftProvider(env, registered.slug);
+	const apple = readProjectAppleProvider(env, registered.slug);
 	const storedGoogle = await googleProviderRepository(database, env).read(
 		registered.id,
 	);
@@ -141,6 +145,7 @@ async function readSupportedProviders(options: Options) {
 		"allauth",
 		...(google ? ["google"] : []),
 		...(microsoft ? ["microsoft"] : []),
+		...(apple ? ["apple"] : []),
 	];
 	const schema = checkedProjectSchema(project.schemaName);
 	const {
@@ -182,7 +187,7 @@ async function readSupportedProviders(options: Options) {
 		throw new Error(
 			"This development project has stored features outside the candidate scope.",
 		);
-	return { google, microsoft };
+	return { google, microsoft, apple };
 }
 
 /** Assemble an explicitly selected internal development realm. This function does not select a runtime. */
@@ -212,12 +217,48 @@ export async function createOwnedProjectRuntimeCandidate(options: Options) {
 		throw new Error(
 			"The development candidate requires an approved project mail transport.",
 		);
-	const { google, microsoft } = await readSupportedProviders(options);
+	const { google, microsoft, apple } = await readSupportedProviders(options);
 	const callbacks = {
 		primaryOrigin: app,
 		publicOrigin: hosted ? origin : undefined,
 		basePath,
 	};
+	const appleOAuth =
+		apple &&
+		(await (async () => {
+			const redirectURI = appleCallbackURL(callbacks);
+			const ids = new Set(
+				[apple.clientId, apple.appBundleIdentifier].filter(
+					(value) => value !== undefined,
+				),
+			);
+			const secrets = new Map(
+				await Promise.all(
+					[...ids].map(
+						async (clientId) =>
+							[
+								clientId,
+								await generateAppleClientSecret({ ...apple, clientId }),
+							] as const,
+					),
+				).catch(() => {
+					throw new Error(
+						"This development project's Apple signing key is invalid.",
+					);
+				}),
+			);
+			return {
+				clientId: apple.clientId,
+				appBundleIdentifier: apple.appBundleIdentifier,
+				redirectURI,
+				async clientSecret(clientId: string) {
+					const secret = secrets.get(clientId);
+					if (!secret)
+						throw new Error("Apple client is unavailable in this project.");
+					return secret;
+				},
+			};
+		})());
 	const readBranding = () => readApplicationBranding(project.id, env);
 	const [branding, clientSecret] = await Promise.all([
 		readBranding(),
@@ -308,7 +349,7 @@ export async function createOwnedProjectRuntimeCandidate(options: Options) {
 		database,
 		schemaName: project.schemaName,
 		keys: encryptionKeys,
-		configured: readProjectAppleProvider(env, project.slug),
+		configured: apple,
 	});
 	const engine = createOwnedProjectEngine({
 		database,
@@ -349,6 +390,7 @@ export async function createOwnedProjectRuntimeCandidate(options: Options) {
 						},
 					}
 				: {}),
+			...(appleOAuth ? { apple: appleOAuth } : {}),
 			broker: {
 				clientId: project.brokerClientId,
 				clientSecret,

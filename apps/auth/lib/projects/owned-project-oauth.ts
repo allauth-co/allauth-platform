@@ -57,6 +57,17 @@ const trustedSigningAlgorithms = [
 	"Ed25519",
 ];
 const originControls = /[\\\u0000-\u0020\u007f]/;
+// Match the existing social start/link URL contract while keeping protocol inputs server-owned.
+const reservedAuthorizationParams = new Set([
+	"state",
+	"client_id",
+	"redirect_uri",
+	"response_type",
+	"code_challenge",
+	"code_challenge_method",
+	"nonce",
+	"scope",
+]);
 const googleMetadata: oauth.AuthorizationServer = {
 	issuer: "https://accounts.google.com",
 	authorization_endpoint: "https://accounts.google.com/o/oauth2/v2/auth",
@@ -84,6 +95,15 @@ export const ownedProjectOAuthStartInput = z.strictObject({
 		})
 		.optional(),
 	additionalData: z.record(z.string(), z.unknown()).optional(),
+	additionalParams: z
+		.record(z.string(), z.string())
+		.refine(
+			(params) =>
+				!Object.keys(params).some((name) =>
+					reservedAuthorizationParams.has(name),
+				),
+		)
+		.optional(),
 	scopes: z
 		.array(
 			z
@@ -142,6 +162,7 @@ export interface OwnedProjectOAuthOptions {
 			user: ProjectUser;
 			provider: ProjectOAuthProvider;
 			destination: string;
+			verificationDestination?: string;
 			registered: boolean;
 			transport: "browser" | "id-token";
 		},
@@ -487,6 +508,10 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 				authorization.searchParams.set("include_granted_scopes", "true");
 			if (body.provider === "allauth" && options.broker.hintGoogle)
 				authorization.searchParams.set("idp_hint", "google");
+			for (const [name, value] of Object.entries(body.additionalParams ?? {})) {
+				if (!reservedAuthorizationParams.has(name))
+					authorization.searchParams.set(name, value);
+			}
 			const flow: ProjectOAuthState = {
 				...body.additionalData,
 				link: undefined,
@@ -648,12 +673,14 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 				404,
 			);
 		const requestOrigin = request.headers.get("origin")!;
+		const destination = safeURL(
+			input.callbackURL ?? "/",
+			requestOrigin,
+			origins,
+		);
 		if (
-			[
-				input.callbackURL,
-				input.newUserCallbackURL,
-				input.errorCallbackURL,
-			].some(
+			!destination ||
+			[input.newUserCallbackURL, input.errorCallbackURL].some(
 				(value) =>
 					value !== undefined && !safeURL(value, requestOrigin, origins),
 			)
@@ -761,7 +788,7 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 					request,
 					user: account.user,
 					provider: "apple",
-					destination: origin,
+					destination: destination.href,
 					registered: account.registered,
 					transport: "id-token",
 				});
@@ -1072,6 +1099,7 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 					user: account.user,
 					provider,
 					destination: ((account.registered && newUser) || destination).href,
+					verificationDestination: destination.href,
 					registered: account.registered,
 					transport: "browser",
 				});

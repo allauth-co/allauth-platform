@@ -41,6 +41,26 @@ export interface SignUpVerification {
 	onFailure?(): void;
 }
 
+/** Deliver through the configured project transport after the caller commits the new user. */
+export function scheduleOwnedSignUpVerification(
+	verification: SignUpVerification | undefined,
+	user: { id: string; email: string; name: string } | null,
+	callbackURL: string,
+) {
+	try {
+		verification?.defer(async () => {
+			if (!user) return;
+			try {
+				await verification.send(user, callbackURL);
+			} catch {
+				verification.onFailure?.();
+			}
+		});
+	} catch {
+		verification?.onFailure?.();
+	}
+}
+
 export interface OwnedSignUpOptions {
 	database: Pool;
 	project: Pick<Project, "schemaName" | "slug">;
@@ -196,24 +216,6 @@ export function createOwnedSignUpHttp(options: OwnedSignUpOptions) {
 			return url.href;
 		}) ?? [];
 
-	function scheduleVerification(
-		user: { id: string; email: string; name: string } | null,
-		callbackURL: string,
-	) {
-		try {
-			verification?.defer(async () => {
-				if (!user) return;
-				try {
-					await verification.send(user, callbackURL);
-				} catch {
-					verification.onFailure?.();
-				}
-			});
-		} catch {
-			verification?.onFailure?.();
-		}
-	}
-
 	async function signUp(request: Request, caller: string) {
 		if (!policy.signUpEnabled || !policy.emailAndPasswordEnabled)
 			return failure(
@@ -314,7 +316,7 @@ export function createOwnedSignUpHttp(options: OwnedSignUpOptions) {
 		};
 		if (!decision.allowed) {
 			if (policy.requireEmailVerification && selectedCallback)
-				scheduleVerification(null, selectedCallback);
+				scheduleOwnedSignUpVerification(verification, null, selectedCallback);
 			return json({ token: null, user });
 		}
 		let safe: PasswordSafety;
@@ -390,7 +392,8 @@ export function createOwnedSignUpHttp(options: OwnedSignUpOptions) {
 				"Username is already taken. Please try another.",
 			);
 		if (policy.requireEmailVerification && selectedCallback)
-			scheduleVerification(
+			scheduleOwnedSignUpVerification(
+				verification,
 				outcome === "created"
 					? { id: user.id, email: user.email, name: user.name }
 					: null,

@@ -1,7 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { Pool, PoolClient } from "pg";
 import * as z from "zod";
-import { rolesInclude } from "../configuration";
 import type { ControlPrincipal } from "../control/types";
 import type { OwnedProjectAccountDeletionOptions } from "./owned-project-account-deletion";
 import {
@@ -15,6 +14,7 @@ import {
 	accountLinkHeaders,
 	accountLinkJson,
 } from "./owned-project-account-links";
+import { lockOwnedProjectWorkspaceAdministrator } from "./owned-project-admin-authority";
 import type { ProjectUser } from "./owned-project-engine-store";
 import { createProjectEngineStore } from "./owned-project-engine-store";
 import type { Project } from "./registry";
@@ -95,40 +95,6 @@ export function createOwnedProjectAdminDeletion(
 		throw new Error("Invalid project administrator route binding.");
 	const store = createProjectEngineStore(options.database, project.schemaName);
 
-	async function workspaceAuthority(
-		client: PoolClient,
-		principal: ControlPrincipal,
-	) {
-		const actor = (
-			await client.query<{ role: string | null }>(
-				`SELECT u.role FROM public."user" u JOIN public."session" s ON s."userId"=u.id
-			 WHERE u.id=$1 AND s.id=$2 AND s."expiresAt">clock_timestamp() AND s."impersonatedBy" IS NULL
-			 AND u."emailVerified"=TRUE AND u.banned IS DISTINCT FROM TRUE
-			 AND u."directoryDisabled" IS DISTINCT FROM TRUE AND u."isAnonymous" IS DISTINCT FROM TRUE
-			 FOR SHARE OF u,s`,
-				[principal.user.id, principal.session.id],
-			)
-		).rows[0];
-		if (!actor) return false;
-		const workspace = (
-			await client.query<{ protected: boolean }>(
-				`SELECT w.protected FROM public."allauthProject" p JOIN public."allauthWorkspace" w ON w.id=p."workspaceId"
-			 WHERE p.id=$1 AND p.slug=$2 AND p."schemaName"=$3 AND p."workspaceId"=$4 FOR SHARE OF p,w`,
-				[project.id, project.slug, project.schemaName, project.workspaceId],
-			)
-		).rows[0];
-		if (!workspace) return false;
-		if (rolesInclude(actor.role, "admin")) return true;
-		if (workspace.protected) return false;
-		const member = (
-			await client.query<{ role: string }>(
-				`SELECT role FROM public."allauthWorkspaceMember" WHERE "workspaceId"=$1 AND "userId"=$2 FOR SHARE`,
-				[project.workspaceId, principal.user.id],
-			)
-		).rows[0];
-		return member?.role === "owner" || member?.role === "admin";
-	}
-
 	function realmAdmin(user: ProjectUser | null): user is ProjectUser {
 		return Boolean(
 			user &&
@@ -147,7 +113,13 @@ export function createOwnedProjectAdminDeletion(
 		workspace: ControlPrincipal | null,
 	) {
 		if (workspace) {
-			if (!(await workspaceAuthority(client, workspace)))
+			if (
+				!(await lockOwnedProjectWorkspaceAdministrator(
+					client,
+					project,
+					workspace,
+				))
+			)
 				return workspaceDenied();
 			const target = await store.lockUser(client, userId);
 			return target
