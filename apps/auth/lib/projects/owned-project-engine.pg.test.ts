@@ -21,6 +21,7 @@ import type { createAllAuthClient } from "../../sdk/client";
 import { createAllAuthProxy } from "../../sdk/next";
 import { defaultAuthPolicy } from "../auth-policy/policy";
 import { clerkCompatiblePasswords } from "../clerk-password";
+import { allauthControl } from "../control";
 import { createControlSecurity } from "../control/security";
 import { defaultSecurityPolicy, securitySubject } from "../control/security-policy";
 import { readLegacySessionCookie } from "./legacy-session-cookie";
@@ -637,6 +638,52 @@ describe.skipIf(!existsSync(fixturePath))("isolated PostgreSQL owned project eng
 		} finally {
 			vi.stubGlobal("fetch", originalFetch);
 		}
+	});
+
+	it("preserves the native pending MFA event without creating a project session", async () => {
+		if (!legacyDatabase) throw new Error("The isolated native database was not initialized.");
+		const email = "audit-mfa@fixture.example";
+		const userId = await seed(email, { mfa: true });
+		await database.query(
+			`INSERT INTO "${schema}"."twoFactor" (id, "userId", secret, "backupCodes", verified)
+			 VALUES ($1,$2,$3,$4,true)`,
+			[
+				randomUUID(), userId,
+				await symmetricEncrypt({ key: signingSecret, data: "isolated-totp-audit-fixture-secret" }),
+				await symmetricEncrypt({ key: signingSecret, data: '["abcde-fghij"]' }),
+			],
+		);
+		const { auth } = await getTestInstance({
+			baseURL: origin, basePath, secret: signingSecret,
+			database: { db: legacyDatabase, type: "postgres" },
+			advanced: { cookiePrefix: `allauth_project_${slug}` },
+			emailAndPassword: { enabled: true, autoSignIn: false, password: clerkCompatiblePasswords },
+			plugins: [productionTwoFactor(origin), allauthControl({ ipHeader: "x-real-ip" })],
+			logger: { disabled: true },
+		}, { disableTestUser: true });
+		const ip = "203.0.113.146";
+		const userAgent = "pending-mfa-rehearsal";
+		const signIn = () => request("/sign-in/email", { email, password }, { "x-real-ip": ip, "user-agent": userAgent });
+		const events = async () => (await database.query(
+			`SELECT type,outcome,"userId","targetId","actorId","ipAddress","userAgent",metadata
+			 FROM "${schema}"."allauthEvent"
+			 WHERE "userAgent"=$1 AND type IN ('auth.mfa-required','auth.sign-in') ORDER BY "createdAt",id`,
+			[userAgent],
+		)).rows;
+		const legacy = await auth.handler(signIn());
+		expect(legacy.status).toBe(200);
+		expect(await legacy.json()).toMatchObject({ twoFactorRedirect: true });
+		const expected = await events();
+		expect(expected).toHaveLength(1);
+		expect(expected[0]).toMatchObject({ type: "auth.mfa-required", outcome: "success" });
+		const candidate = await engine(schema, ip).dispatch(signIn());
+		expect(candidate.status).toBe(200);
+		expect(await candidate.json()).toMatchObject({ twoFactorRedirect: true });
+		expect(cookies(candidate)).not.toContain(".session_token");
+		expect(await events()).toEqual([expected[0], expected[0]]);
+		expect((await database.query(
+			`SELECT id FROM "${schema}"."session" WHERE "userId"=$1`, [userId],
+		)).rowCount).toBe(0);
 	});
 
 	it("rotates and revokes sessions on MFA enrolment and disable", async () => {

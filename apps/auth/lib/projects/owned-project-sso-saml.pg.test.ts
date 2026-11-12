@@ -1153,7 +1153,7 @@ describe.skipIf(!existsSync(fixturePath))(
 			);
 			const audit = await database.query(
 				`SELECT type,outcome FROM "${schema}"."allauthEvent" WHERE "userId"=$1 AND metadata->>'path'=$2 ORDER BY type`,
-				[managed, `/sso/saml2/sp/acs/${providerId}`],
+				[managed, "/sso/saml2/sp/acs/:providerId"],
 			);
 			expect(audit.rows).toContainEqual({
 				type: "session.created",

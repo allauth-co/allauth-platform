@@ -158,9 +158,11 @@ it("discards consent for the previous authorization when the URL changes in the 
 					continueURL: `/oauth2/continue?${second}`,
 				}),
 			);
-			await new Promise((resolve) => setTimeout(resolve, 0));
 		});
-		expect(container.textContent).toContain("two wants to access");
+		await vi.waitFor(async () => {
+			await act(async () => {});
+			expect(container.textContent).toContain("two wants to access");
+		});
 		expect(container.textContent).toContain("Read your email address");
 		expect(container.textContent).not.toContain("Read your name and profile");
 		await act(async () => button("Decline")!.click());

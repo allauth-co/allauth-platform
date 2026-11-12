@@ -650,6 +650,20 @@ export function createOwnedProjectEngine(
 		});
 	}
 
+	function primaryAuditMetadata(path: string) {
+		const callback =
+			/^(\/(?:callback|oauth2\/callback|sso\/callback|sso\/saml2\/sp\/acs))\/([^/]+)$/.exec(
+				path,
+			);
+		if (!callback) return { path, method: path.split("/").pop() };
+		const enterprise = path.startsWith("/sso/");
+		return {
+			path: `${callback[1]}/:${enterprise ? "providerId" : "id"}`,
+			method: enterprise ? "sso" : "social",
+			provider: callback[2],
+		};
+	}
+
 	async function createSession(
 		client: PoolClient,
 		user: ProjectUser,
@@ -658,14 +672,7 @@ export function createOwnedProjectEngine(
 		path: string,
 		prior?: ProjectSession,
 	) {
-		const callback =
-			/^(\/(?:callback|oauth2\/callback|sso\/callback|sso\/saml2\/sp\/acs))\/([^/]+)$/.exec(
-				path,
-			);
-		const enterprise = Boolean(callback && path.startsWith("/sso/"));
-		const auditPath = callback
-			? `${callback[1]}/:${enterprise ? "providerId" : "id"}`
-			: path;
+		const eventMetadata = primaryAuditMetadata(path);
 		const headers = new Headers();
 		const existing = multiSessionTokens(request.headers);
 		const owned = [];
@@ -678,7 +685,7 @@ export function createOwnedProjectEngine(
 		if (owned.length) {
 			const removed = await store.revoke(
 				{ tokens: owned.map((item) => item.token) },
-				auditPath,
+				eventMetadata.path,
 				Boolean(backchannel),
 				client,
 			);
@@ -707,15 +714,10 @@ export function createOwnedProjectEngine(
 			outcome: "success",
 			userId: user.id,
 			targetId: id,
-			metadata: { path: auditPath },
+			metadata: { path: eventMetadata.path },
 		});
 		const primaryPath = isPrimaryAuthenticationPath(path);
 		if (!prior && primaryPath) {
-			const method = callback
-				? enterprise
-					? "sso"
-					: "social"
-				: path.split("/").pop();
 			await store.recordEvent(client, {
 				type: "auth.sign-in",
 				outcome: "success",
@@ -723,7 +725,7 @@ export function createOwnedProjectEngine(
 				userId: user.id,
 				targetId: id,
 				...browserEventContext(request),
-				metadata: { path: auditPath, method, provider: callback?.[2] },
+				metadata: eventMetadata,
 			});
 		}
 		// The audit trigger records ordinary primary sign-ins. Rotation and
@@ -854,6 +856,13 @@ export function createOwnedProjectEngine(
 		if (user.twoFactorEnabled && !device?.trusted) {
 			const challenge = await mfa.issue(client, user.id);
 			if (!challenge) return unsupported();
+			if (isPrimaryAuthenticationPath(path))
+				await store.recordEvent(client, {
+					type: "auth.mfa-required",
+					outcome: "success",
+					...browserEventContext(request),
+					metadata: { path: primaryAuditMetadata(path).path },
+				});
 			const headers = new Headers();
 			headers.append("Set-Cookie", challenge.setCookie);
 			if (device?.setCookie) headers.append("Set-Cookie", device.setCookie);
