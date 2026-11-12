@@ -263,4 +263,10 @@ it("rechecks candidate compatibility at activation and checks legacy readiness a
 	await projectRuntime.confirmInternalProjectEngine(internal, env);
 	expect(fixture.createOwned).toHaveBeenCalledTimes(2);
 	expect(fixture.createAuth).toHaveBeenCalledOnce();
+
+	fixture.createOwned.mockRejectedValueOnce(new Error("Incompatible reactivation configuration."));
+	await expect(projectRuntime.confirmInternalProjectEngine(internal, {
+		...env, ALLAUTH_PROJECT_ENGINE_INTERNAL_PREPARE_REVISION: "2",
+	})).rejects.toThrow("Incompatible reactivation configuration.");
+	expect(fixture.createOwned).toHaveBeenCalledTimes(3);
 });

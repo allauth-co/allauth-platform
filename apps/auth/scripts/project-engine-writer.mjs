@@ -16,6 +16,9 @@ async function projectEngine([operation, previous, revision, next, ...rest]) {
 		!writers.includes(next) || !/^(0|[1-9][0-9]{0,9})$/.test(revision ?? "") ||
 		Number(revision) > 2147483647))
 		throw new Error("Supply the expected writer, revision and next writer.");
+	const prepared = process.env.ALLAUTH_PROJECT_ENGINE_INTERNAL_PREPARE_REVISION?.trim() || "0";
+	if (!reading && previous === "legacy" && next === "allauth" && revision !== prepared)
+		throw new Error("Deploy and verify readiness for the exact legacy revision before activating AllAuth.");
 	const pool = new Pool({
 		connectionString: process.env.DATABASE_URL,
 		max: 1,

@@ -69,6 +69,7 @@ import { projectOriginFingerprint } from "./origins";
 import type { OwnedProjectSCIMConsole } from "./owned-project-scim-console";
 import {
 	internalProjectEngineSelected,
+	internalProjectPreparationRevision,
 	selectInternalProjectEngine,
 } from "./project-engine-internal-selection";
 import { internalProjectWriterLease } from "./project-engine-internal-writer";
@@ -726,9 +727,9 @@ export function confirmInternalProjectEngine(
 		throw new Error("The internal project selection changed.");
 	const origin = hostname ? `https://${hostname}` : undefined;
 	return lease.withCurrent(async ({ writer, revision }) => {
-		// Keep the initial preflight separate from live cache entries. Legacy can
+		// Keep preflight separate from live cache entries. Legacy can
 		// still change configuration until the database commits the switch.
-		const preparing = revision === 0;
+		const preparing = writer === "legacy" && revision === internalProjectPreparationRevision(env);
 		const useCandidate = preparing || writer === "allauth";
 		await withConfiguredProjectEntry(
 			project,
@@ -740,7 +741,7 @@ export function confirmInternalProjectEngine(
 					throw new Error("The internal project writer is unavailable.");
 			},
 			useCandidate ? candidate : undefined,
-			preparing ? { writer: "allauth", revision: 1 } : { writer, revision },
+			preparing ? { writer: "allauth", revision: revision + 1 } : { writer, revision },
 			preparing,
 		);
 	});

@@ -9,6 +9,14 @@ export const internalProjectEngineIdSetting =
 	"ALLAUTH_PROJECT_ENGINE_INTERNAL_ID";
 const projectIdPattern = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/;
 
+/** Prepare only the legacy revision explicitly selected for activation. */
+export function internalProjectPreparationRevision(env: AuthEnvironment) {
+	const revision = setting(env, "ALLAUTH_PROJECT_ENGINE_INTERNAL_PREPARE_REVISION").trim() || "0";
+	if (!/^(0|[1-9][0-9]{0,9})$/.test(revision) || Number(revision) > 2147483647)
+		throw new Error("The internal project preparation revision is invalid.");
+	return Number(revision);
+}
+
 /** The first release cohort is a single immutable development realm in the protected platform workspace. */
 export function internalProjectEngineSelected(
 	env: AuthEnvironment,
