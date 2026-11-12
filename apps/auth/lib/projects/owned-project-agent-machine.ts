@@ -125,6 +125,60 @@ export async function authorizeOwnedAgentHostRead(
 	return proof instanceof Response ? proof : host;
 }
 
+/** Verify a host proof and lock its eligible owner before changing an agent credential. */
+export async function authorizeOwnedAgentHostMutation(
+	client: PoolClient,
+	request: Request,
+	path: string,
+) {
+	const url = new URL(request.url);
+	const decoded = decodeAgentMachineJWT(request);
+	if (decoded === null || (decoded && decoded.typ === "agent+jwt"))
+		return agentMachineProblem(401, "unauthorized", "Authentication required");
+	if (
+		!decoded ||
+		decoded.typ !== "host+jwt" ||
+		!validAgentIdentifier(decoded.claims.iss)
+	)
+		return invalidAgentJWT(url.origin);
+	const issuer = decoded.claims.iss;
+	const audience = agentMachineAudience(url, path);
+	if (
+		![decoded.claims.aud]
+			.flat()
+			.some((value) => value && audience.includes(value))
+	)
+		return invalidAgentJWT(url.origin);
+	const observed = await readAgentMachineHost(client, issuer);
+	const unavailable = () =>
+		agentMachineProblem(401, "agent_not_found", "Agent not found", url.origin);
+	if (!observed?.userId || observed.status !== "active" || !observed.publicKey)
+		return unavailable();
+	const proof = await verifyAgentMachineJWT(
+		decoded.token,
+		observed,
+		audience,
+		url.origin,
+	);
+	if (proof instanceof Response) return proof;
+	const owner = await client.query(
+		`SELECT id FROM "user" WHERE id=$1 AND banned IS DISTINCT FROM true AND "directoryDisabled" IS DISTINCT FROM true FOR UPDATE`,
+		[observed.userId],
+	);
+	if (!owner.rowCount)
+		return agentMachineProblem(401, "unauthorized", "Authentication required");
+	const host = await readAgentMachineHost(client, issuer, "share");
+	if (!host || host.id !== observed.id || host.status !== "active")
+		return unavailable();
+	if (
+		host.userId !== observed.userId ||
+		host.publicKey !== observed.publicKey ||
+		host.jwksUrl !== observed.jwksUrl
+	)
+		return invalidAgentJWT(url.origin);
+	return { host, ownerId: observed.userId, proof, token: decoded.token };
+}
+
 export async function verifyAgentMachineJWT(
 	token: string,
 	row: Pick<AgentMachineHost, "publicKey" | "jwksUrl">,
@@ -178,7 +232,7 @@ export async function verifyAgentMachineJWT(
 
 export async function consumeAgentMachineReplay(
 	client: PoolClient,
-	purpose: "agent-status" | "host-registration",
+	purpose: "agent-status" | "host-registration" | "host-agent-key-rotation",
 	principalId: string,
 	jti: string,
 ) {

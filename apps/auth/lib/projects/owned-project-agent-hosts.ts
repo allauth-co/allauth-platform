@@ -43,6 +43,10 @@ import {
 	introspectOwnedProjectAgent,
 } from "./owned-project-agent-introspection";
 import {
+	agentKeyRotationPath,
+	rotateOwnedAgentKey,
+} from "./owned-project-agent-key-rotation";
+import {
 	agentMachineAudience,
 	agentMachineProblem,
 	decodeAgentMachineJWT,
@@ -298,6 +302,8 @@ export function createOwnedProjectAgentHosts(options: BrowserHosts) {
 			request.method === "GET" &&
 			(path === "/agent/get" || path === "/agent/list");
 		const agentRevoke = request.method === "POST" && path === agentRevokePath;
+		const agentRotation =
+			request.method === "POST" && path === agentKeyRotationPath;
 		const reactivate =
 			request.method === "POST" && path === agentReactivationPath;
 		const grantRevoke =
@@ -331,6 +337,7 @@ export function createOwnedProjectAgentHosts(options: BrowserHosts) {
 			!catalog &&
 			!introspect &&
 			!hostRotation &&
+			!agentRotation &&
 			!reactivate &&
 			!agentRead
 		)
@@ -339,7 +346,7 @@ export function createOwnedProjectAgentHosts(options: BrowserHosts) {
 			admitOwnedProjectNativeRoute(client, options.trustedIP(request), path, {
 				max: register
 					? 10
-					: decision || agentCleanup
+					: decision || agentCleanup || agentRotation
 						? 5
 						: pending || status
 							? 300
@@ -357,6 +364,12 @@ export function createOwnedProjectAgentHosts(options: BrowserHosts) {
 			}),
 		);
 		if (limited) return limited;
+		if (agentRotation) {
+			const body = await options.readBody(request);
+			return options.store.transaction((client) =>
+				rotateOwnedAgentKey(client, request, body),
+			);
+		}
 		if (reactivate) {
 			const body = await options.readBody(request);
 			return options.store.transaction((client) =>

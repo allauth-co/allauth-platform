@@ -2548,6 +2548,273 @@ describe.skipIf(!existsSync(fixture))(
 			});
 		});
 
+		it("rotates an active delegated agent under its signed host across native and owned writers", async () => {
+			const path = "/agent/rotate-key";
+			const schema = `"${alpha.schemaName}"`;
+			const machine = await nativeMachine(
+				"Delegated agent key rotation",
+				cleanupCookies[1],
+			);
+			const foreign = await nativeMachine(
+				"Separate host for key rotation",
+				cleanupCookies[1],
+			);
+			const pending = await pendingApproval(
+				machine.hostId,
+				"ciba",
+				cleanupOwners[1],
+			);
+			const extra = await generateKeyPair("EdDSA", { extractable: true });
+			const registration = await legacy.handler(
+				request(
+					alpha,
+					"/agent/register",
+					"",
+					{ mode: "delegated", name: "Second owned agent" },
+					`Bearer ${await registerProof(machine, extra)}`,
+				),
+			);
+			expect(registration.status).toBe(200);
+			const { agent_id: sibling } = (await registration.json()) as {
+				agent_id: string;
+			};
+			const grant = randomUUID();
+			await database.query(
+				`INSERT INTO ${schema}."agentCapabilityGrant" (id,"agentId",capability,status,"createdAt","updatedAt") VALUES ($1,$2,'fixture.read','active',now(),now())`,
+				[grant, machine.agentId],
+			);
+			const row = async (id = machine.agentId) =>
+				(
+					await database.query<{
+						publicKey: string;
+						kid: string | null;
+						updatedAt: Date;
+						hostId: string;
+						userId: string;
+						status: string;
+						mode: string;
+						activatedAt: Date;
+						expiresAt: Date;
+					}>(
+						`SELECT "publicKey",kid,"updatedAt","hostId","userId",status,mode,"activatedAt","expiresAt" FROM ${schema}."agent" WHERE id=$1`,
+						[id],
+					)
+				).rows[0];
+			const pair = async (kid?: string) => {
+				const agentKey = await generateKeyPair("EdDSA", { extractable: true });
+				const publicKey = {
+					...(await exportJWK(agentKey.publicKey)),
+					...(kid ? { kid } : {}),
+				};
+				return { agentKey, publicKey };
+			};
+			const nativeKey = await pair("fixture-native-agent-key");
+			const candidateKey = await pair();
+			const rollbackKey = await pair("fixture-rollback-agent-key");
+			const nativeBody = {
+				agent_id: machine.agentId,
+				public_key: nativeKey.publicKey,
+			};
+			const ownedBody = {
+				agent_id: machine.agentId,
+				public_key: candidateKey.publicKey,
+			};
+			const bearer = `Bearer ${await nativeClientHostProof(machine)}`;
+			const ownAgentBearer = `Bearer ${await new SignJWT({})
+				.setProtectedHeader({ alg: "EdDSA", typ: "agent+jwt" })
+				.setIssuer(machine.hostId)
+				.setSubject(machine.agentId)
+				.setAudience(agentAudience)
+				.setIssuedAt()
+				.setExpirationTime("45s")
+				.setJti(randomUUID())
+				.sign(machine.agentKey.privateKey)}`;
+			const write = (
+				input: typeof ownedBody,
+				proof: string,
+				ip: string,
+				project = alpha,
+			) => {
+				const call = request(project, path, "", input, proof);
+				call.headers.set("x-real-ip", ip);
+				return call;
+			};
+			await expectSame(path, cleanupCookies[1], 401, nativeBody);
+			await expectSame(path, "", 401, nativeBody, ownAgentBearer);
+			await expectSame(
+				path,
+				"",
+				403,
+				{ ...nativeBody, agent_id: foreign.agentId },
+				bearer,
+			);
+			await expectSame(
+				path,
+				"",
+				403,
+				{ ...nativeBody, agent_id: pending.agentId },
+				bearer,
+			);
+			await expectSame(
+				path,
+				"",
+				400,
+				{
+					...nativeBody,
+					public_key: { ...nativeKey.publicKey, crv: "X25519" },
+				},
+				bearer,
+			);
+			expect(
+				(await owned.dispatch(request(alpha, path, "", nativeBody, bearer)))
+					.status,
+			).toBe(429);
+			expect(
+				(await outside.dispatch(write(nativeBody, bearer, "192.0.2.178", beta)))
+					.status,
+			).toBe(401);
+			expect(
+				(await disabled.dispatch(write(nativeBody, bearer, "192.0.2.178")))
+					.status,
+			).toBe(501);
+			const legacyWrite = await legacy.handler(
+				write(nativeBody, bearer, "192.0.2.179"),
+			);
+			expect(legacyWrite.status).toBe(200);
+			const expected = { agent_id: machine.agentId, status: "active" };
+			expect(await legacyWrite.json()).toEqual(expected);
+			const requestStatus = async (agentKey: typeof machine.agentKey) =>
+				request(
+					alpha,
+					statusPath,
+					"",
+					undefined,
+					`Bearer ${await agentProof({ ...machine, agentKey })}`,
+				);
+			expect(
+				(await owned.dispatch(await requestStatus(machine.agentKey))).status,
+			).toBe(401);
+			expect(
+				(await owned.dispatch(await requestStatus(nativeKey.agentKey))).status,
+			).toBe(200);
+			const before = await row();
+			const noJti = `Bearer ${await hostProof(machine)}`;
+			await database.query(`CREATE FUNCTION ${schema}."rejectFixtureAgentKeyRotation"() RETURNS trigger LANGUAGE plpgsql AS $$
+				BEGIN RAISE EXCEPTION 'fixture agent key write failed'; END;
+			$$`);
+			try {
+				await database.query(`CREATE TRIGGER "rejectFixtureAgentKeyRotation" BEFORE UPDATE ON ${schema}."agent"
+					FOR EACH ROW WHEN (OLD."publicKey" IS DISTINCT FROM NEW."publicKey") EXECUTE FUNCTION ${schema}."rejectFixtureAgentKeyRotation"()`);
+				await expect(
+					owned.dispatch(write(ownedBody, noJti, "192.0.2.182")),
+				).rejects.toThrow("fixture agent key write failed");
+				expect(await row()).toEqual(before);
+			} finally {
+				await database.query(
+					`DROP TRIGGER IF EXISTS "rejectFixtureAgentKeyRotation" ON ${schema}."agent"`,
+				);
+				await database.query(
+					`DROP FUNCTION ${schema}."rejectFixtureAgentKeyRotation"()`,
+				);
+			}
+			const rotate = () =>
+				owned.dispatch(write(ownedBody, noJti, "192.0.2.180"));
+			const [changed, retry] = await Promise.all([rotate(), rotate()]);
+			expect([changed.status, retry.status]).toEqual([200, 200]);
+			expect(await changed.json()).toEqual(expected);
+			expect(await retry.json()).toEqual(expected);
+			const after = await row();
+			expect(after).toEqual({
+				...before,
+				publicKey: JSON.stringify(candidateKey.publicKey),
+				kid: null,
+				updatedAt: after.updatedAt,
+			});
+			const reordered = {
+				...ownedBody,
+				public_key: Object.fromEntries(
+					Object.entries(candidateKey.publicKey).reverse(),
+				),
+			};
+			const same = await owned.dispatch(write(reordered, noJti, "192.0.2.180"));
+			expect(same.status).toBe(200);
+			expect(await row()).toEqual(after);
+			const stale = await candidate(alpha, true).dispatch(
+				write(nativeBody, noJti, "192.0.2.180"),
+			);
+			expect(stale.status).toBe(401);
+			expect(await stale.json()).toMatchObject({ error: "jti_replay" });
+			const siblingKey = await pair("fixture-sibling-agent-key");
+			const siblingRotation = await owned.dispatch(
+				write(
+					{
+						...ownedBody,
+						agent_id: sibling,
+						public_key: siblingKey.publicKey,
+					},
+					noJti,
+					"192.0.2.180",
+				),
+			);
+			expect(siblingRotation.status).toBe(200);
+			expect(await siblingRotation.json()).toEqual({
+				agent_id: sibling,
+				status: "active",
+			});
+			const fresh = await owned.dispatch(
+				write(
+					ownedBody,
+					`Bearer ${await nativeClientHostProof(machine)}`,
+					"192.0.2.181",
+				),
+			);
+			expect(fresh.status).toBe(200);
+			expect(await fresh.json()).toEqual(expected);
+			const grants = await database.query(
+				`SELECT id,status FROM ${schema}."agentCapabilityGrant" WHERE "agentId"=$1`,
+				[machine.agentId],
+			);
+			expect(grants.rows).toEqual([{ id: grant, status: "active" }]);
+			legacy = await native(nativePool);
+			expect(
+				(await legacy.handler(await requestStatus(nativeKey.agentKey))).status,
+			).toBe(401);
+			const restored = await legacy.handler(
+				await requestStatus(candidateKey.agentKey),
+			);
+			expect(restored.status).toBe(200);
+			expect(await restored.json()).toMatchObject({
+				...expected,
+				agent_capability_grants: [
+					{ capability: "fixture.read", status: "active" },
+				],
+			});
+			const rollback = await legacy.handler(
+				write(
+					{ ...ownedBody, public_key: rollbackKey.publicKey },
+					`Bearer ${await nativeClientHostProof(machine)}`,
+					"192.0.2.181",
+				),
+			);
+			expect(rollback.status).toBe(200);
+			expect(await rollback.json()).toEqual(expected);
+			const afterRollbackReplay = await owned.dispatch(
+				write(ownedBody, noJti, "192.0.2.181"),
+			);
+			expect(afterRollbackReplay.status).toBe(401);
+			expect(await afterRollbackReplay.json()).toMatchObject({
+				error: "jti_replay",
+			});
+			expect(
+				(await owned.dispatch(await requestStatus(candidateKey.agentKey)))
+					.status,
+			).toBe(401);
+			expect(
+				(await owned.dispatch(await requestStatus(rollbackKey.agentKey)))
+					.status,
+			).toBe(200);
+		});
+
 		it("updates the fresh browser owner's host and replaces its inline key under the stable ID across writers", async () => {
 			const path = "/host/update";
 			const host = await nativeMachineHost("Browser key update", ownerCookie);

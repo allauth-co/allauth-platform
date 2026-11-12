@@ -21,7 +21,7 @@ The platform installs `@better-auth/agent-auth` 0.6.2. The endpoint inventory be
 | Agent revocation | `POST /agent/revoke` | Signed browser session of the agent or host owner, or an active signed host selecting an agent on that host. Direct agent JWT revocation is pending. |
 | Agent expiry cleanup | `POST /agent/cleanup` | Live browser owner can expire their overdue active agents and pending approval records. |
 | Agent reactivation | `POST /agent/reactivate` | Active signed host and eligible owner, existing delegated inline agent, and empty host defaults for expired-agent renewal. |
-| Agent key rotation | `POST /agent/rotate-key` | Pending. |
+| Agent key rotation | `POST /agent/rotate-key` | Active signed inline host can rotate an active owned delegated agent’s inline key. |
 | Browser approvals | `GET /agent/ciba/pending`, `POST /agent/approve-capability` | Current owner’s pending device and CIBA summaries. Fresh verified owner can approve or deny an existing, owner-bound delegated registration without capability grants. The decision accepts native `approval_id` or `agent_id`. |
 | Capability grant revocation | `POST /agent/revoke-capability` | Fresh verified browser owner, active signed host, or active signed agent can revoke named existing grants within their scope. |
 | Agent approval requests and grants | `POST /agent/request-capability`, `POST /agent/grant-capability`, `POST /agent/ciba/authorize`, `POST /agent/device/code` | Pending |
@@ -64,6 +64,8 @@ Signed host self-revocation verifies the active host’s existing inline key, ac
 Browser host update replaces the inline Ed25519 key under the original host ID and preserves existing agent and approval links. The candidate rejects a key ID already assigned to another host or matching another host ID. The native and owned engines accept each other’s replacement keys and reject the previous key after a successful write.
 
 Signed host rotation uses the replacement JWK thumbprint as the host ID. The installed route’s issuer lookup requires the existing host ID. A client using the key ID as its issuer can rotate through this route when those IDs match. PostgreSQL’s agent and approval foreign keys prevent changing the ID of a referenced host. The fixture reports that conflict before writing and supports same-ID key metadata updates under the same authorization.
+
+The installed delegated-agent rotation endpoint requires a host JWT. The fixture replaces the inline key and key ID under the same agent, host and owner, with the native five-per-minute limit. A previously accepted host proof can retry the current replacement key for that agent. Another key change for the same agent requires a fresh proof. The client from the matching upstream release tag sends an agent JWT for this endpoint. The tested compatibility lane is the native host-signed HTTP request. [Tagged Agent Auth client](https://github.com/better-auth/agent-auth/blob/a6736a4414e6cd3febffc86d00d9924694883364/packages/sdk/src/client.ts#L1005)
 
 Capability catalog reads preserve the native empty list and unknown-capability response. Both require a live signed host or delegated agent in the selected realm. Agent credentials share the same single-use proof records and bounded heartbeat as signed status. Host credentials remain reusable for catalog reads within their existing lifetime.
 

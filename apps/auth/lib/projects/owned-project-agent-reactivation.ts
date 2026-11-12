@@ -11,13 +11,8 @@ import {
 	invalidAgentBody,
 } from "./owned-project-agent-enrollment";
 import {
-	agentMachineAudience,
 	agentMachineProblem as problem,
-	decodeAgentMachineJWT,
-	invalidAgentJWT,
-	readAgentMachineHost,
-	validAgentIdentifier,
-	verifyAgentMachineJWT,
+	authorizeOwnedAgentHostMutation,
 } from "./owned-project-agent-machine";
 import {
 	agentAbsoluteLifetime,
@@ -47,58 +42,16 @@ export async function reactivateOwnedProjectAgent(
 		);
 	const parsed = input.safeParse(body);
 	if (!parsed.success) return invalidAgentBody(parsed.error);
-	const url = new URL(request.url);
-	const decoded = decodeAgentMachineJWT(request);
-	if (decoded === null || (decoded && decoded.typ === "agent+jwt"))
-		return problem(401, "unauthorized", "Authentication required");
-	if (
-		!decoded ||
-		decoded.typ !== "host+jwt" ||
-		!validAgentIdentifier(decoded.claims.iss)
-	)
-		return invalidAgentJWT(url.origin);
-	const issuer = decoded.claims.iss;
-	const audience = agentMachineAudience(url, agentReactivationPath);
-	if (
-		![decoded.claims.aud]
-			.flat()
-			.some((value) => value && audience.includes(value))
-	)
-		return invalidAgentJWT(url.origin);
-	const host = await readAgentMachineHost(client, issuer);
-	const unavailable = () =>
-		problem(401, "agent_not_found", "Agent not found", url.origin);
-	if (!host?.userId || host.status !== "active" || !host.publicKey)
-		return unavailable();
-	const proof = await verifyAgentMachineJWT(
-		decoded.token,
-		host,
-		audience,
-		url.origin,
+	const authority = await authorizeOwnedAgentHostMutation(
+		client,
+		request,
+		agentReactivationPath,
 	);
-	if (proof instanceof Response) return proof;
-	const owner = await client.query(
-		`SELECT id FROM "user" WHERE id=$1 AND banned IS DISTINCT FROM true AND "directoryDisabled" IS DISTINCT FROM true FOR UPDATE`,
-		[host.userId],
-	);
-	if (!owner.rowCount)
-		return problem(401, "unauthorized", "Authentication required");
-	const lockedHost = await readAgentMachineHost(client, issuer, "share");
-	if (
-		!lockedHost ||
-		lockedHost.id !== host.id ||
-		lockedHost.status !== "active"
-	)
-		return unavailable();
-	if (
-		lockedHost.userId !== host.userId ||
-		lockedHost.publicKey !== host.publicKey ||
-		lockedHost.jwksUrl !== host.jwksUrl
-	)
-		return invalidAgentJWT(url.origin);
+	if (authority instanceof Response) return authority;
+	const { host, ownerId } = authority;
 	const target = await lockHostOwnedAgent(
 		client,
-		lockedHost.id,
+		host.id,
 		parsed.data.agent_id,
 	);
 	if (target instanceof Response) return target;
@@ -114,10 +67,7 @@ export async function reactivateOwnedProjectAgent(
 		`SELECT ${ownedAgentStatusColumns},"publicKey","jwksUrl",("createdAt"+$2::int*interval '1 second'<=statement_timestamp()) AS "absoluteExpired" FROM "agent" WHERE id=$1`,
 		[target.id, agentAbsoluteLifetime],
 	);
-	if (
-		agent.mode !== "delegated" ||
-		(agent.userId && agent.userId !== host.userId)
-	)
+	if (agent.mode !== "delegated" || (agent.userId && agent.userId !== ownerId))
 		return problem(
 			403,
 			"unauthorized",
@@ -130,7 +80,7 @@ export async function reactivateOwnedProjectAgent(
 		agent.status !== "expired" ||
 		!agent.publicKey ||
 		agent.jwksUrl ||
-		agentHostCapabilities(lockedHost.defaultCapabilities).length
+		agentHostCapabilities(host.defaultCapabilities).length
 	)
 		return problem(
 			501,
