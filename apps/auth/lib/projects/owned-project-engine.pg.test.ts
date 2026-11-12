@@ -1,7 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { createHash, createHmac, randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
-import { mkdtemp, rm, symlink } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -17,8 +17,8 @@ import { createLocalJWKSet, type JSONWebKeySet, jwtVerify } from "jose";
 import { Kysely, PostgresDialect } from "kysely";
 import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { createAllAuthClient } from "../../sdk/client";
-import { createAllAuthProxy } from "../../sdk/next";
+import type { createAllAuthClient } from "../../sdk/client";
+import type { createAllAuthProxy } from "../../sdk/next";
 import { defaultAuthPolicy } from "../auth-policy/policy";
 import { clerkCompatiblePasswords } from "../clerk-password";
 import { createControlSecurity } from "../control/security";
@@ -39,6 +39,7 @@ import { readProjectSessionPrincipal } from "./session-principal";
 
 const fixturePath = new URL("../../../../.secrets/local-postgres.json", import.meta.url);
 const origin = "https://fixture-auth.example";
+const connectedOrigin = "https://connected.fixture.example";
 const slug = "owned-fixture";
 const basePath = `/api/projects/${slug}/auth`;
 const cookieName = `__Secure-allauth_project_${slug}.session_token`;
@@ -121,6 +122,7 @@ describe.skipIf(!existsSync(fixturePath))("isolated PostgreSQL owned project eng
 			baseURL: origin,
 			basePath,
 			secret: signingSecret,
+			trustedOrigins: [connectedOrigin],
 			session: { cookieCache: { enabled: false } },
 			advanced: { cookiePrefix: `allauth_project_${slug}` },
 			user: { additionalFields: { directoryDisabled: { type: "boolean", input: false, required: false } } },
@@ -259,16 +261,11 @@ describe.skipIf(!existsSync(fixturePath))("isolated PostgreSQL owned project eng
 		)).rows).toEqual([{ image: null }]);
 	});
 
-	it("keeps signed application sign-in, session and sign-out working in archived SDK v1 and SDK v2", async () => {
+	it.each(["legacy", "owned"] as const)("keeps the signed application proxy working with released SDK archives on the %s writer", async (writer) => {
 		const directory = await mkdtemp(join(tmpdir(), "allauth-owned-sdk-"));
 		const originalFetch = globalThis.fetch;
 		try {
-			const archive = fileURLToPath(new URL("../../public/sdk/allauth-react-1.0.0.tgz", import.meta.url));
-			expect(spawnSync("tar", ["-xzf", archive, "-C", directory]).status).toBe(0);
-			await symlink(fileURLToPath(new URL("../../node_modules", import.meta.url)), join(directory, "node_modules"), "dir");
-			const legacyClient = await import(/* @vite-ignore */ pathToFileURL(join(directory, "package/client.ts")).href) as { createAllAuthClient: typeof createAllAuthClient };
-			const legacyProxy = await import(/* @vite-ignore */ pathToFileURL(join(directory, "package/next.ts")).href) as { createAllAuthProxy: typeof createAllAuthProxy };
-			const appOrigin = "https://connected.fixture.example";
+			const appOrigin = connectedOrigin;
 			const project = { id: randomUUID(), slug, schemaName: schema, proxyVersion: "owned-sdk-fixture", origins: [appOrigin] } as Project;
 			const environment = { BETTER_AUTH_SECRET: "isolated-sdk-transport-fixture-secret" };
 			const owner = createOwnedProjectEngine({
@@ -280,20 +277,25 @@ describe.skipIf(!existsSync(fixturePath))("isolated PostgreSQL owned project eng
 				allauthURL: origin, getClientIP: () => "203.0.113.51",
 			};
 
-			for (const [version, buildClient, buildProxy] of [
-				["v1", legacyClient.createAllAuthClient, legacyProxy.createAllAuthProxy],
-				["v2", createAllAuthClient, createAllAuthProxy],
-			] as const) {
+			for (const version of ["1.0.0", "1.4.7", "2.0.0"]) {
+				const release = join(directory, version);
+				await mkdir(release);
+				const archive = fileURLToPath(new URL(`../../public/sdk/allauth-react-${version}.tgz`, import.meta.url));
+				expect(spawnSync("tar", ["-xzf", archive, "-C", release]).status).toBe(0);
+				await symlink(fileURLToPath(new URL("../../node_modules", import.meta.url)), join(release, "node_modules"), "dir");
+				const { createAllAuthClient: buildClient } = await import(/* @vite-ignore */ pathToFileURL(join(release, "package/client.ts")).href) as { createAllAuthClient: typeof createAllAuthClient };
+				const { createAllAuthProxy: buildProxy } = await import(/* @vite-ignore */ pathToFileURL(join(release, "package/next.ts")).href) as { createAllAuthProxy: typeof createAllAuthProxy };
 				const jar = new Map<string, string>();
 				const proxy = buildProxy(options);
-				const email = `connected-${version}@fixture.example`;
+				const email = `connected-${writer}-${version}@fixture.example`;
 				const userId = await seed(email);
 				const client = buildClient("/api/allauth", () => { throw new Error("Unexpected second factor."); });
 				vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
 					const request = input instanceof Request ? input : new Request(input, init);
 					const url = new URL(request.url);
 					if (url.origin === origin && url.pathname.startsWith(basePath + "/")) {
-						return owner.dispatch(await verifiedProjectRequest(request, project, environment));
+						const verified = await verifiedProjectRequest(request, project, environment);
+						return writer === "legacy" ? nativeRequest(verified) : owner.dispatch(verified);
 					}
 					if (url.origin !== "http://localhost" || !url.pathname.startsWith("/api/allauth/"))
 						throw new Error("External authentication is unavailable in the isolated SDK fixture.");
