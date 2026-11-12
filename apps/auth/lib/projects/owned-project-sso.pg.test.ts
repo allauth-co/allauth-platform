@@ -508,17 +508,19 @@ describe.skipIf(!existsSync(fixturePath))(
 			).rows[0];
 		}
 
-		it.each([
-			"native",
-			"owned",
-		] as const)("returns a configured %s provider denial to the same accounts host with its exact authorization return", async (engine) => {
-			const continuation =
-				"/oauth2/continue?client_id=fixture&resource=one&resource=two&sig=fixture%2Bproof&ba_param=client_id&ba_param=resource";
+		const enterpriseContinuation =
+			"/oauth2/continue?client_id=fixture&resource=one&resource=two&sig=fixture%2Bproof&ba_param=client_id&ba_param=resource";
+
+		async function enterpriseErrorLocation(
+			engine: "native" | "owned",
+			query: URLSearchParams,
+			useExpectedState = true,
+		) {
 			const errorCallback = new URL("/auth-error", origin);
-			errorCallback.searchParams.set("callbackUrl", continuation);
+			errorCallback.searchParams.set("callbackUrl", enterpriseContinuation);
 			const input = {
 				...body,
-				callbackURL: origin + continuation,
+				callbackURL: origin + enterpriseContinuation,
 				errorCallbackURL: errorCallback.href,
 			};
 			const candidate = owned();
@@ -533,8 +535,11 @@ describe.skipIf(!existsSync(fixturePath))(
 			const state = authorization.searchParams.get("state");
 			expect(state).toBeTruthy();
 			const callback = new URL(callbackURL);
-			callback.searchParams.set("state", state!);
-			callback.searchParams.set("error", "access_denied");
+			callback.search = query.toString();
+			callback.searchParams.set(
+				"state",
+				useExpectedState ? state! : "A".repeat(32),
+			);
 			const request = new Request(callback, {
 				headers: { cookie: cookies(started), "sec-fetch-mode": "navigate" },
 			});
@@ -546,12 +551,93 @@ describe.skipIf(!existsSync(fixturePath))(
 			const location = new URL(result.headers.get("location")!);
 			expect(location.origin).toBe(origin);
 			expect(location.pathname).toBe("/auth-error");
-			expect(location.searchParams.getAll("callbackUrl")).toEqual([
-				continuation,
-			]);
-			expect(location.searchParams.get("error")).toBeTruthy();
 			expect(cookies(result)).not.toContain("session_token");
 			expect(tokenRequests).toBe(before);
+			return location.searchParams;
+		}
+
+		it.each([
+			"native",
+			"owned",
+		] as const)("preserves standard authorization errors and the exact accounts-host return on the %s engine", async (engine) => {
+			const codes = [
+				"invalid_request",
+				"unauthorized_client",
+				"access_denied",
+				"unsupported_response_type",
+				"invalid_scope",
+				"server_error",
+				"temporarily_unavailable",
+				"interaction_required",
+				"login_required",
+				"account_selection_required",
+				"consent_required",
+				"invalid_request_uri",
+				"invalid_request_object",
+				"request_not_supported",
+				"request_uri_not_supported",
+				"registration_not_supported",
+			];
+			for (const error of codes) {
+				const redirected = await enterpriseErrorLocation(
+					engine,
+					new URLSearchParams({
+						error,
+						error_description: "Synthetic provider detail",
+						error_uri: `${issuer}/synthetic-error`,
+					}),
+				);
+				expect(redirected.getAll("callbackUrl")).toEqual([
+					enterpriseContinuation,
+				]);
+				expect(redirected.getAll("error"), error).toEqual([error]);
+				expect(redirected.get("error_description")).toBe(
+					engine === "native" ? "Synthetic provider detail" : null,
+				);
+				expect(redirected.has("error_uri")).toBe(false);
+			}
+			const missingCode = await enterpriseErrorLocation(
+				engine,
+				new URLSearchParams(),
+			);
+			expect(missingCode.get("error")).toBe("invalid_request");
+			expect(missingCode.get("error_description")).toBe(
+				engine === "native" ? "authorization_code_not_found" : null,
+			);
+		});
+
+		it("keeps project OIDC authorization errors bounded by response validation and the registered allowlist", async () => {
+			const custom = "fixture_provider_detail";
+			const legacy = await enterpriseErrorLocation(
+				"native",
+				new URLSearchParams({ error: custom }),
+			);
+			expect(legacy.get("error")).toBe(custom);
+			expect(legacy.get("error_description")).toBe(custom);
+			for (const query of [
+				`error=${custom}`,
+				"error=access_denied&error=consent_required",
+				"error=access_denied&code=synthetic",
+				"error=access_denied&access_token=synthetic",
+				"error=access_denied&iss=https://unrelated.fixture.example",
+			]) {
+				const redirected = await enterpriseErrorLocation(
+					"owned",
+					new URLSearchParams(query),
+				);
+				expect(redirected.getAll("callbackUrl")).toEqual([
+					enterpriseContinuation,
+				]);
+				expect(redirected.getAll("error"), query).toEqual(["invalid_provider"]);
+				expect(redirected.has("error_description")).toBe(false);
+			}
+			const wrongState = await enterpriseErrorLocation(
+				"owned",
+				new URLSearchParams({ error: "access_denied" }),
+				false,
+			);
+			expect(wrongState.get("error")).toBe("state_mismatch");
+			expect(wrongState.has("callbackUrl")).toBe(false);
 		});
 
 		it("finishes a native pending SSO callback with the exact active directory identity", async () => {

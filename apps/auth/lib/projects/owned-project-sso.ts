@@ -38,6 +38,26 @@ import { projectOrigin, projectSlug } from "./validation";
 
 const unsafeURL = /[\\\u0000-\u0020\u007f]/;
 const defaultScopes = ["openid", "email", "profile", "offline_access"];
+// OAuth 2.0 §4.1.2.1 and OpenID Connect Core §3.1.2.6.
+const authorizationErrorCodes = new Set([
+	"invalid_request",
+	"unauthorized_client",
+	"access_denied",
+	"unsupported_response_type",
+	"invalid_scope",
+	"server_error",
+	"temporarily_unavailable",
+	"interaction_required",
+	"login_required",
+	"account_selection_required",
+	"consent_required",
+	"invalid_request_uri",
+	"invalid_request_object",
+	"request_not_supported",
+	"request_uri_not_supported",
+	"registration_not_supported",
+]);
+const authorizationResultFields = ["code", "id_token", "access_token", "token"];
 const algorithms = [
 	"RS256",
 	"RS384",
@@ -389,11 +409,23 @@ export function createOwnedProjectSso(options: OwnedProjectSsoOptions) {
 		state: string,
 		flow: SsoState,
 		provider: SsoProvider,
-	): Promise<SsoIdentity> {
+	): Promise<SsoIdentity | string> {
 		const resolved = await resolveProjectOidc(provider, network, origins);
 		const { config, metadata } = resolved;
 		const client: oauth.Client = { client_id: config.clientId };
-		const query = oauth.validateAuthResponse(metadata, client, url, state);
+		let query: URLSearchParams;
+		try {
+			query = oauth.validateAuthResponse(metadata, client, url, state);
+		} catch (error) {
+			if (
+				error instanceof oauth.AuthorizationResponseError &&
+				authorizationErrorCodes.has(error.error) &&
+				!authorizationResultFields.some((field) => error.cause.has(field))
+			)
+				return error.error;
+			throw error;
+		}
+		if (!query.get("code")) return "invalid_request";
 		const auth = await projectOidcClientAuth(
 			resolved,
 			provider.providerId,
@@ -526,12 +558,13 @@ export function createOwnedProjectSso(options: OwnedProjectSsoOptions) {
 			const provider = await store.getProvider(providerId);
 			if (!provider?.oidcConfig || !sameSsoProvider(provider, reference))
 				return failure("invalid_state", flow, true);
-			let identity: SsoIdentity;
+			let identity: SsoIdentity | string;
 			try {
 				identity = await exchange(url, state, flow, provider);
 			} catch {
 				return failure("invalid_provider", flow, true);
 			}
+			if (typeof identity === "string") return failure(identity, flow, true);
 			let rejection = "internal_server_error";
 			const abort = Symbol("project SSO admission rejected");
 			try {
