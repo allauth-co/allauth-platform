@@ -1,6 +1,7 @@
 "use client";
 import { useQuery } from "@tanstack/react-query";
-import { useState } from "react";
+import { useSearchParams } from "next/navigation";
+import { useRef, useState } from "react";
 import { toast } from "sonner";
 import {
 	oauthBrowserQuery,
@@ -17,10 +18,11 @@ import {
 } from "./ui/card";
 
 interface Context {
-	client: { client_id: string; client_name: string };
+	client: { client_id: string; client_name?: string | null };
 	scopes: string[];
 	continueURL: string;
 }
+const invalidRequest = "This authorization request is invalid or has expired";
 const labels: Record<string, string> = {
 	openid: "Confirm your identity",
 	profile: "Read your name and profile",
@@ -29,31 +31,61 @@ const labels: Record<string, string> = {
 	"organization:read": "Read the selected organization",
 };
 export function OAuthConsent({ name, email }: { name: string; email: string }) {
+	const params = oauthBrowserQuery(useSearchParams());
+	const signed = params?.toString();
+	const submitting = useRef(false);
 	const [busy, setBusy] = useState(false);
 	const context = useQuery({
-		queryKey: ["oauth-context"],
-		queryFn: async (): Promise<Context> => {
-			const signed = oauthBrowserQuery(window.location.search);
-			if (!signed)
-				throw new Error("This authorization request is invalid or has expired");
+		queryKey: ["oauth-context", signed],
+		queryFn: async ({ signal }): Promise<Context> => {
+			if (!signed) throw new Error(invalidRequest);
 			const response = await fetch(`/api/oauth/context?${signed}`, {
 				cache: "no-store",
+				signal,
 			});
-			if (!response.ok)
-				throw new Error("This authorization request is invalid or has expired");
-			return response.json();
+			if (!response.ok) throw new Error(invalidRequest);
+			const verified: Context | null = await response.json().catch(() => null);
+			if (
+				verified?.continueURL !== `/oauth2/continue?${signed}` ||
+				verified.client?.client_id !== params?.get("client_id") ||
+				!Array.isArray(verified.scopes) ||
+				verified.scopes.some((scope) => typeof scope !== "string")
+			)
+				throw new Error(invalidRequest);
+			return verified;
 		},
+		enabled: Boolean(signed),
+		staleTime: 0,
+		gcTime: 0,
 		retry: false,
 	});
+	const verified =
+		context.isSuccess && context.fetchStatus === "idle" ? context.data : null;
+	const failure = !signed
+		? invalidRequest
+		: context.error
+			? errorMessage(context.error)
+			: null;
+	const clientName =
+		typeof verified?.client.client_name === "string"
+			? verified.client.client_name
+			: null;
 	const consent = async (accept: boolean) => {
+		if (!verified || !signed || submitting.current) return;
+		if (
+			oauthBrowserQuery(
+				new URLSearchParams(window.location.search),
+			)?.toString() !== signed
+		)
+			return;
+		submitting.current = true;
 		setBusy(true);
 		try {
-			await submitOAuthBrowserAction("consent", window.location.search, {
-				accept,
-			});
+			await submitOAuthBrowserAction("consent", signed, { accept });
 		} catch (e) {
 			toast.error(errorMessage(e));
 		} finally {
+			submitting.current = false;
 			setBusy(false);
 		}
 	};
@@ -61,28 +93,30 @@ export function OAuthConsent({ name, email }: { name: string; email: string }) {
 		<Card className="max-w-lg mx-auto my-8">
 			<CardHeader>
 				<CardTitle>Authorize application</CardTitle>
-				<CardDescription>
-					{context.data
-						? `${context.data.client.client_name || context.data.client.client_id} wants to access your AllAuth account.`
-						: "Checking authorization request…"}
-				</CardDescription>
+				{!failure && (
+					<CardDescription>
+						{verified
+							? `${clientName || verified.client.client_id} wants to access your AllAuth account.`
+							: "Checking authorization request…"}
+					</CardDescription>
+				)}
 			</CardHeader>
 			<CardContent className="space-y-6">
 				<div className="bg-muted p-4 rounded-md">
 					<p className="font-medium text-sm">{name}</p>
 					<p className="text-sm text-muted-foreground">{email}</p>
 				</div>
-				{context.error && (
+				{failure && (
 					<p className="text-sm text-destructive" role="alert">
-						{errorMessage(context.error)}
+						{failure}
 					</p>
 				)}
-				{context.data && (
+				{verified && (
 					<>
 						<div>
 							<p className="text-sm font-medium mb-3">Requested permissions</p>
 							<ul className="space-y-3 text-sm">
-								{context.data.scopes.map((scope) => (
+								{verified.scopes.map((scope) => (
 									<li key={scope}>{labels[scope] || scope}</li>
 								))}
 							</ul>
