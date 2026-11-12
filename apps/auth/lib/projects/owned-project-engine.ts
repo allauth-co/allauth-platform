@@ -2659,7 +2659,7 @@ export function createOwnedProjectEngine(
 			return (await oneTimeToken.dispatch(path, request)) ?? unsupported();
 		if (path.startsWith("/api-key/"))
 			return (
-				(await personalKeys(path, request)) ??
+				(await personalKeys.dispatch(path, request)) ??
 				new Response(null, { status: 404 })
 			);
 		const directoryResponse = await directory?.dispatch(path, request);
@@ -2989,6 +2989,8 @@ export function createOwnedProjectEngine(
 		readOAuthContext: async (request) =>
 			issuer ? issuer.readContext(request) : unsupported(),
 		issueOneTimeToken: oneTimeToken.issue,
+		verifyApiKey: options.sdk?.personalApiKeys ? personalKeys.verifyApiKey : undefined,
+		deleteAllExpiredApiKeys: options.sdk?.personalApiKeys ? personalKeys.deleteAllExpiredApiKeys : undefined,
 		manageSCIMConsole: options.manageSCIMConsole,
 		manageOrganizationConsole: options.manageOrganizationConsole,
 		manageUserConsole: options.manageUserConsole,

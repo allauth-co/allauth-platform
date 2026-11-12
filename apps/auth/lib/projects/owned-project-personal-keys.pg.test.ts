@@ -166,6 +166,7 @@ describe.skipIf(!existsSync(fixturePath))(
 				signingSecret,
 				policy: defaultAuthPolicy,
 				trustedIP: () => "203.0.113.81",
+				sdk: { personalApiKeys: true },
 			});
 		});
 
@@ -200,6 +201,112 @@ describe.skipIf(!existsSync(fixturePath))(
 		async function verify(key: string) {
 			return native.api.verifyApiKey({ body: { key, permissions } });
 		}
+
+		it("verifies the persisted key and server-only rate and expiry state across writers", async () => {
+			const account = await user("server-key-interoperation");
+			const headers = new Headers({ cookie: account.cookie, origin });
+			const mint = (name: string) =>
+				native.api.createApiKey({ body: { name }, headers });
+			const minted = await mint("Server verification");
+			const other = await mint("Independent active key");
+			const input = { key: minted.key, configId: "default", permissions };
+			const first = await native.api.verifyApiKey({
+				body: input,
+				asResponse: true,
+			});
+			expect(await json(first)).toMatchObject({
+				valid: true,
+				error: null,
+				key: { id: minted.id, requestCount: 1, permissions },
+			});
+			const second = await owned.verifyApiKey!(input);
+			expect(second.headers.get("cache-control")).toBe("no-store");
+			const secondBody = await json(second);
+			expect(secondBody).toMatchObject({
+				valid: true,
+				error: null,
+				key: { id: minted.id, requestCount: 2, permissions },
+			});
+			expect(secondBody.key).not.toHaveProperty("key");
+			expect(JSON.stringify(secondBody)).not.toContain(minted.key);
+			expect(await verify(minted.key)).toMatchObject({
+				valid: true,
+				error: null,
+				key: { id: minted.id, requestCount: 3 },
+			});
+			for (const body of [
+				{ ...input, key: "synthetic-unknown-key" },
+				{ ...input, configId: "other" },
+				{ ...input, permissions: { identity: ["write"] } },
+				{ ...input, permissions: {} },
+			]) {
+				expect(await json(await owned.verifyApiKey!(body))).toEqual(
+					await json(await native.api.verifyApiKey({ body, asResponse: true })),
+				);
+			}
+
+			await database.query(
+				`UPDATE "${schema}"."apikey" SET "requestCount"=100,"lastRequest"=now() WHERE id=$1`,
+				[minted.id],
+			);
+			const [oldLimit, newLimit] = await Promise.all([
+				native.api.verifyApiKey({ body: input, asResponse: true }),
+				owned.verifyApiKey!(input),
+			]);
+			for (const limit of [oldLimit, newLimit]) {
+				expect(await json(limit)).toMatchObject({
+					valid: false,
+					key: null,
+					error: {
+						code: "RATE_LIMITED",
+						message: "Rate limit exceeded.",
+						details: { tryAgainIn: expect.any(Number) },
+					},
+				});
+			}
+			await database.query(
+				`UPDATE "${schema}"."apikey" SET "expiresAt"=now()-interval '1 minute' WHERE id=$1`,
+				[minted.id],
+			);
+			expect(await json(await owned.verifyApiKey!(input))).toEqual({
+				valid: false,
+				key: null,
+				error: { code: "KEY_EXPIRED", message: "API Key has expired" },
+			});
+			expect(await verify(minted.key)).toMatchObject({
+				valid: false,
+				key: null,
+			});
+
+			const expired = await mint("Expired maintenance key");
+			await database.query(
+				`UPDATE "${schema}"."apikey" SET "expiresAt"=now()-interval '1 minute' WHERE id=$1`,
+				[expired.id],
+			);
+			expect(await json(await owned.deleteAllExpiredApiKeys!())).toEqual({
+				success: true,
+				error: null,
+			});
+			expect(await verify(expired.key)).toMatchObject({
+				valid: false,
+				key: null,
+			});
+			expect(await verify(other.key)).toMatchObject({
+				valid: true,
+				key: { id: other.id },
+			});
+			for (const writer of [native.handler, owned.dispatch])
+				expect(
+					(
+						await writer(
+							request("/api-key/delete-all-expired-api-keys", {
+								body: {},
+								cookie: account.cookie,
+							}),
+						)
+					).status,
+				).toBe(404);
+		});
 
 		it("writes native-readable personal key records and preserves usage limits through rollback", async () => {
 			const account = await user("owned-key");

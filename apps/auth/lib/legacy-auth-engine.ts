@@ -16,7 +16,10 @@ type LegacyInstance = Pick<AuthInstance, "$context" | "handler"> & {
 		| "getOAuthServerConfig"
 		| "getOAuthClientPublicPrelogin"
 		| "generateOneTimeToken"
-	>;
+	> &
+		Partial<
+			Pick<AuthInstance["api"], "verifyApiKey" | "deleteAllExpiredApiKeys">
+		>;
 };
 
 const engines = new WeakMap<LegacyInstance, AuthEngine>();
@@ -30,8 +33,24 @@ export function legacyAuthEngine(instance: LegacyInstance): AuthEngine {
 		return runWithAdapter((await instance.$context).adapter, operation);
 	}
 
+	async function privateResponse(operation: () => Promise<Response>) {
+		const response = await withAdapter(operation);
+		response.headers.set("cache-control", "no-store");
+		return response;
+	}
+
+	const verifyApiKey = instance.api.verifyApiKey;
+	const deleteAllExpiredApiKeys = instance.api.deleteAllExpiredApiKeys;
 	const engine: AuthEngine = {
 		dispatch: (request) => instance.handler(request),
+		verifyApiKey:
+			verifyApiKey &&
+			((body) =>
+				privateResponse(() => verifyApiKey({ body, asResponse: true }))),
+		deleteAllExpiredApiKeys:
+			deleteAllExpiredApiKeys &&
+			(() =>
+				privateResponse(() => deleteAllExpiredApiKeys({ asResponse: true }))),
 		issueOneTimeToken: (headers) =>
 			isServerTokenRequest(headers)
 				? withAdapter(async () => {

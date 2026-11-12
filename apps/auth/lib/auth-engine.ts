@@ -6,6 +6,12 @@ import type { OwnedProjectUserConsole } from "./projects/owned-project-user-cons
 import type { DirectoryOperation } from "./projects/service-directory-transport";
 import type { SessionCheckAdmission } from "./projects/session-introspection-admission";
 
+export interface PersonalApiKeyVerification {
+	key: string;
+	configId?: string;
+	permissions?: Record<string, string[]>;
+}
+
 /** Operations on the authentication realm already selected by trusted routing. */
 export interface AuthEngine {
 	dispatch(request: Request): Promise<Response>;
@@ -13,6 +19,9 @@ export interface AuthEngine {
 	readOAuthContext(request: Request): Promise<Response>;
 	/** Server-only session transfer. The HTTP generation endpoint stays disabled. */
 	issueOneTimeToken?(headers: Headers): Promise<Response>;
+	/** These key operations are reserved for server code in the selected realm. */
+	verifyApiKey?(input: PersonalApiKeyVerification): Promise<Response>;
+	deleteAllExpiredApiKeys?(): Promise<Response>;
 	manageSCIMConsole?: OwnedProjectSCIMConsole;
 	manageOrganizationConsole?: OwnedProjectOrganizationConsole;
 	manageUserConsole?: OwnedProjectUserConsole;

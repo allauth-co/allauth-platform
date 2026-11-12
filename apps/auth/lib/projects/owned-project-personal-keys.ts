@@ -1,6 +1,7 @@
 import { randomInt, randomUUID } from "node:crypto";
 import type { Pool, PoolClient } from "pg";
 import * as z from "zod";
+import type { PersonalApiKeyVerification } from "../auth-engine";
 import { createProjectEngineStore } from "./owned-project-engine-store";
 import { issuerDigest } from "./owned-project-issuer-http";
 import { admitOwnedProjectNativeRoute } from "./owned-project-native-admission";
@@ -91,6 +92,21 @@ type KeyRow = Record<(typeof columns)[number], unknown> & {
 	id: string;
 	permissions: string | null;
 	metadata: string | null;
+};
+
+type VerifiableKey = KeyRow & {
+	enabled: boolean | null;
+	expiresAt: Date | null;
+	lastRequest: Date | null;
+	rateLimitEnabled: boolean | null;
+	rateLimitTimeWindow: number | null;
+	rateLimitMax: number | null;
+	requestCount: number;
+	remaining: number | null;
+	createdAt: Date;
+	lastRefillAt: Date | null;
+	refillAmount: number | null;
+	refillInterval: number | null;
 };
 
 type KeyAuthority = {
@@ -184,9 +200,159 @@ function apiKeyResponse(body: object, authority: KeyAuthority) {
 	return Response.json(body, { headers });
 }
 
-/** HTTP lifecycle for personal keys in the selected project's native default configuration. */
+function permits(
+	permissions: string | null,
+	requested: PersonalApiKeyVerification["permissions"],
+) {
+	if (!requested) return true;
+	const grants = writeFields.permissions.safeParse(
+		parseStoredJSON(permissions, 1),
+	);
+	const allowed = grants.success ? grants.data : undefined;
+	if (!allowed) return false;
+	const resources = Object.entries(requested);
+	return (
+		resources.length > 0 &&
+		resources.every(
+			([resource, actions]) =>
+				Object.hasOwn(allowed, resource) &&
+				actions.length > 0 &&
+				actions.every((action) => allowed[resource]!.includes(action)),
+		)
+	);
+}
+
+function serverKeyResponse(body: object) {
+	return Response.json(body, { headers: { "cache-control": "no-store" } });
+}
+
+function invalidKey(
+	code: string,
+	message: string,
+	details?: { tryAgainIn: number },
+) {
+	return serverKeyResponse({
+		valid: false,
+		error: { code, message, ...(details && { details }) },
+		key: null,
+	});
+}
+
+function calculateKeyQuota(row: VerifiableKey, now: Date) {
+	let { remaining, lastRefillAt } = row;
+	if (remaining === null) return { remaining, lastRefillAt };
+	if (
+		row.refillInterval &&
+		row.refillAmount &&
+		now.getTime() - (lastRefillAt ?? row.createdAt).getTime() >
+			row.refillInterval
+	) {
+		remaining = row.refillAmount;
+		lastRefillAt = now;
+	}
+	return { remaining: remaining - 1, lastRefillAt };
+}
+
+function calculateKeyRate(
+	row: VerifiableKey,
+	now: Date,
+): { requestCount: number; lastRequest: Date | null } | { tryAgainIn: number } {
+	const { lastRequest, rateLimitTimeWindow, rateLimitMax, requestCount } = row;
+	if (row.rateLimitEnabled === false) return { requestCount, lastRequest: now };
+	if (rateLimitTimeWindow === null || rateLimitMax === null)
+		return { requestCount, lastRequest };
+	if (
+		lastRequest === null ||
+		now.getTime() - lastRequest.getTime() > rateLimitTimeWindow
+	)
+		return { requestCount: 1, lastRequest: now };
+	if (requestCount >= rateLimitMax)
+		return {
+			tryAgainIn: Math.ceil(
+				rateLimitTimeWindow - (now.getTime() - lastRequest.getTime()),
+			),
+		};
+	return { requestCount: requestCount + 1, lastRequest: now };
+}
+
+/** Browser lifecycle and server verification for the installed default key configuration. */
 export function createOwnedProjectPersonalKeys(options: PersonalKeyOptions) {
 	const store = createProjectEngineStore(options.database, options.schemaName);
+
+	async function verifyApiKey(input: PersonalApiKeyVerification) {
+		const invalid = () => invalidKey("INVALID_API_KEY", "Invalid API key.");
+		if (input.configId && input.configId !== "default") return invalid();
+		return store.transaction(async (client) => {
+			const { rows } = await client.query<VerifiableKey>(
+				`SELECT ${publicColumns} FROM "apikey" WHERE key=$1 AND ${defaultConfiguration}
+				 ORDER BY id LIMIT 2 FOR UPDATE`,
+				[issuerDigest(input.key)],
+			);
+			if (rows.length !== 1) return invalid();
+			const row = rows[0]!;
+			if (row.enabled === false)
+				return invalidKey("KEY_DISABLED", "API Key is disabled");
+			const now = new Date();
+			if (row.expiresAt && row.expiresAt < now) {
+				await client.query('DELETE FROM "apikey" WHERE id=$1', [row.id]);
+				return invalidKey("KEY_EXPIRED", "API Key has expired");
+			}
+			if (!permits(row.permissions, input.permissions))
+				return invalidKey("KEY_NOT_FOUND", "API Key not found");
+			const quota = calculateKeyQuota(row, now);
+			if (quota.remaining !== null && quota.remaining < 0) {
+				if (row.remaining === 0 && row.refillAmount === null)
+					await client.query('DELETE FROM "apikey" WHERE id=$1', [row.id]);
+				return invalidKey(
+					"USAGE_EXCEEDED",
+					"API Key has reached its usage limit",
+				);
+			}
+			const rate = calculateKeyRate(row, now);
+			if ("tryAgainIn" in rate) {
+				if (
+					quota.remaining !== row.remaining ||
+					quota.lastRefillAt !== row.lastRefillAt
+				)
+					await client.query(
+						'UPDATE "apikey" SET remaining=$2,"lastRefillAt"=$3 WHERE id=$1',
+						[row.id, quota.remaining, quota.lastRefillAt],
+					);
+				return invalidKey("RATE_LIMITED", "Rate limit exceeded.", {
+					tryAgainIn: rate.tryAgainIn,
+				});
+			}
+			const {
+				rows: [current],
+			} = await client.query<KeyRow>(
+				`UPDATE "apikey" SET remaining=$2,"lastRefillAt"=$3,"requestCount"=$4,"lastRequest"=$5,"updatedAt"=$6
+				 WHERE id=$1 RETURNING ${publicColumns}`,
+				[
+					row.id,
+					quota.remaining,
+					quota.lastRefillAt,
+					rate.requestCount,
+					rate.lastRequest,
+					now,
+				],
+			);
+			if (!current) return invalid();
+			return serverKeyResponse({
+				valid: true,
+				error: null,
+				key: publicKey(current),
+			});
+		});
+	}
+
+	async function deleteAllExpiredApiKeys() {
+		await store.transaction((client) =>
+			client.query(
+				'DELETE FROM "apikey" WHERE "expiresAt" < statement_timestamp()',
+			),
+		);
+		return serverKeyResponse({ success: true, error: null });
+	}
 
 	async function checkOrganizationListing(
 		client: PoolClient,
@@ -455,7 +621,7 @@ export function createOwnedProjectPersonalKeys(options: PersonalKeyOptions) {
 		return apiKeyResponse({ success: true }, authority);
 	}
 
-	return async function dispatch(path: string, request: Request) {
+	async function dispatch(path: string, request: Request) {
 		if (!isKeyRoute(path) || request.method !== routes[path]) return;
 		const limited = await store.transaction((client) =>
 			admitOwnedProjectNativeRoute(client, options.trustedIP(request), path, {
@@ -487,5 +653,7 @@ export function createOwnedProjectPersonalKeys(options: PersonalKeyOptions) {
 					return revoke(client, authority, body);
 			}
 		});
-	};
+	}
+
+	return { dispatch, verifyApiKey, deleteAllExpiredApiKeys };
 }
