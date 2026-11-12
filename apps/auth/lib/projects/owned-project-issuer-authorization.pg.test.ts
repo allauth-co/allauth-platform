@@ -11,6 +11,7 @@ import { Kysely, PostgresDialect } from "kysely";
 import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { defaultAuthPolicy } from "../auth-policy/policy";
+import { isPlatformAdmin } from "../configuration";
 import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
 import { readLegacySessionCookie } from "./legacy-session-cookie";
 import { createOwnedProjectEngine } from "./owned-project-engine";
@@ -143,6 +144,11 @@ describe.skipIf(!existsSync(fixture))(
 					advanced: { cookiePrefix: "allauth_project_issuer-fixture" },
 					onAPIError: { errorURL },
 					session: { cookieCache: { enabled: false } },
+					user: {
+						additionalFields: {
+							role: { type: "string", required: false, input: false },
+						},
+					},
 					logger: { disabled: true },
 					plugins: [
 						organization(),
@@ -161,6 +167,9 @@ describe.skipIf(!existsSync(fixture))(
 							grantTypes: ["authorization_code", "refresh_token"],
 							codeExpiresIn: 60,
 							enforcePerClientResources: true,
+							clientReference: () => "allauth:platform",
+							clientPrivileges: ({ user, session }) =>
+								isPlatformAdmin(user, session),
 							postLogin: {
 								page: "/oauth/select-organization",
 								shouldRedirect: ({ session, scopes }) =>
@@ -288,8 +297,8 @@ describe.skipIf(!existsSync(fixture))(
 			return response;
 		}
 
-		it("preserves ownership and stored updates for connected-app consent management", async () => {
-			const engine = createOwnedProjectEngine({
+		function managementEngine() {
+			return createOwnedProjectEngine({
 				database,
 				project: { slug: "issuer-fixture", schemaName: schema },
 				policy: defaultAuthPolicy,
@@ -300,6 +309,10 @@ describe.skipIf(!existsSync(fixture))(
 				trustedIP: () => "192.0.2.29",
 				issuer: true,
 			});
+		}
+
+		it("preserves ownership and stored updates for connected-app consent management", async () => {
+			const engine = managementEngine();
 			const owner = await browser();
 			const other = await browser();
 			const clientId = await registration();
@@ -368,6 +381,83 @@ describe.skipIf(!existsSync(fixture))(
 			);
 			expect(removed.status).toBe(200);
 			expect((await legacy(consentRequest())).status).toBe(404);
+		});
+
+		it("preserves client catalog fields, private ownership, signed prelogin and native deletion semantics", async () => {
+			const engine = managementEngine();
+			const administrator = await browser();
+			const ordinary = await browser();
+			await database.query(
+				`UPDATE "${schema}"."user" SET role='admin' WHERE id=$1`,
+				[administrator.userId],
+			);
+			const clientId = await registration();
+			const otherId = await registration();
+			await database.query(
+				`UPDATE "${schema}"."oauthClient" SET "referenceId"='allauth:platform',
+				 "clientSecret"=$2,"tokenEndpointAuthMethod"='client_secret_basic',
+				 "createdAt"=now(),uri='https://app.project-issuer.fixture.example',
+				 metadata='{"allauthFixture":"opaque"}'::jsonb WHERE "clientId"=$1`,
+				[clientId, issuerDigest("synthetic-client-credential")],
+			);
+			await database.query(
+				`UPDATE "${schema}"."oauthClient" SET "userId"=$2 WHERE "clientId"=$1`,
+				[otherId, ordinary.userId],
+			);
+			const detail = (cookie = administrator.cookie, id = clientId) =>
+				request("/oauth2/get-client", {
+					cookie,
+					query: new URLSearchParams({ client_id: id }),
+				});
+			const native = await legacy(detail());
+			expect(native.status).toBe(200);
+			const expected = await native.json();
+			expect(expected).not.toHaveProperty("client_secret");
+			expect(await (await engine.dispatch(detail())).json()).toEqual(expected);
+			expect((await engine.dispatch(detail(ordinary.cookie))).status).toBe(401);
+			expect(
+				(await engine.dispatch(detail(administrator.cookie, otherId))).status,
+			).toBe(401);
+			const list = () =>
+				request("/oauth2/get-clients", { cookie: administrator.cookie });
+			expect(await (await engine.dispatch(list())).json()).toEqual(
+				await (await legacy(list())).json(),
+			);
+			const publicClient = () =>
+				request("/oauth2/public-client", {
+					cookie: ordinary.cookie,
+					query: new URLSearchParams({ client_id: clientId }),
+				});
+			const publicData = await (await legacy(publicClient())).json();
+			expect(await (await engine.dispatch(publicClient())).json()).toEqual(
+				publicData,
+			);
+			const login = await resultURL(
+				await candidate("/oauth2/authorize", { query: query(clientId) }),
+			);
+			const prelogin = (
+				id: string,
+				oauthQuery = login.searchParams.toString(),
+			) =>
+				request("/oauth2/public-client-prelogin", {
+					body: { client_id: id, oauth_query: oauthQuery },
+				});
+			expect(await (await engine.dispatch(prelogin(clientId))).json()).toEqual(
+				publicData,
+			);
+			expect((await engine.dispatch(prelogin(otherId))).status).toBe(401);
+			expect(
+				(await engine.dispatch(prelogin(clientId, "client_id=unverified")))
+					.status,
+			).toBe(401);
+			const remove = (id: string) =>
+				request("/oauth2/delete-client", {
+					cookie: administrator.cookie,
+					body: { client_id: id },
+				});
+			expect((await engine.dispatch(remove(otherId))).status).toBe(401);
+			expect((await engine.dispatch(remove(clientId))).status).toBe(200);
+			expect((await legacy(detail())).status).toBe(404);
 		});
 
 		it("resumes native consent, writes legacy-readable grants, and redeems the code after switching back", async () => {

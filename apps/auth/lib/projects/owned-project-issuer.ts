@@ -2,6 +2,7 @@ import type { LegacyMfaKeys } from "./legacy-mfa-record";
 import { createProjectEngineStore } from "./owned-project-engine-store";
 import type { OwnedProjectIssuerAuthorizationOptions } from "./owned-project-issuer-authorization";
 import { createOwnedProjectIssuerAuthorization } from "./owned-project-issuer-authorization";
+import { createOwnedProjectIssuerClients } from "./owned-project-issuer-clients";
 import { createOwnedProjectConsentManagement } from "./owned-project-issuer-consent-management";
 import { createOwnedProjectIssuerDevice } from "./owned-project-issuer-device";
 import { issuerJSON } from "./owned-project-issuer-http";
@@ -25,6 +26,11 @@ const providerAdmission = new Map<string, { methods: string[]; max: number }>([
 	["/oauth2/get-consents", { methods: ["GET"], max: 100 }],
 	["/oauth2/update-consent", { methods: ["POST"], max: 100 }],
 	["/oauth2/delete-consent", { methods: ["POST"], max: 100 }],
+	["/oauth2/get-client", { methods: ["GET"], max: 100 }],
+	["/oauth2/get-clients", { methods: ["GET"], max: 100 }],
+	["/oauth2/public-client", { methods: ["GET"], max: 100 }],
+	["/oauth2/public-client-prelogin", { methods: ["POST"], max: 100 }],
+	["/oauth2/delete-client", { methods: ["POST"], max: 100 }],
 	["/oauth2/end-session", { methods: ["GET", "POST"], max: 100 }],
 	["/oauth2/end-session/confirm", { methods: ["POST"], max: 100 }],
 	["/jwks", { methods: ["GET"], max: 100 }],
@@ -36,9 +42,9 @@ export function createOwnedProjectIssuer(
 		projectSlug: string;
 		platformOrigin: string;
 		trustedIP(request: Request): string | null;
-		authorizeConsentManagement: Parameters<
-			typeof createOwnedProjectConsentManagement
-		>[0]["authorize"];
+		readManagementUser: Parameters<
+			typeof createOwnedProjectIssuerClients
+		>[0]["readManagementUser"];
 		logout: Pick<
 			OwnedProjectIssuerLogoutOptions,
 			"sessionCookie" | "revokeSession" | "clearBrowserSession"
@@ -50,8 +56,13 @@ export function createOwnedProjectIssuer(
 	const consentManagement = createOwnedProjectConsentManagement({
 		store,
 		readBody: options.readBody,
-		authorize: options.authorizeConsentManagement,
+		async authorize(client, request, write) {
+			return (
+				(await options.readManagementUser(client, request, write))?.id ?? null
+			);
+		},
 	});
+	const clients = createOwnedProjectIssuerClients({ ...options, store });
 	const device = createOwnedProjectIssuerDevice(options);
 	const logout = createOwnedProjectIssuerLogout({
 		...options,
@@ -89,6 +100,7 @@ export function createOwnedProjectIssuer(
 		return (
 			(await authorization(path, request)) ??
 			(await consentManagement(path, request)) ??
+			(await clients(path, request)) ??
 			(await logout(path, request)) ??
 			device(path, request)
 		);

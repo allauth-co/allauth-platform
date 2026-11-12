@@ -404,7 +404,7 @@ export function createOwnedProjectEngine(
 				},
 			},
 			readSession: (request, client) => currentSession(request.headers, client),
-			async authorizeConsentManagement(client, request, write) {
+			async readManagementUser(client, request, write) {
 				const bearer = serverSessionBearer(request.headers);
 				if (!bearer && !trustedRequest(request.headers, write)) return null;
 				const current = await eligibleSession(
@@ -412,7 +412,7 @@ export function createOwnedProjectEngine(
 					client,
 				);
 				if (!current) return null;
-				if (!write) return current.user.id;
+				if (!write) return current.user;
 				const user = await store.lockUser(client, current.user.id);
 				if (
 					!user ||
@@ -423,7 +423,7 @@ export function createOwnedProjectEngine(
 					!(await store.lockSession(client, current.token, user.id, false))
 				)
 					return null;
-				return user.id;
+				return user;
 			},
 			async readConsoleOAuthSession(request, client) {
 				return (
