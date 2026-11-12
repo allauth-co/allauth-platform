@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { type FormEvent, useEffect, useId, useRef, useState } from "react";
 import { appCallback, authError } from "@/sdk/helpers";
 import { useAllAuth, withAuthReturnTo } from "@/sdk/react";
 import { HostedProjectCard } from "./hosted-project-forms";
@@ -25,17 +25,21 @@ function retrySeconds(value?: string) {
 }
 
 function VerificationResend({
-	email,
+	rememberedEmail,
 	destination,
 }: {
-	email: string;
+	rememberedEmail: string;
 	destination: string;
 }) {
 	const { client, capabilities } = useAllAuth();
+	const id = useId();
 	const active = useRef<AbortController | null>(null);
-	const [remaining, setRemaining] = useState(resendCooldownSeconds);
-	const [resendAt, setResendAt] = useState(
-		() => Date.now() + resendCooldownSeconds * 1000,
+	const [email, setEmail] = useState(rememberedEmail);
+	const [remaining, setRemaining] = useState(
+		rememberedEmail ? resendCooldownSeconds : 0,
+	);
+	const [resendAt, setResendAt] = useState(() =>
+		rememberedEmail ? Date.now() + resendCooldownSeconds * 1000 : 0,
 	);
 	const [busy, setBusy] = useState(false);
 	const [message, setMessage] = useState("");
@@ -43,6 +47,7 @@ function VerificationResend({
 
 	useEffect(() => () => active.current?.abort(), []);
 	useEffect(() => {
+		if (!resendAt) return;
 		const timer = window.setInterval(() => {
 			const seconds = Math.max(0, Math.ceil((resendAt - Date.now()) / 1000));
 			setRemaining(seconds);
@@ -56,8 +61,17 @@ function VerificationResend({
 		setResendAt(Date.now() + seconds * 1000);
 	}
 
-	async function resend() {
-		if (!capabilities || active.current || Date.now() < resendAt) return;
+	async function resend(event: FormEvent<HTMLFormElement>) {
+		event.preventDefault();
+		const address = email.trim();
+		if (
+			!capabilities ||
+			active.current ||
+			Date.now() < resendAt ||
+			!address ||
+			!event.currentTarget.reportValidity()
+		)
+			return;
 		const controller = new AbortController();
 		active.current = controller;
 		setBusy(true);
@@ -66,7 +80,7 @@ function VerificationResend({
 		try {
 			const result = await client.sendVerificationEmail(
 				{
-					email,
+					email: address,
 					callbackURL: appCallback(destination, window.location.origin),
 				},
 				{ signal: controller.signal },
@@ -82,7 +96,9 @@ function VerificationResend({
 					"Verification email could not be requested. Please try again.",
 				);
 			coolDown();
-			setMessage("Check your inbox for a new verification link.");
+			setMessage(
+				"If this email needs verification, check your inbox for a new verification link.",
+			);
 		} catch (cause) {
 			if (!controller.signal.aborted) setError(authError(cause));
 		} finally {
@@ -93,7 +109,24 @@ function VerificationResend({
 
 	if (!capabilities) return null;
 	return (
-		<div className="allauth-stack">
+		<form className="allauth-stack" onSubmit={(event) => void resend(event)}>
+			<div className="allauth-field">
+				<label htmlFor={id}>Email address</label>
+				<input
+					id={id}
+					name="email"
+					type="email"
+					autoComplete="email"
+					required
+					value={email}
+					onChange={(event) => {
+						setEmail(event.target.value);
+						setMessage("");
+						setError("");
+					}}
+					disabled={busy}
+				/>
+			</div>
 			{message && <p role="status">{message}</p>}
 			{error && (
 				<p className="allauth-error" role="alert">
@@ -101,18 +134,19 @@ function VerificationResend({
 				</p>
 			)}
 			<button
-				type="button"
+				type="submit"
 				className="allauth-secondary"
-				disabled={busy || remaining > 0}
-				onClick={() => void resend()}
+				disabled={busy || remaining > 0 || !email.trim()}
 			>
 				{busy
 					? "Sending…"
 					: remaining > 0
 						? `Resend in ${remaining}s`
-						: "Resend verification email"}
+						: rememberedEmail || message
+							? "Resend verification email"
+							: "Send verification email"}
 			</button>
-		</div>
+		</form>
 	);
 }
 
@@ -129,13 +163,15 @@ export function HostedProjectEmailStatus({
 	showEmail: boolean;
 }) {
 	const { capabilities, configError, reloadConfig } = useAllAuth();
-	const [email, setEmail] = useState("");
+	const [email, setEmail] = useState<string | null>(null);
 	useEffect(() => {
+		let remembered = "";
 		try {
-			setEmail(window.sessionStorage.getItem(emailKeys[view]) ?? "");
+			remembered = window.sessionStorage.getItem(emailKeys[view]) ?? "";
 		} catch {
-			// Instructions are still available when browser storage is disabled.
+			// Verification can use a typed address when browser storage is disabled.
 		}
+		setEmail(remembered);
 	}, [view]);
 
 	const verifying = view === "verifyEmail";
@@ -165,7 +201,9 @@ export function HostedProjectEmailStatus({
 		>
 			<div className="allauth-stack">
 				<p>{instruction}</p>
-				{email && <p className="allauth-muted">{email}</p>}
+				{email && (!verifying || !showEmail) && (
+					<p className="allauth-muted">{email}</p>
+				)}
 				{configError && (
 					<>
 						<p className="allauth-error" role="alert">
@@ -180,10 +218,10 @@ export function HostedProjectEmailStatus({
 						</button>
 					</>
 				)}
-				{verifying && showEmail && email && (
+				{verifying && showEmail && email !== null && (
 					<VerificationResend
 						key={destination}
-						email={email}
+						rememberedEmail={email}
 						destination={destination}
 					/>
 				)}

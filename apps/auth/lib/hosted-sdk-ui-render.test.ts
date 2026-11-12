@@ -12,6 +12,8 @@ import type {
 
 const native = vi.hoisted(() => ({
 	social: vi.fn(),
+	signUp: vi.fn(),
+	getSession: vi.fn(),
 	signOut: vi.fn(),
 	sendVerificationEmail: vi.fn(),
 	onChallenge: undefined as ((methods?: string[]) => void) | undefined,
@@ -24,6 +26,8 @@ vi.mock("@/sdk/client", () => ({
 		native.onChallenge = onChallenge;
 		return {
 			signIn: { social: native.social },
+			signUp: { email: native.signUp },
+			getSession: native.getSession,
 			signOut: native.signOut,
 			sendVerificationEmail: native.sendVerificationEmail,
 		};
@@ -44,6 +48,8 @@ afterEach(async () => {
 	vi.useRealTimers();
 	window.sessionStorage.clear();
 	native.social.mockReset();
+	native.signUp.mockReset();
+	native.getSession.mockReset();
 	native.signOut.mockReset();
 	native.sendVerificationEmail.mockReset();
 	native.onChallenge = undefined;
@@ -142,6 +148,39 @@ it("resends verification to the remembered email after the cooldown and honors s
 		"new verification link",
 	);
 	expect(resend.textContent).toBe("Resend in 60s");
+});
+
+it("keeps the signed return when requesting verification without a remembered email", async () => {
+	vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+	vi.stubGlobal("fetch", async () =>
+		Response.json({
+			emailPassword: true,
+			google: false,
+			organizations: true,
+			twoFactor: true,
+		}),
+	);
+	native.sendVerificationEmail.mockResolvedValue({
+		data: { status: true },
+		error: null,
+	});
+	const signed =
+		"/oauth2/continue?client_id=fixture&resource=one&resource=two&sig=fixture%2Bsignature";
+	const container = await renderHostedAuth("verifyEmail", signed);
+	expect(container.querySelector('input[name="email"]')).not.toBeNull();
+	await enter(container, "email", "signup@customer.example");
+	await submit(container);
+	expect(native.sendVerificationEmail).toHaveBeenCalledExactlyOnceWith(
+		{
+			email: "signup@customer.example",
+			callbackURL: `https://accounts.customer.example${signed}`,
+		},
+		{ signal: expect.any(AbortSignal) },
+	);
+	expect(container.querySelector('[role="status"]')?.textContent).toContain(
+		"If this email needs verification",
+	);
+	expect(container.querySelector("button")?.disabled).toBe(true);
 });
 
 it.each([
@@ -296,13 +335,25 @@ it("renders the project branding and sends the existing AllAuth broker the exact
 		...container.querySelectorAll('nav[aria-label="Sign-in methods"] a'),
 	];
 	expect(
+		methods.map(
+			(link) =>
+				new URL(link.getAttribute("href")!, window.location.origin).pathname,
+		),
+	).toEqual([
+		"/sign-in",
+		"/magic-link",
+		"/email-otp",
+		"/enterprise-sign-in",
+		"/verify-email",
+	]);
+	expect(
 		methods.map((link) =>
 			new URL(
 				link.getAttribute("href")!,
 				window.location.origin,
 			).searchParams.get("returnTo"),
 		),
-	).toEqual([destination, destination, destination, destination]);
+	).toEqual([destination, destination, destination, destination, destination]);
 	expect(
 		container
 			.querySelector('a[href^="/sign-in?interface=legacy"]')
@@ -382,6 +433,48 @@ it("keeps the broker registration action unavailable when the project disables s
 	const container = await renderHostedAuth("signUp");
 	expect(container.textContent).toContain("Account creation is not enabled");
 	expect(container.textContent).not.toContain("Continue with AllAuth");
+});
+
+it("hands a hosted email signup awaiting verification to the first-party verification page", async () => {
+	vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+	vi.stubGlobal("fetch", async () =>
+		Response.json({
+			emailPassword: true,
+			google: false,
+			organizations: true,
+			twoFactor: true,
+			signUpEnabled: true,
+			emailVerificationRequired: true,
+			branding: { name: "Customer portal", showPoweredBy: false },
+		}),
+	);
+	native.signUp.mockResolvedValue({
+		data: { user: { id: "fixture-user" } },
+		error: null,
+	});
+	native.getSession.mockResolvedValue({ data: null, error: null });
+	const assign = vi
+		.spyOn(window.location, "assign")
+		.mockImplementation(() => {});
+	const signed =
+		"/oauth2/continue?client_id=fixture&resource=one&resource=two&sig=fixture%2Bsignature";
+	const container = await renderHostedAuth("signUp", signed);
+	expect(container.textContent).toContain(
+		"Create your Customer portal account",
+	);
+	await enter(container, "firstName", "Fixture");
+	await enter(container, "email", "signup@customer.example");
+	await enter(container, "password", "Synthetic-ready-password-123!");
+	await submit(container);
+	expect(native.signUp).toHaveBeenCalledExactlyOnceWith({
+		name: "Fixture",
+		email: "signup@customer.example",
+		password: "Synthetic-ready-password-123!",
+		callbackURL: `https://accounts.customer.example${signed}`,
+	});
+	expect(assign).toHaveBeenCalledExactlyOnceWith(
+		`/verify-email?${new URLSearchParams({ returnTo: signed })}`,
+	);
 });
 
 function hostedRequests(

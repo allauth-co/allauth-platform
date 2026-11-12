@@ -157,6 +157,16 @@ function HostedProjectChoices({
 							Sign in with your organization
 						</a>
 					)}
+					{showPassword &&
+						showEmail &&
+						capabilities.emailVerificationRequired !== false && (
+							<a
+								className="underline"
+								href={withAuthReturnTo("/verify-email", destination)}
+							>
+								Resend verification email
+							</a>
+						)}
 				</nav>
 			)}
 			<a className="text-sm underline" href={legacyPath}>
@@ -172,7 +182,11 @@ function HostedProjectSignUp({
 	destination,
 	legacyPath,
 	showBroker,
-}: Pick<HostedProjectAuthProps, "destination" | "legacyPath" | "showBroker">) {
+	showEmail,
+}: Pick<
+	HostedProjectAuthProps,
+	"destination" | "legacyPath" | "showBroker" | "showEmail"
+>) {
 	const { capabilities, branding } = useAllAuth();
 	const choices = (
 		<HostedProjectChoices
@@ -212,7 +226,11 @@ function HostedProjectSignUp({
 	}
 	return (
 		<>
-			<SignUp afterSignUpUrl={destination} signInUrl="/sign-in" />
+			<SignUp
+				afterSignUpUrl={destination}
+				checkEmailUrl={showEmail ? "/verify-email" : undefined}
+				signInUrl="/sign-in"
+			/>
 			{choices}
 		</>
 	);
@@ -257,6 +275,7 @@ export function HostedProjectAuth({
 						destination={destination}
 						legacyPath={legacyPath}
 						showBroker={showBroker}
+						showEmail={showEmail}
 					/>
 				)}
 				{view === "forgotPassword" && (

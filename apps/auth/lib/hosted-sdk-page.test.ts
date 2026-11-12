@@ -422,18 +422,20 @@ it("selects email status views only for an enabled hosted project without a bear
 	}
 	const signedQuery = "client_id=fixture&resource=one&resource=two&sig=signed";
 	const destination = `/oauth2/continue?${signedQuery}`;
-	engine.readOAuthContext.mockResolvedValue(
+	engine.readOAuthContext.mockImplementation(async () =>
 		Response.json({ continueURL: destination }),
 	);
-	const signed = await HostedProjectAuthPage({
-		view: "verifyEmail",
-		searchParams: Promise.resolve({ callbackUrl: destination }),
-	});
-	expect(signed.type).toBe(HostedProjectAuth);
-	expect(signed.props).toMatchObject({ destination });
-	expect(engine.readOAuthContext.mock.calls[0]?.[0].url).toBe(
-		`https://${accountsHostname}/api/oauth/context?${signedQuery}`,
-	);
+	for (const parameter of ["callbackUrl", "returnTo"]) {
+		const signed = await HostedProjectAuthPage({
+			view: "verifyEmail",
+			searchParams: Promise.resolve({ [parameter]: destination }),
+		});
+		expect(signed.type).toBe(HostedProjectAuth);
+		expect(signed.props).toMatchObject({ destination });
+		expect(engine.readOAuthContext.mock.lastCall?.[0].url).toBe(
+			`https://${accountsHostname}/api/oauth/context?${signedQuery}`,
+		);
+	}
 
 	runtime.withPortalHeadersEngine.mockClear();
 	const bearer = await HostedProjectAuthPage({
