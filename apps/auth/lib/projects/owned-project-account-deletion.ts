@@ -148,7 +148,7 @@ export function createOwnedProjectAccountDeletion(
 	async function recordDeletionRequest(
 		client: PoolClient,
 		request: Request,
-		userId: string,
+		userId: string | undefined,
 		errorCode?: string,
 	) {
 		await store.recordEvent(client, {
@@ -207,18 +207,25 @@ export function createOwnedProjectAccountDeletion(
 	) {
 		const lease = randomUUID();
 		const claim = await store.transaction(async (client) => {
+			async function reject(response: Response, userId?: string) {
+				if (path === "/delete-user") {
+					const { code } = (await response.clone().json()) as { code: string };
+					await recordDeletionRequest(client, request, userId, code);
+				}
+				return response;
+			}
 			const current = await lockAuthority(client, request);
 			if (!current)
 				return path === "/delete-user"
-					? accountLinkError(401, "UNAUTHORIZED", "Unauthorized")
+					? reject(accountLinkError(401, "UNAUTHORIZED", "Unauthorized"))
 					: accountLinkError(
 							404,
 							"FAILED_TO_GET_USER_INFO",
 							"Failed to get user info",
 						);
 			const incorrect = await passwordError(client, current.user.id, password);
-			if (incorrect) return incorrect;
-			if (!proofToken.test(token)) return invalid();
+			if (incorrect) return reject(incorrect, current.user.id);
+			if (!proofToken.test(token)) return reject(invalid(), current.user.id);
 			const identifier = `delete-account-${token}`;
 			const { rows } = await client.query<{
 				id: string;
@@ -229,7 +236,8 @@ export function createOwnedProjectAccountDeletion(
 				[identifier],
 			);
 			const proof = rows.length === 1 ? rows[0] : null;
-			if (!proof?.live || proof.value !== current.user.id) return invalid();
+			if (!proof?.live || proof.value !== current.user.id)
+				return reject(invalid(), current.user.id);
 			const key = await claimProjectUserDeletion(
 				client,
 				current.user.id,

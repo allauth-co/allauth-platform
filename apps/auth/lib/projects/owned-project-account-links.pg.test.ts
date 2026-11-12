@@ -1,5 +1,6 @@
-import { randomUUID } from "node:crypto";
+import { createHmac, randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
+import { betterAuth } from "better-auth";
 import { symmetricDecrypt, symmetricEncrypt } from "better-auth/crypto";
 import { getTestInstance } from "better-auth/test";
 import {
@@ -11,10 +12,13 @@ import {
 } from "jose";
 import { Kysely, PostgresDialect } from "kysely";
 import { Pool } from "pg";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { createAuthOptions } from "../auth";
 import { defaultAuthPolicy } from "../auth-policy/policy";
 import { clerkCompatiblePasswords } from "../clerk-password";
 import { allauthControl } from "../control";
+import { newWebhookSigningSecret } from "../control/webhook-contract";
+import { deliverPendingWebhooks } from "../control/webhooks";
 import { productionTwoFactor } from "../mfa";
 import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
 import type { OwnedProjectAccountDeletionOptions } from "./owned-project-account-deletion";
@@ -168,6 +172,7 @@ describe.skipIf(!existsSync(fixturePath))(
 				"002-control-plane.sql",
 				"004-webhooks.sql",
 				"005-free-plugins.sql",
+				"006-analytics.sql",
 			])
 				await nativePool.query(
 					readFileSync(
@@ -320,6 +325,264 @@ describe.skipIf(!existsSync(fixturePath))(
 			expect(nativeEvents).toHaveLength(2);
 			const engine = owned(ip);
 			expect(await capture(engine.dispatch)).toEqual(nativeEvents);
+		});
+
+		it("delivers the installed signed self-erasure events for failed and completed confirmations", async () => {
+			if (!nativeDatabase)
+				throw new Error("The fixture database is unavailable.");
+			const webhookDatabase = nativeDatabase;
+			const ip = "192.0.2.61";
+			const userAgent = "synthetic-self-erasure-client";
+			const webhookSecret = newWebhookSigningSecret();
+			const webhookURL = "https://self-erasure-hook.fixture.example/events";
+			const endpoint = randomUUID();
+			const subjects = {
+				native: [
+					await user("native-delete-get"),
+					await user("native-delete-post"),
+				],
+				owned: [
+					await user("owned-delete-get"),
+					await user("owned-delete-post"),
+				],
+			} as const;
+			const outbound = vi
+				.spyOn(globalThis, "fetch")
+				.mockImplementation(async (input) => {
+					const url = new URL(input instanceof Request ? input.url : input);
+					expect(url.href).toBe(`${origin}/.well-known/openid-configuration`);
+					return Response.json({
+						issuer: origin,
+						authorization_endpoint: `${origin}/oauth2/authorize`,
+						token_endpoint: `${origin}/oauth2/token`,
+						jwks_uri: `${origin}/jwks`,
+					});
+				});
+			try {
+				const stock = betterAuth({
+					...createAuthOptions(
+						{ db: webhookDatabase, type: "postgres", transaction: true },
+						{
+							ALLAUTH_AUTH_URL: origin,
+							ALLAUTH_AUTH_SECRET: secret,
+							AUTH_RUNTIME: "node",
+							SCIM_CREDENTIAL_HASH_SECRET:
+								"synthetic-self-erasure-test-scim-secret",
+						},
+						{
+							name: "Synthetic project self-erasure fixture",
+							basePath: "/api/auth",
+							cookiePrefix,
+							primaryOrigin: origin,
+							origins: [],
+							broker: {
+								clientId: "fixture-broker",
+								clientSecret: "synthetic-broker-secret",
+							},
+							authorizeAdmin: async () => null,
+							management: { id: "self-erasure-fixture" },
+						},
+					),
+					logger: { disabled: true },
+				});
+				await database.query(
+					`INSERT INTO "${schema}"."allauthWebhookEndpoint"(id,url,"eventTypes","encryptedSecret")
+					 VALUES ($1,$2,'["user.*"]',$3)`,
+					[
+						endpoint,
+						webhookURL,
+						await symmetricEncrypt({ key: secret, data: webhookSecret }),
+					],
+				);
+				for (const [writer, dispatch] of [
+					["native", stock.handler],
+					["owned", owned(ip).dispatch],
+				] as const) {
+					for (const [method, account] of [
+						["GET", subjects[writer][0]],
+						["POST", subjects[writer][1]],
+					] as const) {
+						const [userName] = account.email.split("@");
+						const owner = { actorId: account.id, userId: account.id };
+						const requestContext = { ipAddress: ip, userAgent };
+						const path =
+							method === "GET" ? "/delete-user/callback" : "/delete-user";
+						const userProjection = {
+							id: account.id,
+							name: userName,
+							email: account.email,
+							emailVerified: true,
+						};
+						const passwordOverride = "synthetic-wrong-confirmation-password";
+						const scenarios = [
+							{ status: 404, code: "INVALID_TOKEN" },
+							{ status: 404, code: "INVALID_TOKEN", expires: -60 },
+							...(method === "POST"
+								? [
+										{
+											status: 400,
+											code: "INVALID_PASSWORD",
+											expires: 3600,
+											password: passwordOverride,
+										},
+										{
+											status: 401,
+											code: "UNAUTHORIZED",
+											expires: 3600,
+											missingSession: true,
+										},
+									]
+								: []),
+							{ status: method === "GET" ? 302 : 200, expires: 3600 },
+						];
+						for (const scenario of scenarios) {
+							const token = randomUUID().replaceAll("-", "");
+							if (scenario.expires !== undefined)
+								await database.query(
+									`INSERT INTO "${schema}"."verification"(id,identifier,value,"expiresAt")
+									 VALUES ($1,$2,$3,statement_timestamp() + ($4::int * interval '1 second'))`,
+									[
+										randomUUID(),
+										`delete-account-${token}`,
+										account.id,
+										scenario.expires,
+									],
+								);
+							const request =
+								method === "GET"
+									? follow(
+											`${base}${path}?${new URLSearchParams({ token, callbackURL: destination })}`,
+											account.cookie,
+										)
+									: post(
+											path,
+											{ token, password: scenario.password },
+											scenario.missingSession ? undefined : account.cookie,
+										);
+							request.headers.set("x-real-ip", ip);
+							request.headers.set("user-agent", userAgent);
+							const response = await dispatch(request);
+							expect(response.status).toBe(scenario.status);
+							if (scenario.code)
+								expect(await response.json()).toMatchObject({
+									code: scenario.code,
+								});
+							else if (method === "GET")
+								expect(response.headers.get("location")).toBe(destination);
+							else
+								expect(await response.json()).toEqual({
+									success: true,
+									message: "User deleted",
+								});
+
+							const received: unknown[] = [];
+							const stats = await deliverPendingWebhooks({
+								database: webhookDatabase,
+								secret,
+								now: () => new Date(Date.now() + 1000),
+								resolver: async () => [{ address: "93.184.216.34", family: 4 }],
+								async transport({ destination: target, body, headers }) {
+									expect(target.url.href).toBe(webhookURL);
+									const signature = createHmac(
+										"sha256",
+										Buffer.from(webhookSecret.slice(6), "base64"),
+									)
+										.update(
+											`${headers["webhook-id"]}.${headers["webhook-timestamp"]}.${body}`,
+										)
+										.digest("base64");
+									expect(headers["webhook-signature"]).toBe(`v1,${signature}`);
+									for (const sensitive of [
+										token,
+										password,
+										passwordOverride,
+										account.cookie.split("=")[1]!,
+										webhookSecret,
+									])
+										expect(body).not.toContain(sensitive);
+									const envelope = JSON.parse(body);
+									const { id, createdAt, ...event } = envelope.data.event;
+									expect(envelope).toMatchObject({
+										id,
+										type: "user.deleted",
+										timestamp: createdAt,
+									});
+									received.push({
+										event,
+										...(envelope.data.user && { user: envelope.data.user }),
+									});
+									return 204;
+								},
+							});
+							const common = { type: "user.deleted", metadata: { path } };
+							const expected = scenario.code
+								? method === "GET"
+									? []
+									: [
+											{
+												event: {
+													...common,
+													outcome: "failure",
+													...requestContext,
+													metadata: { path, errorCode: scenario.code },
+													...(!scenario.missingSession && owner),
+												},
+												...(!scenario.missingSession && {
+													user: userProjection,
+												}),
+											},
+										]
+								: [
+										{
+											event: {
+												...common,
+												outcome: "success",
+												...owner,
+												targetId: account.id,
+											},
+										},
+										...(method === "POST"
+											? [
+													{
+														event: {
+															...common,
+															outcome: "success",
+															...owner,
+															...requestContext,
+														},
+													},
+												]
+											: []),
+									];
+							expect(stats).toEqual({
+								claimed: expected.length,
+								delivered: expected.length,
+								retried: 0,
+								failed: 0,
+							});
+							expect(received).toHaveLength(expected.length);
+							expect(received).toEqual(expect.arrayContaining(expected));
+							if (scenario.code) {
+								expect(await identity(account.id)).toMatchObject({
+									email: account.email,
+								});
+								expect((await session(account.cookie))?.user.id).toBe(
+									account.id,
+								);
+							} else {
+								expect(await identity(account.id)).toBeUndefined();
+								expect(await session(account.cookie)).toBeNull();
+							}
+						}
+					}
+				}
+			} finally {
+				outbound.mockRestore();
+				await database.query(
+					`DELETE FROM "${schema}"."allauthWebhookEndpoint" WHERE id=$1`,
+					[endpoint],
+				);
+			}
 		});
 
 		it("preserves email change request events without exposing whether the address is already registered", async () => {
