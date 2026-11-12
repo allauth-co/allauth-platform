@@ -14,6 +14,7 @@ import { symmetricEncrypt } from "better-auth/crypto";
 import type { JSONWebKeySet } from "jose";
 import {
 	createLocalJWKSet,
+	exportJWK,
 	exportPKCS8,
 	generateKeyPair,
 	jwtVerify,
@@ -294,7 +295,7 @@ async function analyticsActivity(database: Pool, project: Project) {
 async function openProcess(
 	databaseURL: string,
 	project: Project,
-	owned: boolean,
+	owned: boolean | "agent-fixture",
 	microsoftProject = project.slug,
 	apple?: AppleFixture,
 	encryptedSamlFixture?: ProjectEncryptedSamlFixtureAdmission,
@@ -325,7 +326,8 @@ async function openProcess(
 		projectId: project.id,
 		projectSlug: project.slug,
 		schemaName: project.schemaName,
-		owned,
+		owned: Boolean(owned),
+		agentFixture: owned === "agent-fixture",
 		appleIssuerKey: apple?.issuerKey,
 		encryptedSamlFixture,
 		rejectInvitationMailTo: rejectedInvitationEmail,
@@ -6420,6 +6422,212 @@ describe.skipIf(!existsSync(fixture))(
 				} finally {
 					try {
 						await database?.end();
+						if (created) await dropClosedFixtureDatabase(admin, name);
+					} finally {
+						await admin.end();
+					}
+				}
+			}
+		}, 90_000);
+
+		it("restarts with a native Agent host without forwarding hosted machine bearer credentials", async () => {
+			const local: { container: string; DATABASE_URL: string } = JSON.parse(
+				readFileSync(fixture, "utf8"),
+			);
+			const base = new URL(local.DATABASE_URL);
+			if (
+				local.container !== "allauth-production-test-20261007" ||
+				base.hostname !== "127.0.0.1" ||
+				base.port !== "55445"
+			)
+				throw new Error(
+					"Agent restart requires the isolated local PostgreSQL fixture.",
+				);
+			const admin = new Pool({ connectionString: base.href, max: 1 });
+			const name = `allauth_hosted_${randomUUID().replaceAll("-", "")}`;
+			const databaseURL = new URL(`/${name}`, base).href;
+			let created = false;
+			let service: Awaited<ReturnType<typeof openProcess>> | undefined;
+			try {
+				await admin.query(`CREATE DATABASE "${name}"`);
+				created = true;
+				const { alpha, beta } = await seed(databaseURL);
+				const direct = `/api/projects/${alpha.slug}/auth`;
+				const outside = `/api/projects/${beta.slug}/auth`;
+				const hosted = "/api/auth";
+				const host = `${alpha.slug}-accounts.allauth.co`;
+				const directIssuer = `${platformOrigin}${direct}`;
+				const hostedIssuer = `https://${host}${hosted}`;
+				const proxy = { proxy: alpha, origin: alpha.primaryOrigin };
+				const [hostKey, agentKey] = await Promise.all([
+					generateKeyPair("EdDSA", { extractable: true }),
+					generateKeyPair("EdDSA", { extractable: true }),
+				]);
+				const kid = "runtime-native-agent-host";
+				const publicKey = { ...(await exportJWK(hostKey.publicKey)), kid };
+				service = await openProcess(databaseURL, alpha, false);
+				const login = await service.request(`${hosted}/sign-in/email`, {
+					host,
+					body: {
+						email: credentials.project.email,
+						password: credentials.password,
+					},
+				});
+				expect(login.status).toBe(200);
+				const browser = { host, cookie: cookie(login) };
+				const creation = await service.request(`${hosted}/host/create`, {
+					...browser,
+					body: { name: "Native Agent host" },
+				});
+				expect(creation.status).toBe(200);
+				const pending = (await creation.json()) as {
+					hostId: string;
+					enrollmentToken: string;
+				};
+				expect(pending).toMatchObject({
+					hostId: expect.any(String),
+					enrollmentToken: expect.any(String),
+					status: "pending_enrollment",
+				});
+				const detail = `${hosted}/host/get?host_id=${encodeURIComponent(pending.hostId)}`;
+				const nativeDetail = await service.request(detail, browser);
+				expect(nativeDetail.status).toBe(200);
+				const before = await nativeDetail.json();
+				await service.stop();
+				service = undefined;
+
+				await expect(openProcess(databaseURL, alpha, true)).rejects.toThrow(
+					"This development project has stored features outside the candidate scope.",
+				);
+				service = await openProcess(databaseURL, alpha, "agent-fixture");
+				const stored = await service.request(detail, browser);
+				expect(stored.status).toBe(200);
+				expect(await stored.json()).toEqual(before);
+				const enrollment = {
+					token: pending.enrollmentToken,
+					public_key: publicKey,
+				};
+				const sibling = await service.request(`${outside}/host/enroll`, {
+					proxy: beta,
+					origin: beta.primaryOrigin,
+					body: enrollment,
+				});
+				expect(sibling.status).toBe(401);
+				const enrolled = await service.request(`${direct}/host/enroll`, {
+					...proxy,
+					body: enrollment,
+				});
+				expect(enrolled.status).toBe(200);
+				expect(await enrolled.json()).toMatchObject({
+					hostId: pending.hostId,
+					status: "active",
+					default_capabilities: [],
+				});
+
+				const signedHost = await new SignJWT({
+					agent_public_key: await exportJWK(agentKey.publicKey),
+				})
+					.setProtectedHeader({ alg: "EdDSA", typ: "host+jwt", kid })
+					.setIssuer(pending.hostId)
+					.setAudience(directIssuer)
+					.setIssuedAt()
+					.setExpirationTime("45s")
+					.setJti(randomUUID())
+					.sign(hostKey.privateKey);
+				const registration = await service.request(`${direct}/agent/register`, {
+					...proxy,
+					authorization: `Bearer ${signedHost}`,
+					body: { name: "Restarted delegated Agent", mode: "delegated" },
+				});
+				expect(registration.status).toBe(200);
+				const registered = (await registration.json()) as { agent_id: string };
+				expect(registered).toMatchObject({
+					agent_id: expect.any(String),
+					host_id: pending.hostId,
+					status: "active",
+					agent_capability_grants: [],
+				});
+				const agentBearer = async () =>
+					`Bearer ${await new SignJWT({ htm: "GET" })
+						.setProtectedHeader({ alg: "EdDSA", typ: "agent+jwt" })
+						.setIssuer(pending.hostId)
+						.setSubject(registered.agent_id)
+						.setAudience([directIssuer, hostedIssuer])
+						.setIssuedAt()
+						.setExpirationTime("45s")
+						.setJti(randomUUID())
+						.sign(agentKey.privateKey)}`;
+				const authority = {
+					agent_id: registered.agent_id,
+					host_id: pending.hostId,
+					user_id: credentials.project.id,
+					status: "active",
+					mode: "delegated",
+					agent_capability_grants: [],
+				};
+				async function expectDirectAgent(
+					writer: NonNullable<typeof service>,
+					authorization: string,
+				) {
+					const viaGateway = await writer.request(`${hosted}/agent/status`, {
+						host,
+						authorization,
+					});
+					expect(viaGateway.status).toBe(401);
+					expect(await viaGateway.json()).toEqual({
+						error: "unauthorized",
+						message: "Authentication required",
+					});
+					const viaProject = await writer.request(`${direct}/agent/status`, {
+						...proxy,
+						authorization,
+					});
+					expect(viaProject.status).toBe(200);
+					expect(await viaProject.json()).toMatchObject(authority);
+				}
+				const previousBearer = await agentBearer();
+				await expectDirectAgent(service, previousBearer);
+				const updatedName = "Agent host updated by AllAuth";
+				const update = await service.request(`${hosted}/host/update`, {
+					...browser,
+					body: { host_id: pending.hostId, name: updatedName },
+				});
+				expect(update.status).toBe(200);
+				await service.stop();
+				service = undefined;
+
+				service = await openProcess(databaseURL, alpha, "agent-fixture");
+				const replay = await service.request(`${direct}/agent/status`, {
+					...proxy,
+					authorization: previousBearer,
+				});
+				expect(replay.status).toBe(401);
+				expect(await replay.json()).toMatchObject({ error: "jti_replay" });
+				await service.stop();
+				service = undefined;
+
+				service = await openProcess(databaseURL, alpha, false);
+				const rolledBack = await service.request(detail, browser);
+				expect(rolledBack.status).toBe(200);
+				expect(await rolledBack.json()).toMatchObject({
+					id: pending.hostId,
+					name: updatedName,
+					status: "active",
+				});
+				await expectDirectAgent(service, await agentBearer());
+				const spent = await service.request(`${direct}/host/enroll`, {
+					...proxy,
+					body: enrollment,
+				});
+				expect(spent.status).toBe(401);
+				expect(await spent.json()).toMatchObject({
+					error: "enrollment_token_invalid",
+				});
+			} finally {
+				try {
+					await service?.stop();
+				} finally {
+					try {
 						if (created) await dropClosedFixtureDatabase(admin, name);
 					} finally {
 						await admin.end();

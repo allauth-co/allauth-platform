@@ -106,6 +106,7 @@ type Options = {
 	fetchPasswordRange?: Parameters<typeof createOwnedProjectPasswordSafety>[0];
 	webhookResolver?: NonNullable<EngineOptions["webhookManagement"]>["resolver"];
 	encryptedSamlFixture?: ProjectEncryptedSamlFixtureAdmission;
+	agentFixture?: Readonly<{ projectId: string; schemaName: string }>;
 	postBackchannelLogout?: NonNullable<
 		EngineOptions["backchannelLogout"]
 	>["post"];
@@ -126,30 +127,42 @@ const authAdmission = {
 	"send-verification-email": [3, 60_000],
 } as const;
 
+function verifyLocalRuntimeFixture(
+	options: Options,
+	binding: Readonly<{ projectId: string; schemaName: string }>,
+	feature: "encrypted SAML" | "Agent Auth",
+) {
+	const { database, project, env } = options;
+	const databaseURL = new URL(setting(env, "DATABASE_URL"));
+	if (
+		process.env.NODE_ENV !== "test" ||
+		!/^postgres(?:ql)?:$/.test(databaseURL.protocol) ||
+		databaseURL.hostname !== "127.0.0.1" ||
+		databaseURL.port !== "55445" ||
+		!/^\/allauth_hosted_[a-f0-9]{32}$/.test(databaseURL.pathname) ||
+		database.options.connectionString !== databaseURL.href ||
+		database.options.options !== `-c search_path=${project.schemaName}` ||
+		binding.projectId !== project.id ||
+		binding.schemaName !== project.schemaName
+	)
+		throw new Error(
+			`This development project has an invalid ${feature} fixture binding.`,
+		);
+}
+
 async function readSupportedProviders(
 	options: Options,
 	baseURL: string,
 	customSamlTransport: ProjectCustomSamlTransport,
 ) {
 	const { database, project, env } = options;
+	const agentFixture = options.agentFixture;
+	if (agentFixture)
+		verifyLocalRuntimeFixture(options, agentFixture, "Agent Auth");
+	const agentHosts = Boolean(agentFixture);
 	const admission = options.encryptedSamlFixture;
-	if (admission) {
-		const databaseURL = new URL(setting(env, "DATABASE_URL"));
-		if (
-			process.env.NODE_ENV !== "test" ||
-			!/^postgres(?:ql)?:$/.test(databaseURL.protocol) ||
-			databaseURL.hostname !== "127.0.0.1" ||
-			databaseURL.port !== "55445" ||
-			!/^\/allauth_hosted_[a-f0-9]{32}$/.test(databaseURL.pathname) ||
-			database.options.connectionString !== databaseURL.href ||
-			database.options.options !== `-c search_path=${project.schemaName}` ||
-			admission.projectId !== project.id ||
-			admission.schemaName !== project.schemaName
-		)
-			throw new Error(
-				"This development project has an invalid encrypted SAML fixture binding.",
-			);
-	}
+	if (admission)
+		verifyLocalRuntimeFixture(options, admission, "encrypted SAML");
 	if (
 		project.environment !== "development" ||
 		!/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(project.id) ||
@@ -277,7 +290,7 @@ async function readSupportedProviders(
 		   k."rateLimitTimeWindow" IS DISTINCT FROM 60000 OR
 		   k."rateLimitMax" IS DISTINCT FROM 100
 		 ) OR
-		 EXISTS (SELECT 1 FROM "${schema}"."agentHost") OR
+		 (NOT $4::boolean AND EXISTS (SELECT 1 FROM "${schema}"."agentHost")) OR
 		 (NOT $2::boolean AND EXISTS (SELECT 1 FROM "${schema}"."allauthAvatarAsset" WHERE state <> 'deleted')) OR
 		 EXISTS (
 		  SELECT 1 FROM "${schema}"."account" a JOIN "${schema}"."user" u ON u.id=a."userId"
@@ -304,14 +317,14 @@ async function readSupportedProviders(
 		  jsonb_typeof("grantTypes") <> 'array' OR NOT "grantTypes" <@ '["authorization_code","refresh_token","urn:ietf:params:oauth:grant-type:device_code"]'::jsonb
 		 ))
 		) AS incompatible`,
-		[providers, ownedAvatarSelected(env, project.id), project.id],
+		[providers, ownedAvatarSelected(env, project.id), project.id, agentHosts],
 	);
 	if (!snapshot || snapshot.incompatible)
 		throw new Error(
 			"This development project has stored features outside the candidate scope.",
 		);
 	await assertOwnedProjectWebhookAdmission(database, schema, options.policy);
-	return { google, microsoft, apple };
+	return { google, microsoft, apple, agentHosts };
 }
 
 function projectSupport(options: Options, platformOrigin: string) {
@@ -408,7 +421,7 @@ export async function createOwnedProjectRuntimeCandidate(options: Options) {
 		throw new Error(
 			"The development candidate requires an approved project mail transport.",
 		);
-	const { google, microsoft, apple } = await readSupportedProviders(
+	const { google, microsoft, apple, agentHosts } = await readSupportedProviders(
 		options,
 		`${origin}${basePath}`,
 		customSamlTransport,
@@ -588,6 +601,7 @@ export async function createOwnedProjectRuntimeCandidate(options: Options) {
 		appName: project.name,
 		openApi: true,
 		analytics: true,
+		agentHosts,
 		webhookManagement: {
 			encryptionSecret: options.signingSecret,
 			resolver: options.webhookResolver,
