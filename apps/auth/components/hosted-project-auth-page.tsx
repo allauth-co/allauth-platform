@@ -16,10 +16,11 @@ import {
 	hostedSdkBasePath,
 	hostedSdkViewRequest,
 } from "@/lib/domains/hosted-sdk-policy";
-import { hostedSdkSelected } from "@/lib/domains/hosted-sdk-selection";
+import { hostedSdkSelectionMode } from "@/lib/domains/hosted-sdk-selection";
 import { portalSession, withPortalHeadersEngine } from "@/lib/domains/hosting";
 import { emailConfigured } from "@/lib/email/send";
 import { isProjectWriterUnavailable } from "@/lib/projects/project-engine-unavailable";
+import { publicSDKConfiguration } from "@/sdk/branding";
 import { AllAuthAuth } from "./better-auth-ui/allauth-auth";
 import { HostedProjectAuth } from "./hosted-project-auth";
 import { HostedProjectIssuerNavigation } from "./hosted-project-auth-status";
@@ -28,6 +29,28 @@ import { HostedProjectUnavailable } from "./hosted-project-unavailable";
 export type HostedProjectAuthPageProps = {
 	searchParams: Promise<HostedSdkSearchParams>;
 };
+
+function HostedProjectMethodUnavailable({
+	destination,
+}: {
+	destination: string;
+}) {
+	const signIn = `/sign-in?${new URLSearchParams({ returnTo: destination })}`;
+	return (
+		<section
+			className="mx-auto max-w-sm space-y-3 px-6 py-12 text-center"
+			role="status"
+		>
+			<h1 className="text-lg font-semibold">Sign-in option unavailable</h1>
+			<p className="text-sm text-muted-foreground">
+				This authentication method is unavailable for this application.
+			</p>
+			<a className="text-sm underline" href={signIn}>
+				Back to sign in
+			</a>
+		</section>
+	);
+}
 
 /** Select the project view only on a reverified project hostname. */
 export async function HostedProjectAuthPage({
@@ -62,13 +85,19 @@ export async function HostedProjectAuthPage({
 	const result = await withPortalHeadersEngine(
 		requestHeaders,
 		async (engine, _bound, binding) => {
-			if (
-				!binding ||
-				!(await hostedSdkSelected(env, binding.project, binding.kind))
-			)
-				return null;
+			if (!binding) return null;
+			const mode = await hostedSdkSelectionMode(
+				env,
+				binding.project,
+				binding.kind,
+			);
+			if (!mode) return null;
+			const active = mode === "allauth";
 			if (params.interface === "legacy") return null;
-			const rejected = { kind: "redirect", destination: "/auth-error" } as const;
+			const rejected = {
+				kind: "redirect",
+				destination: "/auth-error",
+			} as const;
 			if (params.interface !== undefined) return rejected;
 			if (view === "authRedirect") {
 				const request = hostedAuthRedirectRequest(
@@ -104,33 +133,58 @@ export async function HostedProjectAuthPage({
 				))
 			)
 				return rejected;
-			const config = await engine.dispatch(
-				new Request(`https://${binding.hostname}/api/auth/sdk/config`, {
+			const configRequest = new Request(
+				`https://${binding.hostname}/api/auth/sdk/config`,
+				{
 					headers: { accept: "application/json" },
-				}),
+				},
 			);
-			if (!config.ok) return null;
+			const unavailable = { kind: "unavailable" } as const;
+			const config = active
+				? await engine.dispatch(configRequest).catch(() => null)
+				: await engine.dispatch(configRequest);
+			if (!config?.ok) return active ? unavailable : null;
 			const data: unknown = await config.json().catch(() => null);
-			if (!data || typeof data !== "object") return null;
+			if (!data || typeof data !== "object") return active ? unavailable : null;
+			if (active) {
+				try {
+					publicSDKConfiguration(data);
+				} catch {
+					return unavailable;
+				}
+			}
 			const showPassword =
 				"emailPassword" in data && data.emailPassword === true;
 			const showEmail = emailConfigured(
 				projectEmailEnvironment(env, binding.project.slug),
 			);
-			const showSso = authConfiguration(env).enterpriseSSO;
+			const showSso =
+				active &&
+				"enterpriseSSO" in data &&
+				typeof data.enterpriseSSO === "boolean"
+					? data.enterpriseSSO
+					: authConfiguration(env).enterpriseSSO;
 			const showRecovery = showPassword && showEmail;
+			const requiresPassword =
+				request.username ||
+				(view === "resetPassword" && (!active || !request.resetStatus)) ||
+				(!active && view === "resetLinkSent");
+			const requiresEmail =
+				view === "magicLink" ||
+				view === "emailOtp" ||
+				(!active && view === "magicLinkSent");
 			if (
-				(request.username && !showPassword) ||
-				((view === "magicLink" ||
-					view === "magicLinkSent" ||
-					view === "emailOtp") &&
-					!showEmail) ||
-				((view === "resetPassword" || view === "resetLinkSent") &&
-					!showPassword) ||
+				(requiresPassword && !showPassword) ||
+				(requiresEmail && !showEmail) ||
 				(view === "forgotPassword" && !showRecovery) ||
 				(view === "enterpriseSignIn" && !showSso)
-			)
-				return null;
+			) {
+				if (!active) return null;
+				return {
+					kind: "method-unavailable",
+					destination: request.destination,
+				} as const;
+			}
 			return {
 				kind: "form",
 				component: (
@@ -145,7 +199,9 @@ export async function HostedProjectAuthPage({
 						showPassword={showPassword}
 						showEmail={showEmail}
 						showSso={showSso}
-						showBroker={!("googleProvider" in data && data.googleProvider === "google")}
+						showBroker={
+							!("googleProvider" in data && data.googleProvider === "google")
+						}
 					/>
 				),
 			} as const;
@@ -157,6 +213,8 @@ export async function HostedProjectAuthPage({
 
 	if (!result) return standardForm;
 	if (result.kind === "unavailable") return <HostedProjectUnavailable />;
+	if (result.kind === "method-unavailable")
+		return <HostedProjectMethodUnavailable destination={result.destination} />;
 	if (result.kind === "redirect") redirect(result.destination);
 	if (result.kind === "issuer")
 		return <HostedProjectIssuerNavigation destination={result.destination} />;

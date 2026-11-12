@@ -50,13 +50,15 @@ export function hostedSdkTransportEnabled(
 	);
 }
 
-/** New pages follow the authoritative writer unless explicitly previewing the first-party UI. */
-export async function hostedSdkSelected(
+/** Distinguish an active AllAuth writer from the independent legacy-writer preview. */
+export async function hostedSdkSelectionMode(
 	env: AuthEnvironment,
 	project: Project,
 	kind: DomainKind,
-) {
-	const previewed = independentlyPreviewed(env, project, kind);
+): Promise<"allauth" | "preview" | undefined> {
+	const previewed = independentlyPreviewed(env, project, kind)
+		? "preview"
+		: undefined;
 	const lease = projectWriterLease(project, env);
 	if (!lease) return previewed;
 	const { writer, revision } = await lease.read();
@@ -68,5 +70,14 @@ export async function hostedSdkSelected(
 		})
 	)
 		throw projectWriterUnavailable();
-	return true;
+	return "allauth";
+}
+
+/** New pages follow the authoritative writer unless explicitly previewing the first-party UI. */
+export async function hostedSdkSelected(
+	env: AuthEnvironment,
+	project: Project,
+	kind: DomainKind,
+) {
+	return Boolean(await hostedSdkSelectionMode(env, project, kind));
 }

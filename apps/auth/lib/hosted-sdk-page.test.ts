@@ -1,3 +1,4 @@
+import { renderToStaticMarkup } from "react-dom/server";
 import { beforeEach, expect, it, vi } from "vitest";
 import { AllAuthAuth } from "@/components/better-auth-ui/allauth-auth";
 import { HostedProjectAuth } from "@/components/hosted-project-auth";
@@ -39,7 +40,13 @@ vi.mock("@/components/better-auth-ui/allauth-auth", () => ({
 
 function engineConfiguration(configuration: Record<string, unknown>) {
 	return {
-		dispatch: vi.fn(async (_request: Request) => Response.json(configuration)),
+		dispatch: vi.fn(async (_request: Request) => Response.json({
+			emailPassword: true,
+			google: false,
+			organizations: true,
+			twoFactor: true,
+			...configuration,
+		})),
 		readOAuthContext: vi.fn(
 			async (_request: Request): Promise<Response> =>
 				new Response(null, { status: 400 }),
@@ -598,6 +605,144 @@ it("only selects alternate sign-in methods when the verified project can offer t
 		showEmail: true,
 		showPassword: false,
 	});
+});
+
+it.each([
+	["accounts", "fixture-project-accounts.allauth.co"],
+	["accounts", accountsHostname],
+	["frontend-api", "fixture-project-api.allauth.co"],
+	["frontend-api", "frontend-api.fixture.example"],
+] as const)("keeps selected %s capability and config responses first-party on %s", async (kind, hostname) => {
+	runtime.headers.mockResolvedValue(
+		new Headers({ [portalHeader]: "fixture-proof" }),
+	);
+	runtime.getAuthEnvironment.mockResolvedValue({
+		ALLAUTH_PROJECT_ENGINE_INTERNAL_ID: project.id,
+		EMAIL_PROVIDER: "",
+		CLOUDFLARE_ACCOUNT_ID: "",
+		CLOUDFLARE_EMAIL_API_TOKEN: "",
+	});
+	const internal = {
+		...project,
+		workspaceId: platformWorkspaceId,
+		schemaName: `allauth_project_${project.id.replaceAll("-", "")}`,
+	};
+	runtime.readWriter.mockResolvedValue({ writer: "allauth", revision: 1 });
+	let engine = engineConfiguration({
+		emailPassword: false,
+		enterpriseSSO: false,
+	});
+	runtime.withPortalHeadersEngine.mockImplementation(async (_headers, select) =>
+		select(engine, new Headers(), { kind, hostname, project: internal }),
+	);
+	const read = (
+		view: Parameters<typeof HostedProjectAuthPage>[0]["view"],
+		params: Awaited<HostedProjectAuthPageProps["searchParams"]> = {},
+	) => HostedProjectAuthPage({ view, searchParams: Promise.resolve(params) });
+
+	const signedQuery = "client_id=fixture&resource=one&resource=two&sig=signed";
+	const destination = `/oauth2/continue?${signedQuery}`;
+	engine.readOAuthContext.mockImplementation(async () =>
+		Response.json({ continueURL: destination }),
+	);
+	for (const [view, params] of [
+		["signIn", { method: "username" }],
+		["magicLink", {}],
+		["emailOtp", {}],
+		["forgotPassword", {}],
+		["resetPassword", { token: "fixture-reset-token" }],
+		["enterpriseSignIn", {}],
+	] as const) {
+		const page = await read(view, { returnTo: destination, ...params });
+		expect(page.type).not.toBe(AllAuthAuth);
+		const html = renderToStaticMarkup(page);
+		expect(html).toContain("Sign-in option unavailable");
+		expect(html).toContain(
+			`/sign-in?${new URLSearchParams({ returnTo: destination })}`,
+		);
+		expect(html).not.toContain("fixture-reset-token");
+	}
+	expect(engine.dispatch.mock.lastCall?.[0].url).toBe(
+		`https://${hostname}/api/auth/sdk/config`,
+	);
+	expect(engine.readOAuthContext.mock.lastCall?.[0].url).toBe(
+		`https://${hostname}/api/oauth/context?${signedQuery}`,
+	);
+	const follow = async (page: Awaited<ReturnType<typeof read>>) => {
+		const href = /href="([^"]+)"/.exec(renderToStaticMarkup(page))?.[1];
+		expect(href).toBeDefined();
+		const target = new URL(href!, `https://${hostname}`);
+		expect(target.pathname).toBe("/sign-in");
+		return read("signIn", Object.fromEntries(target.searchParams));
+	};
+	const next = await follow(await read("emailOtp", { returnTo: destination }));
+	expect(next.type).toBe(HostedProjectAuth);
+	expect(next.props).toMatchObject({ destination });
+	const local = await follow(await read("emailOtp"));
+	expect(local.type).toBe(HostedProjectAuth);
+	expect(local.props).toMatchObject({
+		destination: kind === "accounts" ? "/console" : "/account",
+	});
+	for (const [view, params] of [
+		["resetPassword", {}],
+		["resetPassword", { error: "INVALID_TOKEN" }],
+		["magicLinkSent", {}],
+		["resetLinkSent", {}],
+	] as const) {
+		const page = await read(view, { returnTo: destination, ...params });
+		expect(page.type).toBe(HostedProjectAuth);
+		expect(page.props).toMatchObject({
+			view,
+			destination,
+			showRecovery: false,
+		});
+	}
+
+	engine = engineConfiguration({ emailPassword: true, enterpriseSSO: true });
+	const reset = await read("resetPassword", { token: "fixture-reset-token" });
+	expect(reset.type).toBe(HostedProjectAuth);
+	expect(reset.props).toMatchObject({
+		view: "resetPassword",
+		showRecovery: false,
+		showEmail: false,
+	});
+	expect((await read("enterpriseSignIn")).props).toMatchObject({
+		showSso: true,
+	});
+	expect(renderToStaticMarkup(await read("forgotPassword"))).toContain(
+		"Sign-in option unavailable",
+	);
+	engine = engineConfiguration({
+		google: true,
+		googleProvider: "google",
+		emailPassword: false,
+	});
+	const directGoogle = await read("signIn");
+	expect(directGoogle.type).toBe(HostedProjectAuth);
+	expect(directGoogle.props).toMatchObject({
+		showBroker: false,
+		showPassword: false,
+	});
+
+	for (const failed of [
+		new Response(null, { status: 503 }),
+		new Response("not JSON"),
+		Response.json(null),
+		Response.json([]),
+		Response.json({ emailPassword: "invalid" }),
+	]) {
+		engine.dispatch.mockResolvedValueOnce(failed);
+		expect((await read("signIn")).type).toBe(HostedProjectUnavailable);
+	}
+	engine.dispatch.mockRejectedValueOnce(
+		new Error("Fixture config read failed."),
+	);
+	expect((await read("signIn")).type).toBe(HostedProjectUnavailable);
+	expect((await read("signIn", { interface: "legacy" })).type).toBe(
+		AllAuthAuth,
+	);
+	runtime.readWriter.mockResolvedValue({ writer: "legacy", revision: 2 });
+	expect((await read("signIn")).type).toBe(AllAuthAuth);
 });
 
 it("selects project MFA for a local callback and keeps unbound broker MFA on the standard page", async () => {

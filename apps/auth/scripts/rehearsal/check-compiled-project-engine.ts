@@ -493,16 +493,7 @@ async function startConnectedDevice(realm: Realm, client: string) {
 			const userCode = new URLSearchParams({ user_code: codes.user_code });
 			const reviewPath = `/account/device?${userCode}`;
 			const destination = new URL(reviewPath, `https://${managedHostname}`);
-			if (handoff.status === 307) assert.equal(handoff.location, destination.href);
-			else {
-				expectStatus(handoff, 200, "Render the streamed project device handoff.");
-				// Next serializes a temporary redirect as a refresh tag after streaming begins.
-				const redirect = handoff.body.match(
-					/<meta id="__next-page-redirect" http-equiv="refresh" content="1;url=([^"<>]+)"\s*\/?\s*>/,
-				);
-				assert.ok(redirect, "The original device link must redirect the browser.");
-				assert.equal(redirect[1], destination.href);
-			}
+			expectTemporaryRedirect(handoff, destination.href, "Hand off the original device link.");
 			const browser = { host: destination.hostname, clientIP: "192.0.2.65" };
 			const page = await request(reviewPath, browser);
 			expectStatus(
@@ -682,18 +673,31 @@ async function startConfiguredWebhook(realm: Realm, cookie: string) {
 		assert.equal(endpoint?.enabled, false);
 		assert.ok(!result.body.includes("encryptedSecret"));
 	}
-	function changePolicy() {
+	let version = 1;
+	function changePolicy(changes: Partial<typeof fixturePolicy>) {
 		return request(`/api/admin/configuration?project=${realm.slug}`, {
 			cookie,
 			method: "PATCH",
-			body: { version: 1, policy: { ...fixturePolicy, requireEmailVerification: true } },
+			body: { version, policy: { ...fixturePolicy, ...changes } },
 		});
 	}
 	await read();
 	return {
+		async withPasswordDisabled(check: () => Promise<void>) {
+			const disabled = await changePolicy({ emailAndPasswordEnabled: false });
+			expectStatus(disabled, 200, "Disable passwords while the fixture Google provider is enabled.");
+			version += 1;
+			try {
+				await check();
+			} finally {
+				const restored = await changePolicy({});
+				expectStatus(restored, 200, "Restore the fixture password policy.");
+				version += 1;
+			}
+		},
 		async rotate() {
 			await read();
-			expectStatus(await changePolicy(), 409, "The active writer refuses an incompatible webhook policy.");
+			expectStatus(await changePolicy({ requireEmailVerification: true }), 409, "The active writer refuses an incompatible webhook policy.");
 			const result = await request(`${path}/rotate`, { cookie, body: { id } });
 			expectStatus(result, 200, "The AllAuth writer rotates the configured webhook credential.");
 			assert.ok(typeof (JSON.parse(result.body) as { secret?: unknown }).secret === "string");
@@ -704,7 +708,7 @@ async function startConfiguredWebhook(realm: Realm, cookie: string) {
 		},
 		async removeAfterRollback() {
 			await read();
-			expectStatus(await changePolicy(), 200, "Legacy accepts the same policy change after rollback.");
+			expectStatus(await changePolicy({ requireEmailVerification: true }), 200, "Legacy accepts the same policy change after rollback.");
 			const result = await request(`${path}/delete`, { cookie, body: { id } });
 			expectStatus(result, 200, "The restored legacy writer removes the same endpoint.");
 			assert.equal(
@@ -721,6 +725,23 @@ function expectStatus(
 	action: string,
 ) {
 	assert.equal(response.status, status, action);
+}
+
+function expectTemporaryRedirect(
+	response: Awaited<ReturnType<typeof request>>,
+	destination: string,
+	action: string,
+) {
+	if (response.status === 307) {
+		assert.equal(response.location, destination, action);
+		return;
+	}
+	// Next uses a refresh tag if it has already streamed the response headers.
+	expectStatus(response, 200, action);
+	const redirect = response.body.match(
+		/<meta id="__next-page-redirect" http-equiv="refresh" content="1;url=([^"<>]+)"\s*\/?\s*>/,
+	);
+	assert.equal(redirect?.[1], destination, action);
 }
 
 function sessionCookie(response: Awaited<ReturnType<typeof request>>) {
@@ -1416,6 +1437,50 @@ try {
 				200,
 				"The selected writer serves first-party configuration on the frontend hostname.",
 			);
+		}
+		const hostedTransports = [managedHost, host, ...frontendHosts.map(({ hostname }) => hostname)];
+		if (connected) {
+			const rejectedQuery = new URLSearchParams(connected.queryString);
+			const state = `rejected-continuation-${randomUUID()}`;
+			rejectedQuery.set("state", state);
+			// Use an honestly signed but expired browser continuation.
+			const clock = Date.now;
+			const elapsed = clock() - 120_000;
+			let expired: URLSearchParams;
+			try {
+				Date.now = () => elapsed;
+				expired = signProjectIssuerQuery(rejectedQuery, authSecret);
+			} finally {
+				Date.now = clock;
+			}
+			for (const hostname of hostedTransports) {
+				const browser = { host: hostname };
+				const rejected = await request(`/sign-in?${expired}`, browser);
+				expectTemporaryRedirect(rejected, "/auth-error", "Reject the expired project continuation.");
+				assert.deepEqual(rejected.cookies, []);
+				const guidance = await request("/auth-error", browser);
+				expectStatus(guidance, 200, "Show the first-party hosted sign-in error.");
+				assert.match(guidance.body, /Sign-in did not finish/);
+				assert.ok(!guidance.body.includes(state));
+			}
+		}
+		if (!railway) {
+			assert.ok(configuredWebhook, "The policy fixture owns the configuration revision.");
+			await configuredWebhook.withPasswordDisabled(async () => {
+				for (const hostname of hostedTransports) {
+					const browser = { host: hostname };
+					for (const path of ["/sign-in?method=username", "/forgot-password"]) {
+						const page = await request(path, browser);
+						expectStatus(page, 200, "Render first-party guidance for a disabled sign-in method.");
+						assert.match(page.body, /Sign-in option unavailable/);
+						const destination = frontendHosts.some((frontend) => frontend.hostname === hostname)
+							? "%2Faccount"
+							: "%2Fconsole";
+						assert.ok(page.body.includes(`/sign-in?returnTo=${destination}`));
+					}
+					await hostedPage(hostname, true, "/reset-link-sent");
+				}
+			});
 		}
 		assert.equal(nativeFrontendSessions.length, frontendHosts.length);
 		await checkFrontendSessions(nativeFrontendSessions);
