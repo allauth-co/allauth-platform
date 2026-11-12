@@ -1055,7 +1055,7 @@ try {
 			const authorization = new URLSearchParams(connected.queryString);
 			const state = `${"signed-application-state".repeat(355)}+one&two`;
 			authorization.set("state", state);
-			const oauthQuery = signProjectIssuerQuery(authorization, authSecret);
+			const oauthQuery = signProjectIssuerQuery(authorization, authSecret).toString();
 			const callbackURL = `https://${host}/oauth2/continue?${oauthQuery}`;
 			const transport = {
 				host,
