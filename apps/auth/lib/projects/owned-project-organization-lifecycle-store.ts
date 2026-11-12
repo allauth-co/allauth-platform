@@ -34,6 +34,26 @@ export interface ProjectOrganizationTransaction {
 	): Promise<{ rows: Row[]; rowCount: number | null }>;
 }
 
+/** Retry only failures for which PostgreSQL has rolled back the complete transaction. */
+export async function retryProjectOrganizationTransaction<T>(
+	work: () => Promise<T>,
+	retries = 2,
+): Promise<T> {
+	try {
+		return await work();
+	} catch (error) {
+		if (
+			retries > 0 &&
+			error &&
+			typeof error === "object" &&
+			"code" in error &&
+			(error.code === "40P01" || error.code === "40001")
+		)
+			return retryProjectOrganizationTransaction(work, retries - 1);
+		throw error;
+	}
+}
+
 /** Membership, grant, and session changes share the caller's project transaction. */
 export function projectOrganizationLifecycle(
 	client: ProjectOrganizationTransaction,
@@ -160,8 +180,11 @@ export function projectOrganizationLifecycle(
 			);
 	}
 
-	/** Preserve console consent while invalidating issued and pending authorization for this member. */
-	function revokeConsoleMemberGrants(organizationId: string, userId: string) {
+	/** Preserve console consent while invalidating issued and pending authorization. */
+	function revokeConsoleOrganizationGrants(
+		organizationId: string,
+		userId?: string,
+	) {
 		return revokeOrganizationGrants(organizationId, userId, {
 			eraseGrants: true,
 			keepConsent: true,
@@ -266,7 +289,7 @@ export function projectOrganizationLifecycle(
 		hasEnterpriseOrganizationAuthority,
 		lockOrganizationMemberships,
 		clearOrganizationSessions,
-		revokeConsoleMemberGrants,
+		revokeConsoleOrganizationGrants,
 		deleteOrganization,
 		recordOrganizationChange,
 	};

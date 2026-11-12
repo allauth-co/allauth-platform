@@ -536,6 +536,11 @@ export async function createOwnedProjectRuntimeCandidate(options: Options) {
 		project,
 		managementOrigin: platform,
 		readWorkspacePrincipal,
+		invitationDelivery: {
+			email: mailEnvironment,
+			inviteLink: (id) => `${app}/account?invitation=${encodeURIComponent(id)}`,
+			readBranding,
+		},
 	});
 	const manageUserConsole = createOwnedProjectUserConsole({
 		database,

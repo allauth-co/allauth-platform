@@ -2,7 +2,9 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { createServer } from "node:http";
 import { APIError } from "better-auth";
 import { GET as openid } from "../../app/.well-known/openid-configuration/route";
+import * as consoleOrganizationInvitations from "../../app/api/admin/organizations/[organizationId]/invitations/route";
 import * as consoleOrganizationMembers from "../../app/api/admin/organizations/[organizationId]/members/route";
+import * as consoleOrganizationRoles from "../../app/api/admin/organizations/[organizationId]/roles/route";
 import * as consoleOrganizationDetail from "../../app/api/admin/organizations/[organizationId]/route";
 import * as consoleOrganizationTeams from "../../app/api/admin/organizations/[organizationId]/teams/route";
 import * as consoleOrganizations from "../../app/api/admin/organizations/route";
@@ -38,9 +40,16 @@ export interface ProjectRuntimeFixtureBoot {
 	owned: boolean;
 	appleIssuerKey?: string;
 	encryptedSamlFixture?: ProjectEncryptedSamlFixtureAdmission;
+	rejectInvitationMailTo?: string;
 }
 
 const trustedFixtureIP = "192.0.2.55";
+const organizationSubresources = {
+	invitations: consoleOrganizationInvitations,
+	members: consoleOrganizationMembers,
+	roles: consoleOrganizationRoles,
+	teams: consoleOrganizationTeams,
+};
 
 async function requestFromHTTP(incoming: IncomingMessage) {
 	const headers = new Headers();
@@ -94,7 +103,9 @@ async function dispatch(request: Request) {
 		if (request.method === "POST") return consoleOrganizations.POST(request);
 	}
 	const organization =
-		/^\/api\/admin\/organizations\/([^/]+)(?:\/(members|teams))?$/.exec(path);
+		/^\/api\/admin\/organizations\/([^/]+)(?:\/(invitations|members|roles|teams))?$/.exec(
+			path,
+		);
 	if (organization) {
 		const context = {
 			params: Promise.resolve({
@@ -103,9 +114,9 @@ async function dispatch(request: Request) {
 		};
 		if (organization[2]) {
 			const resource =
-				organization[2] === "members"
-					? consoleOrganizationMembers
-					: consoleOrganizationTeams;
+				organizationSubresources[
+					organization[2] as keyof typeof organizationSubresources
+				];
 			if (request.method === "GET") return resource.GET(request, context);
 			if (request.method === "POST") return resource.POST(request, context);
 			return new Response(null, { status: 405 });
@@ -201,6 +212,11 @@ async function boot(selection: ProjectRuntimeFixtureBoot) {
 			...process.env,
 			EMAIL: {
 				async send(message: { to: string; subject: string; text: string }) {
+					if (
+						message.to === selection.rejectInvitationMailTo &&
+						message.subject.startsWith("You've been invited to ")
+					)
+						throw new Error("Synthetic invitation delivery rejection.");
 					process.send?.({
 						mail: {
 							to: message.to,

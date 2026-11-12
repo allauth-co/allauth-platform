@@ -18,6 +18,7 @@ import {
 	isOrganizationLifecycleRoute,
 	organizationLifecycleRoutes,
 } from "./owned-project-organization-lifecycle";
+import { retryProjectOrganizationTransaction } from "./owned-project-organization-lifecycle-store";
 import {
 	listProjectOrganizationMembers,
 	organizationMembersQuery,
@@ -389,25 +390,6 @@ export function createOwnedProjectOrganizationHttp(
 		options.project.schemaName,
 	);
 
-	async function retryTransaction<T>(
-		work: (client: PoolClient) => Promise<T>,
-		retries = 2,
-	): Promise<T> {
-		try {
-			return await store.transaction(work);
-		} catch (error) {
-			if (
-				retries > 0 &&
-				error &&
-				typeof error === "object" &&
-				"code" in error &&
-				(error.code === "40P01" || error.code === "40001")
-			)
-				return retryTransaction(work, retries - 1);
-			throw error;
-		}
-	}
-
 	async function lockPrincipal(
 		client: PoolClient,
 		request: Request,
@@ -453,7 +435,8 @@ export function createOwnedProjectOrganizationHttp(
 				(isOrganizationLifecycleRoute(path) ||
 					isOrganizationRoleRoute(path) ||
 					isOrganizationTeamRoute(path))
-					? retryTransaction
+					? <T>(work: (client: PoolClient) => Promise<T>) =>
+							retryProjectOrganizationTransaction(() => store.transaction(work))
 					: store.transaction;
 			const result = await runTransaction<RouteResult>(async (client) => {
 				if (

@@ -214,9 +214,15 @@ export async function deleteConsoleOrganization(database: ControlDatabase, organ
 const consoleOrganizationResources = {
 	members: { list: listConsoleOrganizationMembers, change: changeConsoleMember },
 	teams: { list: listConsoleOrganizationTeams, change: changeConsoleTeam },
+	roles: { list: listConsoleOrganizationRoles, change: changeConsoleRole },
+	invitations: { list: listConsoleOrganizationInvitations, change: changeConsoleInvitation },
 } as const;
 
 export type ConsoleOrganizationResource = keyof typeof consoleOrganizationResources;
+export type ConsoleOrganizationInvitation = Extract<
+	Awaited<ReturnType<typeof changeConsoleInvitation>>,
+	{ invitation: unknown }
+>;
 
 /** The console shares a response contract across project writers. */
 export async function executeConsoleOrganization(
@@ -227,7 +233,7 @@ export async function executeConsoleOrganization(
 	organizationId?: string,
 	mode: "native" | "owned" = "native",
 	resource?: ConsoleOrganizationResource,
-): Promise<{ body: unknown; status: 200 | 201 }> {
+): Promise<{ body: unknown; status: 200 | 201; invitationDelivery?: ConsoleOrganizationInvitation }> {
 	if (resource !== undefined) {
 		if (organizationId === undefined) throw new APIError("BAD_REQUEST");
 		const operation = consoleOrganizationResources[resource];
@@ -235,8 +241,12 @@ export async function executeConsoleOrganization(
 			const query = Object.fromEntries(new URL(request.url).searchParams);
 			return { body: await operation.list(database, organizationId, query), status: 200 };
 		}
-		if (request.method === "POST")
-			return { body: await operation.change(database, organizationId, await readBody(), actorId, mode), status: 200 };
+		if (request.method === "POST") {
+			const result = await operation.change(database, organizationId, await readBody(), actorId, mode);
+			if ("invitation" in result && result.invitation)
+				return { body: result, status: 200, invitationDelivery: result };
+			return { body: result, status: 200 };
+		}
 	} else if (organizationId === undefined) {
 		if (request.method === "GET")
 			return { body: await listConsoleOrganizations(database, consoleOrganizationListQuery(new URL(request.url).searchParams)), status: 200 };
@@ -288,7 +298,7 @@ export async function changeConsoleMember(
 			if (lifecycle) await lifecycle.clearOrganizationSessions(organizationId, member.userId);
 			else await sql`UPDATE session SET "activeOrganizationId"=NULL,"activeTeamId"=NULL WHERE "userId"=${member.userId} AND "activeOrganizationId"=${organizationId}`.execute(transaction);
 		}
-		if (lifecycle) await lifecycle.revokeConsoleMemberGrants(organizationId, member.userId);
+		if (lifecycle) await lifecycle.revokeConsoleOrganizationGrants(organizationId, member.userId);
 		else {
 			await sql`DELETE FROM "oauthAccessToken" WHERE "userId"=${member.userId} AND "referenceId"=${organizationId}`.execute(transaction);
 			await sql`DELETE FROM "oauthRefreshToken" WHERE "userId"=${member.userId} AND "referenceId"=${organizationId}`.execute(transaction);
@@ -329,11 +339,22 @@ export async function changeConsoleTeam(database: ControlDatabase, organizationI
 		await audit(transaction, actorId, `organization.team.${input.action}`, organizationId, teamId); return { success: true, teamId };
 	});
 }
-export async function changeConsoleRole(database: ControlDatabase, organizationId: string, raw: unknown, actorId: string) {
+export async function changeConsoleRole(
+	database: ControlDatabase,
+	organizationId: string,
+	raw: unknown,
+	actorId: string,
+	mode: "native" | "owned" = "native",
+) {
 	const input = roleInput.parse(raw);
 	if (["owner", "admin", "member"].includes(input.role)) throw new APIError("BAD_REQUEST", { message: "Built-in roles cannot be changed." });
-	return database.transaction().execute(async (transaction) => {
+	return organizationTransaction(database, async (transaction) => {
 		await organizationLock(transaction, organizationId);
+		const lifecycle = mode === "owned"
+			? projectOrganizationLifecycle(consoleOrganizationTransactionClient(transaction))
+			: undefined;
+		// The issuer holds a member share lock while admitting organization grants.
+		await lifecycle?.lockOrganizationMemberships(organizationId);
 		const current = (await sql<{ id: string }>`SELECT id FROM "organizationRole" WHERE "organizationId"=${organizationId} AND role=${input.role}`.execute(transaction)).rows[0];
 		if (input.action === "create") { if (current) throw new APIError("CONFLICT"); await sql`INSERT INTO "organizationRole" (id,"organizationId",role,permission,"createdAt") VALUES (${randomUUID()},${organizationId},${input.role},${JSON.stringify(input.permission)},CURRENT_TIMESTAMP)`.execute(transaction); }
 		else {
@@ -345,18 +366,29 @@ export async function changeConsoleRole(database: ControlDatabase, organizationI
 				await sql`DELETE FROM "organizationRole" WHERE id=${current.id}`.execute(transaction);
 			}
 		}
-		await sql`DELETE FROM "oauthAccessToken" WHERE "referenceId"=${organizationId}`.execute(transaction); await sql`DELETE FROM "oauthRefreshToken" WHERE "referenceId"=${organizationId}`.execute(transaction);
+		if (lifecycle) await lifecycle.revokeConsoleOrganizationGrants(organizationId);
+		else {
+			await sql`DELETE FROM "oauthAccessToken" WHERE "referenceId"=${organizationId}`.execute(transaction);
+			await sql`DELETE FROM "oauthRefreshToken" WHERE "referenceId"=${organizationId}`.execute(transaction);
+		}
 		await audit(transaction, actorId, `organization.role.${input.action}`, organizationId, input.role); return { success: true };
 	});
 }
 /** Native invitation records remain compatible with Better Auth's accept/reject endpoints. */
-export async function changeConsoleInvitation(database: ControlDatabase, organizationId: string, raw: unknown, actorId: string) {
+export async function changeConsoleInvitation(
+	database: ControlDatabase,
+	organizationId: string,
+	raw: unknown,
+	actorId: string,
+	mode: "native" | "owned" = "native",
+) {
 	const input = invitationInput.parse(raw);
-	return database.transaction().execute(async (transaction) => {
+	return organizationTransaction(database, async (transaction) => {
 		const organization = await organizationLock(transaction, organizationId);
 		if (input.action === "cancel") { if (!(await sql`UPDATE invitation SET status='canceled' WHERE id=${input.invitationId} AND "organizationId"=${organizationId} AND status='pending' RETURNING id`.execute(transaction)).rows.length) throw new APIError("NOT_FOUND"); await audit(transaction, actorId, "organization.invitation.cancelled", organizationId, input.invitationId); return { success: true as const }; }
 		await validRole(transaction, organizationId, input.role);
-		const inviter = input.inviterId ? await validUser(transaction, input.inviterId) : (await sql<{ id: string; name: string; email: string }>`SELECT u.id,u.name,u.email FROM member m JOIN "user" u ON u.id=m."userId" WHERE m."organizationId"=${organizationId} AND ${roleHas("m.role", "owner")} AND u."emailVerified"=true AND coalesce(u.banned,false)=false AND coalesce(u."directoryDisabled",false)=false ORDER BY m."createdAt" LIMIT 1`.execute(transaction)).rows[0];
+		const lock = mode === "owned";
+		const inviter = input.inviterId ? await validUser(transaction, input.inviterId, lock) : (await sql<{ id: string; name: string; email: string }>`SELECT u.id,u.name,u.email FROM member m JOIN "user" u ON u.id=m."userId" WHERE m."organizationId"=${organizationId} AND ${roleHas("m.role", "owner")} AND u."emailVerified"=true AND coalesce(u.banned,false)=false AND coalesce(u."directoryDisabled",false)=false ORDER BY m."createdAt" LIMIT 1${lock ? sql` FOR SHARE OF u,m` : sql``}`.execute(transaction)).rows[0];
 		if (!inviter || !await canInvite(transaction, organizationId, inviter.id)) throw new APIError("BAD_REQUEST", { message: "Choose a verified organization member with permission to create invitations." });
 		if (input.teamId && !(await sql`SELECT id FROM team WHERE id=${input.teamId} AND "organizationId"=${organizationId}`.execute(transaction)).rows.length) throw new APIError("NOT_FOUND");
 		if ((await sql`SELECT m.id FROM member m JOIN "user" u ON u.id=m."userId" WHERE m."organizationId"=${organizationId} AND lower(u.email)=${input.email}`.execute(transaction)).rows.length) throw new APIError("CONFLICT", { message: "This email already belongs to an organization member." });

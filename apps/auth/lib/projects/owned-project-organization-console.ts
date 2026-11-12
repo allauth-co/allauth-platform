@@ -1,6 +1,11 @@
 import { APIError } from "better-auth";
 import { Kysely, PostgresDialect, sql } from "kysely";
 import type { Pool } from "pg";
+import type { ConsoleOrganizationInvitationDelivery } from "../console/organization-invitation-delivery";
+import {
+	deliverConsoleOrganizationInvitation,
+	requireConsoleInvitationDelivery,
+} from "../console/organization-invitation-delivery";
 import type { ConsoleOrganizationResource } from "../console/organizations";
 import {
 	consoleOrganizationTransactionClient,
@@ -8,6 +13,7 @@ import {
 } from "../console/organizations";
 import type { ControlDatabase, ControlPrincipal } from "../control/types";
 import { lockOwnedProjectWorkspaceAdministrator } from "./owned-project-admin-authority";
+import { retryProjectOrganizationTransaction } from "./owned-project-organization-lifecycle-store";
 import type { Project } from "./registry";
 import { checkedProjectSchema, projectOrigin, projectSlug } from "./validation";
 
@@ -16,7 +22,7 @@ export type OwnedProjectOrganizationConsole = (
 	readBody: () => Promise<unknown>,
 	organizationId?: string,
 	resource?: ConsoleOrganizationResource,
-) => Promise<{ body: unknown; status: 200 | 201 }>;
+) => Promise<{ body: unknown; status: 200 | 201 | 502 }>;
 
 type ProjectIdentity = Pick<
 	Project,
@@ -55,6 +61,7 @@ export function createOwnedProjectOrganizationConsole(options: {
 	project: ProjectIdentity;
 	managementOrigin: string;
 	readWorkspacePrincipal(headers: Headers): Promise<ControlPrincipal | null>;
+	invitationDelivery?: ConsoleOrganizationInvitationDelivery;
 }): OwnedProjectOrganizationConsole {
 	const project = {
 		...options.project,
@@ -82,25 +89,44 @@ export function createOwnedProjectOrganizationConsole(options: {
 			throw new APIError("UNAUTHORIZED");
 		const principal = await options.readWorkspacePrincipal(request.headers);
 		if (!principal) throw new APIError("UNAUTHORIZED");
-		return database.transaction().execute(async (transaction) => {
-			await sql`SET LOCAL search_path TO ${sql.id(project.schemaName)}`.execute(
-				transaction,
-			);
-			const authorized = await lockOwnedProjectWorkspaceAdministrator(
-				consoleOrganizationTransactionClient(transaction),
-				project,
-				principal,
-			);
-			if (!authorized) throw new APIError("UNAUTHORIZED");
-			return executeConsoleOrganization(
-				transaction,
-				request,
-				readBody,
-				principal.user.id,
-				organizationId,
-				"owned",
-				resource,
-			);
-		});
+		let parsedBody: Promise<unknown> | undefined;
+		const execute = () =>
+			database.transaction().execute(async (transaction) => {
+				await sql`SET LOCAL search_path TO ${sql.id(project.schemaName)}`.execute(
+					transaction,
+				);
+				const authorized = await lockOwnedProjectWorkspaceAdministrator(
+					consoleOrganizationTransactionClient(transaction),
+					project,
+					principal,
+				);
+				if (!authorized) throw new APIError("UNAUTHORIZED");
+				return executeConsoleOrganization(
+					transaction,
+					request,
+					async () => {
+						const body = await (parsedBody ??= readBody());
+						if (resource === "invitations")
+							requireConsoleInvitationDelivery(
+								body,
+								options.invitationDelivery,
+							);
+						return body;
+					},
+					principal.user.id,
+					organizationId,
+					"owned",
+					resource,
+				);
+			});
+		const result = await (writing
+			? retryProjectOrganizationTransaction(execute)
+			: execute());
+		return result.invitationDelivery
+			? deliverConsoleOrganizationInvitation(
+					result.invitationDelivery,
+					options.invitationDelivery,
+				)
+			: result;
 	};
 }

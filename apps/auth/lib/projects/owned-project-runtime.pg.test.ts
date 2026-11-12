@@ -71,6 +71,8 @@ const oauthRedirectURI = "https://rp.runtime.fixture.example/callback";
 const supportOrigin = "https://support.runtime.fixture.example";
 const supportCallback = `${supportOrigin}/api/allauth/support/callback`;
 const supportTarget = "fixture-support-target";
+const rejectedInvitationEmail =
+	"reject-console-invitation@runtime.fixture.example";
 const directoryOrg = "fixture-directory";
 const directoryProvider = "fixture-directory-provider";
 const directoryIssuer = "https://idp.runtime-fixture.example.net";
@@ -190,6 +192,7 @@ async function openProcess(
 		owned,
 		appleIssuerKey: apple?.issuerKey,
 		encryptedSamlFixture,
+		rejectInvitationMailTo: rejectedInvitationEmail,
 	};
 	child.send(boot);
 	try {
@@ -1018,6 +1021,10 @@ describe.skipIf(!existsSync(fixture))(
 					`/api/admin/organizations/${encodeURIComponent(id)}/members?project=${project.slug}`;
 				const organizationTeams = (project: Project, id: string) =>
 					`/api/admin/organizations/${encodeURIComponent(id)}/teams?project=${project.slug}`;
+				const organizationRoles = (project: Project, id: string) =>
+					`/api/admin/organizations/${encodeURIComponent(id)}/roles?project=${project.slug}`;
+				const organizationInvitations = (project: Project, id: string) =>
+					`/api/admin/organizations/${encodeURIComponent(id)}/invitations?project=${project.slug}`;
 				const usersPath = (project: Project) =>
 					`/api/admin/users?project=${project.slug}&search=${credentials.project.id}&limit=1`;
 				const userPath = (project: Project, metadata = false) =>
@@ -3101,6 +3108,289 @@ describe.skipIf(!existsSync(fixture))(
 				} finally {
 					await teamDatabase.end();
 				}
+				const rolesRoute = organizationRoles(alpha, ownedOrganization.id);
+				const invitationsRoute = organizationInvitations(
+					alpha,
+					ownedOrganization.id,
+				);
+				const root = { cookie: rootCookie };
+				const retainedRole = "fixture-retained-billing";
+				const invitedRole = "fixture-invited-billing";
+				const permission = { member: ["update"] };
+				const updatedPermission = { member: ["delete"] };
+				const changeRole = (body: Record<string, unknown>) =>
+					service!.request(rolesRoute, { ...root, body });
+				const changeInvitation = (body: Record<string, unknown>) =>
+					service!.request(invitationsRoute, { ...root, body });
+				for (const path of [rolesRoute, invitationsRoute]) {
+					expect(
+						(await service.request(path, { cookie: legacyCookie })).status,
+					).toBe(401);
+					expect(
+						(
+							await service.request(path, {
+								...root,
+								origin: alpha.primaryOrigin,
+								body: {},
+							})
+						).status,
+					).toBe(403);
+				}
+				for (const path of [
+					organizationRoles(beta, ownedOrganization.id),
+					organizationInvitations(beta, ownedOrganization.id),
+				])
+					expect((await service.request(path, root)).status).toBe(404);
+				expect(
+					(await changeRole({ action: "delete", role: "owner" })).status,
+				).toBe(400);
+				expect(
+					(await changeRole({ action: "delete", role: customRole })).status,
+				).toBe(409);
+				for (const role of [retainedRole, invitedRole]) {
+					const created = await changeRole({
+						action: "create",
+						role,
+						permission,
+					});
+					expect(created.status, await created.clone().text()).toBe(200);
+					expect(await created.json()).toEqual({ success: true });
+				}
+				const rolesDatabase = new Pool({
+					connectionString: url(restored),
+					max: 1,
+				});
+				try {
+					const realm = `"${alpha.schemaName}"`;
+					const client = randomUUID();
+					await rolesDatabase.query(
+						`INSERT INTO ${realm}."oauthClient"(id,"clientId","redirectUris") VALUES ($1,$1,'[]')`,
+						[client],
+					);
+					const selectedGrant = await seedRuntimeMembershipGrant(
+						rolesDatabase,
+						alpha.schemaName,
+						client,
+						credentials.project.id,
+						ownedOrganization.id,
+					);
+					const preservedGrant = await seedRuntimeMembershipGrant(
+						rolesDatabase,
+						alpha.schemaName,
+						client,
+						credentials.project.id,
+						directoryOrg,
+					);
+					const updated = await changeRole({
+						action: "update",
+						role: retainedRole,
+						permission: updatedPermission,
+					});
+					expect(updated.status, await updated.clone().text()).toBe(200);
+					expect(
+						await runtimeMembershipGrantState(
+							rolesDatabase,
+							alpha.schemaName,
+							selectedGrant,
+						),
+					).toEqual({
+						access: false,
+						refresh: false,
+						consent: true,
+						code: false,
+					});
+					expect(
+						await runtimeMembershipGrantState(
+							rolesDatabase,
+							alpha.schemaName,
+							preservedGrant,
+						),
+					).toEqual({
+						access: true,
+						refresh: true,
+						consent: true,
+						code: true,
+					});
+					const audit = await rolesDatabase.query(
+						`SELECT type,"actorId","organizationId" FROM ${realm}."allauthEvent" WHERE "targetId"=$1 ORDER BY type`,
+						[retainedRole],
+					);
+					expect(audit.rows).toEqual(
+						["create", "update"].map((action) => ({
+							type: `organization.role.${action}`,
+							actorId: credentials.platform.id,
+							organizationId: ownedOrganization.id,
+						})),
+					);
+					await rolesDatabase.query(
+						`DELETE FROM ${realm}."oauthClient" WHERE id=$1`,
+						[client],
+					);
+					await rolesDatabase.query(
+						`DELETE FROM ${realm}."verification" WHERE id=$1`,
+						[preservedGrant.code],
+					);
+				} finally {
+					await rolesDatabase.end();
+				}
+				expect(
+					await (
+						await service.request(
+							`${rolesRoute}&search=fixture-retained&limit=1`,
+							root,
+						)
+					).json(),
+				).toMatchObject({
+					roles: [
+						{
+							role: retainedRole,
+							permission: updatedPermission,
+							builtIn: false,
+						},
+					],
+					total: 1,
+					limit: 1,
+					offset: 0,
+				});
+				const inviteEmail = "fixture-console-invite@runtime.fixture.example";
+				expect(
+					(
+						await changeInvitation({
+							action: "send",
+							email: inviteEmail,
+							inviterId: supportTarget,
+						})
+					).status,
+				).toBe(400);
+				expect(
+					(
+						await changeInvitation({
+							action: "send",
+							email: inviteEmail,
+							teamId: deletedTeam,
+						})
+					).status,
+				).toBe(404);
+				expect(
+					(
+						await changeInvitation({
+							action: "send",
+							email: credentials.project.email,
+						})
+					).status,
+				).toBe(409);
+				const sent = await changeInvitation({
+					action: "send",
+					email: inviteEmail.toUpperCase(),
+					role: invitedRole,
+					teamId: retainedTeam,
+				});
+				expect(sent.status, await sent.clone().text()).toBe(201);
+				const sentResult = (await sent.json()) as {
+					invitation: { id: string };
+					emailAccepted: boolean;
+				};
+				expect(sentResult).toEqual({
+					invitation: {
+						id: expect.any(String),
+						email: inviteEmail,
+						role: invitedRole,
+						expiresAt: expect.any(String),
+					},
+					emailAccepted: true,
+				});
+				const invitationId = sentResult.invitation.id;
+				await vi.waitFor(() => {
+					const mail = service!.mail.find((item) => item.to === inviteEmail);
+					expect(mail?.subject).toContain(patchedOrganization.name);
+					expect(mail?.text).toContain(
+						`${alpha.primaryOrigin}/account?invitation=${invitationId}`,
+					);
+				});
+				expect(
+					(await changeInvitation({ action: "send", email: inviteEmail }))
+						.status,
+				).toBe(409);
+				expect(
+					(await changeRole({ action: "delete", role: invitedRole })).status,
+				).toBe(409);
+				expect(
+					(await changeInvitation({ action: "cancel", invitationId })).status,
+				).toBe(200);
+				expect(
+					(await changeRole({ action: "delete", role: invitedRole })).status,
+				).toBe(200);
+				const failedMail = await changeInvitation({
+					action: "send",
+					email: rejectedInvitationEmail,
+					teamId: retainedTeam,
+				});
+				expect(failedMail.status, await failedMail.clone().text()).toBe(502);
+				const failedResult = (await failedMail.json()) as {
+					invitation: { id: string };
+					emailAccepted: boolean;
+				};
+				expect(failedResult).toMatchObject({
+					invitation: { email: rejectedInvitationEmail, role: "member" },
+					emailAccepted: false,
+				});
+				const persistedInvitationId = failedResult.invitation.id;
+				expect(
+					await (
+						await service.request(
+							`${invitationsRoute}&search=${persistedInvitationId}&limit=1`,
+							root,
+						)
+					).json(),
+				).toMatchObject({
+					invitations: [
+						{
+							id: persistedInvitationId,
+							email: rejectedInvitationEmail,
+							status: "pending",
+							teamId: retainedTeam,
+							inviterId: credentials.project.id,
+						},
+					],
+					total: 1,
+					limit: 1,
+					offset: 0,
+				});
+				const invitationAudit = new Pool({
+					connectionString: url(restored),
+					max: 1,
+				});
+				try {
+					const events = await invitationAudit.query(
+						`SELECT type,"actorId","organizationId","targetId" FROM "${alpha.schemaName}"."allauthEvent" WHERE "targetId"=ANY($1::text[])`,
+						[[invitationId, persistedInvitationId]],
+					);
+					expect(events.rows).toHaveLength(3);
+					expect(events.rows).toEqual(
+						expect.arrayContaining(
+							[
+								{
+									targetId: invitationId,
+									type: "organization.invitation.created",
+								},
+								{
+									targetId: invitationId,
+									type: "organization.invitation.cancelled",
+								},
+								{
+									targetId: persistedInvitationId,
+									type: "organization.invitation.created",
+								},
+							].map((event) => ({
+								...event,
+								actorId: credentials.platform.id,
+								organizationId: ownedOrganization.id,
+							})),
+						),
+					);
+				} finally {
+					await invitationAudit.end();
+				}
 				const ownedConfig = await service.request("/api/config", {
 					host: alphaHost,
 				});
@@ -3695,6 +3985,78 @@ describe.skipIf(!existsSync(fixture))(
 					total: 1,
 					limit: 25,
 					offset: 0,
+				});
+				expect(
+					await (
+						await service.request(
+							`${rolesRoute}&search=fixture-retained&limit=1`,
+							root,
+						)
+					).json(),
+				).toMatchObject({
+					roles: [
+						{
+							role: retainedRole,
+							permission: updatedPermission,
+							builtIn: false,
+						},
+					],
+					total: 1,
+				});
+				expect(
+					await (
+						await service.request(`${rolesRoute}&search=fixture-invited`, root)
+					).json(),
+				).toMatchObject({
+					roles: [],
+					total: 0,
+				});
+				const rollbackInvitation = `${invitationsRoute}&search=${persistedInvitationId}`;
+				expect(
+					await (await service.request(rollbackInvitation, root)).json(),
+				).toMatchObject({
+					invitations: [
+						{
+							id: persistedInvitationId,
+							status: "pending",
+							teamId: retainedTeam,
+						},
+					],
+					total: 1,
+				});
+				const rollbackCancel = await changeInvitation({
+					action: "cancel",
+					invitationId: persistedInvitationId,
+				});
+				expect(rollbackCancel.status, await rollbackCancel.clone().text()).toBe(
+					200,
+				);
+				expect(await rollbackCancel.json()).toEqual({ success: true });
+				expect(
+					await (await service.request(rollbackInvitation, root)).json(),
+				).toMatchObject({
+					invitations: [{ id: persistedInvitationId, status: "canceled" }],
+				});
+				const unconfiguredEmail =
+					"unconfigured-console-invite@runtime.fixture.example";
+				const unconfigured = await changeInvitation({
+					action: "send",
+					email: unconfiguredEmail,
+				});
+				expect(unconfigured.status).toBe(409);
+				expect(await unconfigured.json()).toEqual({
+					error: "Configure Cloudflare email before sending invitations.",
+				});
+				expect(
+					await (
+						await service.request(
+							`${invitationsRoute}&search=${unconfiguredEmail}`,
+							root,
+						)
+					).json(),
+				).toMatchObject({
+					invitations: [],
+					total: 0,
 				});
 				expect(rollbackMembers.status).toBe(200);
 				expect(await rollbackMembers.json()).toMatchObject({
