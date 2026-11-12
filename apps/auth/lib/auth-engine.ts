@@ -15,6 +15,8 @@ export interface PersonalApiKeyVerification {
 /** Operations on the authentication realm already selected by trusted routing. */
 export interface AuthEngine {
 	dispatch(request: Request): Promise<Response>;
+	/** Recheck stored SAML configuration even when the protected writer is cached. */
+	verifySamlReadiness?(): Promise<void>;
 	readIssuerMetadata(kind: "openid" | "oauth"): Promise<Response>;
 	readOAuthContext(request: Request): Promise<Response>;
 	/** Server-only session transfer. The HTTP generation endpoint stays disabled. */

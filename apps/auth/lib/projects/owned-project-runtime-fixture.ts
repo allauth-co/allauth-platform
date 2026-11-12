@@ -40,7 +40,6 @@ export interface ProjectRuntimeFixtureBoot {
 	projectSlug: string;
 	schemaName: string;
 	owned: boolean;
-	agentFixture?: boolean;
 	appleIssuerKey?: string;
 	encryptedSamlFixture?: ProjectEncryptedSamlFixtureAdmission;
 	rejectInvitationMailTo?: string;
@@ -226,12 +225,6 @@ async function boot(selection: ProjectRuntimeFixtureBoot) {
 	const encryptedSamlFixture =
 		selection.encryptedSamlFixture &&
 		Object.freeze({ ...selection.encryptedSamlFixture });
-	const agentFixture = selection.agentFixture
-		? Object.freeze({
-				projectId: selection.projectId,
-				schemaName: selection.schemaName,
-			})
-		: undefined;
 	if (selection.owned) {
 		const env = {
 			...process.env,
@@ -277,7 +270,6 @@ async function boot(selection: ProjectRuntimeFixtureBoot) {
 					signingSecret,
 					credentialHashSecret,
 					encryptedSamlFixture,
-					agentFixture,
 					trustedIP: (request) => request.headers.get("x-real-ip"),
 					defer(work) {
 						const operation = Promise.resolve()

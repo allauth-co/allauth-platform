@@ -9,6 +9,8 @@ import {
 	ssoPolicyErrorDescription,
 	ssoSessionErrorCode,
 } from "./owned-project-sso-admission";
+import type { ProjectEncryptedSamlApproval } from "./owned-project-sso-saml-approval";
+import { configureApprovedProjectSaml } from "./owned-project-sso-saml-approval";
 import type { ProjectCustomSamlTransport } from "./owned-project-sso-saml-eligibility";
 import { configureProjectSamlTransport } from "./owned-project-sso-saml-eligibility";
 import {
@@ -134,6 +136,7 @@ export function createOwnedProjectSaml(options: {
 	signUpEnabled: boolean;
 	generatedSPOnly?: boolean;
 	customTransport?: ProjectCustomSamlTransport;
+	encryptedApproval?: ProjectEncryptedSamlApproval;
 	allowEncrypted(provider: SsoProvider): boolean;
 	defaultError: URL;
 	store: SsoStore;
@@ -146,18 +149,54 @@ export function createOwnedProjectSaml(options: {
 		`${options.origin}${options.basePath}/sso/saml2/sp/acs/${providerId}`;
 	const clear = `${options.cookieName}=; Max-Age=0; ${options.cookieAttributes}`;
 
-	function currentProviderMatches(
-		provider: SsoProvider | null,
-		reference: ReturnType<typeof ssoProviderReference>,
-	): provider is SsoProvider {
-		if (!provider?.samlConfig || !sameSsoProvider(provider, reference))
-			return false;
+	async function approvalIsCurrent(provider: SsoProvider) {
+		const approval = options.encryptedApproval;
+		if (approval?.providerId !== provider.providerId) return true;
 		try {
-			options.allowEncrypted(provider);
-			return true;
+			approval.assertProvider(provider);
+			return Boolean(
+				await options.customTransport?.authorizeAcs(
+					approval.receiver,
+					provider.providerId,
+				),
+			);
 		} catch {
 			return false;
 		}
+	}
+
+	async function currentProviderMatches(
+		provider: SsoProvider,
+		reference: ReturnType<typeof ssoProviderReference>,
+	) {
+		if (!provider.samlConfig || !sameSsoProvider(provider, reference))
+			return false;
+		try {
+			options.allowEncrypted(provider);
+			return await approvalIsCurrent(provider);
+		} catch {
+			return false;
+		}
+	}
+
+	function configure(
+		provider: SsoProvider & { samlConfig: Record<string, unknown> },
+		relayState?: string,
+	) {
+		const approval = options.encryptedApproval;
+		if (approval?.providerId === provider.providerId)
+			return configureApprovedProjectSaml(
+				approval,
+				provider,
+				options.customTransport,
+				relayState,
+			);
+		return configureProjectSamlTransport(provider, acs(provider.providerId), {
+			relayState,
+			generatedSPOnly: options.generatedSPOnly,
+			customTransport: options.customTransport,
+			allowEncrypted: options.allowEncrypted(provider),
+		});
 	}
 
 	function finish(response: Response) {
@@ -254,15 +293,9 @@ export function createOwnedProjectSaml(options: {
 		try {
 			if (!provider.samlConfig) throw new Error("Invalid SAML provider.");
 			const relay = randomBytes(32).toString("base64url");
-			const { configured } = await configureProjectSamlTransport(
+			const { configured } = await configure(
 				{ ...provider, samlConfig: provider.samlConfig },
-				acs(provider.providerId),
-				{
-					relayState: relay,
-					generatedSPOnly: options.generatedSPOnly,
-					customTransport: options.customTransport,
-					allowEncrypted: options.allowEncrypted(provider),
-				},
+				relay,
 			);
 			const login = configured.service.createLoginRequest(
 				configured.idp,
@@ -282,7 +315,8 @@ export function createOwnedProjectSaml(options: {
 			const reference = ssoProviderReference(provider);
 			const issued = await store.transaction(async (client) => {
 				const current = await store.getProvider(provider.providerId, client);
-				if (!currentProviderMatches(current, reference)) return false;
+				if (!current || !(await currentProviderMatches(current, reference)))
+					return false;
 				const now = Date.now();
 				await client.query(
 					`INSERT INTO "verification"(id, identifier, value, "expiresAt")
@@ -347,7 +381,7 @@ export function createOwnedProjectSaml(options: {
 		const reference = ssoProviderReference(provider);
 		return store.transaction(async (client) => {
 			const current = await store.getProvider(providerId, client);
-			if (!currentProviderMatches(current, reference))
+			if (!current || !(await currentProviderMatches(current, reference)))
 				return "invalid_state" as const;
 			const requestRow = await verification(
 				client,
@@ -422,18 +456,21 @@ export function createOwnedProjectSaml(options: {
 		let selected: Awaited<ReturnType<typeof configureProjectSamlTransport>>;
 		let proof: VerifiedSaml;
 		try {
-			selected = await configureProjectSamlTransport(
-				{ ...provider, samlConfig: provider.samlConfig },
-				acs(providerId),
-				{
-					generatedSPOnly: options.generatedSPOnly,
-					customTransport: options.customTransport,
-					allowEncrypted: options.allowEncrypted(provider),
-				},
-			);
+			selected = await configure({
+				...provider,
+				samlConfig: provider.samlConfig,
+			});
 			if (selected.custom && request.url !== selected.acs)
 				throw new Error("This transport is not the registered SAML receiver.");
 			proof = await verifyOwnedSaml(form.response, selected.configured);
+			const approval = options.encryptedApproval;
+			if (
+				approval?.providerId === providerId &&
+				(!proof.requestId ||
+					!proof.encryption ||
+					!approval.acceptsProfile(proof.encryption))
+			)
+				throw new Error("This response is outside the approved SAML profile.");
 		} catch {
 			return markOwnedCallbackFailure(
 				json(
@@ -482,7 +519,10 @@ export function createOwnedProjectSaml(options: {
 			const absoluteDestination = new URL(destination, options.origin).href;
 			const result = await store.transaction(async (client) => {
 				const current = await store.getProvider(providerId, client);
-				if (!currentProviderMatches(current, consumed.reference)) {
+				if (
+					!current ||
+					!(await currentProviderMatches(current, consumed.reference))
+				) {
 					rejection = "invalid_state";
 					throw abort;
 				}
@@ -547,5 +587,5 @@ export function createOwnedProjectSaml(options: {
 		}
 	}
 
-	return { start, callback };
+	return { start, callback, approvalIsCurrent };
 }

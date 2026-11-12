@@ -64,6 +64,8 @@ export function postgresDatabase(pool: Pool) {
 const auditPaths = new Set(["/admin/create-user", "/admin/update-user", "/admin/set-role", "/admin/ban-user", "/admin/unban-user", "/admin/impersonate-user", "/admin/stop-impersonating", "/admin/remove-user", "/admin/set-user-password", "/admin/revoke-user-session", "/admin/revoke-user-sessions", "/sso/register", "/sso/update-provider", "/sso/delete-provider", "/sso/verify-domain", "/oauth2/create-client", "/oauth2/update-client", "/oauth2/delete-client", "/oauth2/rotate-client-secret", "/admin/oauth2/create-client", "/admin/oauth2/update-client"]);
 
 export interface AuthRealm {
+	/** Authoritative legacy realm connection for Agent proof replay only. */
+	agentReplayDatabase?: Pick<Pool, "query" | "connect">;
 	/** Platform-owned billing scope, independent of tenant organisation roles. */
 	workspaceId?: string;
 	/** Validated server-owned native identities for this exact project/environment. */
@@ -270,7 +272,7 @@ export function createAuthOptions(database: BetterAuthOptions["database"], env: 
 				},
 			}),
 			accountSessions(),
-			...extraServerPlugins(env, { project: Boolean(realm), origin: realm?.publicOrigin || realm?.primaryOrigin || url, projectSlug: realm?.slug }),
+			...extraServerPlugins(env, { project: Boolean(realm), origin: realm?.publicOrigin || realm?.primaryOrigin || url, projectSlug: realm?.slug, agentReplayDatabase: realm?.agentReplayDatabase }),
 			authPolicyPlugin(policy, { project: Boolean(realm) }),
 			...(aliasProject ? [projectEmailAliases({ project: aliasProject, readConfiguration: () => setting(env, projectEmailAliasVariable(aliasProject)) })] : []),
 			multiSession({ maximumSessions: 5 }),

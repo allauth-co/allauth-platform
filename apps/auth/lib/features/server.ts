@@ -19,10 +19,12 @@ import {
 	username,
 } from "better-auth/plugins";
 import { decodeJwt, decodeProtectedHeader } from "jose";
+import type { Pool } from "pg";
 import { verifyMessage } from "viem";
 import { parseSiweMessage } from "viem/siwe";
 import type { AuthEnvironment } from "../configuration";
 import { isPlatformAdmin, setting } from "../configuration";
+import { nativeProjectAgentKeyRotation, nativeProjectAgentReplayStorage } from "../projects/owned-project-agent-native-replay";
 import {
 	agentProtocolPath,
 	cookieOnlyFeaturePath,
@@ -84,10 +86,33 @@ function projectAnonymous() {
 
 // Better Auth merges endpoint maps by their API key. Agent Auth's deviceCode
 // would otherwise replace the native /device/code endpoint despite a different URL.
-function allauthAgentAuth(options: Parameters<typeof agentAuth>[0]) {
-	const plugin = agentAuth(options);
+function allauthAgentAuth({
+	replayDatabase,
+	...options
+}: NonNullable<Parameters<typeof agentAuth>[0]> & {
+	replayDatabase?: Pick<Pool, "query" | "connect">;
+}) {
+	const plugin = agentAuth(
+		replayDatabase
+			? { ...options, jtiCacheStorage: "secondary-storage" }
+			: options,
+	);
 	const { deviceCode: agentDeviceCode, ...endpoints } = plugin.endpoints;
-	return { ...plugin, endpoints: { ...endpoints, agentDeviceCode } };
+	return {
+		...plugin,
+		init: replayDatabase
+			? (context: Parameters<typeof plugin.init>[0]) =>
+					plugin.init({
+						...context,
+						secondaryStorage: nativeProjectAgentReplayStorage(replayDatabase),
+					})
+			: plugin.init,
+		endpoints: {
+			...endpoints,
+			agentDeviceCode,
+			...(replayDatabase ? { rotateKey: nativeProjectAgentKeyRotation(replayDatabase) } : {}),
+		},
+	};
 }
 
 /** Guards the additional native endpoints without replacing their protocol checks. */
@@ -238,7 +263,12 @@ export function featureBoundaries() {
 /** Compatible, free native plugins. Billing and challenge providers remain unconfigured. */
 export function extraServerPlugins(
 	env: AuthEnvironment,
-	options: { project: boolean; origin: string; projectSlug?: string },
+	options: {
+		project: boolean;
+		origin: string;
+		projectSlug?: string;
+		agentReplayDatabase?: Pick<Pool, "query" | "connect">;
+	},
 ) {
 	const origin = new URL(options.origin).origin;
 	const googleId = setting(env, "GOOGLE_CLIENT_ID");
@@ -298,6 +328,7 @@ export function extraServerPlugins(
 			},
 		}),
 		allauthAgentAuth({
+			replayDatabase: options.agentReplayDatabase,
 			providerName: "AllAuth",
 			modes: ["delegated"],
 			capabilities: [],

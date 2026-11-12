@@ -16,11 +16,11 @@ import {
 } from "./owned-project-agent-machine";
 import {
 	agentAbsoluteLifetime,
-	agentSessionLifetime,
 	ownedAgentStateError,
 	ownedAgentStatusColumns,
 	type OwnedAgentStatusRecord,
 	ownedAgentStatusResponse,
+	renewOwnedAgentSession,
 } from "./owned-project-agent-status";
 
 export const agentReactivationPath = "/agent/reactivate";
@@ -95,15 +95,13 @@ export async function reactivateOwnedProjectAgent(
 			"Agent's absolute lifetime has elapsed",
 		);
 	}
-	await client.query(`DELETE FROM "agentCapabilityGrant" WHERE "agentId"=$1`, [
-		agent.id,
-	]);
-	const {
-		rows: [active],
-	} = await client.query<OwnedAgentStatusRecord>(
-		`UPDATE "agent" SET status='active',"activatedAt"=statement_timestamp(),"expiresAt"=statement_timestamp()+$2::int*interval '1 second',
-		 "lastUsedAt"=statement_timestamp(),"updatedAt"=statement_timestamp() WHERE id=$1 RETURNING ${ownedAgentStatusColumns}`,
-		[agent.id, agentSessionLifetime],
-	);
-	return ownedAgentStatusResponse(client, active);
+	const active = await renewOwnedAgentSession(client, agent, ownerId);
+	return active
+		? ownedAgentStatusResponse(client, active)
+		: problem(
+				401,
+				"agent_expired",
+				"Agent session has expired",
+				new URL(request.url).origin,
+			);
 }

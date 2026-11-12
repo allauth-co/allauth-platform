@@ -16,7 +16,7 @@ import {
 } from "./owned-project-agent-machine";
 
 export const agentKeyRotationPath = "/agent/rotate-key";
-const input = z.object({
+export const ownedAgentKeyRotationInput = z.object({
 	agent_id: z.string().min(1),
 	public_key: z.record(z.string(), z.unknown()),
 });
@@ -42,7 +42,7 @@ export async function rotateOwnedAgentKey(
 			},
 			400,
 		);
-	const parsed = input.safeParse(body);
+	const parsed = ownedAgentKeyRotationInput.safeParse(body);
 	if (!parsed.success) return invalidAgentBody(parsed.error);
 	const authority = await authorizeOwnedAgentHostMutation(
 		client,

@@ -231,7 +231,7 @@ export async function verifyAgentMachineJWT(
 }
 
 export async function consumeAgentMachineReplay(
-	client: PoolClient,
+	client: Pick<PoolClient, "query">,
 	purpose: "agent-status" | "host-registration" | "host-agent-key-rotation",
 	principalId: string,
 	jti: string,

@@ -55,6 +55,15 @@ async function issueOwnedCibaApproval(
 ) {
 	const denied = await prepareOwnedPendingAgentApproval(client, target);
 	if (denied) return denied;
+	return writeOwnedCibaReceipt(client, target, email, message);
+}
+
+async function writeOwnedCibaReceipt(
+	client: PoolClient,
+	target: Omit<CibaTarget, "agentId"> & { agentId: string | null },
+	email: string,
+	message: string | null,
+) {
 	const receipt = newCibaReceipt();
 	await client.query(
 		`INSERT INTO "approvalRequest" (id,method,"agentId","hostId","userId",status,"loginHint","bindingMessage","deliveryMode",interval,"expiresAt","createdAt","updatedAt")
@@ -142,24 +151,26 @@ export async function authorizeOwnedAgentCiba(
 			"invalid_capabilities",
 			"One or more requested capability names don't exist or are blocked",
 		);
-	if (!agentId)
-		return problem(
-			400,
-			"invalid_request",
-			"A pending agent on this host is required.",
-		);
 	const email = await verifiedOwnerEmail(client, principal.ownerId);
 	// Use the native unknown-recipient response for all other login hints.
 	if (!email || email.toLowerCase() !== hint.toLowerCase())
 		return json(newCibaReceipt());
 	const target = {
-		agentId,
 		hostId: principal.host.id,
 		ownerId: principal.ownerId,
 	};
+	if (agentId === undefined)
+		return json(
+			await writeOwnedCibaReceipt(
+				client,
+				{ ...target, agentId: null },
+				email,
+				bindingMessage(message),
+			),
+		);
 	const result = await issueOwnedCibaApproval(
 		client,
-		target,
+		{ ...target, agentId },
 		email,
 		bindingMessage(message),
 	);

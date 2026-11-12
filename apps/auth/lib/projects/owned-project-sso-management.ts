@@ -28,6 +28,7 @@ import {
 	registerProjectSsoProvider,
 } from "./owned-project-sso-register";
 import { configureProjectSamlTransport } from "./owned-project-sso-saml-eligibility";
+import { configureApprovedProjectSaml } from "./owned-project-sso-saml-approval";
 import { allowsEncryptedSamlFixtureProvider } from "./owned-project-sso-saml-fixture-admission";
 import {
 	projectSamlAcs,
@@ -76,6 +77,7 @@ export interface OwnedProjectSsoManagementOptions {
 	saml?: OwnedProjectSsoOptions["saml"];
 	customSamlTransport?: OwnedProjectSsoOptions["customSamlTransport"];
 	encryptedSamlFixture?: OwnedProjectSsoOptions["encryptedSamlFixture"];
+	encryptedSamlApproval?: OwnedProjectSsoOptions["encryptedSamlApproval"];
 	trustedRequest(headers: Headers, mutation: boolean): boolean;
 	readBody(request: Request): Promise<unknown>;
 	readSession(
@@ -316,11 +318,23 @@ export function createOwnedProjectSsoManagement(
 				options.schemaName,
 				{ ...provider, samlConfig: config },
 			);
-			const selected = await configureProjectSamlTransport(
-				{ ...provider, samlConfig: config },
-				acs,
-				{ ...samlScope, allowEncrypted },
-			);
+			const approval = options.encryptedSamlApproval;
+			const selected =
+				approval?.providerId === id.data
+					? await configureApprovedProjectSaml(
+							approval,
+							{
+								...provider,
+								oidcConfig: readStoredSsoConfiguration(provider.oidcConfig),
+								samlConfig: config,
+							},
+							options.customSamlTransport,
+						)
+					: await configureProjectSamlTransport(
+							{ ...provider, samlConfig: config },
+							acs,
+							{ ...samlScope, allowEncrypted },
+						);
 			if (!selected.configured.postLocations.includes(selected.acs))
 				throw new Error("Invalid SAML configuration");
 			return new Response(selected.configured.service.getMetadata(), {

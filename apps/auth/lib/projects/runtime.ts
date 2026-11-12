@@ -71,6 +71,8 @@ import type { OwnedProjectSCIMConsole } from "./owned-project-scim-console";
 import {
 	internalProjectEngineSelected,
 	internalProjectPreparationRevision,
+	projectAgentReplayApproved,
+	protectedInternalProject,
 	selectInternalProjectEngine,
 } from "./project-engine-internal-selection";
 import { protectedProjectWriterLease } from "./project-engine-internal-writer";
@@ -334,6 +336,7 @@ async function build(
 			postgresDatabase(pool),
 			env,
 			{
+				...(protectedInternalProject(project) ? { agentReplayDatabase: pool } : {}),
 				...(google ? { google } : {}),
 				...(apple ? { apple } : {}),
 				...(microsoft ? { microsoft } : {}),
@@ -541,7 +544,7 @@ async function withProjectEntry<T>(
 	const lease = protectedProjectWriterLease(project, env);
 	if (!lease) return withConfiguredProjectEntry(project, env, publicOrigin, callback);
 	return lease.withCurrent(({ writer, revision }) => {
-		const candidate = writer === "allauth" ? selectInternalProjectEngine(project, env) : undefined;
+		const candidate = writer === "allauth" ? selectInternalProjectEngine(project, env, { revision, preparing: false }) : undefined;
 		if (writer === "allauth" && !candidate)
 			throw new Error("The internal project writer is unavailable.");
 		return withConfiguredProjectEntry(
@@ -571,10 +574,18 @@ async function withConfiguredProjectEntry<T>(
 				.update(aliasConfiguration)
 				.digest("hex")
 		: "";
+	const samlApproval = owned && writer && setting(env, "ALLAUTH_PROJECT_ENGINE_ENCRYPTED_SAML_APPROVAL");
+	const samlApprovalVersion = samlApproval
+		? createHmac("sha256", setting(env, "ALLAUTH_AUTH_SECRET")).update(samlApproval).digest("hex")
+		: "";
+	const agentApproval = owned && writer && setting(env, "ALLAUTH_PROJECT_ENGINE_AGENT_REPLAY_APPROVAL");
+	const agentApprovalVersion = agentApproval
+		? createHmac("sha256", setting(env, "ALLAUTH_AUTH_SECRET")).update(agentApproval).digest("hex")
+		: "";
 	// Transport secrets can rotate while the native auth instance remains cached.
 	// Verification must receive the registry row read for this request.
 	return entries.use(
-		`${project.id}:${configured.version}:engine:${preparing ? "preflight:" : ""}${writer ? `${writer.writer}:${writer.revision}` : owned ? "owned-fixture" : "legacy"}:metrics:${projectEngineMetricsSelected(env, project.id)}:shadow:${projectSessionShadowSelected(env, project)}:origins:${projectOriginFingerprint(project)}:owned-avatars:${ownedAvatarSelected(env, project.id)}:native-passkeys:${selectedNativePasskeys(env, project, publicOrigin).version}:google:${googleProvider.version}:microsoft:${microsoftConfigurationVersion(microsoft)}:apple:${appleConfigurationVersion(apple)}:${apple ? Math.floor(Date.now() / 86400000) : 0}:aliases:${aliasVersion}:${publicOrigin ?? ""}`,
+		`${project.id}:${configured.version}:engine:${preparing ? "preflight:" : ""}${writer ? `${writer.writer}:${writer.revision}` : owned ? "owned-fixture" : "legacy"}:metrics:${projectEngineMetricsSelected(env, project.id)}:shadow:${projectSessionShadowSelected(env, project)}:origins:${projectOriginFingerprint(project)}:owned-avatars:${ownedAvatarSelected(env, project.id)}:native-passkeys:${selectedNativePasskeys(env, project, publicOrigin).version}:google:${googleProvider.version}:microsoft:${microsoftConfigurationVersion(microsoft)}:apple:${appleConfigurationVersion(apple)}:${apple ? Math.floor(Date.now() / 86400000) : 0}:aliases:${aliasVersion}:saml:${samlApprovalVersion}:agent:${agentApprovalVersion}:${publicOrigin ?? ""}`,
 		() => build(project, env, configured.policy, googleProvider, publicOrigin, owned, writer),
 		(entry) => callback(entry, project),
 	);
@@ -739,16 +750,17 @@ export function confirmInternalProjectEngine(
 	env: AuthEnvironment,
 	hostname?: string,
 ) {
-	const candidate = selectInternalProjectEngine(project, env);
 	const lease = protectedProjectWriterLease(project, env);
-	if (!candidate || !lease)
+	if (!internalProjectEngineSelected(env, project) || !lease)
 		throw new Error("The internal project selection changed.");
 	const origin = hostname ? `https://${hostname}` : undefined;
 	return lease.withCurrent(async ({ writer, revision }) => {
 		// Keep preflight separate from live cache entries. Legacy can
 		// still change configuration until the database commits the switch.
 		const preparing = writer === "legacy" && revision === internalProjectPreparationRevision(env);
+		if (preparing) projectAgentReplayApproved(project, env, { revision, preparing });
 		const useCandidate = preparing || writer === "allauth";
+		const candidate = useCandidate ? selectInternalProjectEngine(project, env, { revision, preparing }) : undefined;
 		await withConfiguredProjectEntry(
 			project,
 			env,
@@ -757,6 +769,7 @@ export function confirmInternalProjectEngine(
 				const expected = useCandidate ? "owned" : "legacy";
 				if (entry.kind !== expected || !internalProjectEngineSelected(env, entry.project))
 					throw new Error("The internal project writer is unavailable.");
+				if (entry.kind === "owned") await entry.engine.verifySamlReadiness?.();
 			},
 			useCandidate ? candidate : undefined,
 			preparing ? { writer: "allauth", revision: revision + 1 } : { writer, revision },

@@ -27,6 +27,7 @@ import {
 	ssoScope,
 } from "./owned-project-sso-oidc";
 import { createOwnedProjectSaml } from "./owned-project-sso-saml";
+import type { ProjectEncryptedSamlApproval } from "./owned-project-sso-saml-approval";
 import type { ProjectCustomSamlTransport } from "./owned-project-sso-saml-eligibility";
 import type { ProjectEncryptedSamlFixtureAdmission } from "./owned-project-sso-saml-fixture-admission";
 import { allowsEncryptedSamlFixtureProvider } from "./owned-project-sso-saml-fixture-admission";
@@ -110,6 +111,7 @@ export interface OwnedProjectSsoOptions extends ProjectSsoAdmission {
 	saml?: boolean | "generated-sp" | "encrypted-fixture";
 	customSamlTransport?: ProjectCustomSamlTransport;
 	encryptedSamlFixture?: ProjectEncryptedSamlFixtureAdmission;
+	encryptedSamlApproval?: ProjectEncryptedSamlApproval;
 	/** Session/MFA admission runs on the same client as the exact account and directory binding. */
 	complete(
 		client: PoolClient,
@@ -199,6 +201,7 @@ export function createOwnedProjectSso(options: OwnedProjectSsoOptions) {
 			signUpEnabled: options.signUpEnabled,
 			generatedSPOnly: options.saml === "generated-sp",
 			customTransport: options.customSamlTransport,
+			encryptedApproval: options.encryptedSamlApproval,
 			allowEncrypted: (provider) =>
 				options.saml === "encrypted-fixture" ||
 				allowsEncryptedSamlFixtureProvider(
@@ -267,6 +270,39 @@ export function createOwnedProjectSso(options: OwnedProjectSsoOptions) {
 		);
 	}
 
+	function selectProvider(body: OwnedProjectSsoInput) {
+		return store.selectProvider({
+			providerId: body.providerId,
+			organizationSlug: body.organizationSlug,
+			domain: body.domain || body.email?.split("@")[1],
+		});
+	}
+
+	async function verifyEncryptedSamlStart(input: OwnedProjectSsoInput) {
+		const approval = options.encryptedSamlApproval;
+		if (!approval) return true;
+		const provider = await selectProvider(input);
+		if (
+			provider?.providerId !== approval.providerId &&
+			input.providerId !== approval.providerId
+		)
+			return true;
+		return Boolean(
+			saml && provider && (await saml.approvalIsCurrent(provider)),
+		);
+	}
+
+	async function verifyEncryptedSamlCallback(
+		request: Request,
+		providerId: string,
+	) {
+		const approval = options.encryptedSamlApproval;
+		if (approval?.providerId !== providerId) return true;
+		if (!saml || request.url !== approval.receiver) return false;
+		const provider = await store.getProvider(providerId);
+		return Boolean(provider && (await saml.approvalIsCurrent(provider)));
+	}
+
 	async function start(request: Request, input: OwnedProjectSsoInput) {
 		const caller = request.headers.get("origin");
 		if (
@@ -319,11 +355,7 @@ export function createOwnedProjectSso(options: OwnedProjectSsoOptions) {
 				},
 				403,
 			);
-		const provider = await store.selectProvider({
-			providerId: body.providerId,
-			organizationSlug: body.organizationSlug,
-			domain: body.domain || body.email?.split("@")[1],
-		});
+		const provider = await selectProvider(body);
 		if (!provider)
 			return json(
 				{
@@ -362,7 +394,8 @@ export function createOwnedProjectSso(options: OwnedProjectSsoOptions) {
 		}
 		if (
 			!provider.oidcConfig ||
-			provider.providerId === options.encryptedSamlFixture?.providerId
+			provider.providerId === options.encryptedSamlFixture?.providerId ||
+			provider.providerId === options.encryptedSamlApproval?.providerId
 		)
 			return json(
 				{
@@ -555,6 +588,7 @@ export function createOwnedProjectSso(options: OwnedProjectSsoOptions) {
 			request.method !== "GET" ||
 			!url ||
 			providerId === options.encryptedSamlFixture?.providerId ||
+			providerId === options.encryptedSamlApproval?.providerId ||
 			!ssoProviderId.safeParse(providerId).success
 		)
 			return failure("invalid_request");
@@ -681,5 +715,11 @@ export function createOwnedProjectSso(options: OwnedProjectSsoOptions) {
 		return saml.callback(request, providerId);
 	}
 
-	return { start, callback, samlCallback };
+	return {
+		start,
+		callback,
+		samlCallback,
+		verifyEncryptedSamlStart,
+		verifyEncryptedSamlCallback,
+	};
 }

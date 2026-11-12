@@ -4410,7 +4410,22 @@ describe.skipIf(!existsSync(fixture))(
 				`UPDATE "${alpha.schemaName}"."agent" SET "expiresAt"=now()-interval '1 minute' WHERE id=$1`,
 				[machine.agentId],
 			);
-			const expired = await owned.dispatch(
+			const mismatched = await owned.dispatch(
+				request(
+					alpha,
+					statusPath,
+					"",
+					undefined,
+					`Bearer ${await agentProof(machine, `${agentAudience}/agent/session`)}`,
+				),
+			);
+			expect(mismatched.status).toBe(401);
+			const inactive = await database.query(
+				`SELECT status,"expiresAt"<now() AS expired FROM "${alpha.schemaName}"."agent" WHERE id=$1`,
+				[machine.agentId],
+			);
+			expect(inactive.rows).toEqual([{ status: "active", expired: true }]);
+			const renewed = await owned.dispatch(
 				request(
 					alpha,
 					statusPath,
@@ -4419,13 +4434,17 @@ describe.skipIf(!existsSync(fixture))(
 					`Bearer ${await agentProof(machine)}`,
 				),
 			);
-			expect(expired.status).toBe(401);
-			expect(await expired.json()).toMatchObject({ error: "agent_expired" });
+			expect(renewed.status).toBe(200);
+			expect(await renewed.json()).toMatchObject({
+				agent_id: machine.agentId,
+				status: "active",
+				agent_capability_grants: [],
+			});
 			const record = await database.query(
 				`SELECT status,"expiresAt"<now() AS expired FROM "${alpha.schemaName}"."agent" WHERE id=$1`,
 				[machine.agentId],
 			);
-			expect(record.rows).toEqual([{ status: "active", expired: true }]);
+			expect(record.rows).toEqual([{ status: "active", expired: false }]);
 		});
 
 		function machineRegistration(

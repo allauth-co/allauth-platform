@@ -2768,6 +2768,7 @@ export function createOwnedProjectEngine(
 			signUpEnabled: policy.signUpEnabled,
 			denyProviderProfile: security.denyProvisioning,
 			prepareProviderSignup: security.prepareProviderSignup,
+			encryptedSamlApproval: options.sso?.encryptedSamlApproval,
 			async complete(
 				client,
 				{ user, request, providerId, destination, managed, protocol },
@@ -3192,6 +3193,12 @@ export function createOwnedProjectEngine(
 					"INVALID_BODY",
 					"Invalid enterprise sign-in request.",
 				);
+			if (!(await sso.verifyEncryptedSamlStart(body.data)))
+				return failure(
+					503,
+					"AUTHENTICATION_UNAVAILABLE",
+					"Enterprise sign-in is unavailable.",
+				);
 			const denied = await store.transaction((client) =>
 				security.admit(client, request, {
 					email: body.data.email?.toLowerCase(),
@@ -3220,6 +3227,12 @@ export function createOwnedProjectEngine(
 		) {
 			const provider = path.slice(samlCallbackPath.length);
 			if (!provider || provider.includes("/")) return forbidden();
+			if (!(await sso.verifyEncryptedSamlCallback(request, provider)))
+				return failure(
+					503,
+					"AUTHENTICATION_UNAVAILABLE",
+					"Enterprise sign-in is unavailable.",
+				);
 			const denied = await store.transaction((client) =>
 				security.admit(client, request),
 			);

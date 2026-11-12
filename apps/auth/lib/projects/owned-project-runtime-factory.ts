@@ -54,6 +54,7 @@ import { projectAdministrator } from "../workspaces/authorization";
 import { backendCredentialRepository } from "./backend-credentials";
 import { projectBrokerTwoFactor } from "./broker-two-factor";
 import { readLegacyProjectKeyring } from "./legacy-project-keyring";
+import { assertOwnedProjectAgentAdmission } from "./owned-project-agent-admission";
 import { createOwnedEmailVerification } from "./owned-email-verification";
 import { createOwnedProjectAppleDeletion } from "./owned-project-apple-deletion";
 import { createOwnedProjectApplicationConsole } from "./owned-project-application-console";
@@ -67,6 +68,8 @@ import { createOwnedProjectPasswordSafety } from "./owned-project-password-safet
 import { createOwnedProjectSCIMConsole } from "./owned-project-scim-console";
 import { checkProjectOidcConfiguration } from "./owned-project-sso-oidc";
 import { readStoredSsoConfiguration } from "./owned-project-sso-projection";
+import type { ProjectEncryptedSamlApproval } from "./owned-project-sso-saml-approval";
+import { configureApprovedProjectSaml } from "./owned-project-sso-saml-approval";
 import type { ProjectCustomSamlTransport } from "./owned-project-sso-saml-eligibility";
 import { configureProjectSamlTransport } from "./owned-project-sso-saml-eligibility";
 import type { ProjectEncryptedSamlFixtureAdmission } from "./owned-project-sso-saml-fixture-admission";
@@ -80,6 +83,7 @@ import {
 	ownedWebhookSelectors,
 } from "./owned-project-webhook-admission";
 import type { ProjectAvatarStorage } from "./project-avatar-upload";
+import { protectedInternalProject } from "./project-engine-internal-selection";
 import { verifiedProjectRequest } from "./proxy";
 import type { Project } from "./registry";
 import {
@@ -106,10 +110,11 @@ type Options = {
 	fetchPasswordRange?: Parameters<typeof createOwnedProjectPasswordSafety>[0];
 	webhookResolver?: NonNullable<EngineOptions["webhookManagement"]>["resolver"];
 	encryptedSamlFixture?: ProjectEncryptedSamlFixtureAdmission;
-	agentFixture?: Readonly<{ projectId: string; schemaName: string }>;
+	encryptedSamlApproval?: ProjectEncryptedSamlApproval;
 	postBackchannelLogout?: NonNullable<
 		EngineOptions["backchannelLogout"]
 	>["post"];
+	agentReplayApproved?: boolean;
 };
 
 const authAdmission = {
@@ -130,7 +135,6 @@ const authAdmission = {
 function verifyLocalRuntimeFixture(
 	options: Options,
 	binding: Readonly<{ projectId: string; schemaName: string }>,
-	feature: "encrypted SAML" | "Agent Auth",
 ) {
 	const { database, project, env } = options;
 	const databaseURL = new URL(setting(env, "DATABASE_URL"));
@@ -146,7 +150,80 @@ function verifyLocalRuntimeFixture(
 		binding.schemaName !== project.schemaName
 	)
 		throw new Error(
-			`This development project has an invalid ${feature} fixture binding.`,
+			"This development project has an invalid encrypted SAML fixture binding.",
+		);
+}
+
+type EnterpriseProviderRow = {
+	id: string;
+	providerId: string;
+	issuer: string;
+	domain: string;
+	domainVerified: boolean | null;
+	organizationId: string | null;
+	oidcConfig: string | null;
+	samlConfig: string | null;
+};
+
+const enterpriseProviderFields =
+	'id,"providerId",issuer,domain,"domainVerified","organizationId","oidcConfig","samlConfig"';
+
+async function verifySamlProvider(
+	entry: EnterpriseProviderRow,
+	options: Options,
+	baseURL: string,
+	customSamlTransport: ProjectCustomSamlTransport,
+) {
+	const samlConfig = readStoredSsoConfiguration(entry.samlConfig);
+	try {
+		if (entry.oidcConfig || !samlConfig) throw new Error();
+		const provider = { ...entry, oidcConfig: undefined, samlConfig };
+		const approval = options.encryptedSamlApproval;
+		if (approval?.providerId === entry.providerId) {
+			await configureApprovedProjectSaml(
+				approval,
+				provider,
+				customSamlTransport,
+			);
+			return;
+		}
+		await configureProjectSamlTransport(
+			provider,
+			projectSamlAcs(baseURL, entry.providerId),
+			{
+				generatedSPOnly: true,
+				allowEncrypted: allowsEncryptedSamlFixtureProvider(
+					options.encryptedSamlFixture,
+					options.project.schemaName,
+					provider,
+				),
+				customTransport: customSamlTransport,
+				validateAll: true,
+			},
+		);
+	} catch {
+		throw new Error(
+			"This development project has a configured SAML provider outside the candidate scope.",
+		);
+	}
+}
+
+function requireEncryptedSamlProvider(
+	options: Options,
+	providers: EnterpriseProviderRow[],
+) {
+	const admission =
+		options.encryptedSamlApproval ?? options.encryptedSamlFixture;
+	if (
+		admission &&
+		!providers.some(
+			(row) => row.providerId === admission.providerId && row.samlConfig,
+		)
+	)
+		throw new Error(
+			options.encryptedSamlFixture
+				? "This development project has an invalid encrypted SAML fixture binding."
+				: "The selected encrypted SAML provider is unavailable.",
 		);
 }
 
@@ -156,13 +233,12 @@ async function readSupportedProviders(
 	customSamlTransport: ProjectCustomSamlTransport,
 ) {
 	const { database, project, env } = options;
-	const agentFixture = options.agentFixture;
-	if (agentFixture)
-		verifyLocalRuntimeFixture(options, agentFixture, "Agent Auth");
-	const agentHosts = Boolean(agentFixture);
+	const agentHosts = options.agentReplayApproved === true && protectedInternalProject(project);
 	const admission = options.encryptedSamlFixture;
+	if (admission && options.encryptedSamlApproval)
+		throw new Error("The isolated SAML fixture cannot use a deployment approval.");
 	if (admission)
-		verifyLocalRuntimeFixture(options, admission, "encrypted SAML");
+		verifyLocalRuntimeFixture(options, admission);
 	if (
 		project.environment !== "development" ||
 		!/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(project.id) ||
@@ -207,53 +283,15 @@ async function readSupportedProviders(
 			);
 	}
 	const schema = checkedProjectSchema(project.schemaName);
-	const { rows: enterprise } = await database.query<{
-		id: string;
-		providerId: string;
-		issuer: string;
-		domain: string;
-		organizationId: string | null;
-		oidcConfig: string | null;
-		samlConfig: string | null;
-	}>(
-		`SELECT id,"providerId",issuer,domain,"organizationId","oidcConfig","samlConfig" FROM "${schema}"."ssoProvider"`,
+	const { rows: enterprise } = await database.query<EnterpriseProviderRow>(
+		`SELECT ${enterpriseProviderFields} FROM "${schema}"."ssoProvider"`,
 	);
-	if (
-		admission &&
-		!enterprise.some(
-			(row) => row.providerId === admission.providerId && row.samlConfig,
-		)
-	)
-		throw new Error(
-			"This development project has an invalid encrypted SAML fixture binding.",
-		);
+	requireEncryptedSamlProvider(options, enterprise);
 	const enterpriseProviderIds = await Promise.all(
 		enterprise.map(async (entry) => {
 			const providerId = ssoProviderId.parse(entry.providerId);
 			if (entry.samlConfig || !entry.oidcConfig) {
-				const samlConfig = readStoredSsoConfiguration(entry.samlConfig);
-				try {
-					if (entry.oidcConfig || !samlConfig) throw new Error();
-					const encrypted = allowsEncryptedSamlFixtureProvider(
-						admission,
-						schema,
-						{ ...entry, samlConfig },
-					);
-					await configureProjectSamlTransport(
-						{ ...entry, samlConfig },
-						projectSamlAcs(baseURL, providerId),
-						{
-							generatedSPOnly: true,
-							allowEncrypted: encrypted,
-							customTransport: customSamlTransport,
-							validateAll: true,
-						},
-					);
-				} catch {
-					throw new Error(
-						"This development project has a configured SAML provider outside the candidate scope.",
-					);
-				}
+				await verifySamlProvider(entry, options, baseURL, customSamlTransport);
 				return providerId;
 			}
 			checkProjectOidcConfiguration({
@@ -290,7 +328,7 @@ async function readSupportedProviders(
 		   k."rateLimitTimeWindow" IS DISTINCT FROM 60000 OR
 		   k."rateLimitMax" IS DISTINCT FROM 100
 		 ) OR
-		 (NOT $4::boolean AND EXISTS (SELECT 1 FROM "${schema}"."agentHost")) OR
+		 (NOT $4::boolean AND (EXISTS (SELECT 1 FROM "${schema}"."agentHost") OR EXISTS (SELECT 1 FROM "${schema}"."approvalRequest"))) OR
 		 (NOT $2::boolean AND EXISTS (SELECT 1 FROM "${schema}"."allauthAvatarAsset" WHERE state <> 'deleted')) OR
 		 EXISTS (
 		  SELECT 1 FROM "${schema}"."account" a JOIN "${schema}"."user" u ON u.id=a."userId"
@@ -323,6 +361,7 @@ async function readSupportedProviders(
 		throw new Error(
 			"This development project has stored features outside the candidate scope.",
 		);
+	if (agentHosts) await assertOwnedProjectAgentAdmission(database, schema);
 	await assertOwnedProjectWebhookAdmission(database, schema, options.policy);
 	return { google, microsoft, apple, agentHosts };
 }
@@ -626,6 +665,7 @@ export async function createOwnedProjectRuntimeCandidate(options: Options) {
 			saml: "generated-sp",
 			customSamlTransport,
 			encryptedSamlFixture: options.encryptedSamlFixture,
+			encryptedSamlApproval: options.encryptedSamlApproval,
 		},
 		scim: { credentialHashSecret: options.credentialHashSecret },
 		manageSCIMConsole,
@@ -796,6 +836,23 @@ export async function createOwnedProjectRuntimeCandidate(options: Options) {
 	});
 	return {
 		...engine,
+		async verifySamlReadiness() {
+			const schema = checkedProjectSchema(project.schemaName);
+			const { rows } = await database.query<EnterpriseProviderRow>(
+				`SELECT ${enterpriseProviderFields} FROM "${schema}"."ssoProvider" WHERE "samlConfig" IS NOT NULL OR "oidcConfig" IS NULL`,
+			);
+			requireEncryptedSamlProvider(options, rows);
+			await Promise.all(
+				rows.map((row) =>
+					verifySamlProvider(
+						row,
+						options,
+						`${origin}${basePath}`,
+						customSamlTransport,
+					),
+				),
+			);
+		},
 		manageApplicationConsole: createOwnedProjectApplicationConsole({
 			database,
 			project,

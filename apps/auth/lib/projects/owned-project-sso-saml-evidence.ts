@@ -1,9 +1,10 @@
-import { createHash, createHmac } from "node:crypto";
+import { createHash } from "node:crypto";
 import type { Pool } from "pg";
 import * as z from "zod";
 import type { AuthEnvironment } from "../configuration";
 import { authOrigin, setting } from "../configuration";
 import { readStoredSsoConfiguration } from "./owned-project-sso-projection";
+import { encryptedSamlConfigurationFingerprint } from "./owned-project-sso-saml-approval";
 import { configureProjectSamlTransport } from "./owned-project-sso-saml-eligibility";
 import { verifyOwnedSaml } from "./owned-project-sso-saml-protocol";
 import { createProjectCustomSamlTransport } from "./owned-project-sso-saml-transport";
@@ -173,10 +174,13 @@ export async function verifyProjectEncryptedSamlEvidence(options: {
 				legacyWriterRevision: revision,
 				receiver,
 				issuer: proof.issuer,
-				configurationFingerprint: createHmac("sha256", secret)
-					.update("allauth:encrypted-saml-evidence:v1\n")
-					.update(JSON.stringify([project.id, receiver, record]))
-					.digest("base64url"),
+				configurationFingerprint: encryptedSamlConfigurationFingerprint(
+					secret,
+					project.id,
+					schema,
+					receiver,
+					provider,
+				),
 				observedAt: new Date(now).toISOString(),
 				...proof.encryption,
 			};
