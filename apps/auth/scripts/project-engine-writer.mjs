@@ -3,26 +3,32 @@ import { loadEnvFile } from "node:process";
 import { Pool } from "pg";
 import {
 	agentReplayApprovalSetting,
+	agentReplayBridgeIdSetting,
 	issueAgentReplayDrainEvidence,
 	verifyAgentReplayDrainEvidence,
 } from "./project-agent-replay-evidence.mjs";
-
+import { assertStoredProjectAgentAdmission } from "./project-agent-stored-admission.mjs";
 import { verifyEncryptedSamlActivation } from "./project-engine-saml-approval.mjs";
+import { verifyProjectWebhookActivation } from "./project-engine-webhook-admission.mjs";
 
 if (existsSync(".env.local")) loadEnvFile(".env.local");
 if (!process.env.DATABASE_URL) throw new Error("DATABASE_URL is required.");
 await projectEngine(process.argv.slice(2));
 
 async function projectEngine([operation, previous, revision, next, ...rest]) {
-	const id = process.env.ALLAUTH_PROJECT_ENGINE_INTERNAL_ID?.trim() ?? "";
-	if (!/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(id))
-		throw new Error("The exact protected internal project ID is required.");
+	const selectedId = process.env.ALLAUTH_PROJECT_ENGINE_INTERNAL_ID?.trim() ?? "";
+	const bridgeId = process.env[agentReplayBridgeIdSetting]?.trim() ?? "";
 	const reading = operation === "status" && previous === undefined;
 	const issuingAgentEvidence =
 		operation === "agent-replay-evidence" &&
 		previous !== undefined &&
 		revision !== undefined &&
 		next === undefined;
+	const id = issuingAgentEvidence ? bridgeId : selectedId;
+	if (!/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(id))
+		throw new Error(issuingAgentEvidence ? "The exact protected Agent replay bridge ID is required." : "The exact protected internal project ID is required.");
+	if (issuingAgentEvidence && selectedId && selectedId !== bridgeId)
+		throw new Error("The protected project Agent replay bridge is unavailable.");
 	const writers = ["legacy", "allauth"];
 	if (
 		!reading &&
@@ -74,8 +80,8 @@ async function projectEngine([operation, previous, revision, next, ...rest]) {
 		}
 		const current = reading
 			? await readProtectedWriter(pool, id)
-			: previous === "legacy" && next === "allauth"
-				? await switchProtectedProject(pool, id, Number(revision), replaySecret)
+			: previous !== next
+				? await switchProtectedProject(pool, id, previous, Number(revision), next, bridgeId, replaySecret)
 				: (
 						await pool.query(
 							"SELECT writer,revision FROM public.allauth_switch_project_engine_writer($1,$2,$3,$4)",
@@ -105,7 +111,7 @@ async function readProtectedWriter(database, id) {
 	return current;
 }
 
-async function switchProtectedProject(pool, id, revision, secret) {
+async function switchProtectedProject(pool, id, previous, revision, next, bridgeId, secret) {
 	const client = await pool.connect();
 	try {
 		await client.query("BEGIN");
@@ -114,8 +120,8 @@ async function switchProtectedProject(pool, id, revision, secret) {
 			[id],
 		);
 		const current = await readProtectedWriter(client, id);
-		if (current?.writer !== "legacy" || current.revision !== revision)
-			throw new Error("The protected legacy project revision changed.");
+		if (current?.writer !== previous || current.revision !== revision)
+			throw new Error("The protected project writer revision changed.");
 		const schema = `allauth_project_${id.replaceAll("-", "")}`;
 		const {
 			rows: [stored],
@@ -123,20 +129,22 @@ async function switchProtectedProject(pool, id, revision, secret) {
 			`SELECT EXISTS (SELECT 1 FROM "${schema}"."agentHost") OR EXISTS (SELECT 1 FROM "${schema}"."approvalRequest") AS agent`,
 		);
 		const raw = process.env[agentReplayApprovalSetting]?.trim() || "";
-		if (stored.agent || raw)
-			verifyAgentReplayDrainEvidence(raw, secret, id, revision);
-		await verifyEncryptedSamlActivation(
-			client,
-			id,
-			schema,
-			revision,
-			process.env,
-		);
+		if (stored.agent || raw) {
+			if (bridgeId !== id) throw new Error("The protected project Agent replay bridge is unavailable.");
+			if (next === "allauth") {
+				verifyAgentReplayDrainEvidence(raw, secret, id, revision);
+				await assertStoredProjectAgentAdmission(client, schema);
+			}
+		}
+		if (next === "allauth") {
+			await verifyProjectWebhookActivation(client, id, schema);
+			await verifyEncryptedSamlActivation(client, id, schema, revision, process.env);
+		}
 		const {
 			rows: [selected],
 		} = await client.query(
-			"SELECT writer,revision FROM public.allauth_switch_project_engine_writer($1,'legacy',$2,'allauth')",
-			[id, revision],
+			"SELECT writer,revision FROM public.allauth_switch_project_engine_writer($1,$2,$3,$4)",
+			[id, previous, revision, next],
 		);
 		await client.query("COMMIT");
 		return selected;

@@ -2,6 +2,8 @@ import { createHmac, timingSafeEqual } from "node:crypto";
 
 export const agentReplayApprovalSetting =
 	"ALLAUTH_PROJECT_ENGINE_AGENT_REPLAY_APPROVAL";
+export const agentReplayBridgeIdSetting =
+	"ALLAUTH_PROJECT_ENGINE_AGENT_BRIDGE_ID";
 const kind = "operator-verified-agent-replay-drain-v1";
 const drainWindowMs = 90_000;
 const preparationWindowMs = 15 * 60_000;

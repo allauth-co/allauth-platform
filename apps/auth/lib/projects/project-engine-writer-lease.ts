@@ -44,6 +44,30 @@ interface ActiveLease {
 
 const activeLease = new AsyncLocalStorage<ActiveLease>();
 
+function retainPendingWork<Result>(current: ActiveLease, work: Promise<Result>) {
+	current.pending.add(work);
+	void work.then(
+		() => current.pending.delete(work),
+		() => current.pending.delete(work),
+	);
+	return work;
+}
+
+/** Drain native Agent work before releasing its exact protected legacy writer lease. */
+export function retainLegacyProjectBackgroundWork(
+	id: string,
+	work: Promise<unknown>,
+) {
+	const current = activeLease.getStore();
+	if (
+		current?.projectId === id &&
+		current.accepting &&
+		current.lease.writer === "legacy" &&
+		!current.lease.signal.aborted
+	)
+		void retainPendingWork(current, work);
+}
+
 function failure(code: string, message: string) {
 	return Object.assign(new Error(message), { code });
 }
@@ -200,13 +224,10 @@ export function createProjectEngineWriterLease(options: Options) {
 		const current = nested();
 		if (current) {
 			checkExpected(current.lease, expected);
-			const operation = Promise.resolve().then(() => work(current.lease));
-			current.pending.add(operation);
-			void operation.then(
-				() => current.pending.delete(operation),
-				() => current.pending.delete(operation),
+			return retainPendingWork(
+				current,
+				Promise.resolve().then(() => work(current.lease)),
 			);
-			return operation;
 		}
 		return transaction(database, async (client, signal) => {
 			await client.query(

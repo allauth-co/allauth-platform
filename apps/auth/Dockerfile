@@ -43,6 +43,10 @@ COPY apps/auth/package.json apps/auth/pnpm-lock.yaml apps/auth/pnpm-workspace.ya
 COPY apps/auth/patches ./apps/auth/patches
 WORKDIR /app/apps/auth
 RUN pnpm install --frozen-lockfile --store-dir=/pnpm/store
+# Next bundles these packages for the app. The standalone writer command loads them directly.
+RUN mkdir -p /operator-node-modules/zod /operator-node-modules/@xmldom/xmldom \
+    && cp -aL node_modules/zod/. /operator-node-modules/zod/ \
+    && cp -aL node_modules/@xmldom/xmldom/. /operator-node-modules/@xmldom/xmldom/
 COPY apps/auth ./
 
 FROM build-input AS build
@@ -68,7 +72,10 @@ COPY --from=build-input --chown=node:node /app/apps/auth/migrations ./migrations
 COPY --from=build-input --chown=node:node /app/apps/auth/scripts/database.mjs ./scripts/database.mjs
 COPY --from=build-input --chown=node:node /app/apps/auth/scripts/project-engine-writer.mjs ./scripts/project-engine-writer.mjs
 COPY --from=build-input --chown=node:node /app/apps/auth/scripts/project-engine-saml-approval.mjs ./scripts/project-engine-saml-approval.mjs
+COPY --from=build-input --chown=node:node /app/apps/auth/scripts/project-engine-webhook-admission.mjs ./scripts/project-engine-webhook-admission.mjs
 COPY --from=build-input --chown=node:node /app/apps/auth/scripts/project-agent-replay-evidence.mjs ./scripts/project-agent-replay-evidence.mjs
+COPY --from=build-input --chown=node:node /app/apps/auth/scripts/project-agent-stored-admission.mjs ./scripts/project-agent-stored-admission.mjs
+COPY --from=build-input --chown=node:node /operator-node-modules/ ./scripts/node_modules/
 COPY --from=build-input --chown=node:node /app/LICENSE.md /app/LICENSE.md
 USER node
 EXPOSE 3000

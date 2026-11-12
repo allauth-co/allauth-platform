@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { Pool, PoolClient } from "pg";
 import * as z from "zod";
+import { storedSamlProviderId as ssoProviderId } from "../../scripts/project-engine-saml-approval.mjs";
 import { reservedProjectEmailError } from "../project-email-alias-config";
 import type { LegacyMfaKeys } from "./legacy-mfa-record";
 import { sealLegacyMfaRecord } from "./legacy-mfa-record";
@@ -11,24 +12,7 @@ import { ssoProfileRejected } from "./owned-project-sso-admission";
 import { checkedProjectSchema } from "./validation";
 
 const stateAge = 600;
-const reservedProviders = new Set([
-	"credential",
-	"allauth",
-	"google",
-	"apple",
-	"microsoft",
-	"github",
-	"passkey",
-	"email-otp",
-	"magic-link",
-	"phone-number",
-	"anonymous",
-	"siwe",
-]);
-export const ssoProviderId = z
-	.string()
-	.regex(/^[A-Za-z0-9._-]{1,128}$/)
-	.refine((value) => !reservedProviders.has(value.toLowerCase()));
+export { ssoProviderId };
 export const ssoReferenceSchema = z.object({
 	providerId: ssoProviderId,
 	source: z.object({

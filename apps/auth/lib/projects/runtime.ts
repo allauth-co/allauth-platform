@@ -72,7 +72,7 @@ import {
 	internalProjectEngineSelected,
 	internalProjectPreparationRevision,
 	projectAgentReplayApproved,
-	protectedInternalProject,
+	projectAgentReplayBridgeSelected,
 	selectInternalProjectEngine,
 } from "./project-engine-internal-selection";
 import { protectedProjectWriterLease } from "./project-engine-internal-writer";
@@ -336,7 +336,9 @@ async function build(
 			postgresDatabase(pool),
 			env,
 			{
-				...(protectedInternalProject(project) ? { agentReplayDatabase: pool } : {}),
+				...(projectAgentReplayBridgeSelected(project, environment)
+					? { agentReplayBridge: { projectId: project.id, database: pool } }
+					: {}),
 				...(google ? { google } : {}),
 				...(apple ? { apple } : {}),
 				...(microsoft ? { microsoft } : {}),
@@ -582,10 +584,11 @@ async function withConfiguredProjectEntry<T>(
 	const agentApprovalVersion = agentApproval
 		? createHmac("sha256", setting(env, "ALLAUTH_AUTH_SECRET")).update(agentApproval).digest("hex")
 		: "";
+	const agentBridge = projectAgentReplayBridgeSelected(project, env);
 	// Transport secrets can rotate while the native auth instance remains cached.
 	// Verification must receive the registry row read for this request.
 	return entries.use(
-		`${project.id}:${configured.version}:engine:${preparing ? "preflight:" : ""}${writer ? `${writer.writer}:${writer.revision}` : owned ? "owned-fixture" : "legacy"}:metrics:${projectEngineMetricsSelected(env, project.id)}:shadow:${projectSessionShadowSelected(env, project)}:origins:${projectOriginFingerprint(project)}:owned-avatars:${ownedAvatarSelected(env, project.id)}:native-passkeys:${selectedNativePasskeys(env, project, publicOrigin).version}:google:${googleProvider.version}:microsoft:${microsoftConfigurationVersion(microsoft)}:apple:${appleConfigurationVersion(apple)}:${apple ? Math.floor(Date.now() / 86400000) : 0}:aliases:${aliasVersion}:saml:${samlApprovalVersion}:agent:${agentApprovalVersion}:${publicOrigin ?? ""}`,
+		`${project.id}:${configured.version}:engine:${preparing ? "preflight:" : ""}${writer ? `${writer.writer}:${writer.revision}` : owned ? "owned-fixture" : "legacy"}:metrics:${projectEngineMetricsSelected(env, project.id)}:shadow:${projectSessionShadowSelected(env, project)}:origins:${projectOriginFingerprint(project)}:owned-avatars:${ownedAvatarSelected(env, project.id)}:native-passkeys:${selectedNativePasskeys(env, project, publicOrigin).version}:google:${googleProvider.version}:microsoft:${microsoftConfigurationVersion(microsoft)}:apple:${appleConfigurationVersion(apple)}:${apple ? Math.floor(Date.now() / 86400000) : 0}:aliases:${aliasVersion}:saml:${samlApprovalVersion}:agent:${agentBridge}:${agentApprovalVersion}:${publicOrigin ?? ""}`,
 		() => build(project, env, configured.policy, googleProvider, publicOrigin, owned, writer),
 		(entry) => callback(entry, project),
 	);

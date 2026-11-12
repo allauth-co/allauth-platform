@@ -1,5 +1,6 @@
 import { agentAuth } from "@better-auth/agent-auth";
 import type { BetterAuthPlugin } from "@better-auth/core";
+import { tryGetCurrentAuthEndpointContext } from "@better-auth/core/context";
 import { i18n, locales } from "@better-auth/i18n";
 import { oauthDeviceAuthorization } from "@better-auth/oauth-provider";
 import { APIError } from "better-auth";
@@ -19,12 +20,13 @@ import {
 	username,
 } from "better-auth/plugins";
 import { decodeJwt, decodeProtectedHeader } from "jose";
-import type { Pool } from "pg";
 import { verifyMessage } from "viem";
 import { parseSiweMessage } from "viem/siwe";
 import type { AuthEnvironment } from "../configuration";
 import { isPlatformAdmin, setting } from "../configuration";
+import type { NativeProjectAgentReplayBridge } from "../projects/owned-project-agent-native-replay";
 import { nativeProjectAgentKeyRotation, nativeProjectAgentReplayStorage } from "../projects/owned-project-agent-native-replay";
+import { retainLegacyProjectBackgroundWork } from "../projects/project-engine-writer-lease";
 import {
 	agentProtocolPath,
 	cookieOnlyFeaturePath,
@@ -87,30 +89,49 @@ function projectAnonymous() {
 // Better Auth merges endpoint maps by their API key. Agent Auth's deviceCode
 // would otherwise replace the native /device/code endpoint despite a different URL.
 function allauthAgentAuth({
-	replayDatabase,
+	replayBridge,
 	...options
 }: NonNullable<Parameters<typeof agentAuth>[0]> & {
-	replayDatabase?: Pick<Pool, "query" | "connect">;
+	replayBridge?: NativeProjectAgentReplayBridge;
 }) {
 	const plugin = agentAuth(
-		replayDatabase
+		replayBridge
 			? { ...options, jtiCacheStorage: "secondary-storage" }
 			: options,
 	);
 	const { deviceCode: agentDeviceCode, ...endpoints } = plugin.endpoints;
 	return {
 		...plugin,
-		init: replayDatabase
-			? (context: Parameters<typeof plugin.init>[0]) =>
+		init: replayBridge
+			? (context: Parameters<typeof plugin.init>[0]) => {
 					plugin.init({
 						...context,
-						secondaryStorage: nativeProjectAgentReplayStorage(replayDatabase),
-					})
+						secondaryStorage: nativeProjectAgentReplayStorage(
+							replayBridge.database,
+						),
+					});
+					const nativeBackground = context.runInBackground;
+					return {
+						context: {
+							runInBackground(work: Promise<unknown>) {
+								const path = tryGetCurrentAuthEndpointContext()?.path ?? "";
+								if (agentProtocolPath(path))
+									retainLegacyProjectBackgroundWork(
+										replayBridge.projectId,
+										work,
+									);
+								nativeBackground(work);
+							},
+						},
+					};
+				}
 			: plugin.init,
 		endpoints: {
 			...endpoints,
 			agentDeviceCode,
-			...(replayDatabase ? { rotateKey: nativeProjectAgentKeyRotation(replayDatabase) } : {}),
+			...(replayBridge
+				? { rotateKey: nativeProjectAgentKeyRotation(replayBridge.database) }
+				: {}),
 		},
 	};
 }
@@ -267,7 +288,7 @@ export function extraServerPlugins(
 		project: boolean;
 		origin: string;
 		projectSlug?: string;
-		agentReplayDatabase?: Pick<Pool, "query" | "connect">;
+		agentReplayBridge?: NativeProjectAgentReplayBridge;
 	},
 ) {
 	const origin = new URL(options.origin).origin;
@@ -328,7 +349,7 @@ export function extraServerPlugins(
 			},
 		}),
 		allauthAgentAuth({
-			replayDatabase: options.agentReplayDatabase,
+			replayBridge: options.agentReplayBridge,
 			providerName: "AllAuth",
 			modes: ["delegated"],
 			capabilities: [],

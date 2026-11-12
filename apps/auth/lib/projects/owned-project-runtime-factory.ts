@@ -83,7 +83,7 @@ import {
 	ownedWebhookSelectors,
 } from "./owned-project-webhook-admission";
 import type { ProjectAvatarStorage } from "./project-avatar-upload";
-import { protectedInternalProject } from "./project-engine-internal-selection";
+import { projectAgentReplayBridgeSelected } from "./project-engine-internal-selection";
 import { verifiedProjectRequest } from "./proxy";
 import type { Project } from "./registry";
 import {
@@ -233,7 +233,7 @@ async function readSupportedProviders(
 	customSamlTransport: ProjectCustomSamlTransport,
 ) {
 	const { database, project, env } = options;
-	const agentHosts = options.agentReplayApproved === true && protectedInternalProject(project);
+	const agentHosts = options.agentReplayApproved === true && projectAgentReplayBridgeSelected(project, env);
 	const admission = options.encryptedSamlFixture;
 	if (admission && options.encryptedSamlApproval)
 		throw new Error("The isolated SAML fixture cannot use a deployment approval.");

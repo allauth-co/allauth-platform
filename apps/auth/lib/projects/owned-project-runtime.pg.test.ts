@@ -27,6 +27,7 @@ import { createSiweMessage } from "viem/siwe";
 import { describe, expect, it, vi } from "vitest";
 import {
 	agentReplayApprovalSetting,
+	agentReplayBridgeIdSetting,
 	issueAgentReplayDrainEvidence,
 	verifyAgentReplayDrainEvidence,
 } from "../../scripts/project-agent-replay-evidence.mjs";
@@ -309,7 +310,7 @@ async function openProcess(
 	project: Project,
 	owned:
 		| boolean
-		| { agentReplayApproval?: string; encryptedSamlApproval?: string },
+		| { agentReplayApproval?: string; agentBridgeId?: string; legacyAgentBridgeOnly?: boolean; encryptedSamlApproval?: string },
 	microsoftProject = project.slug,
 	apple?: AppleFixture,
 	encryptedSamlFixture?: ProjectEncryptedSamlFixtureAdmission,
@@ -321,7 +322,7 @@ async function openProcess(
 			...childEnvironment(microsoftProject, apple),
 			...(internal
 				? {
-						ALLAUTH_PROJECT_ENGINE_INTERNAL_ID: project.id,
+						...(!internal.legacyAgentBridgeOnly ? { ALLAUTH_PROJECT_ENGINE_INTERNAL_ID: project.id } : {}),
 						ALLAUTH_PROJECT_ENGINE_ENCRYPTED_SAML_APPROVAL:
 							internal.encryptedSamlApproval,
 						EMAIL_PROVIDER: "cloudflare",
@@ -331,6 +332,7 @@ async function openProcess(
 						...(internal.agentReplayApproval
 							? { [agentReplayApprovalSetting]: internal.agentReplayApproval }
 							: {}),
+						...(internal.agentBridgeId ? { [agentReplayBridgeIdSetting]: internal.agentBridgeId } : {}),
 					}
 				: {}),
 		},
@@ -1054,7 +1056,7 @@ async function seed(databaseURL: string, protectedAgentRealm = false) {
 			[supportOrigin],
 			protectedAgentRealm ? platformWorkspaceId : workspace.id,
 		);
-		const beta = await provision("runtime-control-fixture");
+		const beta = await provision("runtime-control-fixture", [], protectedAgentRealm ? platformWorkspaceId : workspace.id);
 		await insertAccount(alpha.schemaName, credentials.realmAdmin, "admin");
 		for (const project of [alpha, beta])
 			await insertAccount(project.schemaName, analyticsAccount);
@@ -6698,6 +6700,69 @@ describe.skipIf(!existsSync(fixture))(
 				await expect(switchWithCli(expired)).rejects.toThrow(
 					"outside its activation window",
 				);
+				for (const malformed of [
+					{
+						...approval,
+						profiles: [...approval.profiles, ...approval.profiles],
+					},
+					{ ...approval, extra: true },
+					{
+						...approval,
+						profiles: [{ ...approval.profiles[0]!, extra: true }],
+					},
+					{
+						...approval,
+						verifiedAt: new Date(approval.verifiedAt).toUTCString(),
+					},
+				]) {
+					await expect(switchWithCli(malformed)).rejects.toThrow(
+						"outside its activation window",
+					);
+					expect(await fence.read()).toEqual({ writer: "legacy", revision: 0 });
+				}
+				await setConfiguration({});
+				await expect(switchWithCli(undefined)).rejects.toThrow(
+					"stored project SAML configuration is unavailable",
+				);
+				expect(await fence.read()).toEqual({ writer: "legacy", revision: 0 });
+				await setConfiguration(provider.samlConfig);
+				const configurationFingerprint = (
+					receiver: string,
+					samlConfig: Record<string, unknown>,
+				) =>
+					encryptedSamlConfigurationFingerprint(
+						platformSecret,
+						alpha.id,
+						alpha.schemaName,
+						receiver,
+						{ ...provider, samlConfig, domainVerified: true },
+					);
+				const alternateReceiver = `https://${defaultHost}${callback}`;
+				await expect(
+					switchWithCli({
+						...approval,
+						receiver: alternateReceiver,
+						configurationFingerprint: configurationFingerprint(
+							alternateReceiver,
+							provider.samlConfig,
+						),
+					}),
+				).rejects.toThrow("does not match deployment approval");
+				const xmlRequiresAssertion = {
+					...provider.samlConfig,
+					wantAssertionsSigned: false,
+				};
+				await setConfiguration(xmlRequiresAssertion);
+				await expect(
+					switchWithCli({
+						...incompatible,
+						configurationFingerprint: configurationFingerprint(
+							acs,
+							xmlRequiresAssertion,
+						),
+					}),
+				).rejects.toThrow("does not match deployment approval");
+				expect(await fence.read()).toEqual({ writer: "legacy", revision: 0 });
 				await setConfiguration({
 					...provider.samlConfig,
 					wantAssertionsSigned: false,
@@ -6907,12 +6972,14 @@ describe.skipIf(!existsSync(fixture))(
 				]);
 				const kid = "runtime-native-agent-host";
 				const publicKey = { ...(await exportJWK(hostKey.publicKey)), kid };
-				const start = (agentReplayApproval?: string) =>
-					openProcess(databaseURL, alpha, { agentReplayApproval });
+				const start = (agentReplayApproval?: string, agentBridgeId = alpha.id) =>
+					openProcess(databaseURL, alpha, { agentReplayApproval, agentBridgeId });
 				async function writerCommand(
 					args: string[],
 					approval?: string,
 					revision = "0",
+					bridgeId: string | null = alpha.id,
+					candidateId: string | null = alpha.id,
 				) {
 					const { stdout } = await promisify(execFile)(
 						process.execPath,
@@ -6922,15 +6989,16 @@ describe.skipIf(!existsSync(fixture))(
 							env: {
 								...childEnvironment(),
 								DATABASE_URL: databaseURL,
-								ALLAUTH_PROJECT_ENGINE_INTERNAL_ID: alpha.id,
+								...(candidateId ? { ALLAUTH_PROJECT_ENGINE_INTERNAL_ID: candidateId } : {}),
 								ALLAUTH_PROJECT_ENGINE_INTERNAL_PREPARE_REVISION: revision,
 								...(approval ? { [agentReplayApprovalSetting]: approval } : {}),
+								...(bridgeId ? { [agentReplayBridgeIdSetting]: bridgeId } : {}),
 							},
 						},
 					);
 					return stdout.trim();
 				}
-				service = await start();
+				service = await openProcess(databaseURL, alpha, false);
 				expect(await writer.read()).toEqual({ writer: "legacy", revision: 0 });
 				const login = await service.request(`${hosted}/sign-in/email`, {
 					host,
@@ -6958,7 +7026,7 @@ describe.skipIf(!existsSync(fixture))(
 				const detail = `${hosted}/host/get?host_id=${encodeURIComponent(pending.hostId)}`;
 				const nativeDetail = await service.request(detail, browser);
 				expect(nativeDetail.status).toBe(200);
-				const before = await nativeDetail.json();
+				let before = await nativeDetail.json();
 				const [previousKeys, previousAgentKeys, pendingAgentKeys] =
 					await Promise.all([
 						generateKeyPair("EdDSA", { extractable: true }),
@@ -6969,7 +7037,7 @@ describe.skipIf(!existsSync(fixture))(
 					...browser,
 					body: {
 						name: "Previously active host",
-						public_key: await exportJWK(previousKeys.publicKey),
+						public_key: { ...(await exportJWK(previousKeys.publicKey)), kid: "native-previous-fixture-host" },
 					},
 				});
 				expect(previousHost.status).toBe(200);
@@ -7019,6 +7087,32 @@ describe.skipIf(!existsSync(fixture))(
 					agent_id: string;
 					approval: { device_code: string; user_code: string };
 				};
+				const beforeBridge = await service.request(`${direct}/agent/status`, {
+					...proxy, authorization: await signAgentProof(previousHostId, previousAgentId, previousAgentKeys.privateKey),
+				});
+				expect(beforeBridge.status).toBe(200);
+				async function agentReplayRows(project: Project) {
+					const result = await database!.query(`SELECT count(*)::int AS count FROM "${project.schemaName}"."verification" WHERE identifier LIKE 'agent-status-jti:%'`);
+					return result.rows[0]?.count;
+				}
+				expect(await agentReplayRows(alpha)).toBe(0);
+				await service.stop();
+				service = undefined;
+				service = await openProcess(databaseURL, alpha, { agentBridgeId: alpha.id, legacyAgentBridgeOnly: true });
+				expect((await service.request("/api/health")).status).toBe(200);
+				expect(await writer.read()).toEqual({ writer: "legacy", revision: 0 });
+				const siblingHostId = randomUUID();
+				const siblingAgentId = randomUUID();
+				const siblingKeys = await generateKeyPair("EdDSA", { extractable: true });
+				const siblingKey = JSON.stringify(await exportJWK(siblingKeys.publicKey));
+				await database.query(`INSERT INTO "${beta.schemaName}"."agentHost" (id,"userId","publicKey",status,"createdAt","updatedAt") VALUES ($1,$2,$3,'active',now(),now())`, [siblingHostId, credentials.project.id, siblingKey]);
+				await database.query(`INSERT INTO "${beta.schemaName}"."agent" (id,name,"userId","hostId",status,mode,"publicKey","createdAt","updatedAt","activatedAt","expiresAt") VALUES ($1,'Sibling Agent',$2,$3,'active','delegated',$4,now(),now(),now(),now()+interval '15 minutes')`, [siblingAgentId, credentials.project.id, siblingHostId, siblingKey]);
+				const siblingProof = await new SignJWT({})
+					.setProtectedHeader({ alg: "EdDSA", typ: "agent+jwt" }).setIssuer(siblingHostId).setSubject(siblingAgentId)
+					.setAudience(`${platformOrigin}${outside}`).setIssuedAt().setExpirationTime("45s").setJti(randomUUID()).sign(siblingKeys.privateKey);
+				const siblingStatus = await service.request(`${outside}/agent/status`, { proxy: beta, origin: beta.primaryOrigin, authorization: `Bearer ${siblingProof}` });
+				expect(siblingStatus.status).toBe(200);
+				expect(await agentReplayRows(beta)).toBe(0);
 				const [nativeRotationKey, ownedRotationKey, unusedRotationKey] =
 					await Promise.all([
 						generateKeyPair("EdDSA", { extractable: true }),
@@ -7048,6 +7142,15 @@ describe.skipIf(!existsSync(fixture))(
 					},
 				);
 				expect(nativeRotated.status, await nativeRotated.text()).toBe(200);
+				const bridgedRegistration = await new SignJWT({ agent_public_key: await exportJWK(previousAgentKeys.publicKey) })
+					.setProtectedHeader({ alg: "EdDSA", typ: "host+jwt" })
+					.setIssuer(previousHostId).setAudience(directIssuer).setIssuedAt().setExpirationTime("45s").setJti(randomUUID())
+					.sign(previousKeys.privateKey);
+				const bridged = await service.request(`${direct}/agent/register`, {
+					...proxy, authorization: `Bearer ${bridgedRegistration}`,
+					body: { name: "Agent from the bridged native writer", mode: "delegated" },
+				});
+				expect(bridged.status).toBe(200);
 				async function signAgentProof(
 					hostId: string,
 					agentId: string,
@@ -7095,11 +7198,13 @@ describe.skipIf(!existsSync(fixture))(
 				expect(nativeReads.map((result) => result.status).sort()).toEqual([
 					200, 401,
 				]);
+				expect(await agentReplayRows(alpha)).toBe(1);
 				await database.query(
 					`UPDATE ${schema}."agent" SET "expiresAt"=now()-interval '1 minute' WHERE id=$1`,
 					[previousAgentId],
 				);
-				expect((await service.request("/api/health")).status).toBe(503);
+				expect((await service.request("/api/health")).status).toBe(200);
+				await expect(writerCommand(["switch", "legacy", "0", "allauth"], undefined, "0", null)).rejects.toThrow("Agent replay bridge is unavailable");
 				await expect(
 					writerCommand(["switch", "legacy", "0", "allauth"]),
 				).rejects.toThrow("Agent replay drain evidence is unavailable");
@@ -7110,11 +7215,15 @@ describe.skipIf(!existsSync(fixture))(
 						new Date().toISOString(),
 					]),
 				).rejects.toThrow("Agent replay drain evidence is unavailable");
-				const approval = await writerCommand([
+				const evidenceRequest = [
 					"agent-replay-evidence",
 					"fixture-bridge",
 					new Date(Date.now() - 120_000).toISOString(),
-				]);
+				];
+				await expect(writerCommand(evidenceRequest, undefined, "0", null)).rejects.toThrow("exact protected Agent replay bridge ID");
+				await expect(writerCommand(evidenceRequest, undefined, "0", beta.id)).rejects.toThrow("Agent replay bridge is unavailable");
+				const approval = await writerCommand(evidenceRequest, undefined, "0", alpha.id, null);
+				await expect(writerCommand(["switch", "legacy", "0", "allauth"], approval, "0", beta.id)).rejects.toThrow("Agent replay bridge is unavailable");
 				const oldObservation = Date.now() - 16 * 60_000;
 				const staleApproval = issueAgentReplayDrainEvidence(
 					platformSecret,
@@ -7146,6 +7255,10 @@ describe.skipIf(!existsSync(fixture))(
 				).rejects.toThrow("Agent replay drain evidence is unavailable");
 				await service.stop();
 				service = undefined;
+				service = await start(approval, beta.id);
+				expect((await service.request("/api/health")).status).toBe(503);
+				await service.stop();
+				service = undefined;
 				service = await start(approval);
 				await database.query(
 					`UPDATE ${schema}."agentHost" SET "defaultCapabilities"='["unsupported"]' WHERE id=$1`,
@@ -7175,6 +7288,17 @@ describe.skipIf(!existsSync(fixture))(
 						return { status: result.status, body: await result.json() };
 					})
 					.toEqual({ status: 200, body: { status: "ok" } });
+				const conflictingHost = await service.request(`${hosted}/host/update`, {
+					...browser, body: { host_id: pending.hostId, public_key: { ...publicKey, kid: "native-previous-fixture-host" } },
+				});
+				expect(conflictingHost.status).toBe(200);
+				await expect(writerCommand(["switch", "legacy", "0", "allauth"], approval)).rejects.toThrow("stored Agent Auth outside the candidate scope");
+				expect(await writer.read()).toEqual({ writer: "legacy", revision: 0 });
+				const repairedHost = await service.request(`${hosted}/host/update`, {
+					...browser, body: { host_id: pending.hostId, public_key: publicKey },
+				});
+				expect(repairedHost.status).toBe(200);
+				before = await (await service.request(detail, browser)).json();
 				expect(
 					JSON.parse(
 						await writerCommand(["switch", "legacy", "0", "allauth"], approval),
@@ -7211,7 +7335,7 @@ describe.skipIf(!existsSync(fixture))(
 					`${direct}/agent/register`,
 					{
 						...proxy,
-						authorization: `Bearer ${previousRegistration}`,
+						authorization: `Bearer ${bridgedRegistration}`,
 						body: { name: "Agent from native", mode: "delegated" },
 					},
 				);
@@ -7375,6 +7499,8 @@ describe.skipIf(!existsSync(fixture))(
 				expect(await replay.json()).toMatchObject({ error: "jti_replay" });
 				await service.stop();
 				service = undefined;
+				await expect(writerCommand(["switch", "allauth", "1", "legacy"], approval, "0", null)).rejects.toThrow("Agent replay bridge is unavailable");
+				expect(await writer.read()).toEqual({ writer: "allauth", revision: 1 });
 
 				expect(
 					JSON.parse(

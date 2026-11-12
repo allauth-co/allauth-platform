@@ -8,6 +8,11 @@ import {
 } from "./owned-project-agent-key-rotation";
 import { consumeAgentMachineReplay } from "./owned-project-agent-machine";
 
+export interface NativeProjectAgentReplayBridge {
+	projectId: string;
+	database: Pick<Pool, "query" | "connect">;
+}
+
 const nativePrefix = "agent-auth:jti:";
 
 function unavailable(): never {

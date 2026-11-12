@@ -3,9 +3,17 @@ import type {
 	Document as XmlDocument,
 	Element as XmlElement,
 } from "@xmldom/xmldom";
-import { DOMParser } from "@xmldom/xmldom";
 import samlifyDefault, * as samlifyNamespace from "samlify";
-import * as z from "zod";
+import type * as z from "zod";
+import {
+	configuredSamlMetadataDescriptor,
+	configuredServiceMetadata,
+	effectiveSamlAssertionSigning,
+	parseSamlXml as parseXML,
+	requiredSignedSamlPostReceiver,
+	samlMetadataShape,
+	storedProjectSamlConfig,
+} from "../../scripts/project-engine-saml-approval.mjs";
 import { validAvatarPath } from "../avatars/protocol";
 import { ssoHttpsUrl } from "./owned-project-sso-network";
 import type { SsoIdentity } from "./owned-project-sso-store";
@@ -45,50 +53,6 @@ const canonicalizations = new Set([
 	"http://www.w3.org/TR/2001/REC-xml-c14n-20010315#WithComments",
 ]);
 const enveloped = `${signatureNS}enveloped-signature`;
-const identifier = z.string().min(1).max(2048);
-const certificate = z.union([
-	z.string().min(1),
-	z.array(z.string().min(1)).min(1).max(16),
-]);
-const endpoint = z.object({
-	Binding: z.string().min(1),
-	Location: z.string().min(1),
-});
-const metadata = z.object({
-	metadata: z.string().max(102400).optional(),
-	entityID: identifier.optional(),
-	privateKey: z.string().max(16384).optional(),
-	privateKeyPass: z.string().max(4096).optional(),
-	isAssertionEncrypted: z.boolean().optional(),
-	encPrivateKey: z.string().min(1).max(16384).optional(),
-	encPrivateKeyPass: z.string().max(4096).optional(),
-});
-const config = z.object({
-	issuer: identifier,
-	entryPoint: z.string().max(2048).optional(),
-	cert: certificate.optional(),
-	audience: identifier.optional(),
-	callbackUrl: z.string().max(2048).optional(),
-	idpInitiatedCallbackUrl: z.string().max(2048).optional(),
-	idpMetadata: metadata.extend({
-		cert: certificate.optional(),
-		singleSignOnService: z.array(endpoint).max(16).optional(),
-	}),
-	spMetadata: metadata.optional(),
-	wantAssertionsSigned: z.boolean().optional(),
-	authnRequestsSigned: z.boolean().optional(),
-	identifierFormat: identifier.optional(),
-	privateKey: z.string().max(16384).optional(),
-	mapping: z
-		.object({
-			email: identifier.optional(),
-			name: identifier.optional(),
-			firstName: identifier.optional(),
-			lastName: identifier.optional(),
-			extraFields: z.record(z.string(), z.string()).optional(),
-		})
-		.optional(),
-});
 
 function invalid(): never {
 	throw new Error("Invalid configured SAML authentication message.");
@@ -96,12 +60,6 @@ function invalid(): never {
 
 export function isSamlRelativeRedirect(value: string) {
 	return /^\/(?!\/|\\|%2f|%5c)/i.test(value);
-}
-
-function parseXML(xml: string) {
-	if (/<!\s*(?:DOCTYPE|ENTITY)\b/i.test(xml)) invalid();
-	const options = { locator: false, onError: invalid };
-	return new DOMParser(options).parseFromString(xml, "text/xml");
 }
 
 function children(element: XmlElement, namespace: string, name: string) {
@@ -125,88 +83,22 @@ function text(element: XmlElement) {
 	return element.textContent ?? "";
 }
 
-function metadataDescriptor(
-	xml: string,
-	name: "SPSSODescriptor" | "IDPSSODescriptor",
-) {
-	const root = parseXML(xml).documentElement;
-	if (
-		!root ||
-		root.localName !== "EntityDescriptor" ||
-		root.namespaceURI !== metadataNS
-	)
-		invalid();
-	return child(root, metadataNS, name);
-}
-
-function metadataFlag(element: XmlElement, name: string) {
-	const value = element.getAttribute(name)?.trim();
-	if (value === undefined || value === "false" || value === "0") return false;
-	if (value === "true" || value === "1") return true;
-	return invalid();
-}
-
-/** Read only the direct, namespace-qualified SP elements consumed by native SAML. */
-function configuredServiceMetadata(xml: string) {
-	if (new TextEncoder().encode(xml).length > 102400) invalid();
-	const document = parseXML(xml);
-	const root = document.documentElement;
-	if (
-		root?.localName !== "EntityDescriptor" ||
-		root.namespaceURI !== metadataNS
-	)
-		invalid();
-	const descriptor = child(root, metadataNS, "SPSSODescriptor");
-	const entityID = root.getAttribute("entityID");
-	if (!entityID || entityID.length > 2048 || entityID !== entityID.trim())
-		invalid();
-	for (const node of Array.from(root.getElementsByTagName("*"))) {
-		if (
-			node.localName === "EntityDescriptor" ||
-			(node.localName === "SPSSODescriptor" && node !== descriptor) ||
-			((node.localName === "AssertionConsumerService" ||
-				node.localName === "NameIDFormat") &&
-				(node.namespaceURI !== metadataNS || node.parentNode !== descriptor))
-		)
-			invalid();
-	}
-	const consumers = children(
-		descriptor,
-		metadataNS,
-		"AssertionConsumerService",
-	);
-	const postLocations = consumers
-		.filter((item) => item.getAttribute("Binding") === post)
-		.map((item) => item.getAttribute("Location") ?? "");
-	return {
-		descriptor,
-		entityID,
-		postLocations,
-		consumerCount: consumers.length,
-		wantAssertion: metadataFlag(descriptor, "WantAssertionsSigned"),
-		requestsSigned: metadataFlag(descriptor, "AuthnRequestsSigned"),
-	};
-}
-
 /** Resolve one signed POST receiver, with encryption limited to the fixture admission. */
 export function declaredSignedSamlAcs(
 	value: unknown,
 	allowEncrypted?: boolean,
 ) {
-	const saved = config.parse(value);
+	const saved = storedProjectSamlConfig.parse(value);
 	const metadata = saved.spMetadata?.metadata;
 	if (metadata === undefined) return undefined;
 	const custom = configuredServiceMetadata(metadata);
 	if (
-		!custom.requestsSigned ||
-		custom.consumerCount !== 1 ||
-		custom.postLocations.length !== 1 ||
-		(!allowEncrypted &&
-			(saved.idpMetadata.isAssertionEncrypted ||
-				saved.spMetadata?.isAssertionEncrypted))
+		!allowEncrypted &&
+		(saved.idpMetadata.isAssertionEncrypted ||
+			saved.spMetadata?.isAssertionEncrypted)
 	)
 		invalid();
-	return custom.postLocations[0]!;
+	return requiredSignedSamlPostReceiver(custom);
 }
 
 function pem(value: string | undefined) {
@@ -218,8 +110,8 @@ function pem(value: string | undefined) {
 }
 
 function decryptionKey(
-	idp: z.infer<typeof metadata>,
-	sp: z.infer<typeof metadata> | undefined,
+	idp: z.infer<typeof samlMetadataShape>,
+	sp: z.infer<typeof samlMetadataShape> | undefined,
 	allowEncrypted: boolean | undefined,
 ) {
 	if (
@@ -285,7 +177,7 @@ export function configureOwnedSaml(
 		allowEncrypted?: boolean;
 	} = {},
 ) {
-	const saved = config.parse(value);
+	const saved = storedProjectSamlConfig.parse(value);
 	const sp = saved.spMetadata;
 	const idp = saved.idpMetadata;
 	const encryptionKey = decryptionKey(idp, sp, options.allowEncrypted);
@@ -295,9 +187,10 @@ export function configureOwnedSaml(
 		spMetadata === undefined
 			? undefined
 			: configuredServiceMetadata(spMetadata);
-	const wantAssertion =
-		custom?.wantAssertion ?? saved.wantAssertionsSigned === true;
-	if (saved.wantAssertionsSigned && !wantAssertion) invalid();
+	const wantAssertion = effectiveSamlAssertionSigning(
+		saved.wantAssertionsSigned,
+		custom,
+	);
 	const postLocations = custom?.postLocations ?? [acs];
 	if (!postLocations.length) invalid();
 	for (const location of postLocations) {
@@ -353,7 +246,8 @@ export function configureOwnedSaml(
 			service.entityMeta.getX509Certificate("encryption"),
 			encryptionKey,
 		);
-	if (idp.metadata) metadataDescriptor(idp.metadata, "IDPSSODescriptor");
+	if (idp.metadata)
+		configuredSamlMetadataDescriptor(idp.metadata, "IDPSSODescriptor");
 	const configuredCerts = idp.cert ?? saved.cert;
 	const certs =
 		typeof configuredCerts === "string" ? [configuredCerts] : configuredCerts;

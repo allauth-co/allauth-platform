@@ -1,6 +1,7 @@
 import { after } from "next/server";
 import {
 	agentReplayApprovalSetting,
+	agentReplayBridgeIdSetting,
 	verifyAgentReplayDrainEvidence,
 } from "../../scripts/project-agent-replay-evidence.mjs";
 import type { AuthEnvironment } from "../configuration";
@@ -48,13 +49,28 @@ export function internalProjectEngineSelected(
 	);
 }
 
+/** Scope the legacy Agent bridge independently of candidate selection. */
+export function projectAgentReplayBridgeSelected(
+	project: ProjectBinding,
+	env: AuthEnvironment,
+) {
+	return (
+		protectedInternalProject(project) &&
+		setting(env, agentReplayBridgeIdSetting).trim() === project.id
+	);
+}
+
 /** Check the operator's exact revision and drain window, including cached preparation. */
 export function projectAgentReplayApproved(
-	project: Pick<Project, "id">,
+	project: ProjectBinding,
 	env: AuthEnvironment,
 	writer: { revision: number; preparing: boolean },
 ) {
 	const evidence = setting(env, agentReplayApprovalSetting).trim();
+	if (evidence && !projectAgentReplayBridgeSelected(project, env))
+		throw new Error(
+			"The protected project Agent replay bridge is unavailable.",
+		);
 	return evidence
 		? verifyAgentReplayDrainEvidence(
 				evidence,

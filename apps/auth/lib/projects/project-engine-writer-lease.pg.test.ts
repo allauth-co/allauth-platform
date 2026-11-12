@@ -13,10 +13,17 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import { getTestInstance } from "better-auth/test";
+import { exportJWK, generateKeyPair, SignJWT } from "jose";
+import { Kysely, PostgresDialect } from "kysely";
 import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { extraServerPlugins } from "../features/server";
+import { defaultAuthPolicy } from "../auth-policy/policy";
+import { authPolicyRepository } from "../auth-policy/storage";
 import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
 import { platformWorkspaceId } from "../workspaces/types";
+import { assertOwnedProjectWebhookAdmission } from "./owned-project-webhook-admission";
 import type { ProjectEngineWriterState } from "./project-engine-writer-lease";
 import {
 	createProjectEngineWriterLease,
@@ -64,7 +71,9 @@ describe.skipIf(!existsSync(fixturePath))(
 		const alpha = realm();
 		const beta = realm();
 		const gamma = realm();
+		const heartbeatRealm = realm();
 		const upgrade = realm();
+		const webhookActivation = realm();
 		const production = realm("production");
 		const externalWorkspace = randomUUID();
 		const external = realm("development", externalWorkspace);
@@ -151,7 +160,9 @@ describe.skipIf(!existsSync(fixturePath))(
 					alpha,
 					beta,
 					gamma,
+					heartbeatRealm,
 					upgrade,
+					webhookActivation,
 					production,
 					external,
 				].entries()) {
@@ -223,6 +234,62 @@ describe.skipIf(!existsSync(fixturePath))(
 				`-c search_path=${project.schemaName}${tag}`,
 			);
 		}
+
+		it("checks webhook policy again under the operator's activation lock", async () => {
+			const project = webhookActivation;
+			await seedWebhook(writerPool(project));
+			const policy = authPolicyRepository(database);
+			const eligible = {
+				...defaultAuthPolicy,
+				requireEmailVerification: false,
+			};
+			await policy.update(project.id, 0, eligible, "fixture");
+			await assertOwnedProjectWebhookAdmission(
+				database,
+				project.schemaName,
+				eligible,
+			);
+
+			const script = fileURLToPath(
+				new URL("../../scripts/project-engine-writer.mjs", import.meta.url),
+			);
+			const writerCommand = (...args: string[]) =>
+				execute(process.execPath, [script, ...args], {
+					cwd: new URL("../../", import.meta.url),
+					env: {
+						...process.env,
+						DATABASE_URL: url,
+						ALLAUTH_PROJECT_ENGINE_INTERNAL_ID: project.id,
+						ALLAUTH_PROJECT_ENGINE_INTERNAL_PREPARE_REVISION: "0",
+						ALLAUTH_PROJECT_ENGINE_AGENT_BRIDGE_ID: "",
+						ALLAUTH_PROJECT_ENGINE_AGENT_REPLAY_APPROVAL: "",
+						ALLAUTH_PROJECT_ENGINE_ENCRYPTED_SAML_APPROVAL: "",
+					},
+				});
+
+			await policy.update(project.id, 1, defaultAuthPolicy, "fixture");
+			await expect(
+				writerCommand("switch", "legacy", "0", "allauth"),
+			).rejects.toThrow(/configured webhooks/);
+			await expect(fence(project).read()).resolves.toEqual(legacy);
+			await policy.update(project.id, 2, eligible, "fixture");
+			expect(
+				JSON.parse(
+					(await writerCommand("switch", "legacy", "0", "allauth")).stdout,
+				),
+			).toEqual({
+				writer: "allauth",
+				revision: 1,
+			});
+			expect(
+				JSON.parse(
+					(await writerCommand("switch", "allauth", "1", "legacy")).stdout,
+				),
+			).toEqual({
+				writer: "legacy",
+				revision: 2,
+			});
+		});
 
 		async function waitingOperator() {
 			await vi.waitFor(
@@ -491,6 +558,141 @@ describe.skipIf(!existsSync(fixturePath))(
 			} finally {
 				finish.open();
 				await Promise.allSettled([inFlight, rollback, late]);
+			}
+		});
+
+		it("drains the native Agent heartbeat before switching the protected writer", async () => {
+			const native = writerPool(heartbeatRealm, legacy);
+			await seed(native);
+			const origin = "https://writer.fixture.example";
+			const secret = "synthetic-writer-agent-fixture-secret";
+			const environment = {
+				ALLAUTH_AUTH_URL: origin,
+				ALLAUTH_AUTH_SECRET: secret,
+			};
+			const hostId = randomUUID();
+			const agentId = randomUUID();
+			const key = await generateKeyPair("EdDSA");
+			const publicKey = JSON.stringify(await exportJWK(key.publicKey));
+			await native.query(
+				`INSERT INTO "agentHost"(id,"userId","publicKey",status,"createdAt","updatedAt") VALUES($1,'fixture-user',$2,'active',now(),now())`,
+				[hostId, publicKey],
+			);
+			await native.query(
+				`INSERT INTO "agent"(id,name,"userId","hostId",status,mode,"publicKey","expiresAt","createdAt","updatedAt")
+				VALUES($1,'Writer Agent fixture','fixture-user',$2,'active','delegated',$3,now()+interval '1 minute',now(),now())`,
+				[agentId, hostId, publicKey],
+			);
+			const agentPlugin = extraServerPlugins(environment, {
+				project: true,
+				origin,
+				agentReplayBridge: { projectId: heartbeatRealm.id, database: native },
+			}).find(({ id }) => id === "agent-auth");
+			if (!agentPlugin)
+				throw new Error("The native Agent plugin is unavailable.");
+			const { auth } = await getTestInstance(
+				{
+					baseURL: origin,
+					secret,
+					database: {
+						db: new Kysely({ dialect: new PostgresDialect({ pool: native }) }),
+						type: "postgres",
+						transaction: true,
+					},
+					plugins: [agentPlugin],
+					logger: { disabled: true },
+				},
+				{ disableTestUser: true },
+			);
+			const entered = gate();
+			const release = gate();
+			const returned = gate();
+			const adapter = (await auth.$context).adapter;
+			const update = adapter.update.bind(adapter);
+			const delay = vi
+				.spyOn(adapter, "update")
+				.mockImplementation(async (input) => {
+					if (input.model === "agent" && "lastUsedAt" in input.update) {
+						entered.open();
+						await release.waiting;
+					}
+					return update(input);
+				});
+			const authorization = await new SignJWT({})
+				.setProtectedHeader({ alg: "EdDSA", typ: "agent+jwt" })
+				.setIssuer(hostId)
+				.setSubject(agentId)
+				.setAudience(`${origin}/api/auth`)
+				.setIssuedAt()
+				.setExpirationTime("45s")
+				.setJti(randomUUID())
+				.sign(key.privateKey);
+			const request = fence(heartbeatRealm).run("legacy", async () => {
+				try {
+					const response = await auth.handler(
+						new Request(`${origin}/api/auth/agent/session`, {
+							headers: { authorization: `Bearer ${authorization}` },
+						}),
+					);
+					expect(response.status).toBe(200);
+					expect(await response.json()).toMatchObject({
+						agent: { id: agentId },
+					});
+				} finally {
+					returned.open();
+				}
+			});
+			let requestSettled = false;
+			void request.then(
+				() => {
+					requestSettled = true;
+				},
+				() => {
+					requestSettled = true;
+				},
+			);
+			let switching: Promise<ProjectEngineWriterState> | undefined;
+			try {
+				await returned.waiting;
+				expect(delay).toHaveBeenCalledWith(
+					expect.objectContaining({
+						model: "agent",
+						update: expect.objectContaining({ lastUsedAt: expect.any(Date) }),
+					}),
+				);
+				await entered.waiting;
+				switching = fence(heartbeatRealm, heartbeatRealm.id, operator).switch(
+					legacy,
+					"allauth",
+				);
+				void switching.catch(() => {});
+				await waitingOperator();
+				expect(
+					(
+						await native.query('SELECT "lastUsedAt" FROM "agent" WHERE id=$1', [
+							agentId,
+						])
+					).rows,
+				).toEqual([{ lastUsedAt: null }]);
+				expect(requestSettled).toBe(false);
+				release.open();
+				await request;
+				await expect(switching).resolves.toEqual({
+					writer: "allauth",
+					revision: 1,
+				});
+				expect(
+					(
+						await native.query(
+							`SELECT "lastUsedAt", "expiresAt">now()+interval '2 minutes' AS extended FROM "agent" WHERE id=$1`,
+							[agentId],
+						)
+					).rows,
+				).toEqual([{ lastUsedAt: expect.any(Date), extended: true }]);
+			} finally {
+				release.open();
+				await Promise.allSettled([request, switching]);
+				delay.mockRestore();
 			}
 		});
 
