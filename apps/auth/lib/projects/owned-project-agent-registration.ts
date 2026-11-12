@@ -3,6 +3,10 @@ import type { PoolClient } from "pg";
 import * as z from "zod";
 import { hasRemoteAgentKeys } from "../features/helpers";
 import {
+	issueOwnedPendingAgentDeviceCode,
+	writeOwnedAgentDeviceCode,
+} from "./owned-project-agent-device-code";
+import {
 	agentHostCapabilities,
 	agentHostJSON as json,
 	invalidAgentBody,
@@ -45,12 +49,12 @@ const input = z.object({
 	force_approval: z.boolean().optional(),
 });
 
-function displayName(value: string) {
+function displayText(value: string, maxLength = 200) {
 	return value
 		.replace(/<[^>]*>/g, "")
 		.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "")
 		.trim()
-		.slice(0, 200);
+		.slice(0, maxLength);
 }
 
 function unsupported() {
@@ -163,41 +167,90 @@ export async function registerOwnedProjectAgent(
 			"invalid_capabilities",
 			"One or more requested capability names don't exist or are blocked",
 		);
-	const { rows: sameKey } = await client.query<{ status: string }>(
-		`SELECT status FROM "agent" WHERE "hostId"=$1 AND "publicKey"=$2 ORDER BY id LIMIT 2`,
+	const { rows: sameKey } = await client.query<{
+		id: string;
+		name: string;
+		status: string;
+	}>(
+		`SELECT id,name,status FROM "agent" WHERE "hostId"=$1 AND "publicKey"=$2 ORDER BY id LIMIT 2`,
 		[host.id, agentKey.serialized],
 	);
-	if (sameKey.length === 1 && sameKey[0].status === "pending")
-		return unsupported();
+	const approvalFields = {
+		loginHint: parsed.data.login_hint,
+		bindingMessage: parsed.data.binding_message
+			? displayText(parsed.data.binding_message, 500)
+			: undefined,
+	};
+	if (sameKey.length === 1 && sameKey[0].status === "pending") {
+		if (host.status !== "active" || parsed.data.preferred_method === "ciba")
+			return unsupported();
+		const pending = sameKey[0];
+		const approval = await issueOwnedPendingAgentDeviceCode(client, request, {
+			agentId: pending.id,
+			hostId: host.id,
+			ownerId: host.userId,
+			...approvalFields,
+		});
+		if (approval instanceof Response) return approval;
+		return json({
+			agent_id: pending.id,
+			host_id: host.id,
+			name: pending.name,
+			mode: "delegated",
+			status: "pending",
+			agent_capability_grants: [],
+			approval: { method: "device_authorization", ...approval },
+		});
+	}
 	if (sameKey.length)
 		return problem(
 			409,
 			"agent_exists",
 			"An agent with this public key is already registered",
 		);
-	if (parsed.data.force_approval || host.status === "pending")
-		return unsupported();
-	const name = displayName(parsed.data.name);
+	if (host.status === "pending") return unsupported();
+	const name = displayText(parsed.data.name);
 	const hostName =
 		typeof proof.host_name === "string"
-			? displayName(proof.host_name)
-			: displayName(parsed.data.host_name ?? "");
+			? displayText(proof.host_name)
+			: displayText(parsed.data.host_name ?? "");
 	const id = randomUUID();
+	const pending = parsed.data.force_approval === true;
 	await client.query(
 		`INSERT INTO "agent" (id,name,"userId","hostId",status,mode,"publicKey",kid,"activatedAt","expiresAt","createdAt","updatedAt")
-		 VALUES ($1,$2,$3,$4,'active','delegated',$5,$6,statement_timestamp(),statement_timestamp()+interval '15 minutes',statement_timestamp(),statement_timestamp())`,
-		[id, name, host.userId, host.id, agentKey.serialized, agentKey.kid],
+		 VALUES ($1,$2,$3,$4,$7,'delegated',$5,$6,CASE WHEN $7='active' THEN statement_timestamp() END,
+		 CASE WHEN $7='active' THEN statement_timestamp()+interval '15 minutes' END,statement_timestamp(),statement_timestamp())`,
+		[
+			id,
+			name,
+			host.userId,
+			host.id,
+			agentKey.serialized,
+			agentKey.kid,
+			pending ? "pending" : "active",
+		],
 	);
 	await client.query(
 		`UPDATE "agentHost" SET name=COALESCE(NULLIF($2,''),name),"lastUsedAt"=statement_timestamp(),"expiresAt"=statement_timestamp()+interval '15 minutes' WHERE id=$1`,
 		[host.id, hostName],
 	);
-	return json({
+	const result = {
 		agent_id: id,
 		host_id: host.id,
 		name,
 		mode: "delegated",
-		status: "active",
+		status: pending ? "pending" : "active",
 		agent_capability_grants: [],
+	};
+	if (!pending) return json(result);
+	const approval = await writeOwnedAgentDeviceCode(client, request, {
+		agentId: id,
+		hostId: host.id,
+		ownerId: host.userId,
+		...approvalFields,
+	});
+	return json({
+		...result,
+		approval: { method: "device_authorization", ...approval },
 	});
 }

@@ -4021,7 +4021,12 @@ describe.skipIf(!existsSync(fixture))(
 					force_approval: true,
 				}),
 			);
-			expect(requiresApproval.status).toBe(501);
+			expect(requiresApproval.status).toBe(200);
+			const pending = (await requiresApproval.json()) as {
+				agent_id: string;
+				status: string;
+			};
+			expect(pending.status).toBe("pending");
 			const configuredOut = await owned.dispatch(
 				machineRegistration(await registerProof(host, inactive), name, {
 					capabilities: ["fixture.unconfigured"],
@@ -4035,7 +4040,10 @@ describe.skipIf(!existsSync(fixture))(
 				`SELECT id FROM "${alpha.schemaName}"."agent" WHERE "hostId"=$1`,
 				[host.hostId],
 			);
-			expect(rows).toEqual([{ id: agentId }]);
+			expect(rows).toEqual(
+				expect.arrayContaining([{ id: agentId }, { id: pending.agent_id }]),
+			);
+			expect(rows).toHaveLength(2);
 			const missing = await owned.dispatch(
 				request(alpha, "/agent/register", registrationCookie, { name }),
 			);
@@ -4100,6 +4108,253 @@ describe.skipIf(!existsSync(fixture))(
 				user_id: registrationOwner.id,
 				status: "active",
 			});
+		});
+
+		it("exchanges forced delegated registration and device proofs across writers and polls with the same host", async () => {
+			const path = "/agent/device/code";
+			const scope = `"${alpha.schemaName}"`;
+			const host = await nativeMachineHost(
+				"Device approval host",
+				registrationCookie,
+			);
+			const auth = `Bearer ${await hostProof(host)}`;
+			type DeviceCode = {
+				device_code: string;
+				user_code: string;
+				verification_uri: string;
+				verification_uri_complete: string;
+				expires_in: number;
+				interval: number;
+			};
+			async function verifyReceipt(
+				receipt: DeviceCode,
+				agentId: string,
+				owner: string | null,
+			) {
+				expect(receipt).toEqual({
+					device_code: expect.any(String),
+					user_code: expect.stringMatching(
+						/^[A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4}$/,
+					),
+					verification_uri: `${origin}/device/capabilities`,
+					verification_uri_complete: `${origin}/device/capabilities?agent_id=${agentId}&code=${receipt.user_code}`,
+					expires_in: 300,
+					interval: 5,
+				});
+				const saved = await database.query(
+					`SELECT method,"agentId","hostId","userId",status,"userCodeHash",interval,
+					extract(epoch FROM "expiresAt"-"createdAt")::int AS lifetime,"lastPolledAt","clientNotificationEndpoint"
+					FROM ${scope}."approvalRequest" WHERE id=$1`,
+					[receipt.device_code],
+				);
+				expect(saved.rows).toEqual([
+					{
+						method: "device_authorization",
+						agentId,
+						hostId: host.hostId,
+						userId: owner,
+						status: "pending",
+						userCodeHash: createHash("sha256")
+							.update(receipt.user_code)
+							.digest("base64url"),
+						interval: 5,
+						lifetime: 300,
+						lastPolledAt: null,
+						clientNotificationEndpoint: null,
+					},
+				]);
+			}
+			async function start(writer: "native" | "owned", label: string) {
+				const key = await generateKeyPair("EdDSA", { extractable: true });
+				const input = machineRegistration(
+					await registerProof(host, key),
+					label,
+					{ force_approval: true },
+					"192.0.2.108",
+				);
+				const response =
+					writer === "native"
+						? await legacy.handler(input)
+						: await owned.dispatch(input);
+				expect(response.status).toBe(200);
+				const value = (await response.json()) as {
+					agent_id: string;
+					status: string;
+					approval: DeviceCode & { method: string };
+				};
+				expect(value).toMatchObject({
+					host_id: host.hostId,
+					mode: "delegated",
+					status: "pending",
+					approval: { method: "device_authorization" },
+				});
+				const { method: _method, ...receipt } = value.approval;
+				await verifyReceipt(
+					receipt,
+					value.agent_id,
+					writer === "native" ? null : registrationOwner.id,
+				);
+				return { id: value.agent_id, receipt, key };
+			}
+			async function poll(
+				agentId: string,
+				status: string,
+				userId: string | null,
+			) {
+				const value = await expectSame(
+					`${statusPath}?agent_id=${agentId}`,
+					"",
+					200,
+					undefined,
+					auth,
+				);
+				expect(value).toMatchObject({
+					agent_id: agentId,
+					host_id: host.hostId,
+					status,
+					user_id: userId,
+				});
+			}
+			function decide(receipt: DeviceCode, cookie: string, ip: string) {
+				return approvalDecision(
+					cookie,
+					{
+						action: "approve",
+						approval_id: receipt.device_code,
+						user_code: receipt.user_code,
+					},
+					ip,
+				);
+			}
+			async function expire(receipt: DeviceCode) {
+				await database.query(
+					`UPDATE ${scope}."approvalRequest" SET "expiresAt"=now()-interval '1 second' WHERE id=$1`,
+					[receipt.device_code],
+				);
+			}
+			async function issue(
+				writer: "native" | "owned",
+				agentId: string,
+				owner: string | null,
+			) {
+				const input = request(alpha, path, "", { agent_id: agentId }, auth);
+				const response =
+					writer === "native"
+						? await legacy.handler(input)
+						: await owned.dispatch(input);
+				expect(response.status).toBe(200);
+				const receipt = (await response.json()) as DeviceCode;
+				await verifyReceipt(receipt, agentId, owner);
+				return receipt;
+			}
+			async function confirm(response: Response, agentId: string) {
+				expect(response.status).toBe(200);
+				expect(await response.json()).toEqual({
+					status: "approved",
+					agentId,
+					added: [],
+				});
+				await poll(agentId, "active", registrationOwner.id);
+				expect(
+					(
+						await owned.dispatch(
+							request(alpha, "/agent/revoke", "", { agent_id: agentId }, auth),
+						)
+					).status,
+				).toBe(200);
+			}
+
+			const nativePending = await start("native", "Native forced approval");
+			await poll(nativePending.id, "pending", null);
+			await expire(nativePending.receipt);
+			const fromNative = await issue("native", nativePending.id, null);
+			const foreignBrowser = await owned.dispatch(
+				decide(fromNative, peerCookie, "192.0.2.109"),
+			);
+			expect(foreignBrowser.status).toBe(403);
+			const wrongProof = await owned.dispatch(
+				approvalDecision(
+					registrationCookie,
+					{
+						action: "approve",
+						approval_id: fromNative.device_code,
+						user_code: "0000-0000",
+					},
+					"192.0.2.109",
+				),
+			);
+			expect(wrongProof.status).toBe(403);
+			await poll(nativePending.id, "pending", null);
+			await confirm(
+				await owned.dispatch(
+					decide(fromNative, registrationCookie, "192.0.2.110"),
+				),
+				nativePending.id,
+			);
+			const stale = await database.query(
+				`SELECT status FROM ${scope}."approvalRequest" WHERE id=$1`,
+				[nativePending.receipt.device_code],
+			);
+			expect(stale.rows).toEqual([{ status: "expired" }]);
+
+			const ownedPending = await start("owned", "Owned forced approval");
+			await poll(ownedPending.id, "pending", registrationOwner.id);
+			const reissued = await owned.dispatch(
+				machineRegistration(
+					await registerProof(host, ownedPending.key),
+					"retry",
+					{ force_approval: true },
+					"192.0.2.108",
+				),
+			);
+			expect(reissued.status).toBe(200);
+			expect(await reissued.json()).toMatchObject({
+				agent_id: ownedPending.id,
+				name: "Owned forced approval",
+				status: "pending",
+				approval: { method: "device_authorization" },
+			});
+			await expire(ownedPending.receipt);
+			const fromOwned = await issue(
+				"owned",
+				ownedPending.id,
+				registrationOwner.id,
+			);
+			const nativeForeign = await legacy.handler(
+				decide(fromOwned, peerCookie, "192.0.2.111"),
+			);
+			expect(nativeForeign.status).toBe(403);
+			await confirm(
+				await legacy.handler(
+					decide(fromOwned, registrationCookie, "192.0.2.112"),
+				),
+				ownedPending.id,
+			);
+
+			const priorNative = await start(
+				"native",
+				"Native pending reissued by AllAuth",
+			);
+			const outsideRealm = await outside.dispatch(
+				request(beta, path, "", { agent_id: priorNative.id }, auth),
+			);
+			expect(outsideRealm.status).toBe(401);
+			const browserOnly = await owned.dispatch(
+				request(alpha, path, registrationCookie, { agent_id: priorNative.id }),
+			);
+			expect(browserOnly.status).toBe(401);
+			const ownedReissue = await issue(
+				"owned",
+				priorNative.id,
+				registrationOwner.id,
+			);
+			await poll(priorNative.id, "pending", registrationOwner.id);
+			await confirm(
+				await legacy.handler(
+					decide(ownedReissue, registrationCookie, "192.0.2.113"),
+				),
+				priorNative.id,
+			);
 		});
 
 		it("serializes the native five-active-agent limit across hosts for the same owner", async () => {

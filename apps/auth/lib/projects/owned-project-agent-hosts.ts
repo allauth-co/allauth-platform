@@ -20,6 +20,10 @@ import {
 } from "./owned-project-agent-browser";
 import { readOwnedAgentCatalog } from "./owned-project-agent-catalog";
 import {
+	agentDeviceCodePath,
+	issueOwnedAgentDeviceCode,
+} from "./owned-project-agent-device-code";
+import {
 	agentHostCapabilities,
 	agentHostJSON as json,
 	agentHostOwnerRequired,
@@ -293,6 +297,8 @@ export function createOwnedProjectAgentHosts(options: BrowserHosts) {
 		const status = request.method === "GET" && path === "/agent/status";
 		const session = request.method === "GET" && path === agentSessionPath;
 		const register = request.method === "POST" && path === "/agent/register";
+		const deviceCode =
+			request.method === "POST" && path === agentDeviceCodePath;
 		const catalog =
 			request.method === "GET" &&
 			(path === "/capability/list" || path === "/capability/describe");
@@ -334,6 +340,7 @@ export function createOwnedProjectAgentHosts(options: BrowserHosts) {
 			!status &&
 			!session &&
 			!register &&
+			!deviceCode &&
 			!catalog &&
 			!introspect &&
 			!hostRotation &&
@@ -351,6 +358,7 @@ export function createOwnedProjectAgentHosts(options: BrowserHosts) {
 						: pending || status
 							? 300
 							: agentRead ||
+									deviceCode ||
 									agentRevoke ||
 									reactivate ||
 									grantRevoke ||
@@ -404,6 +412,12 @@ export function createOwnedProjectAgentHosts(options: BrowserHosts) {
 			const body = await options.readBody(request);
 			return options.store.transaction((client) =>
 				registerOwnedProjectAgent(client, request, body),
+			);
+		}
+		if (deviceCode) {
+			const body = await options.readBody(request);
+			return options.store.transaction((client) =>
+				issueOwnedAgentDeviceCode(client, request, body),
 			);
 		}
 		if (request.headers.has("authorization")) {

@@ -1,8 +1,12 @@
-import { createHash, timingSafeEqual } from "node:crypto";
+import { timingSafeEqual } from "node:crypto";
 import type { PoolClient } from "pg";
 import * as z from "zod";
 import { hasRemoteAgentKeys } from "../features/helpers";
-import { agentHostJSON as json } from "./owned-project-agent-enrollment";
+import { hashAgentDeviceCode } from "./owned-project-agent-device-code";
+import {
+	agentHostJSON as json,
+	readOwnedAgentPublicKey,
+} from "./owned-project-agent-enrollment";
 
 const input = z.object({
 	agent_id: z.string().optional(),
@@ -163,7 +167,7 @@ function deviceCodeMatches(code: string, expected: string | null) {
 		stripped.length === 8
 			? `${stripped.slice(0, 4)}-${stripped.slice(4)}`
 			: code.toUpperCase();
-	const hash = createHash("sha256").update(normalized).digest("base64url");
+	const hash = hashAgentDeviceCode(normalized);
 	const encoder = new TextEncoder();
 	const submitted = encoder.encode(hash);
 	const saved = encoder.encode(expected ?? "");
@@ -226,10 +230,13 @@ export async function decideOwnedAgentApproval(
 		)
 	).rows[0];
 	if (!observed) return error(404, "agent_not_found", "Agent not found");
+	const unbound = observed.userId === null;
+	const sameOwner = (approval: Approval) =>
+		approval.hostId === observed.hostId &&
+		(approval.userId === userId || (unbound && approval.userId === null));
 	if (
-		observed.userId !== userId ||
-		(selected &&
-			(selected.userId !== userId || selected.hostId !== observed.hostId))
+		(!unbound && observed.userId !== userId) ||
+		(selected && !sameOwner(selected))
 	)
 		return wrongOwner();
 	const host = await client.query(
@@ -242,26 +249,40 @@ export async function decideOwnedAgentApproval(
 			mode: string;
 			status: string;
 			metadata: string | null;
+			publicKey: string;
+			jwksUrl: string | null;
 		}>(
-			`SELECT mode,status,metadata FROM "agent" WHERE id=$1 AND "hostId"=$2 AND "userId"=$3 FOR UPDATE`,
-			[agentId, observed.hostId, userId],
+			`SELECT mode,status,metadata,"publicKey","jwksUrl" FROM "agent" WHERE id=$1 AND "hostId"=$2 AND "userId" IS NOT DISTINCT FROM $3 FOR UPDATE`,
+			[agentId, observed.hostId, observed.userId],
 		)
 	).rows[0];
 	if (!agent || agent.mode !== "delegated") return wrongOwner();
 	if (agent.status !== "pending" || (selected && selected.status !== "pending"))
 		return resolved();
+	if (
+		unbound &&
+		(agent.jwksUrl ||
+			(await readOwnedAgentPublicKey(parseStored(agent.publicKey))) instanceof
+				Response)
+	)
+		return unsupported();
 	const { rows: pending } = await client.query<Approval>(
 		`SELECT ${decisionColumns} FROM "approvalRequest" WHERE "agentId"=$1 AND status='pending' ORDER BY id FOR UPDATE`,
 		[agentId],
 	);
 	if (pending.length === 0) return notFound();
-	if (
-		pending.some(
-			(row) => row.userId !== userId || row.hostId !== observed.hostId,
-		)
-	)
-		return wrongOwner();
-	const method = pending[0].method;
+	if (pending.some((row) => !sameOwner(row))) return wrongOwner();
+	const selectedPending =
+		selected && pending.find(({ id }) => id === selected.id);
+	if (selected && !selectedPending) return resolved();
+	const now = Date.now();
+	if (selectedPending && selectedPending.expiresAt.getTime() <= now)
+		return expired();
+	const live =
+		selectedPending?.method === "device_authorization"
+			? pending.filter((row) => row.expiresAt.getTime() > now)
+			: pending;
+	const method = live[0].method;
 	const grants = await client.query(
 		`SELECT id FROM "agentCapabilityGrant" WHERE "agentId"=$1 LIMIT 1`,
 		[agentId],
@@ -269,7 +290,8 @@ export async function decideOwnedAgentApproval(
 	if (
 		capabilities?.length ||
 		grants.rowCount ||
-		pending.some(
+		(unbound && method !== "device_authorization") ||
+		live.some(
 			(row) =>
 				row.method !== method ||
 				row.capabilities?.trim() ||
@@ -282,12 +304,11 @@ export async function decideOwnedAgentApproval(
 		)
 	)
 		return unsupported();
-	if (pending.some((row) => row.expiresAt.getTime() <= Date.now()))
-		return expired();
-	if (method === "device_authorization" && action === "approve") {
+	if (live.some((row) => row.expiresAt.getTime() <= now)) return expired();
+	if (method === "device_authorization" && (action === "approve" || unbound)) {
 		const eligible = selected
-			? pending.filter(({ id }) => id === selected.id)
-			: pending;
+			? live.filter(({ id }) => id === selected.id)
+			: live;
 		if (
 			!user_code ||
 			!eligible.some(({ userCodeHash }) =>
@@ -302,7 +323,7 @@ export async function decideOwnedAgentApproval(
 	}
 	const approved = action === "approve";
 	const nextStatus = approved ? "approved" : "denied";
-	const ids = pending.map(({ id }) => id);
+	const ids = live.map(({ id }) => id);
 	const changes = await client.query(
 		`UPDATE "approvalRequest" SET status=$2,"updatedAt"=statement_timestamp() WHERE id=ANY($1::text[]) AND status='pending'
 		 AND NOT EXISTS(SELECT 1 FROM "approvalRequest" WHERE id=ANY($1::text[]) AND "expiresAt"<=statement_timestamp())`,
@@ -311,10 +332,19 @@ export async function decideOwnedAgentApproval(
 	if (!changes.rowCount) return expired();
 	if (changes.rowCount !== ids.length)
 		throw new Error("The locked approvals could not be resolved together.");
+	if (live.length < pending.length) {
+		const expiredIds = pending
+			.filter((row) => row.expiresAt.getTime() <= now)
+			.map(({ id }) => id);
+		await client.query(
+			`UPDATE "approvalRequest" SET status='expired',"updatedAt"=statement_timestamp() WHERE id=ANY($1::text[])`,
+			[expiredIds],
+		);
+	}
 	if (approved) {
 		await client.query(
-			`UPDATE "agent" SET status='active',"activatedAt"=statement_timestamp(),"expiresAt"=statement_timestamp()+interval '15 minutes',"updatedAt"=statement_timestamp() WHERE id=$1`,
-			[agentId],
+			`UPDATE "agent" SET status='active',"userId"=$2,"activatedAt"=statement_timestamp(),"expiresAt"=statement_timestamp()+interval '15 minutes',"updatedAt"=statement_timestamp() WHERE id=$1`,
+			[agentId, userId],
 		);
 		return json({ status: "approved", agentId, added: [] });
 	}
@@ -328,8 +358,8 @@ export async function decideOwnedAgentApproval(
 			})
 		: agent.metadata;
 	await client.query(
-		`UPDATE "agent" SET status='rejected',metadata=$2,"updatedAt"=statement_timestamp() WHERE id=$1`,
-		[agentId, metadata],
+		`UPDATE "agent" SET status='rejected',metadata=$2,"userId"=$3,"updatedAt"=statement_timestamp() WHERE id=$1`,
+		[agentId, metadata, userId],
 	);
 	return json({ status: "denied" });
 }
