@@ -11,6 +11,7 @@ import {
 	withAuthReturnTo,
 } from "@/sdk/react";
 import type { HostedSdkForm } from "@/lib/domains/hosted-sdk-policy";
+import { HostedProjectEmailStatus } from "./hosted-project-email-status";
 import {
 	HostedProjectCard,
 	HostedProjectEmail,
@@ -263,6 +264,16 @@ export function HostedProjectAuth({
 					<HostedProjectSso showPassword={showPassword} {...continuation} />
 				)}
 				{view === "twoFactor" && <HostedProjectMfa {...continuation} />}
+				{(view === "verifyEmail" ||
+					view === "resetLinkSent" ||
+					view === "magicLinkSent") && (
+					<HostedProjectEmailStatus
+						key={view}
+						view={view}
+						showEmail={showEmail}
+						{...continuation}
+					/>
+				)}
 				{mainForm && (
 					<HostedProjectChoices
 						view={view}

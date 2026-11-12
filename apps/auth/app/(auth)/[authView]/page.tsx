@@ -16,7 +16,9 @@ const paths = new Set([
 const previewViews = {
 	"enterprise-sign-in": "enterpriseSignIn",
 	"magic-link": "magicLink",
+	"magic-link-sent": "magicLinkSent",
 	"email-otp": "emailOtp",
+	"reset-link-sent": "resetLinkSent",
 } as const;
 
 export default async function Page({
@@ -30,7 +32,9 @@ export default async function Page({
 	if (
 		authView === "enterprise-sign-in" ||
 		authView === "magic-link" ||
-		authView === "email-otp"
+		authView === "magic-link-sent" ||
+		authView === "email-otp" ||
+		authView === "reset-link-sent"
 	)
 		return (
 			<HostedProjectAuthPage

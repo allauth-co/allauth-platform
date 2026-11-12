@@ -28,6 +28,7 @@ import { readGoogleProvider } from "../project-providers/repository";
 import { backendCredentialRepository } from "./backend-credentials";
 import { projectBrokerTwoFactor } from "./broker-two-factor";
 import { createOwnedEmailVerification } from "./owned-email-verification";
+import { createOwnedProjectEmailCallbackPolicy } from "./owned-project-email-callback";
 import { createOwnedProjectEngine } from "./owned-project-engine";
 import { createProjectEngineStore } from "./owned-project-engine-store";
 import { admitOwnedProjectNativeRoute } from "./owned-project-native-admission";
@@ -184,6 +185,11 @@ export async function createOwnedProjectRuntimeCandidate(options: Options) {
 	}
 	const accountURL = `${browserOrigin}/account`;
 	const callbackURLs = [accountURL, `${browserOrigin}/`];
+	const callbackPolicy = createOwnedProjectEmailCallbackPolicy({
+		browserOrigin,
+		publicLinkBaseURL: linkBase,
+		signingSecret,
+	});
 	const mailFailure = () =>
 		console.error("AllAuth project authentication email delivery failed.");
 	const send = ({
@@ -282,6 +288,7 @@ export async function createOwnedProjectRuntimeCandidate(options: Options) {
 			admit,
 			verification: {
 				callbackURLs,
+				callbackPolicy,
 				defer,
 				onFailure: mailFailure,
 				async send(user, callbackURL) {
@@ -304,6 +311,7 @@ export async function createOwnedProjectRuntimeCandidate(options: Options) {
 			publicLinkBaseURL: linkBase,
 			resetCallbackURLs: [`${browserOrigin}/reset-password`],
 			verificationCallbackURLs: callbackURLs,
+			callbackPolicy,
 			email,
 			checkPasswordSafety,
 			admit,

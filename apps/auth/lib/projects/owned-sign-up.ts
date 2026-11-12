@@ -6,6 +6,7 @@ import type { AuthPolicy } from "../auth-policy/policy";
 import { authPolicySchema } from "../auth-policy/policy";
 import { validAvatarPath } from "../avatars/protocol";
 import { clerkCompatiblePasswords } from "../clerk-password";
+import type { OwnedEmailCallbackPolicy } from "./owned-project-email-callback";
 import { createProjectEngineStore } from "./owned-project-engine-store";
 import type { Project } from "./registry";
 import type { SessionCheckAdmission } from "./session-introspection-admission";
@@ -30,6 +31,7 @@ type PasswordSafety = "allowed" | "breached" | "unavailable";
 
 export interface SignUpVerification {
 	callbackURLs: readonly string[];
+	callbackPolicy?: OwnedEmailCallbackPolicy;
 	/** Schedule approved mail work after the response without awaiting it. */
 	defer(work: () => Promise<void>): void;
 	send(
@@ -259,16 +261,24 @@ export function createOwnedSignUpHttp(options: OwnedSignUpOptions) {
 				// Preserve opaque external profile-image values from the existing contract.
 			}
 		}
-		const selectedCallback =
+		let selectedCallback =
 			input.callbackURL === undefined
 				? (callbacks[0] ?? null)
 				: (safeCallback(input.callbackURL, caller)?.href ?? null);
 		if (
+			selectedCallback &&
+			policy.requireEmailVerification &&
+			!callbacks.includes(selectedCallback)
+		) {
+			const target = new URL(selectedCallback);
+			selectedCallback = origins.has(target.origin)
+				? (verification?.callbackPolicy?.(target, "verification", "issue")?.url
+						.href ?? null)
+				: null;
+		}
+		if (
 			input.callbackURL !== undefined &&
-			(!selectedCallback ||
-				!origins.has(new URL(selectedCallback).origin) ||
-				(policy.requireEmailVerification &&
-					!callbacks.includes(selectedCallback)))
+			(!selectedCallback || !origins.has(new URL(selectedCallback).origin))
 		)
 			return failure(
 				403,

@@ -14,9 +14,11 @@ import type { ControlPrincipal } from "../control/types";
 import { signEdgeRequest } from "../domains/edge";
 import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
 import { createWorkspace } from "../workspaces/repository";
+import { signProjectIssuerQuery } from "./owned-project-issuer-authorization-query";
 import type { ProjectRuntimeFixtureBoot } from "./owned-project-runtime-fixture";
 import type { Project } from "./registry";
 import { projectRegistryPool, provisionProject } from "./registry";
+import { projectSecret } from "./runtime";
 
 const fixture = new URL(
 	"../../../../.secrets/local-postgres.json",
@@ -184,30 +186,56 @@ async function openProcess(
 	}
 }
 
-async function issueFixtureTokens(
-	service: Awaited<ReturnType<typeof openProcess>>,
-	transport: { prefix: string; issuer: string; host?: string; cookie: string },
-) {
-	const verifier = "runtime-restart-fixture-project-issuer-proof-verifier";
-	const state = randomUUID();
-	const query = new URLSearchParams({
+const oauthVerifier = "runtime-restart-fixture-project-issuer-proof-verifier";
+
+function fixtureAuthorizationQuery(state = randomUUID()) {
+	return new URLSearchParams({
 		response_type: "code",
 		client_id: oauthClientId,
 		redirect_uri: oauthRedirectURI,
 		scope: "openid profile",
 		state,
 		code_challenge_method: "S256",
-		code_challenge: createHash("sha256").update(verifier).digest("base64url"),
+		code_challenge: createHash("sha256")
+			.update(oauthVerifier)
+			.digest("base64url"),
 	});
+}
+
+async function fixtureRedirect(response: Response) {
+	const location =
+		response.headers.get("location") ??
+		((await response.json()) as { url?: string }).url;
+	expect(location).toBeTruthy();
+	return new URL(location!, platformOrigin);
+}
+
+async function fixtureVerificationMail(
+	service: Awaited<ReturnType<typeof openProcess>>,
+	email: string,
+) {
+	return vi.waitFor(() => {
+		const verification = service.mail.find(({ to }) => to === email);
+		expect(verification?.subject).toContain("Verify your");
+		const match = verification?.text.match(
+			/https:\/\/[^\s<>\]]+\/verify-email\?[^\s<>\]]+/,
+		);
+		expect(match?.[0]).toBeTruthy();
+		return new URL(match![0]);
+	});
+}
+
+async function issueFixtureTokens(
+	service: Awaited<ReturnType<typeof openProcess>>,
+	transport: { prefix: string; issuer: string; host?: string; cookie: string },
+) {
+	const state = randomUUID();
+	const query = fixtureAuthorizationQuery(state);
 	const authorization = await service.request(
 		`${transport.prefix}/oauth2/authorize?${query}`,
 		transport,
 	);
-	const location =
-		authorization.headers.get("location") ??
-		((await authorization.json()) as { url?: string }).url;
-	expect(location).toBeTruthy();
-	const callback = new URL(location!);
+	const callback = await fixtureRedirect(authorization);
 	expect(callback.origin + callback.pathname).toBe(oauthRedirectURI);
 	expect(callback.searchParams.get("state")).toBe(state);
 	expect(callback.searchParams.get("iss")).toBe(transport.issuer);
@@ -218,7 +246,7 @@ async function issueFixtureTokens(
 			client_id: oauthClientId,
 			redirect_uri: oauthRedirectURI,
 			code: callback.searchParams.get("code") ?? "",
-			code_verifier: verifier,
+			code_verifier: oauthVerifier,
 		}),
 	});
 	expect(
@@ -391,6 +419,18 @@ describe.skipIf(!existsSync(fixture))(
 				});
 				expect(hostedLogin.status).toBe(200);
 				const legacyHostedCookie = cookie(hostedLogin);
+				const legacyContinuation = await fixtureRedirect(
+					await service.request(
+						`/api/auth/oauth2/authorize?${fixtureAuthorizationQuery()}`,
+						{ host: alphaHost },
+					),
+				);
+				expect(legacyContinuation.pathname).toBe("/sign-in");
+				expect(legacyContinuation.searchParams.has("sig")).toBe(true);
+				const oauthCallback = new URL(
+					`/oauth2/continue${legacyContinuation.search}`,
+					`https://${alphaHost}`,
+				);
 				expect(
 					(await service.request(management(alpha), { cookie: rootCookie }))
 						.status,
@@ -534,29 +574,26 @@ describe.skipIf(!existsSync(fixture))(
 						email: signupEmail,
 						name: "Runtime Registration",
 						password: credentials.updated,
+						callbackURL: `https://${alphaHost}/console`,
 					},
 				});
 				expect(
 					registration.status,
 					registration.ok ? undefined : await registration.clone().text(),
 				).toBe(200);
-				const verificationURL = await vi.waitFor(() => {
-					const verification = service!.mail.find(
-						({ to }) => to === signupEmail,
-					);
-					expect(verification?.subject).toContain("Verify your");
-					const match = verification?.text.match(
-						/https:\/\/[^\s<>\]]+\/verify-email\?[^\s<>\]]+/,
-					);
-					expect(match?.[0]).toBeTruthy();
-					return new URL(match![0]);
-				});
+				const verificationURL = await fixtureVerificationMail(
+					service,
+					signupEmail,
+				);
 				expect(verificationURL.origin).toBe(`https://${alphaHost}`);
 				const verified = await service.request(
 					verificationURL.pathname + verificationURL.search,
 					{ host: alphaHost },
 				);
 				expect(verified.status).toBe(302);
+				expect(verified.headers.get("location")).toBe(
+					`https://${alphaHost}/console`,
+				);
 				const verifiedCookie = cookie(verified);
 				expect(verifiedCookie).toContain("session_token=");
 				const hostedKeys = await issueFixtureTokens(service, {
@@ -583,6 +620,134 @@ describe.skipIf(!existsSync(fixture))(
 					issuer: hostedIssuer,
 					audience: oauthClientId,
 				});
+				const oauthEmail = "verified-oauth@runtime.fixture.example";
+				const oauthRegistration = await service.request(
+					"/api/auth/sign-up/email",
+					{
+						host: alphaHost,
+						body: {
+							email: oauthEmail,
+							name: "OAuth Registration",
+							password: credentials.updated,
+							callbackURL: oauthCallback.href,
+						},
+					},
+				);
+				expect(
+					oauthRegistration.status,
+					oauthRegistration.ok
+						? undefined
+						: await oauthRegistration.clone().text(),
+				).toBe(200);
+				const oauthMail = await fixtureVerificationMail(service, oauthEmail);
+				const forged = new URL(oauthCallback);
+				forged.searchParams.set("state", "changed-by-caller");
+				const tamperedMail = new URL(oauthMail);
+				tamperedMail.searchParams.set("callbackURL", forged.href);
+				expect(
+					(
+						await service.request(tamperedMail.pathname + tamperedMail.search, {
+							host: alphaHost,
+						})
+					).status,
+				).toBe(403);
+				const verifiedOAuth = await service.request(
+					oauthMail.pathname + oauthMail.search,
+					{ host: alphaHost },
+				);
+				expect(verifiedOAuth.status).toBe(302);
+				expect(verifiedOAuth.headers.get("location")).toBe(oauthCallback.href);
+				const continuation = await fixtureRedirect(
+					await service.request("/api/auth/oauth2/continue", {
+						host: alphaHost,
+						cookie: cookie(verifiedOAuth),
+						body: {
+							selected: true,
+							oauth_query: oauthCallback.searchParams.toString(),
+						},
+					}),
+				);
+				expect(continuation.origin + continuation.pathname).toBe(
+					oauthRedirectURI,
+				);
+				expect(continuation.searchParams.get("state")).toBe(
+					oauthCallback.searchParams.get("state"),
+				);
+				expect(continuation.searchParams.has("code")).toBe(true);
+				const oldClock = vi
+					.spyOn(Date, "now")
+					.mockReturnValue(Date.now() - 120_000);
+				let expiredOAuth: URLSearchParams;
+				try {
+					expiredOAuth = signProjectIssuerQuery(
+						fixtureAuthorizationQuery(),
+						projectSecret({ ALLAUTH_AUTH_SECRET: platformSecret }, alpha.id),
+					);
+				} finally {
+					oldClock.mockRestore();
+				}
+				const expiredMail = new URL(oauthMail);
+				expiredMail.searchParams.set(
+					"callbackURL",
+					`https://${alphaHost}/oauth2/continue?${expiredOAuth}`,
+				);
+				const invalidToken = new URL(expiredMail);
+				invalidToken.searchParams.set("token", "invalid-email-token");
+				expect(
+					(
+						await service.request(invalidToken.pathname + invalidToken.search, {
+							host: alphaHost,
+						})
+					).status,
+				).toBe(401);
+				const expiredFallback = await service.request(
+					expiredMail.pathname + expiredMail.search,
+					{ host: alphaHost },
+				);
+				expect(expiredFallback.status).toBe(302);
+				expect(expiredFallback.headers.get("location")).toBe(
+					`https://${alphaHost}/account`,
+				);
+				expect(
+					(
+						await service.request("/api/auth/oauth2/continue", {
+							host: alphaHost,
+							cookie: cookie(verifiedOAuth),
+							body: { selected: true, oauth_query: expiredOAuth.toString() },
+						})
+					).status,
+				).toBe(400);
+				const resetURL = new URL(`https://${alphaHost}/reset-password`);
+				resetURL.searchParams.set("returnTo", "/account/security?from=reset");
+				const resetRequest = await service.request(
+					"/api/auth/request-password-reset",
+					{
+						host: alphaHost,
+						body: { email: oauthEmail, redirectTo: resetURL.href },
+					},
+				);
+				expect(resetRequest.status).toBe(200);
+				const resetMail = await vi.waitFor(() => {
+					const mail = service!.mail.find(
+						({ to, subject }) =>
+							to === oauthEmail && subject.startsWith("Reset your"),
+					);
+					const match = mail?.text.match(
+						/https:\/\/[^\s<>\]]+\/reset-password\/[^\s<>\]]+/,
+					);
+					expect(match?.[0]).toBeTruthy();
+					return new URL(match![0]);
+				});
+				const resetRedirect = await fixtureRedirect(
+					await service.request(resetMail.pathname + resetMail.search, {
+						host: alphaHost,
+					}),
+				);
+				expect(resetRedirect.pathname).toBe("/reset-password");
+				expect(resetRedirect.searchParams.get("returnTo")).toBe(
+					"/account/security?from=reset",
+				);
+				expect(resetRedirect.searchParams.has("token")).toBe(true);
 				const rotated = await service.request(`${alphaPath}/change-password`, {
 					cookie: legacyCookie,
 					body: {

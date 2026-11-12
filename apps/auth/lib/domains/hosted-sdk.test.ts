@@ -357,6 +357,61 @@ describe("hosted SDK transport", () => {
 		).toBeNull();
 	});
 
+	it("resends through the native project endpoint and keeps the bearer callback outside the hosted alias", async () => {
+		const email = "verify-fixture@example.com";
+		const callbackURL = `${origin}/account/security?from=verify`;
+		const sent: string[] = [];
+		const { auth } = await getTestInstance(
+			{
+				baseURL: origin,
+				emailAndPassword: { enabled: true, requireEmailVerification: true },
+				emailVerification: {
+					sendOnSignUp: false,
+					async sendVerificationEmail({ url }) {
+						sent.push(url);
+					},
+				},
+			},
+			{ disableTestUser: true },
+		);
+		await auth.api.signUpEmail({
+			body: {
+				email,
+				name: "Verification fixture",
+				password: "fixture-password-99",
+			},
+		});
+		expect(sent).toHaveLength(0);
+		verifiedFixture();
+		gateway.dispatch.mockImplementation((incoming: Request) =>
+			auth.handler(incoming),
+		);
+
+		const body = { email, callbackURL };
+		const crossOrigin = await POST(
+			request("send-verification-email", "POST", {
+				origin: "https://foreign.fixture.example",
+				body,
+			}),
+		);
+		expect(crossOrigin.status).toBe(403);
+		expect(gateway.dispatch).not.toHaveBeenCalled();
+		expect((await GET(request("verify-email?token=fixture"))).status).toBe(404);
+		expect(gateway.dispatch).not.toHaveBeenCalled();
+
+		const response = await POST(
+			request("send-verification-email", "POST", { origin, body }),
+		);
+		expect(response.status).toBe(200);
+		expect(await response.json()).toEqual({ status: true });
+		expect(sent).toHaveLength(1);
+		const link = new URL(sent[0]!);
+		expect(link.pathname).toBe("/api/auth/verify-email");
+		expect(link.searchParams.get("callbackURL")).toBe(callbackURL);
+		expect(link.searchParams.has("token")).toBe(true);
+		expect(response.headers.get("cache-control")).toBe("no-store");
+	});
+
 	it("retains native username, email code, magic-link and configured enterprise sign-in contracts", async () => {
 		const email = "alternate@fixture.example";
 		const password = "synthetic-hosted-password";

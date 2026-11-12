@@ -142,9 +142,10 @@ export function signProjectIssuerQuery(
 	return params;
 }
 
-export function readSignedProjectIssuerQuery(
+function readSignedQueryAt(
 	serialized: string,
 	signingSecret: string,
+	now: number,
 ) {
 	if (!serialized || serialized.length > maximumQueryLength) return null;
 	const params = new URLSearchParams(serialized);
@@ -161,7 +162,7 @@ export function readSignedProjectIssuerQuery(
 		!Number.isSafeInteger(expires) ||
 		!Number.isSafeInteger(issuedAt) ||
 		issuedAt < 1 ||
-		expires * 1000 < Date.now() ||
+		expires * 1000 < now ||
 		!timingSafeEqual(
 			encoder.encode(supplied[0]!),
 			encoder.encode(signature(params, signingSecret)),
@@ -171,6 +172,33 @@ export function readSignedProjectIssuerQuery(
 	const consentSessionId = params.get("ba_pl") ?? undefined;
 	for (const name of markers) params.delete(name);
 	return { params, issuedAt, consentSessionId };
+}
+
+export function readSignedProjectIssuerQuery(
+	serialized: string,
+	signingSecret: string,
+) {
+	return readSignedQueryAt(serialized, signingSecret, Date.now());
+}
+
+/** Recognize only a recently expired email callback. This result carries no authorization state. */
+export function isAuthenticExpiredProjectIssuerEmailContinuation(
+	serialized: string,
+	signingSecret: string,
+) {
+	if (!serialized || serialized.length > maximumQueryLength) return false;
+	const now = Date.now();
+	const expires = Number(new URLSearchParams(serialized).get("exp")) * 1000;
+	if (
+		!Number.isSafeInteger(expires) ||
+		expires >= now ||
+		now - expires > 60 * 60_000
+	)
+		return false;
+	const expired = readSignedQueryAt(serialized, signingSecret, expires);
+	return Boolean(
+		expired && !expired.consentSessionId && expired.issuedAt <= expires,
+	);
 }
 
 function isHttpLoopback(hostname: string) {

@@ -14,6 +14,7 @@ import {
 	findOwnedPasswordResetUser,
 	isLegacyPasswordResetToken,
 } from "./owned-password-reset";
+import type { OwnedEmailCallbackPolicy } from "./owned-project-email-callback";
 import { createProjectEngineStore } from "./owned-project-engine-store";
 import type { Project } from "./registry";
 import type { SessionCheckAdmission } from "./session-introspection-admission";
@@ -51,6 +52,7 @@ export interface RecoveryHttpOptions {
 	trustedOrigins: readonly string[];
 	resetCallbackURLs: readonly string[];
 	verificationCallbackURLs: readonly string[];
+	callbackPolicy?: OwnedEmailCallbackPolicy;
 	email: { environment: EmailEnvironment; branding?: ApplicationBranding };
 	checkPasswordSafety: Parameters<
 		typeof createOwnedPasswordReset
@@ -214,14 +216,19 @@ export function createOwnedRecoveryHttp(options: RecoveryHttpOptions) {
 
 	function selectCallback(
 		value: string | undefined,
-		approved: string[],
+		flow: Parameters<OwnedEmailCallbackPolicy>[1],
+		phase: Parameters<OwnedEmailCallbackPolicy>[2],
 		caller = linkBase.origin,
-	) {
-		if (value === undefined) return new URL(approved[0]);
+	): ReturnType<OwnedEmailCallbackPolicy> {
+		const approved = flow === "verification" ? verifyCallbacks : resetCallbacks;
+		if (value === undefined) return { url: new URL(approved[0]) };
 		if (!validURL(value)) return null;
 		try {
 			const target = new URL(value, caller);
-			return approved.includes(target.href) ? target : null;
+			if (approved.includes(target.href)) return { url: target };
+			return origins.has(target.origin)
+				? (options.callbackPolicy?.(target, flow, phase) ?? null)
+				: null;
 		} catch {
 			return null;
 		}
@@ -360,7 +367,8 @@ export function createOwnedRecoveryHttp(options: RecoveryHttpOptions) {
 					: undefined;
 		const destination = selectCallback(
 			value,
-			isReset ? resetCallbacks : verifyCallbacks,
+			isReset ? "password-reset" : "verification",
+			"issue",
 			caller,
 		);
 		if (!destination) return forbidden();
@@ -377,7 +385,7 @@ export function createOwnedRecoveryHttp(options: RecoveryHttpOptions) {
 				"Authentication email is unavailable.",
 			);
 		try {
-			schedule(operation, () => deliver(operation, address, destination));
+			schedule(operation, () => deliver(operation, address, destination.url));
 		} catch {
 			return failure(
 				503,
@@ -481,7 +489,8 @@ export function createOwnedRecoveryHttp(options: RecoveryHttpOptions) {
 		if (candidates.length > 1) return forbidden();
 		const destination = selectCallback(
 			candidates[0],
-			resetToken ? resetCallbacks : verifyCallbacks,
+			resetToken ? "password-reset" : "verification",
+			"consume",
 		);
 		if (!destination) return forbidden();
 		if (resetToken) {
@@ -494,9 +503,14 @@ export function createOwnedRecoveryHttp(options: RecoveryHttpOptions) {
 						resetToken,
 					)
 				: null;
-			return user
-				? redirect(destination, "token", resetToken)
-				: redirect(destination, "error", "INVALID_TOKEN");
+			if (user) return redirect(destination.url, "token", resetToken);
+			return destination.expiredContinuation
+				? failure(
+						401,
+						"INVALID_TOKEN",
+						"Invalid or expired password reset token.",
+					)
+				: redirect(destination.url, "error", "INVALID_TOKEN");
 		}
 
 		const limited = await admission(request, "verify-email");
@@ -507,7 +521,7 @@ export function createOwnedRecoveryHttp(options: RecoveryHttpOptions) {
 				? await verification.verify({
 						token: tokens[0],
 						request,
-						callbackURL: candidates[0] ? destination.href : undefined,
+						callbackURL: candidates[0] ? destination.url.href : undefined,
 					})
 				: { status: "invalid" as const };
 		if (result.status === "verified") {
@@ -517,13 +531,13 @@ export function createOwnedRecoveryHttp(options: RecoveryHttpOptions) {
 					headers: privateHeaders(new Headers(result.response.headers)),
 				});
 			return candidates[0]
-				? redirect(destination)
+				? redirect(destination.url)
 				: json({ status: true, user: null });
 		}
 		const code =
 			result.status === "expired" ? "TOKEN_EXPIRED" : "INVALID_TOKEN";
-		return candidates[0]
-			? redirect(destination, "error", code)
+		return candidates[0] && !destination.expiredContinuation
+			? redirect(destination.url, "error", code)
 			: failure(401, code, "Invalid or expired verification token.");
 	};
 }

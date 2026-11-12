@@ -9,6 +9,7 @@ import type { HostedSdkForm } from "./domains/hosted-sdk-policy";
 
 const native = vi.hoisted(() => ({
 	social: vi.fn(),
+	sendVerificationEmail: vi.fn(),
 	onChallenge: undefined as ((methods?: string[]) => void) | undefined,
 }));
 vi.mock("@/sdk/client", () => ({
@@ -17,7 +18,10 @@ vi.mock("@/sdk/client", () => ({
 		onChallenge: (methods?: string[]) => void,
 	) => {
 		native.onChallenge = onChallenge;
-		return { signIn: { social: native.social } };
+		return {
+			signIn: { social: native.social },
+			sendVerificationEmail: native.sendVerificationEmail,
+		};
 	},
 }));
 
@@ -32,8 +36,128 @@ afterEach(async () => {
 	dispose = undefined;
 	vi.unstubAllGlobals();
 	vi.restoreAllMocks();
+	vi.useRealTimers();
+	window.sessionStorage.clear();
 	native.social.mockReset();
+	native.sendVerificationEmail.mockReset();
 	native.onChallenge = undefined;
+});
+
+it("resends verification to the remembered email after the cooldown and honors server admission", async () => {
+	vi.useFakeTimers();
+	vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+	window.sessionStorage.setItem(
+		"better-auth-ui.verify-email",
+		"user@fixture.example",
+	);
+	vi.stubGlobal(
+		"fetch",
+		vi.fn(async () =>
+			Response.json({
+				emailPassword: true,
+				google: false,
+				organizations: true,
+				twoFactor: true,
+				branding: { name: "Customer portal", showPoweredBy: false },
+			}),
+		),
+	);
+	native.sendVerificationEmail
+		.mockResolvedValueOnce({
+			error: { status: 429, message: "Try again later", retryAfter: "90" },
+		})
+		.mockResolvedValueOnce({ data: { status: true }, error: null });
+
+	const container = await renderHostedAuth("verifyEmail");
+	expect(container.textContent).toContain("Verify your email");
+	const resend = container.querySelector("button")!;
+	expect(resend.disabled).toBe(true);
+	expect(resend.textContent).toBe("Resend in 60s");
+	await act(async () => vi.advanceTimersByTimeAsync(60_000));
+	expect(resend.disabled).toBe(false);
+	await act(async () => {
+		resend.click();
+		resend.click();
+	});
+	expect(native.sendVerificationEmail).toHaveBeenCalledTimes(1);
+	expect(native.sendVerificationEmail).toHaveBeenCalledWith(
+		{
+			email: "user@fixture.example",
+			callbackURL: `${window.location.origin}${destination}`,
+		},
+		{ signal: expect.any(AbortSignal) },
+	);
+	expect(container.querySelector('[role="alert"]')?.textContent).toBe(
+		"Try again later",
+	);
+	expect(resend.textContent).toBe("Resend in 90s");
+	await act(async () => vi.advanceTimersByTimeAsync(60_000));
+	expect(resend.disabled).toBe(true);
+	await act(async () => vi.advanceTimersByTimeAsync(30_000));
+	await act(async () => resend.click());
+	expect(container.querySelector('[role="status"]')?.textContent).toContain(
+		"new verification link",
+	);
+	expect(resend.textContent).toBe("Resend in 60s");
+});
+
+it.each([
+	["resetLinkSent", "reset-link-sent", "a reset link"],
+	["magicLinkSent", "magic-link-sent", "a link to sign in"],
+] as const)("renders the %s page using the existing browser email state", async (view, key, message) => {
+	vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+	vi.stubGlobal(
+		"fetch",
+		vi.fn(async () =>
+			Response.json({
+				emailPassword: true,
+				google: false,
+				organizations: true,
+				twoFactor: true,
+			}),
+		),
+	);
+	window.sessionStorage.setItem(
+		`better-auth-ui.${key}`,
+		"user@fixture.example",
+	);
+	const container = await renderHostedAuth(view);
+	expect(container.textContent).toContain(message);
+	expect(container.textContent).toContain("user@fixture.example");
+	expect(native.sendVerificationEmail).not.toHaveBeenCalled();
+	const signIn = [...container.querySelectorAll("a")].find(
+		(link) => link.textContent === "Back to sign in",
+	);
+	expect(new URL(signIn!.href).searchParams.get("returnTo")).toBe(destination);
+});
+
+it("offers configuration retry without exposing a resend action for missing capabilities", async () => {
+	vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+	window.sessionStorage.setItem(
+		"better-auth-ui.verify-email",
+		"user@fixture.example",
+	);
+	const configuration = vi.fn(async () =>
+		Response.json({
+			emailPassword: true,
+			google: false,
+			organizations: true,
+			twoFactor: true,
+		}),
+	);
+	configuration.mockResolvedValueOnce(new Response(null, { status: 503 }));
+	vi.stubGlobal("fetch", configuration);
+	const container = await renderHostedAuth("verifyEmail");
+	expect(container.querySelector('[role="alert"]')?.textContent).toBe(
+		"Sign-in options could not be loaded.",
+	);
+	const retry = container.querySelector("button")!;
+	expect(retry.textContent).toBe("Try again");
+	await act(async () => retry.click());
+	expect(configuration).toHaveBeenCalledTimes(2);
+	expect(container.querySelector('[role="alert"]')).toBeNull();
+	expect(container.querySelector("button")?.disabled).toBe(true);
+	expect(native.sendVerificationEmail).not.toHaveBeenCalled();
 });
 
 async function renderHostedAuth(view: HostedSdkForm) {

@@ -45,7 +45,7 @@ WORKDIR /app/apps/auth
 RUN pnpm install --frozen-lockfile --store-dir=/pnpm/store
 COPY apps/auth ./
 # Runtime variables are read by dynamic server routes, never passed to this build.
-RUN pnpm run build
+RUN NODE_OPTIONS=--max-old-space-size=4096 pnpm run build
 RUN pnpm --dir /app/packages/better-auth exec tsdown --config /app/apps/auth/scripts/avatar-cleanup.build.mjs
 RUN pnpm --dir /app/packages/better-auth exec tsdown --config /app/apps/auth/scripts/self-host-bootstrap.build.mjs
 

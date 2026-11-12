@@ -9,11 +9,15 @@ import { authPolicySchema } from "../auth-policy/policy";
 import type { ApplicationBranding } from "../branding/types";
 import { clerkCompatiblePasswords } from "../clerk-password";
 import { discoveryHeaders } from "../discovery";
+import { isServerTokenRequest } from "../features/helpers";
 import { applicationMfaCallback } from "../mfa-continuation";
 import { oauthBrowserReturnPath } from "../oauth-browser";
 import type { NativePasskeyCapability } from "../project-native-passkeys";
 import type { LegacyMfaKeys } from "./legacy-mfa-record";
-import { readLegacySessionCookie } from "./legacy-session-cookie";
+import {
+	readLegacySessionCookie,
+	verifyLegacySessionCookie,
+} from "./legacy-session-cookie";
 import { createOwnedProjectMfa } from "./owned-mfa";
 import { createOwnedMfaEnrollment } from "./owned-mfa-enrollment";
 import { createOwnedProjectPasskeyHttp } from "./owned-passkey-http";
@@ -41,6 +45,7 @@ import { createOwnedProjectIssuer } from "./owned-project-issuer";
 import { readSignedProjectIssuerQuery } from "./owned-project-issuer-authorization-query";
 import { ProjectOAuthError } from "./owned-project-issuer-http";
 import { ownedProjectIssuerMetadata } from "./owned-project-issuer-metadata";
+import { admitOwnedProjectNativeRoute } from "./owned-project-native-admission";
 import type { OwnedProjectOAuthOptions } from "./owned-project-oauth";
 import {
 	createOwnedProjectOAuth,
@@ -1239,6 +1244,128 @@ export function createOwnedProjectEngine(
 		return json({ status: true }, 200, headers);
 	}
 
+	function bulkSessionBearer(headers: Headers) {
+		if (
+			!isServerTokenRequest(headers) ||
+			headers.has("allauth-proxy-signature")
+		)
+			return null;
+		const signed = /^Bearer ([^\s,]+)$/i.exec(
+			headers.get("authorization") ?? "",
+		)?.[1];
+		if (!signed || signed.length > 1024) return null;
+		try {
+			return verifyLegacySessionCookie(
+				decodeURIComponent(signed),
+				options.signingSecret,
+			);
+		} catch {
+			return null;
+		}
+	}
+
+	function bulkSessionOrigin(request: Request) {
+		const { headers } = request;
+		const from = headers.get("origin");
+		const site = headers.get("sec-fetch-site");
+		if (site === "cross-site")
+			return failure(403, "INVALID_ORIGIN", "Invalid origin");
+		if (!headers.has("cookie")) return null;
+		const referrer = headers.get("referer");
+		const resolved =
+			from === "null" && site === "same-origin"
+				? origin
+				: from ||
+					(referrer && URL.canParse(referrer)
+						? new URL(referrer).origin
+						: null);
+		if (!resolved || resolved === "null")
+			return failure(403, "MISSING_OR_NULL_ORIGIN", "Missing or null Origin");
+		return acceptedOrigins.has(resolved)
+			? null
+			: failure(403, "INVALID_ORIGIN", "Invalid origin");
+	}
+
+	async function revokeBrowserSessions(
+		request: Request,
+		path: "/revoke-other-sessions" | "/revoke-sessions",
+	) {
+		const limited = await store.transaction((client) =>
+			admitOwnedProjectNativeRoute(client, options.trustedIP(request), path, {
+				max: 100,
+				windowMs: 60_000,
+			}),
+		);
+		if (limited) return limited;
+		const originFailure = bulkSessionOrigin(request);
+		if (originFailure) return originFailure;
+
+		const token =
+			bulkSessionBearer(request.headers) ?? tokenFrom(request.headers);
+		const headers = new Headers();
+		const unauthorized = () =>
+			failure(401, "UNAUTHORIZED", "Unauthorized", headers);
+		if (!token) return unauthorized();
+		return store.transaction(async (client) => {
+			const observed = await store.session(token, refreshWindow, client);
+			if (!observed) {
+				clearSessionCookies(headers);
+				return unauthorized();
+			}
+			if (!ordinarySession(token, observed)) return unauthorized();
+			// Serialize this user's sign-ins and authorization mutations before
+			// locking the caller and the set of sessions it may revoke.
+			const user = await store.lockUser(client, observed.user.id);
+			if (!user || !(await store.lockSession(client, token, user.id, false)))
+				return unauthorized();
+			const current = await eligibleSession(token, client);
+			if (!current || current.user.id !== user.id) return unauthorized();
+
+			if (
+				current.refreshDue &&
+				!new URL(request.url).searchParams.get("disableRefresh") &&
+				!tokenFrom(request.headers, rememberCookie) &&
+				(await store.refresh(
+					token,
+					policy.sessionExpiresInSeconds,
+					updateAge,
+					client,
+				))
+			) {
+				writeCookie(
+					headers,
+					sessionCookie,
+					token,
+					policy.sessionExpiresInSeconds,
+				);
+				if (isServerTokenRequest(request.headers)) {
+					const value = headers
+						.getSetCookie()[0]
+						?.split(";", 1)[0]
+						?.slice(sessionCookie.length + 1);
+					if (value) {
+						headers.set("set-auth-token", value);
+						headers.set("access-control-expose-headers", "set-auth-token");
+					}
+				}
+			}
+			const removed = await store.revoke(
+				{
+					userId: user.id,
+					...(path === "/revoke-other-sessions"
+						? { exceptActiveToken: token }
+						: {}),
+				},
+				path,
+				Boolean(backchannel),
+				client,
+			);
+			if (!removed) throw unavailableLogout;
+			deliverLogoutAfterCommit(client, request, removed.targets);
+			return json({ status: true }, 200, headers);
+		});
+	}
+
 	async function listAccountSessions(headers: Headers) {
 		if (!trustedRequest(headers, false)) return forbidden();
 		const current = await currentSession(headers);
@@ -2076,6 +2203,11 @@ export function createOwnedProjectEngine(
 			);
 		if (request.method === "POST" && path === "/sign-out")
 			return signOut(request);
+		if (
+			request.method === "POST" &&
+			(path === "/revoke-sessions" || path === "/revoke-other-sessions")
+		)
+			return revokeBrowserSessions(request, path);
 		if (
 			request.method === "GET" &&
 			path === "/multi-session/list-device-sessions"

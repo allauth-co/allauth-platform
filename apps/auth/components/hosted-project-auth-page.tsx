@@ -33,6 +33,10 @@ export async function HostedProjectAuthPage({
 	const standardForm =
 		view === "enterpriseSignIn" ? (
 			<AllAuthAuth path="enterprise-sign-in" />
+		) : view === "magicLinkSent" ? (
+			<AllAuthAuth path="magic-link-sent" />
+		) : view === "resetLinkSent" ? (
+			<AllAuthAuth path="reset-link-sent" />
 		) : view === "magicLink" ? (
 			<AllAuthAuth path="magic-link" />
 		) : view === "emailOtp" ? (
@@ -94,7 +98,11 @@ export async function HostedProjectAuthPage({
 			const showRecovery = showPassword && showEmail;
 			if (
 				(request.username && !showPassword) ||
-				((view === "magicLink" || view === "emailOtp") && !showEmail) ||
+				((view === "magicLink" ||
+					view === "magicLinkSent" ||
+					view === "emailOtp") &&
+					!showEmail) ||
+				(view === "resetLinkSent" && !showPassword) ||
 				(view === "enterpriseSignIn" && !showSso)
 			)
 				return null;

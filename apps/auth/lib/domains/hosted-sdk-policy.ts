@@ -12,7 +12,10 @@ const views = {
 	signUp: "/sign-up",
 	forgotPassword: "/forgot-password",
 	resetPassword: "/reset-password",
+	resetLinkSent: "/reset-link-sent",
+	verifyEmail: "/verify-email",
 	magicLink: "/magic-link",
+	magicLinkSent: "/magic-link-sent",
 	emailOtp: "/email-otp",
 	enterpriseSignIn: "/enterprise-sign-in",
 	twoFactor: "/two-factor",
@@ -101,6 +104,15 @@ export function hostedSdkViewRequest(
 	view: HostedSdkView,
 	params: HostedSdkSearchParams,
 ) {
+	if (
+		(view === "verifyEmail" ||
+			view === "resetLinkSent" ||
+			view === "magicLinkSent") &&
+		(params.token !== undefined ||
+			params.code !== undefined ||
+			params.error !== undefined)
+	)
+		return null;
 	const oauth = hostedOAuthRequest(view, params);
 	if (oauth) return oauth;
 	const allowed = new Set([
@@ -152,6 +164,7 @@ const postEndpoints = new Set([
 	"sign-up/email",
 	"request-password-reset",
 	"reset-password",
+	"send-verification-email",
 	"passkey/verify-authentication",
 	"two-factor/verify-totp",
 	"two-factor/verify-backup-code",

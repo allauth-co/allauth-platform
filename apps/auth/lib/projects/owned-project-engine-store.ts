@@ -201,9 +201,17 @@ export function createProjectEngineStore(database: Pool, schemaName: string) {
 		return result.rows[0]!.session;
 	}
 
-	async function refresh(token: string, expiresIn: number, updateAge: number) {
+	async function refresh(
+		token: string,
+		expiresIn: number,
+		updateAge: number,
+		client?: PoolClient,
+	) {
 		// An expired, concurrently revoked or concurrently refreshed session cannot be extended here.
-		const result = await database.query<{ expiresAt: Date; updatedAt: Date }>(
+		const result = await (client ?? database).query<{
+			expiresAt: Date;
+			updatedAt: Date;
+		}>(
 			`UPDATE "${schema}"."session" s
 			SET "expiresAt" = statement_timestamp() + $2::int * interval '1 second', "updatedAt" = statement_timestamp()
 			FROM "${schema}"."user" u
@@ -243,7 +251,8 @@ export function createProjectEngineStore(database: Pool, schemaName: string) {
 	async function revoke(
 		selector:
 			| { tokens: string[] }
-			| { id: string; userId: string; currentToken: string },
+			| { id: string; userId: string; currentToken: string }
+			| { userId: string; exceptActiveToken?: string },
 		path: string,
 		canDeliverBackchannel = false,
 		client?: PoolClient,
@@ -255,16 +264,23 @@ export function createProjectEngineStore(database: Pool, schemaName: string) {
 							'SELECT id, "userId" FROM "session" WHERE token = ANY($1::text[]) ORDER BY id FOR UPDATE',
 							[selector.tokens],
 						)
-					: await client.query<{ id: string; userId: string }>(
-							`SELECT s.id, s."userId" FROM "session" s
+					: "id" in selector
+						? await client.query<{ id: string; userId: string }>(
+								`SELECT s.id, s."userId" FROM "session" s
 					WHERE s.id = $1 AND s."userId" = $2 AND EXISTS (
 						SELECT 1 FROM "session" a JOIN "user" u ON u.id = a."userId"
 						WHERE a.token = $3 AND a."userId" = s."userId" AND a."expiresAt" > statement_timestamp()
 							AND u."emailVerified" AND u.banned IS DISTINCT FROM true
 							AND u."directoryDisabled" IS DISTINCT FROM true AND a."impersonatedBy" IS NULL
 					) FOR UPDATE OF s`,
-							[selector.id, selector.userId, selector.currentToken],
-						);
+								[selector.id, selector.userId, selector.currentToken],
+							)
+						: await client.query<{ id: string; userId: string }>(
+								`SELECT id, "userId" FROM "session" WHERE "userId" = $1
+							 AND ($2::text IS NULL OR (token <> $2 AND "expiresAt" > statement_timestamp()))
+							 ORDER BY id FOR UPDATE`,
+								[selector.userId, selector.exceptActiveToken ?? null],
+							);
 			const ids = selected.rows.map((row) => row.id);
 			if (!ids.length) return { ids, targets: [] };
 			if (path === "/sign-out") {

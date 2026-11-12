@@ -240,3 +240,70 @@ it("selects project MFA for a local callback and keeps signed broker MFA on the 
 	});
 	expect(signed.type).toBe(AllAuthAuth);
 });
+
+it("selects email status views only for an enabled hosted project without a bearer in the page query", async () => {
+	runtime.headers.mockResolvedValue(
+		new Headers({ [portalHeader]: "fixture-proof" }),
+	);
+	runtime.getAuthEnvironment.mockResolvedValue({
+		ALLAUTH_PROJECT_HOSTED_UI_PROJECT_IDS: project.id,
+		EMAIL: { send: vi.fn() },
+	});
+	const engine = engineConfiguration({ emailPassword: true });
+	runtime.withPortalHeadersEngine.mockImplementation(async (_headers, select) =>
+		select(engine, new Headers(), {
+			kind: "accounts",
+			project,
+			hostname: accountsHostname,
+		}),
+	);
+	for (const view of [
+		"verifyEmail",
+		"resetLinkSent",
+		"magicLinkSent",
+	] as const) {
+		const result = await HostedProjectAuthPage({
+			view,
+			searchParams: Promise.resolve({ callbackUrl: "/account/security" }),
+		});
+		expect(result.type).toBe(HostedProjectAuth);
+		expect(result.props).toMatchObject({
+			view,
+			destination: "/account/security",
+		});
+	}
+	const signedQuery = "client_id=fixture&resource=one&resource=two&sig=signed";
+	const destination = `/oauth2/continue?${signedQuery}`;
+	engine.readOAuthContext.mockResolvedValue(
+		Response.json({ continueURL: destination }),
+	);
+	const signed = await HostedProjectAuthPage({
+		view: "verifyEmail",
+		searchParams: Promise.resolve({ callbackUrl: destination }),
+	});
+	expect(signed.type).toBe(HostedProjectAuth);
+	expect(signed.props).toMatchObject({ destination });
+	expect(engine.readOAuthContext.mock.calls[0]?.[0].url).toBe(
+		`https://${accountsHostname}/api/oauth/context?${signedQuery}`,
+	);
+
+	runtime.withPortalHeadersEngine.mockClear();
+	const bearer = await HostedProjectAuthPage({
+		view: "verifyEmail",
+		searchParams: Promise.resolve({
+			callbackUrl: destination,
+			token: "fixture",
+		}),
+	});
+	expect(bearer.type).toBe(AllAuthAuth);
+	expect(runtime.withPortalHeadersEngine).not.toHaveBeenCalled();
+
+	runtime.getAuthEnvironment.mockResolvedValue({});
+	const standard = await HostedProjectAuthPage({
+		view: "resetLinkSent",
+		searchParams: Promise.resolve({}),
+	});
+	expect(standard.type).toBe(AllAuthAuth);
+	expect(standard.props).toEqual({ path: "reset-link-sent" });
+	expect(runtime.withPortalHeadersEngine).not.toHaveBeenCalled();
+});
