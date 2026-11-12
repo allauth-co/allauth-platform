@@ -154,7 +154,14 @@ export function createProjectOAuthStore(
 	async function bind(
 		client: PoolClient,
 		identity: ProjectOAuthIdentity,
-		policy: { signUpEnabled: boolean; requireEmailVerification: boolean },
+		policy: {
+			signUpEnabled: boolean;
+			requireEmailVerification: boolean;
+			denyProfile?(
+				email: string,
+				operation: "existing" | "signup",
+			): Promise<boolean>;
+		},
 		link?: LinkAuthority,
 		path = `/callback/${identity.provider}`,
 	): Promise<Binding> {
@@ -189,6 +196,13 @@ export function createProjectOAuthStore(
 			return directSignIn || directLink
 				? { error: "USER_EMAIL_NOT_FOUND" }
 				: null;
+		let checkedProfile = false;
+		async function profileDenied(operation: "existing" | "signup") {
+			if (checkedProfile || !identity.email || !policy.denyProfile)
+				return false;
+			checkedProfile = true;
+			return policy.denyProfile(identity.email.toLowerCase(), operation);
+		}
 		const emailVerified = identity.email
 			? identity.emailVerified
 			: persistedOwner?.emailVerified === true;
@@ -217,6 +231,7 @@ export function createProjectOAuthStore(
 				(policy.requireEmailVerification && !emailVerified)
 			)
 				return null;
+			if (await profileDenied("signup")) return null;
 			const created = await client.query<{ id: string }>(
 				`INSERT INTO "${schema}"."user" (id, email, name, image, "emailVerified", "twoFactorEnabled", "isAnonymous")
 				VALUES ($1,$2,$3,$4,$5,FALSE,FALSE) ON CONFLICT (email) DO NOTHING RETURNING id`,
@@ -260,6 +275,7 @@ export function createProjectOAuthStore(
 				[account.id, user.id, identity.provider, identity.subject],
 			);
 			if (current.rowCount !== 1) return null;
+			if (await profileDenied("existing")) return null;
 			if (
 				!link &&
 				!user.emailVerified &&
@@ -289,6 +305,7 @@ export function createProjectOAuthStore(
 			// Project account linking has no trusted-provider bypass. Both addresses must be verified.
 			return null;
 		}
+		if (!account && (await profileDenied("existing"))) return null;
 		if (!link && policy.requireEmailVerification && !user.emailVerified)
 			return null;
 		const access = identity.accessToken

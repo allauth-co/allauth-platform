@@ -219,6 +219,7 @@ interface OwnedProjectEngineOptions {
 		| "passkeySignIn"
 		| "otherLinkedSignIn"
 		| "readGuestUserId"
+		| "denyBrowserProfile"
 		| "complete"
 	>;
 	sso?: Omit<
@@ -2302,6 +2303,7 @@ export function createOwnedProjectEngine(
 			baseURL: origin,
 			basePath: options.basePath,
 			trustedOrigins: options.trustedOrigins,
+			denyBrowserProfile: security.denyProvisioning,
 			async readGuestUserId(request) {
 				if (!guest) return undefined;
 				const current = await currentSession(request.headers);
@@ -2567,7 +2569,7 @@ export function createOwnedProjectEngine(
 		passwordPolicy: policy.passwordPolicy,
 		checkPasswordSafety: passwordSafety,
 		primaryOrigin: origin,
-		blockAdminCreation: security.denyAdminProvisioning,
+		blockAdminCreation: security.denyProvisioning,
 		clearUserAuthentication: clearAdminAuthentication,
 		revoke: revokeAdminSessions,
 	});

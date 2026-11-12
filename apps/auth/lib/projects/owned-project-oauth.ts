@@ -166,6 +166,12 @@ export interface OwnedProjectOAuthOptions {
 	apple?: AppleCredentials;
 	/** Bind a live guest from this project to an authoritative OAuth state record. */
 	readGuestUserId?(request: Request): Promise<string | undefined>;
+	/** Apply project rules to a cryptographically verified browser-provider profile. */
+	denyBrowserProfile?(
+		client: PoolClient,
+		request: Request,
+		email: string,
+	): Promise<boolean>;
 	/** Inject a scoped session/MFA operation. Its response is released only after the account transaction commits. */
 	complete(
 		client: PoolClient,
@@ -434,11 +440,13 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 		code: string,
 		state?: ProjectOAuthState,
 		clearState = false,
+		description?: string,
 	) {
 		const target =
 			(state?.errorURL && safeURL(state.errorURL, origin, origins)) ||
 			new URL(defaultError!.href);
 		target.searchParams.set("error", code);
+		if (description) target.searchParams.set("error_description", description);
 		const result = publicRedirect(target.href);
 		if (clearState) return navigation(result, expireState);
 		result.headers.set("cache-control", "no-store");
@@ -1367,6 +1375,16 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 			return errorRedirect("state_mismatch");
 		let flow: ProjectOAuthState | null = null;
 		const rejected = Symbol("project OAuth session rejected");
+		const rejectedSignupProfile = Symbol(
+			"project OAuth signup profile rejected",
+		);
+		const profileFailure = (clearState = false) =>
+			errorRedirect(
+				"validation_failed",
+				flow ?? undefined,
+				clearState,
+				"User validation failed",
+			);
 		try {
 			const linkSession = browserToken(request);
 			flow = await store.consume(state, provider, linkSession);
@@ -1390,6 +1408,7 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 					: undefined;
 			const anonymousUserId = flow.serverContext?.anonymousUserId;
 			const response = await store.transaction(async (client) => {
+				let rejectedProfile = false;
 				const account = await store.bind(
 					client,
 					identity,
@@ -1399,9 +1418,19 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 							options.requireEmailVerification &&
 							provider !== "microsoft" &&
 							provider !== "apple",
+						async denyProfile(email, operation) {
+							rejectedProfile =
+								(await options.denyBrowserProfile?.(client, request, email)) ===
+								true;
+							// Native signup rolls its policy event back with the provisional identity.
+							if (rejectedProfile && operation === "signup")
+								throw rejectedSignupProfile;
+							return rejectedProfile;
+						},
 					},
 					link,
 				);
+				if (rejectedProfile) return profileFailure();
 				if (!account || "error" in account) throw rejected;
 				if (link) {
 					if (
@@ -1430,6 +1459,7 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 			});
 			return navigation(response, expireState);
 		} catch (error) {
+			if (error === rejectedSignupProfile) return profileFailure(true);
 			return errorRedirect(
 				error === rejected ? "account_not_linked" : "internal_server_error",
 				flow ?? undefined,

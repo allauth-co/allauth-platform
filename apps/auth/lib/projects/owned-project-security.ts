@@ -325,11 +325,11 @@ export function createOwnedProjectSecurity(options: SecurityOptions) {
 
 	return {
 		admit,
-		async denyAdminProvisioning(
+		async denyProvisioning(
 			client: SecurityDatabase,
 			request: Request,
 			email: string,
-			reportMonitor: boolean,
+			reportMonitor = true,
 		) {
 			return checkRules(
 				client,
