@@ -1273,7 +1273,7 @@ describe.skipIf(!existsSync(fixture))(
 				expect(list.status).toBe(200);
 				expect(await list.json()).toMatchObject({
 					endpoints: [{ id: endpointId, eventTypes: ["mfa.*", "api-key.*"] }],
-					supportedEventTypes: ["mfa.*", "api-key.*"],
+					supportedEventTypes: ["mfa.*", "api-key.*", "session.created", "passkey.*"],
 				});
 				const hostedManagement = await service.request(
 					`${hosted}/control/webhooks`,
@@ -1282,7 +1282,7 @@ describe.skipIf(!existsSync(fixture))(
 				expect(hostedManagement.status).toBe(403);
 				const unproved = await service.request(`${webhooks}/create`, {
 					cookie: adminCookie,
-					body: { url: destination, eventTypes: ["mfa.*", "*"] },
+					body: { url: destination, eventTypes: ["mfa.*", "session.*"] },
 				});
 				expect(unproved.status).toBe(400);
 				expect(await unproved.json()).toMatchObject({
@@ -1343,7 +1343,7 @@ describe.skipIf(!existsSync(fixture))(
 					cookie: adminCookie,
 					body: {
 						url: "https://webhook.runtime.fixture.example/new-mfa",
-						eventTypes: ["api-key.*", "mfa.*"],
+						eventTypes: ["api-key.*", "mfa.*", "session.created", "passkey.*"],
 					},
 				};
 				const settings = await database.connect();
@@ -1444,7 +1444,7 @@ describe.skipIf(!existsSync(fixture))(
 					endpoints: expect.arrayContaining([
 						{
 							id: newEndpoint.id,
-							eventTypes: ["api-key.*", "mfa.*"],
+							eventTypes: ["api-key.*", "mfa.*", "session.created", "passkey.*"],
 							url: "https://webhook.runtime.fixture.example/new-mfa",
 							enabled: true,
 							description: "",
@@ -1609,7 +1609,7 @@ describe.skipIf(!existsSync(fixture))(
 				expect(restricted.status).toBe(200);
 				expect(await restricted.json()).toMatchObject({
 					endpoints: [{ id: keyEndpoint, eventTypes: ["api-key.*"] }],
-					supportedEventTypes: ["api-key.*"],
+					supportedEventTypes: ["api-key.*", "session.created"],
 				});
 				const staleKey = await service.request(`${hosted}/api-key/create`, {
 					host,

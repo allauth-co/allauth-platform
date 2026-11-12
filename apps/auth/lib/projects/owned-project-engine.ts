@@ -694,6 +694,40 @@ export function createOwnedProjectEngine(
 		};
 	}
 
+	async function insertAuditedSession(
+		client: PoolClient,
+		userId: string,
+		request: Request,
+		rememberMe: boolean,
+		path: string,
+		prior?: ProjectSession,
+	) {
+		const id = randomUUID();
+		const token = btoa(
+			String.fromCharCode(...crypto.getRandomValues(new Uint8Array(24))),
+		)
+			.replaceAll("+", "-")
+			.replaceAll("/", "_");
+		const session = await store.createSession(client, {
+			id,
+			token,
+			userId,
+			expiresIn: rememberMe || prior ? policy.sessionExpiresInSeconds : 86400,
+			ip: security.trustedIP(request) ?? "",
+			userAgent: request.headers.get("user-agent")?.slice(0, 512) ?? "",
+			activeOrganizationId: prior?.activeOrganizationId,
+			activeTeamId: prior?.activeTeamId,
+		});
+		await store.recordEvent(client, {
+			type: "session.created",
+			outcome: "success",
+			userId,
+			targetId: id,
+			metadata: { path },
+		});
+		return { session, token };
+	}
+
 	async function createSession(
 		client: PoolClient,
 		user: ProjectUser,
@@ -723,29 +757,15 @@ export function createOwnedProjectEngine(
 			deliverLogoutAfterCommit(client, request, removed.targets);
 			for (const item of owned) writeCookie(headers, item.name, "", 0);
 		}
-		const id = randomUUID();
-		const token = btoa(
-			String.fromCharCode(...crypto.getRandomValues(new Uint8Array(24))),
-		)
-			.replaceAll("+", "-")
-			.replaceAll("/", "_");
-		const session = await store.createSession(client, {
-			id,
-			token,
-			userId: user.id,
-			expiresIn: rememberMe || prior ? policy.sessionExpiresInSeconds : 86400,
-			ip: security.trustedIP(request) ?? "",
-			userAgent: request.headers.get("user-agent")?.slice(0, 512) ?? "",
-			activeOrganizationId: prior?.activeOrganizationId,
-			activeTeamId: prior?.activeTeamId,
-		});
-		await store.recordEvent(client, {
-			type: "session.created",
-			outcome: "success",
-			userId: user.id,
-			targetId: id,
-			metadata: { path: eventMetadata.path },
-		});
+		const { session, token } = await insertAuditedSession(
+			client,
+			user.id,
+			request,
+			rememberMe,
+			eventMetadata.path,
+			prior,
+		);
+		const id = session.id;
 		const primaryPath = isPrimaryAuthenticationPath(path);
 		if (!prior && primaryPath) {
 			await store.recordEvent(client, {
@@ -892,12 +912,39 @@ export function createOwnedProjectEngine(
 		if (user.twoFactorEnabled && !device?.trusted) {
 			const challenge = await mfa.issue(client, user.id);
 			if (!challenge) return unsupported();
+			const auditPath = primaryAuditMetadata(path).path;
+			// Native records the temporary session and its removal while starting MFA.
+			// Both events commit with the challenge, without exposing a live session.
+			const { session: pending } = await insertAuditedSession(
+				client,
+				user.id,
+				request,
+				rememberMe,
+				auditPath,
+			);
+			const discarded = await client.query('DELETE FROM "session" WHERE id=$1', [
+				pending.id,
+			]);
+			if (discarded.rowCount !== 1)
+				throw new Error("The temporary MFA session was not removed.");
+			const actorId =
+				policy.mfaMode === "required" || path === "/passkey/verify-registration"
+					? (await currentSession(request.headers, client))?.user.id
+					: undefined;
+			await store.recordEvent(client, {
+				type: "session.deleted",
+				outcome: "success",
+				actorId,
+				userId: user.id,
+				targetId: pending.id,
+				metadata: { path: auditPath },
+			});
 			if (isPrimaryAuthenticationPath(path))
 				await store.recordEvent(client, {
 					type: "auth.mfa-required",
 					outcome: "success",
 					...browserEventContext(request),
-					metadata: { path: primaryAuditMetadata(path).path },
+					metadata: { path: auditPath },
 				});
 			const headers = new Headers();
 			headers.append("Set-Cookie", challenge.setCookie);

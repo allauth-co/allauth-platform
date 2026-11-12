@@ -2,8 +2,8 @@ import type { AuthPolicy } from "../auth-policy/policy";
 import type { webhookEventTypes } from "../control/webhook-contract";
 import { checkedProjectSchema } from "./validation";
 
-const supportedSelectors = ["mfa.*", "api-key.*"] as const;
-const apiKeySelectors = ["api-key.*"] as const;
+const commonSelectors = ["api-key.*", "session.created"] as const;
+const optionalMfaSelectors = ["mfa.*", ...commonSelectors, "passkey.*"] as const;
 
 type Queryable = {
 	query<Row extends Record<string, unknown>>(
@@ -16,12 +16,12 @@ export function ownedWebhookSelectors(
 	policy: AuthPolicy,
 ): readonly (typeof webhookEventTypes)[number][] {
 	return policy.mfaMode === "optional" && !policy.requireEmailVerification
-		? supportedSelectors
-		: apiKeySelectors;
+		? optionalMfaSelectors
+		: commonSelectors;
 }
 
 export function ownedWebhookUsesPolicyGuard(selectors: readonly string[]) {
-	return supportedSelectors.some((selector) => selectors.includes(selector));
+	return optionalMfaSelectors.some((selector) => selectors.includes(selector));
 }
 
 /** Fail closed for ambiguous credential records and inconsistent live sessions. */

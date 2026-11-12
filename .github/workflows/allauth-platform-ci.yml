@@ -114,7 +114,7 @@ jobs:
           lib/projects/owned-project-email-otp-recovery.pg.test.ts lib/projects/owned-project-wallet.pg.test.ts
           lib/projects/owned-project-callback-security.pg.test.ts
           lib/projects/owned-project-organization.pg.test.ts lib/projects/owned-project-organization-roles.pg.test.ts
-          lib/control/security.test.ts
+          lib/control/security.test.ts lib/control/webhooks.test.ts
           lib/projects/owned-project-enterprise-catalog.pg.test.ts
           lib/projects/owned-project-scim.pg.test.ts lib/projects/owned-project-scim-resources.pg.test.ts
           lib/projects/owned-project-scim-user-writes.pg.test.ts lib/projects/owned-project-scim-group-writes.pg.test.ts

@@ -70,6 +70,7 @@ describe.skipIf(!existsSync(fixturePath))("PostgreSQL durable signed webhook out
 		await sql`INSERT INTO "allauthWebhookEndpoint" (id,url,description,"eventTypes","encryptedSecret") VALUES (${endpointId},'https://hooks.example.com/receiver','Fixture','["user.*"]',${await symmetricEncrypt({ key:secret,data:signingSecret })})`.execute(database);
 	});
 	afterAll(async () => { for (const [db,name] of [[database,schema],[secondDatabase,secondSchema]] as const) if (db) { await sql`DROP SCHEMA IF EXISTS ${sql.id(name)} CASCADE`.execute(db); await db.destroy(); } });
+	const dueNow = () => new Date(Date.now() + 1_000);
 	const event = async (id = crypto.randomUUID(), db=database, type="user.created") => { await sql`INSERT INTO "allauthEvent" (id,type,outcome,"userId","createdAt",metadata) VALUES (${id},${type},'success','fixture-user',CURRENT_TIMESTAMP,'{}')`.execute(db); return id; };
 	it("queues subscribed events atomically in the correct project schema and captures only safe profiles", async () => {
 		const id=await event(); await event(crypto.randomUUID(),database,"session.created");
@@ -81,7 +82,7 @@ describe.skipIf(!existsSync(fixturePath))("PostgreSQL durable signed webhook out
 	});
 	it("delivers signed exact payloads with pinned destinations and claims once across concurrent workers", async () => {
 		await event(); const transport=vi.fn(async () => 204);
-		const jobs=await Promise.all([deliverPendingWebhooks({ database,secret,resolver:destinationDNS,transport }),deliverPendingWebhooks({ database,secret,resolver:destinationDNS,transport })]);
+		const jobs=await Promise.all([deliverPendingWebhooks({ database,secret,resolver:destinationDNS,transport,now:dueNow }),deliverPendingWebhooks({ database,secret,resolver:destinationDNS,transport,now:dueNow })]);
 		expect(jobs.reduce((total,job)=>total+job.claimed,0)).toBe(1); expect(transport).toHaveBeenCalledTimes(1);
 		const sent=transport.mock.calls[0] as unknown as [{ destination:{ address:{ address:string };url:URL };headers:Record<string,string>;body:string }];
 		expect(sent[0].destination.address.address).toBe("93.184.216.34"); expect(sent[0].destination.url.hostname).toBe("hooks.example.com");
@@ -90,7 +91,7 @@ describe.skipIf(!existsSync(fixturePath))("PostgreSQL durable signed webhook out
 	});
 	it("revalidates DNS at delivery and never invokes transport for rebinding/private destinations", async () => {
 		await event(); const transport=vi.fn(async () => 204);
-		expect(await deliverPendingWebhooks({ database,secret,resolver:async()=>[{ address:"169.254.169.254",family:4 }],transport })).toMatchObject({ failed:1,delivered:0 }); expect(transport).not.toHaveBeenCalled();
+		expect(await deliverPendingWebhooks({ database,secret,resolver:async()=>[{ address:"169.254.169.254",family:4 }],transport,now:dueNow })).toMatchObject({ failed:1,delivered:0 }); expect(transport).not.toHaveBeenCalled();
 		expect((await sql`SELECT "lastError" FROM "allauthWebhookDelivery"`.execute(database)).rows[0]).toMatchObject({ lastError:"UNSAFE_DESTINATION" });
 	});
 	it("refuses redirects and retries transient failures with bounded exponential delay and eight attempts", async () => {
@@ -102,13 +103,13 @@ describe.skipIf(!existsSync(fixturePath))("PostgreSQL durable signed webhook out
 		expect(await deliverPendingWebhooks({ database,secret,resolver:destinationDNS,transport,now:()=>now })).toMatchObject({ failed:1 });
 		expect((await sql`SELECT attempts,status FROM "allauthWebhookDelivery"`.execute(database)).rows[0]).toMatchObject({ attempts:8,status:"failed" });
 		await sql`TRUNCATE "allauthWebhookDelivery","allauthEvent"`.execute(database); await event();
-		expect(await deliverPendingWebhooks({ database,secret,resolver:destinationDNS,transport:async()=>302 })).toMatchObject({ failed:1 }); expect((await sql`SELECT "lastError" FROM "allauthWebhookDelivery"`.execute(database)).rows[0]).toMatchObject({ lastError:"REDIRECT_REFUSED" });
+		expect(await deliverPendingWebhooks({ database,secret,resolver:destinationDNS,transport:async()=>302,now:dueNow })).toMatchObject({ failed:1 }); expect((await sql`SELECT "lastError" FROM "allauthWebhookDelivery"`.execute(database)).rows[0]).toMatchObject({ lastError:"REDIRECT_REFUSED" });
 	});
 	it("recovers only expired processing leases and cleans old delivery snapshots in bounded batches", async () => {
 		await event(); await sql`UPDATE "allauthWebhookDelivery" SET status='processing',attempts=1,"lockedUntil"=CURRENT_TIMESTAMP+INTERVAL '1 minute',"leaseId"='previous'`.execute(database);
-		expect((await deliverPendingWebhooks({ database,secret,resolver:destinationDNS,transport:async()=>204 })).claimed).toBe(0);
+		expect((await deliverPendingWebhooks({ database,secret,resolver:destinationDNS,transport:async()=>204,now:dueNow })).claimed).toBe(0);
 		await sql`UPDATE "allauthWebhookDelivery" SET "lockedUntil"=CURRENT_TIMESTAMP-INTERVAL '1 minute'`.execute(database);
-		expect((await deliverPendingWebhooks({ database,secret,resolver:destinationDNS,transport:async()=>204 })).delivered).toBe(1);
+		expect((await deliverPendingWebhooks({ database,secret,resolver:destinationDNS,transport:async()=>204,now:dueNow })).delivered).toBe(1);
 		await sql`UPDATE "allauthWebhookDelivery" SET "createdAt"=CURRENT_TIMESTAMP-INTERVAL '31 days'`.execute(database); expect(await pruneWebhookDeliveries(database)).toBe(1);
 	});
 	it("requires fresh administrator/same-origin writes and reveals signing secrets only on create/rotate", async () => {

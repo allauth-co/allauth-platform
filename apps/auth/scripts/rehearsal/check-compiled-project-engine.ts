@@ -317,7 +317,7 @@ async function startConfiguredWebhook(realm: Realm, cookie: string) {
 		INSERT INTO public."allauthAuthConfiguration" (id,policy,version,"updatedBy")
 		VALUES ('${realm.id}','${policy}',1,'isolated-writer-rehearsal');
 		INSERT INTO "${schema}"."allauthWebhookEndpoint" (id,url,"eventTypes","encryptedSecret",enabled)
-		VALUES ('${id}','https://webhook.rehearsal.invalid/events','["mfa.*","api-key.*"]','disabled-fixture-placeholder',false);
+		VALUES ('${id}','https://webhook.rehearsal.invalid/events','["mfa.*","api-key.*","session.created","passkey.*"]','disabled-fixture-placeholder',false);
 	`);
 	async function read() {
 		const result = await request(path, { cookie });
@@ -326,7 +326,7 @@ async function startConfiguredWebhook(realm: Realm, cookie: string) {
 			endpoints: { id: string; eventTypes: string[]; enabled: boolean }[];
 		};
 		const endpoint = endpoints.find((item) => item.id === id);
-		assert.deepEqual(endpoint?.eventTypes, ["mfa.*", "api-key.*"]);
+		assert.deepEqual(endpoint?.eventTypes, ["mfa.*", "api-key.*", "session.created", "passkey.*"]);
 		assert.equal(endpoint?.enabled, false);
 		assert.ok(!result.body.includes("encryptedSecret"));
 	}

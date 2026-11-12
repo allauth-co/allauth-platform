@@ -518,6 +518,135 @@ describe.skipIf(!existsSync(fixturePath))(
 			expect(checked).toMatchObject({ status: "rotated" });
 		});
 
+		it("preserves the native session event pair when sign-in is waiting for MFA", async () => {
+			const legacy = await nativeInstance(nativeDatabase!, true);
+			const user = await signedIn();
+			function request(path: string, body: unknown, cookie = "") {
+				const input = post(path, body, cookie);
+				input.headers.set("x-real-ip", auditContext.ipAddress);
+				return input;
+			}
+			expect(
+				(
+					await legacy.handler(
+						request("/two-factor/enable", { password }, user.cookie),
+					)
+				).status,
+			).toBe(200);
+			const code = await verifyCode(user.id);
+			expect(
+				(
+					await legacy.handler(
+						request("/two-factor/verify-totp", { code }, user.cookie),
+					)
+				).status,
+			).toBe(200);
+			const endpoint = randomUUID();
+			await database.query(
+				`INSERT INTO "${schema}"."allauthWebhookEndpoint" (id,url,"eventTypes","encryptedSecret") VALUES ($1,'https://mfa-session.fixture.example/events','["session.created","session.deleted"]','fixture')`,
+				[endpoint],
+			);
+			try {
+				const candidate = createOwnedProjectEngine({
+					database,
+					project: { schemaName: schema, slug },
+					baseURL: origin,
+					basePath: "/api/auth",
+					trustedOrigins: [],
+					signingSecret: secret,
+					policy: { ...defaultAuthPolicy, requireEmailVerification: false },
+					trustedIP: (input) => input.headers.get("x-real-ip"),
+				});
+				const currentSessions = async () =>
+					(
+						await database.query(
+							`SELECT id FROM "${schema}"."session" WHERE "userId"=$1 ORDER BY id`,
+							[user.id],
+						)
+					).rows;
+				const live = await currentSessions();
+				expect(live.length).toBeGreaterThan(0);
+				for (const [label, writer] of [
+					["legacy", legacy.handler],
+					["owned", candidate.dispatch],
+				] as const) {
+					const pending = await writer(
+						request("/sign-in/email", { email: user.email, password }),
+					);
+					expect(pending.status).toBe(200);
+					expect(await pending.json()).toMatchObject({
+						twoFactorRedirect: true,
+					});
+					expect(cookies(pending)).not.toContain(`${sessionCookie}=`);
+					expect(await currentSessions()).toEqual(live);
+					const events = await database.query<{
+						event: { targetId: string; actorId?: string };
+					}>(
+						`SELECT (payload#>'{data,event}') - ARRAY['id','createdAt'] AS event FROM "${schema}"."allauthWebhookDelivery" WHERE "endpointId"=$1 ORDER BY "eventType"`,
+						[endpoint],
+					);
+					const targetId = events.rows[0]?.event.targetId;
+					expect(targetId, label).toEqual(expect.any(String));
+					expect(live).not.toContainEqual({ id: targetId });
+					expect(events.rows.map(({ event }) => event)).toEqual(
+						["session.created", "session.deleted"].map((type) => ({
+							type,
+							outcome: "success",
+							userId: user.id,
+							targetId,
+							metadata: { path: "/sign-in/email" },
+						})),
+					);
+					await database.query(
+						`DELETE FROM "${schema}"."allauthWebhookDelivery" WHERE "endpointId"=$1`,
+						[endpoint],
+					);
+				}
+				const pendingProofs = async () =>
+					(
+						await database.query(
+							`SELECT id FROM "${schema}"."verification" WHERE value=$1 ORDER BY id`,
+							[user.id],
+						)
+					).rows;
+				const proofs = await pendingProofs();
+				await database.query(`
+					CREATE FUNCTION "${schema}"."fixtureRejectPendingSessionAudit"() RETURNS trigger LANGUAGE plpgsql AS $$
+					BEGIN
+						IF NEW.type = 'session.deleted' THEN RAISE EXCEPTION 'Synthetic pending session audit failure'; END IF;
+						RETURN NEW;
+					END $$;
+					CREATE TRIGGER "fixtureRejectPendingSessionAudit" BEFORE INSERT ON "${schema}"."allauthEvent"
+					FOR EACH ROW EXECUTE FUNCTION "${schema}"."fixtureRejectPendingSessionAudit"();
+				`);
+				try {
+					await expect(
+						candidate.dispatch(
+							request("/sign-in/email", { email: user.email, password }),
+						),
+					).rejects.toThrow("Synthetic pending session audit failure");
+					expect(await currentSessions()).toEqual(live);
+					expect(await pendingProofs()).toEqual(proofs);
+					expect(
+						(
+							await database.query(
+								`SELECT id FROM "${schema}"."allauthWebhookDelivery" WHERE "endpointId"=$1`,
+								[endpoint],
+							)
+						).rows,
+					).toEqual([]);
+				} finally {
+					await database.query(`DROP TRIGGER "fixtureRejectPendingSessionAudit" ON "${schema}"."allauthEvent";
+						DROP FUNCTION "${schema}"."fixtureRejectPendingSessionAudit"()`);
+				}
+			} finally {
+				await database.query(
+					`DELETE FROM "${schema}"."allauthWebhookEndpoint" WHERE id=$1`,
+					[endpoint],
+				);
+			}
+		});
+
 		it("delivers the same signed MFA enrollment and mutation events from both writers", async () => {
 			if (!nativeDatabase) throw new Error("Missing fixture database.");
 			const webhookDatabase = nativeDatabase;
