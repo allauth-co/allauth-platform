@@ -154,6 +154,8 @@ export interface OwnedProjectOAuthOptions {
 	google?: Credentials;
 	microsoft?: Credentials & { tenantId: string };
 	apple?: AppleCredentials;
+	/** Bind a live guest from this project to an authoritative OAuth state record. */
+	readGuestUserId?(request: Request): Promise<string | undefined>;
 	/** Inject a scoped session/MFA operation. Its response is released only after the account transaction commits. */
 	complete(
 		client: PoolClient,
@@ -163,6 +165,7 @@ export interface OwnedProjectOAuthOptions {
 			provider: ProjectOAuthProvider;
 			destination: string;
 			verificationDestination?: string;
+			anonymousUserId?: string;
 			registered: boolean;
 			transport: "browser" | "id-token";
 		},
@@ -523,7 +526,12 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 				oauthState: state,
 				idTokenNonce: nonce,
 				requestSignUp: body.requestSignUp,
-				serverContext: { ownedProjectProvider: body.provider },
+				serverContext: {
+					ownedProjectProvider: body.provider,
+					anonymousUserId: linking
+						? undefined
+						: await options.readGuestUserId?.(request),
+				},
 			};
 			if (!linking) await store.issue(state, flow);
 			else {
@@ -1068,6 +1076,7 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 				flow.link && linkSession
 					? { ...flow.link, sessionToken: linkSession }
 					: undefined;
+			const anonymousUserId = flow.serverContext?.anonymousUserId;
 			const response = await store.transaction(async (client) => {
 				const account = await store.bind(
 					client,
@@ -1100,6 +1109,7 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 					provider,
 					destination: ((account.registered && newUser) || destination).href,
 					verificationDestination: destination.href,
+					anonymousUserId,
 					registered: account.registered,
 					transport: "browser",
 				});

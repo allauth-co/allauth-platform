@@ -382,11 +382,13 @@ async function startFixtureApple(
 		destination: string;
 		host?: string;
 		clientIP?: string;
+		cookie?: string;
 	},
 ) {
 	const started = await service.request(`${transport.prefix}/sign-in/social`, {
 		host: transport.host,
 		clientIP: transport.clientIP,
+		cookie: transport.cookie,
 		body: {
 			provider: "apple",
 			callbackURL: transport.destination,
@@ -935,10 +937,28 @@ describe.skipIf(!existsSync(fixture))(
 					...hostedProvider,
 					callback: `${hostedIssuer}/callback/google`,
 				});
+				const nativeGuest = await service.request(
+					`${alphaPath}/sign-in/anonymous`,
+					{ body: {} },
+				);
+				expect(nativeGuest.status).toBe(200);
+				const nativeGuestData = (await nativeGuest.json()) as {
+					user: { id: string };
+				};
+				const hostedGuest = await service.request(
+					"/api/auth/sign-in/anonymous",
+					{
+						host: alphaHost,
+						clientIP: "192.0.2.64",
+						body: {},
+					},
+				);
+				expect(hostedGuest.status).toBe(200);
 				const nativeApple = await startFixtureApple(service, {
 					...hostedProvider,
 					clientIP: "192.0.2.64",
 					callback: `${hostedIssuer}/callback/apple`,
+					cookie: cookie(hostedGuest),
 				});
 				const legacyContinuation = await fixtureRedirect(
 					await service.request(
@@ -963,6 +983,73 @@ describe.skipIf(!existsSync(fixture))(
 
 				service = await open(restored, true);
 				expect((await service.request("/api/health")).status).toBe(200);
+				const guestCookies = cookie(nativeGuest);
+				expect(
+					await (
+						await service.request(`${alphaPath}/get-session`, {
+							cookie: guestCookies,
+						})
+					).json(),
+				).toMatchObject({
+					user: {
+						id: nativeGuestData.user.id,
+						isAnonymous: true,
+						emailVerified: false,
+						role: "guest",
+					},
+				});
+				const upgraded = await service.request(`${alphaPath}/sign-in/email`, {
+					cookie: guestCookies,
+					body: login,
+				});
+				expect(
+					upgraded.status,
+					upgraded.ok ? undefined : await upgraded.clone().text(),
+				).toBe(200);
+				expect(
+					await (
+						await service.request(`${alphaPath}/get-session`, {
+							cookie: guestCookies,
+						})
+					).json(),
+				).toBeNull();
+				const deleteGuest = await service.request(
+					`${alphaPath}/sign-in/anonymous`,
+					{ body: {} },
+				);
+				expect(deleteGuest.status).toBe(200);
+				const repeatedGuest = await service.request(
+					`${alphaPath}/sign-in/anonymous`,
+					{ cookie: cookie(deleteGuest), body: {} },
+				);
+				expect(repeatedGuest.status).toBe(400);
+				expect(await repeatedGuest.json()).toMatchObject({
+					code: "ANONYMOUS_USERS_CANNOT_SIGN_IN_AGAIN_ANONYMOUSLY",
+				});
+				const deletedGuest = await service.request(
+					`${alphaPath}/delete-anonymous-user`,
+					{ cookie: cookie(deleteGuest), body: {} },
+				);
+				expect(deletedGuest.status).toBe(200);
+				expect(await deletedGuest.json()).toEqual({ success: true });
+				expect(
+					await (
+						await service.request(`${alphaPath}/get-session`, {
+							cookie: cookie(deleteGuest),
+						})
+					).json(),
+				).toBeNull();
+				const candidateGuest = await service.request(
+					"/api/auth/sign-in/anonymous",
+					{ host: alphaHost, body: {} },
+				);
+				expect(
+					candidateGuest.status,
+					candidateGuest.ok ? undefined : await candidateGuest.clone().text(),
+				).toBe(200);
+				const candidateGuestData = (await candidateGuest.json()) as {
+					user: { id: string };
+				};
 				for (const [path, host, issuer] of [
 					[`${alphaPath}/sign-in/sso`, undefined, directIssuer],
 					["/api/auth/sign-in/sso", alphaHost, hostedIssuer],
@@ -1134,6 +1221,14 @@ describe.skipIf(!existsSync(fixture))(
 				expect(switchedApple.headers.get("location")).toBe(
 					hostedProvider.destination,
 				);
+				expect(
+					await (
+						await service.request("/api/auth/get-session", {
+							host: alphaHost,
+							cookie: cookie(hostedGuest),
+						})
+					).json(),
+				).toBeNull();
 				const appleBrowserSession = await service.request(
 					"/api/auth/get-session",
 					{ host: alphaHost, cookie: cookie(switchedApple) },
@@ -1148,9 +1243,15 @@ describe.skipIf(!existsSync(fixture))(
 					email: runtimeFixtureApple.email,
 					emailVerified: true,
 				});
+				const ownedAppleGuest = await service.request(
+					`${alphaPath}/sign-in/anonymous`,
+					{ body: {} },
+				);
+				expect(ownedAppleGuest.status).toBe(200);
 				const ownedApple = await startFixtureApple(service, {
 					...directProvider,
 					callback: `${alpha.primaryOrigin}/api/allauth/callback/apple`,
+					cookie: cookie(ownedAppleGuest),
 				});
 				const reservedApple = await service.request(
 					`${alphaPath}/sign-in/social`,
@@ -1688,6 +1789,18 @@ describe.skipIf(!existsSync(fixture))(
 
 				service = await open(restored, false);
 				expect((await service.request("/api/health")).status).toBe(200);
+				const restoredGuest = await service.request("/api/auth/get-session", {
+					host: alphaHost,
+					cookie: cookie(candidateGuest),
+				});
+				expect(await restoredGuest.json()).toMatchObject({
+					user: {
+						id: candidateGuestData.user.id,
+						isAnonymous: true,
+						emailVerified: false,
+						role: "guest",
+					},
+				});
 				const restoredDirectory = await service.request(
 					`${hostedScim}/${encodeURIComponent(directoryUserId)}`,
 					{
@@ -1734,6 +1847,13 @@ describe.skipIf(!existsSync(fixture))(
 				expect(rolledBackApple.headers.get("location")).toBe(
 					directProvider.destination,
 				);
+				expect(
+					await (
+						await service.request(`${alphaPath}/get-session`, {
+							cookie: cookie(ownedAppleGuest),
+						})
+					).json(),
+				).toBeNull();
 				expect(
 					await (
 						await service.request(`${alphaPath}/get-session`, {

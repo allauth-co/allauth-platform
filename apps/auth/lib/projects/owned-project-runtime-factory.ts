@@ -193,7 +193,6 @@ async function readSupportedProviders(options: Options) {
 		 ) OR
 		 EXISTS (SELECT 1 FROM "${schema}"."walletAddress") OR
 		 EXISTS (SELECT 1 FROM "${schema}"."agentHost") OR
-		 EXISTS (SELECT 1 FROM "${schema}"."user" WHERE "isAnonymous" IS TRUE) OR
 		 EXISTS (SELECT 1 FROM "${schema}"."allauthWebhookEndpoint") OR
 		 (NOT $2::boolean AND EXISTS (SELECT 1 FROM "${schema}"."allauthAvatarAsset" WHERE state <> 'deleted')) OR
 		 EXISTS (SELECT 1 FROM "${schema}"."account" WHERE "providerId" <> ALL($1::text[])) OR

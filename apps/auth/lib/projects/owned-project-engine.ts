@@ -45,6 +45,8 @@ import {
 	createProjectEngineStore,
 	projectUserResponse,
 } from "./owned-project-engine-store";
+import type { ProjectGuestProof } from "./owned-project-guest";
+import { createOwnedProjectGuest } from "./owned-project-guest";
 import { createOwnedProjectIssuer } from "./owned-project-issuer";
 import { readSignedProjectIssuerQuery } from "./owned-project-issuer-authorization-query";
 import { ProjectOAuthError } from "./owned-project-issuer-http";
@@ -188,6 +190,7 @@ interface OwnedProjectEngineOptions {
 		| "signUpEnabled"
 		| "requireEmailVerification"
 		| "authorizeLinkedAccounts"
+		| "readGuestUserId"
 		| "complete"
 	>;
 	sso?: Omit<
@@ -432,6 +435,7 @@ export function createOwnedProjectEngine(
 		Request,
 		ProjectBackchannelTarget[]
 	>();
+	const completedGuestUpgrades = new WeakMap<Request, ProjectGuestProof>();
 	const unavailableLogout = Symbol(
 		"Existing session requires a configured logout handler",
 	);
@@ -720,7 +724,11 @@ export function createOwnedProjectEngine(
 		rememberMe: boolean,
 		path: string,
 		callback?: string,
-		providerProof?: { managed?: boolean; allowUnverifiedEmail: boolean },
+		providerProof?: {
+			managed?: boolean;
+			allowUnverifiedEmail: boolean;
+			anonymousUserId?: string;
+		},
 	): Promise<Response> {
 		if (!activeUser(user) || (user.directoryManaged && !providerProof?.managed))
 			return forbidden();
@@ -765,6 +773,25 @@ export function createOwnedProjectEngine(
 			token,
 			user: value,
 		} = await createSession(client, user, request, rememberMe, path);
+		if (
+			guest &&
+			(path.startsWith("/sign-in/") ||
+				path.startsWith("/callback/") ||
+				path === "/verify-email" ||
+				path === "/magic-link/verify" ||
+				path === "/passkey/verify-authentication")
+		) {
+			const proof = await currentGuestProof(
+				request.headers,
+				client,
+				providerProof?.anonymousUserId,
+				user.id,
+			);
+			if (proof)
+				afterOwnedProjectCommit(client, () =>
+					completedGuestUpgrades.set(request, proof),
+				);
+		}
 		if (device?.setCookie) headers.append("Set-Cookie", device.setCookie);
 		if (path === "/sign-in/email" || path === "/sign-in/username") {
 			if (callback) headers.set("Location", callback);
@@ -1804,6 +1831,97 @@ export function createOwnedProjectEngine(
 			},
 		});
 
+	const beforeGuestDelete = accountLinks?.beforeDelete;
+	const guest =
+		beforeGuestDelete &&
+		createOwnedProjectGuest({
+			store,
+			beforeDelete: beforeGuestDelete,
+			async revoke(client, request, userId, path) {
+				const removed = await store.revoke(
+					{ userId },
+					path,
+					Boolean(backchannel),
+					client,
+				);
+				if (!removed) throw unavailableLogout;
+				deliverLogoutAfterCommit(client, request, removed.targets);
+			},
+		});
+
+	async function currentGuestProof(
+		headers: Headers,
+		client?: PoolClient,
+		capturedUser?: string,
+		signedInUser?: string,
+	): Promise<ProjectGuestProof | null> {
+		const current = await currentSession(headers, client);
+		if (current?.user.isAnonymous && current.user.id !== signedInUser)
+			return { token: current.token };
+		return capturedUser && capturedUser !== signedInUser
+			? { userId: capturedUser }
+			: null;
+	}
+
+	async function guestSession(request: Request, path: string) {
+		if (!guest) return unsupported();
+		if (!trustedRequest(request.headers, true)) return forbidden();
+		if (path === "/delete-anonymous-user") {
+			const unauthorizedGuest = () =>
+				failure(401, "UNAUTHORIZED", "Unauthorized");
+			const current = await currentSession(request.headers);
+			if (!current) return unauthorizedGuest();
+			if (!current.user.isAnonymous)
+				return failure(403, "USER_IS_NOT_ANONYMOUS", "User is not anonymous");
+			const result = await guest.erase(request, { token: current.token }, path);
+			if (result.status === "missing") return unauthorizedGuest();
+			if (result.status === "ineligible") return forbidden();
+			if (result.status === "pending")
+				return failure(
+					409,
+					"DELETION_PENDING",
+					"Account deletion is already being processed.",
+				);
+			if (result.status !== "deleted")
+				return failure(
+					503,
+					"FAILED_TO_DELETE_ANONYMOUS_USER",
+					"Failed to delete anonymous user",
+				);
+			const headers = new Headers();
+			clearSessionCookies(headers);
+			writeCookie(
+				headers,
+				`${multiCookiePrefix}${current.token.toLowerCase()}`,
+				"",
+				0,
+			);
+			return json({ success: true }, 200, headers);
+		}
+		if (!policy.signUpEnabled)
+			return failure(
+				403,
+				"FORBIDDEN",
+				"New guest sessions are disabled for this application.",
+			);
+		return store.transaction(async (client) => {
+			if (await currentGuestProof(request.headers, client))
+				return failure(
+					400,
+					"ANONYMOUS_USERS_CANNOT_SIGN_IN_AGAIN_ANONYMOUSLY",
+					"Anonymous users cannot sign in again anonymously",
+				);
+			if (await security.admit(client, request)) return securityBlocked();
+			const user = await guest.create(client);
+			const signedIn = await createSession(client, user, request, true, path);
+			return json(
+				{ token: signedIn.token, user: signedIn.user },
+				200,
+				signedIn.headers,
+			);
+		});
+	}
+
 	const oauth =
 		options.oauth &&
 		createOwnedProjectOAuth({
@@ -1813,6 +1931,11 @@ export function createOwnedProjectEngine(
 			baseURL: origin,
 			basePath: options.basePath,
 			trustedOrigins: options.trustedOrigins,
+			async readGuestUserId(request) {
+				if (!guest) return undefined;
+				const current = await currentSession(request.headers);
+				return current?.user.isAnonymous ? current.user.id : undefined;
+			},
 			signingSecret: options.signingSecret,
 			signUpEnabled: policy.signUpEnabled,
 			requireEmailVerification: policy.requireEmailVerification,
@@ -1828,6 +1951,7 @@ export function createOwnedProjectEngine(
 					provider,
 					destination,
 					verificationDestination,
+					anonymousUserId,
 					registered,
 					transport,
 				},
@@ -1843,6 +1967,7 @@ export function createOwnedProjectEngine(
 					{
 						allowUnverifiedEmail:
 							provider === "microsoft" || provider === "apple",
+						anonymousUserId,
 					},
 				);
 				if (
@@ -2145,6 +2270,11 @@ export function createOwnedProjectEngine(
 		)
 			return forbidden();
 		const path = url.pathname.slice(options.basePath.length);
+		if (
+			request.method === "POST" &&
+			(path === "/sign-in/anonymous" || path === "/delete-anonymous-user")
+		)
+			return guestSession(request, path);
 		const administrative = await adminUsers?.(request, path);
 		if (administrative) return administrative;
 		const issuerResponse = issuer && (await issuer.dispatch(path, request));
@@ -2448,6 +2578,11 @@ export function createOwnedProjectEngine(
 		async dispatch(request) {
 			try {
 				const response = await route(request);
+				const upgradedGuest = completedGuestUpgrades.get(request);
+				if (response.status < 400 && guest && upgradedGuest)
+					await guest
+						.erase(request, upgradedGuest, "/guest/account-upgraded")
+						.catch(() => undefined);
 				const notify = notifications.get(request);
 				if (response.status < 400 && notify && newDevice)
 					newDevice.defer(notify);
@@ -2457,6 +2592,7 @@ export function createOwnedProjectEngine(
 				throw error;
 			} finally {
 				notifications.delete(request);
+				completedGuestUpgrades.delete(request);
 				await deliverCommittedLogout(request);
 			}
 		},

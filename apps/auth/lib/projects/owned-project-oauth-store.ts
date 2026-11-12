@@ -34,6 +34,7 @@ const stateData = z.object({
 		.object({
 			ownedProjectProvider: projectOAuthProvider.optional(),
 			linkedSessionId: z.string().min(1).max(512).optional(),
+			anonymousUserId: z.string().min(1).max(160).optional(),
 		})
 		.optional(),
 });
