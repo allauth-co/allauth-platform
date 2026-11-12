@@ -11,6 +11,11 @@ import type {
 	ProjectUser,
 } from "./owned-project-engine-store";
 import { projectUserResponse } from "./owned-project-engine-store";
+import { admitOwnedProjectNativeRoute } from "./owned-project-native-admission";
+import {
+	realmAdministratorRequestGuard,
+	recordOwnedRealmAdminEvent,
+} from "./owned-project-realm-admin-audit";
 import { projectSupportStore } from "./owned-project-support-store";
 
 const targetInput = z.object({ userId: z.string().min(1).max(160) });
@@ -73,6 +78,34 @@ export function createOwnedProjectRealmImpersonation(options: {
 	): Promise<boolean>;
 }) {
 	const { store } = options;
+	type Session = NonNullable<Awaited<ReturnType<typeof store.session>>>;
+
+	function adminEvent(
+		client: PoolClient,
+		request: Request,
+		path: typeof startPath | typeof stopPath,
+		session: Session | null,
+		targetId?: string,
+		errorCode?: string,
+	) {
+		return recordOwnedRealmAdminEvent(store, client, path, {
+			ipAddress: options.trustedIP(request) ?? undefined,
+			userAgent: request.headers.get("user-agent") ?? undefined,
+			actorId: session?.session.impersonatedBy || session?.user.id,
+			userId: targetId ?? session?.user.id,
+			targetId,
+			errorCode,
+		});
+	}
+	function admit(client: PoolClient, request: Request, path: string) {
+		const ip = options.trustedIP(request);
+		return ip
+			? admitOwnedProjectNativeRoute(client, ip, path, {
+					max: 100,
+					windowMs: 60_000,
+				})
+			: null;
+	}
 
 	async function administratorProof(client: PoolClient, request: Request) {
 		const targetToken = options.readCookie(request.headers, "session");
@@ -109,10 +142,28 @@ export function createOwnedProjectRealmImpersonation(options: {
 				"Invalid impersonation request.",
 			);
 		const actorToken = options.readCookie(request.headers, "session");
-		if (!actorToken) return unauthorized();
 		return store.transaction(async (client) => {
-			const actor = await store.session(actorToken, 0, client);
-			if (!actor) return unauthorized();
+			const limited = await admit(client, request, startPath);
+			if (limited) return limited;
+			const actor = actorToken
+				? await store.session(actorToken, 0, client)
+				: null;
+			const targetId = input.data.userId;
+			const fail = async (response: Response, errorCode: string) => {
+				await adminEvent(
+					client,
+					request,
+					startPath,
+					actor,
+					targetId,
+					errorCode,
+				);
+				return response;
+			};
+			if (!actor || !actorToken)
+				return fail(unauthorized(), "AUTHENTICATION_FAILED");
+			const blocked = realmAdministratorRequestGuard(actor);
+			if (blocked) return blocked;
 			const actingUser = await store.lockUser(client, actor.user.id);
 			if (
 				!actingUser ||
@@ -120,24 +171,33 @@ export function createOwnedProjectRealmImpersonation(options: {
 				!isPlatformAdmin(actingUser, actor.session) ||
 				!(await store.lockSession(client, actorToken, actingUser.id, false))
 			)
-				return accountLinkError(
-					403,
+				return fail(
+					accountLinkError(
+						403,
+						"YOU_ARE_NOT_ALLOWED_TO_IMPERSONATE_USERS",
+						"You are not allowed to impersonate users",
+					),
 					"YOU_ARE_NOT_ALLOWED_TO_IMPERSONATE_USERS",
-					"You are not allowed to impersonate users",
 				);
 			const realm = projectSupportStore(client);
-			const target = await realm.target(input.data.userId);
+			const target = await realm.target(targetId);
 			if (!target)
-				return accountLinkError(404, "USER_NOT_FOUND", "User not found");
+				return fail(
+					accountLinkError(404, "USER_NOT_FOUND", "User not found"),
+					"USER_NOT_FOUND",
+				);
 			if (
 				rolesInclude(target.role, "admin") ||
 				target.banned ||
 				target.directoryDisabled
 			)
-				return accountLinkError(
-					403,
+				return fail(
+					accountLinkError(
+						403,
+						"YOU_CANNOT_IMPERSONATE_ADMINS",
+						"You cannot impersonate this user",
+					),
 					"YOU_CANNOT_IMPERSONATE_ADMINS",
-					"You cannot impersonate this user",
 				);
 			const current = await realm.createSession(
 				target,
@@ -158,6 +218,7 @@ export function createOwnedProjectRealmImpersonation(options: {
 			const result = await store.session(current.token, 0, client);
 			if (!result)
 				throw new Error("The project impersonation session was not created.");
+			await adminEvent(client, request, startPath, actor, targetId);
 			const headers = new Headers();
 			options.clearCookies(headers);
 			options.writeCookie(
@@ -178,18 +239,32 @@ export function createOwnedProjectRealmImpersonation(options: {
 
 	async function stop(request: Request) {
 		const token = options.readCookie(request.headers, "session");
-		if (!token) return unauthorized();
 		return store.transaction(async (client) => {
-			const current = await store.session(token, 0, client);
-			if (!current) return unauthorized();
+			const limited = await admit(client, request, stopPath);
+			if (limited) return limited;
+			const current = token ? await store.session(token, 0, client) : null;
+			const fail = async (response: Response) => {
+				await adminEvent(
+					client,
+					request,
+					stopPath,
+					current,
+					undefined,
+					"AUTHENTICATION_FAILED",
+				);
+				return response;
+			};
+			if (!current) return fail(unauthorized());
 			if (!current.session.impersonatedBy)
-				return accountLinkError(
-					400,
-					"BAD_REQUEST",
-					"You are not impersonating anyone",
+				return fail(
+					accountLinkError(
+						400,
+						"BAD_REQUEST",
+						"You are not impersonating anyone",
+					),
 				);
 			const proof = await administratorProof(client, request);
-			if (!proof) return missingActor();
+			if (!proof) return fail(missingActor());
 			const { actor, actorToken, target, targetToken, short } = proof;
 			const restoredUser = await store.lockUser(client, actor.user.id);
 			if (
@@ -198,7 +273,7 @@ export function createOwnedProjectRealmImpersonation(options: {
 				restoredUser.directoryDisabled ||
 				!(await store.lockSession(client, actorToken, restoredUser.id, false))
 			)
-				return missingActor();
+				return fail(missingActor());
 			const realm = projectSupportStore(client);
 			const locked = await realm.session(targetToken, "token", {
 				lock: "write",
@@ -208,11 +283,11 @@ export function createOwnedProjectRealmImpersonation(options: {
 				locked.id !== target.session.id ||
 				locked.impersonatedBy !== restoredUser.id
 			)
-				return unauthorized();
+				return fail(unauthorized());
 			if (
 				!(await options.revoke(client, request, targetToken, restoredUser.id))
 			)
-				return unauthorized();
+				return fail(unauthorized());
 			await store.record(
 				client,
 				"session.impersonation-stopped",
@@ -222,6 +297,7 @@ export function createOwnedProjectRealmImpersonation(options: {
 				locked.id,
 				restoredUser.id,
 			);
+			await adminEvent(client, request, stopPath, current);
 			const headers = new Headers();
 			options.clearCookies(headers);
 			options.writeCookie(headers, "admin", "", 0);

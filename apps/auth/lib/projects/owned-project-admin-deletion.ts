@@ -17,6 +17,12 @@ import {
 import { lockOwnedProjectWorkspaceAdministrator } from "./owned-project-admin-authority";
 import type { ProjectUser } from "./owned-project-engine-store";
 import { createProjectEngineStore } from "./owned-project-engine-store";
+import { admitOwnedProjectNativeRoute } from "./owned-project-native-admission";
+import type { RealmAdminAuditContext } from "./owned-project-realm-admin-audit";
+import {
+	realmAdministratorRequestGuard,
+	recordOwnedRealmAdminEvent,
+} from "./owned-project-realm-admin-audit";
 import type { Project } from "./registry";
 import { projectOrigin, projectSlug } from "./validation";
 
@@ -38,6 +44,7 @@ export interface OwnedProjectAdminDeletionOptions {
 	platformOrigin: string;
 	trustedOrigins: readonly string[];
 	requireMfa: boolean;
+	auditContext(request: Request): RealmAdminAuditContext;
 	/** The platform engine verifies the original root cookie, before SQL rechecks its authority. */
 	readWorkspacePrincipal(headers: Headers): Promise<ControlPrincipal | null>;
 	/** The project engine verifies its realm-specific session cookie. */
@@ -47,7 +54,7 @@ export interface OwnedProjectAdminDeletionOptions {
 	): Promise<{
 		token: string;
 		user: ProjectUser;
-		session: { id: string };
+		session: { id: string; impersonatedBy?: string | null };
 	} | null>;
 	beforeDelete: OwnedProjectAccountDeletionOptions["beforeDelete"];
 	/** Keep issuer logout and its after-commit delivery on the same writer. */
@@ -78,6 +85,16 @@ const realmDenied = () =>
 		"YOU_ARE_NOT_ALLOWED_TO_DELETE_USERS",
 		"You are not allowed to delete users",
 	);
+type TargetDenial = {
+	response: Response;
+	errorCode?: string;
+	actorId?: string;
+};
+const denyTarget = (
+	response: Response,
+	errorCode?: string,
+	actorId?: string,
+): TargetDenial => ({ response, errorCode, actorId });
 
 /** Administrator erasure shares the self-service lease and requires live authority at both transaction boundaries. */
 export function createOwnedProjectAdminDeletion(
@@ -98,11 +115,12 @@ export function createOwnedProjectAdminDeletion(
 	function realmAdmin(user: ProjectUser | null): user is ProjectUser {
 		return Boolean(
 			user &&
+				user.emailVerified &&
 				!user.banned &&
 				!user.isAnonymous &&
 				!user.directoryDisabled &&
 				user.role?.split(",").includes("admin") &&
-				(!options.requireMfa || (user.emailVerified && user.twoFactorEnabled)),
+				(!options.requireMfa || user.twoFactorEnabled),
 		);
 	}
 
@@ -120,7 +138,7 @@ export function createOwnedProjectAdminDeletion(
 					workspace,
 				))
 			)
-				return workspaceDenied();
+				return denyTarget(workspaceDenied(), "FORBIDDEN");
 			const target = await store.lockUser(client, userId);
 			return target
 				? {
@@ -128,20 +146,41 @@ export function createOwnedProjectAdminDeletion(
 						authorityId: workspace.session.id,
 						target,
 					}
-				: accountLinkError(
-						404,
+				: denyTarget(
+						accountLinkError(
+							404,
+							"NOT_FOUND",
+							"This user does not exist in the selected project.",
+						),
 						"NOT_FOUND",
-						"This user does not exist in the selected project.",
 					);
 		}
 		const session = await options.readRealmSession(request, client);
-		if (!session) return accountLinkError(401, "UNAUTHORIZED", "Unauthorized");
-		if (!realmAdmin(session.user)) return realmDenied();
+		if (!session || session.user.banned || session.user.directoryDisabled)
+			return denyTarget(
+				accountLinkError(401, "UNAUTHORIZED", "Unauthorized"),
+				"AUTHENTICATION_FAILED",
+			);
+		const blocked = realmAdministratorRequestGuard(session);
+		if (blocked) return denyTarget(blocked);
+		if (options.requireMfa && !session.user.twoFactorEnabled)
+			return denyTarget(
+				accountLinkError(401, "UNAUTHORIZED", "Unauthorized"),
+				"AUTHENTICATION_FAILED",
+			);
+		const actorId = session.user.id;
+		const insufficient = () =>
+			denyTarget(realmDenied(), "YOU_ARE_NOT_ALLOWED_TO_DELETE_USERS", actorId);
+		if (!realmAdmin(session.user)) return insufficient();
 		if (userId === session.user.id)
-			return accountLinkError(
-				400,
+			return denyTarget(
+				accountLinkError(
+					400,
+					"YOU_CANNOT_REMOVE_YOURSELF",
+					"You cannot remove yourself",
+				),
 				"YOU_CANNOT_REMOVE_YOURSELF",
-				"You cannot remove yourself",
+				actorId,
 			);
 		// Acquire both rows in the same order when two administrators act concurrently.
 		await client.query(
@@ -153,11 +192,15 @@ export function createOwnedProjectAdminDeletion(
 			!realmAdmin(actor) ||
 			!(await store.lockSession(client, session.token, actor.id, false))
 		)
-			return realmDenied();
+			return insufficient();
 		const target = await store.lockUser(client, userId);
 		return target
 			? { actorId: actor.id, authorityId: session.session.id, target }
-			: accountLinkError(404, "USER_NOT_FOUND", "User not found");
+			: denyTarget(
+					accountLinkError(404, "USER_NOT_FOUND", "User not found"),
+					"USER_NOT_FOUND",
+					actorId,
+				);
 	}
 
 	async function event(
@@ -215,6 +258,17 @@ export function createOwnedProjectAdminDeletion(
 		if (!parsed.success)
 			return accountLinkError(400, "INVALID_BODY", "Select a project user.");
 		const { userId } = parsed.data;
+		const finishDenied = async (client: PoolClient, denial: TargetDenial) => {
+			if (!isWorkspace && denial.errorCode)
+				await recordOwnedRealmAdminEvent(store, client, realmPath, {
+					...options.auditContext(request),
+					actorId: denial.actorId,
+					userId,
+					targetId: userId,
+					errorCode: denial.errorCode,
+				});
+			return denial.response;
+		};
 		let workspace: ControlPrincipal | null = null;
 		let key: string | null = null;
 		const lease = randomUUID();
@@ -231,13 +285,23 @@ export function createOwnedProjectAdminDeletion(
 					return workspaceDenied();
 			}
 			const claim = await store.transaction(async (client) => {
+				const ip = isWorkspace
+					? undefined
+					: options.auditContext(request).ipAddress;
+				if (ip) {
+					const limited = await admitOwnedProjectNativeRoute(client, ip, path, {
+						max: 100,
+						windowMs: 60_000,
+					});
+					if (limited) return limited;
+				}
 				const authority = await lockedTarget(
 					client,
 					request,
 					userId,
 					workspace,
 				);
-				if (authority instanceof Response) return authority;
+				if ("response" in authority) return finishDenied(client, authority);
 				const reserved = await claimProjectUserDeletion(client, userId, lease);
 				return reserved
 					? { ...authority, key: reserved }
@@ -257,7 +321,7 @@ export function createOwnedProjectAdminDeletion(
 				});
 			const result = await store.transaction(async (client) => {
 				const current = await lockedTarget(client, request, userId, workspace);
-				if (current instanceof Response) return current;
+				if ("response" in current) return finishDenied(client, current);
 				if (
 					current.actorId !== claim.actorId ||
 					current.authorityId !== claim.authorityId ||
@@ -298,18 +362,12 @@ export function createOwnedProjectAdminDeletion(
 					userId,
 				);
 				if (!isWorkspace) {
-					await event(
-						client,
-						path,
-						"admin.remove-user",
-						current.actorId,
+					await recordOwnedRealmAdminEvent(store, client, realmPath, {
+						...options.auditContext(request),
+						actorId: current.actorId,
 						userId,
-						userId,
-					);
-					await client.query(
-						`INSERT INTO "allauthAudit" (id,"actorId",action,"targetId","createdAt") VALUES ($1,$2,$3,$4,statement_timestamp())`,
-						[randomUUID(), current.actorId, path, userId],
-					);
+						targetId: userId,
+					});
 				}
 				return accountLinkJson({ success: true }, 200);
 			});

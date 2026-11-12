@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHmac, randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { runWithAdapter } from "@better-auth/core/context";
 import { symmetricEncrypt } from "better-auth/crypto";
@@ -12,6 +12,9 @@ import { defaultAuthPolicy } from "../auth-policy/policy";
 import { clerkCompatiblePasswords } from "../clerk-password";
 import { allauthControl } from "../control";
 import type { ControlPrincipal } from "../control/types";
+import { newWebhookSigningSecret } from "../control/webhook-contract";
+import type { ControlWebhookEnvelope } from "../control/webhooks";
+import { deliverPendingWebhooks } from "../control/webhooks";
 import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
 import { projectManagement } from "./management-plugin";
 import type { OwnedProjectAdminDeletionOptions } from "./owned-project-admin-deletion";
@@ -26,6 +29,10 @@ const origin = "https://administrator-delete.fixture.example";
 const password = "Synthetic-admin-delete-fixture-7!";
 const workspacePath = "/project-admin/remove-user";
 const realmPath = "/admin/remove-user";
+const startPath = "/admin/impersonate-user";
+const stopPath = "/admin/stop-impersonating";
+const clientIP = "192.0.2.9";
+const userAgent = "AllAuth project administrator fixture";
 const platformSecret = "isolated-root-administrator-deletion-fixture-secret";
 
 function fixtureRealm(slug: string) {
@@ -55,6 +62,8 @@ function request(
 		method: body === undefined ? "GET" : "POST",
 		headers: {
 			origin: caller,
+			"x-real-ip": clientIP,
+			"user-agent": userAgent,
 			...(cookie ? { cookie } : {}),
 			...(body === undefined ? {} : { "content-type": "application/json" }),
 		},
@@ -92,7 +101,7 @@ async function legacy(
 				emailAndPassword: { enabled: true, password: clerkCompatiblePasswords },
 				plugins: [
 					admin(),
-					allauthControl(),
+					allauthControl({ ipHeader: "x-real-ip" }),
 					...(options.realm && options.authorize
 						? [
 								projectManagement({
@@ -120,6 +129,7 @@ describe.skipIf(!existsSync(fixturePath))(
 		const nativeDatabases: NativeDatabase[] = [];
 		let root: Awaited<ReturnType<typeof legacy>>;
 		let native: Awaited<ReturnType<typeof legacy>>;
+		let nativeProjectDatabase: NativeDatabase;
 		let hash: string;
 		const rootId = "fixture-workspace-owner";
 		const realmAdmin = "fixture-project-admin";
@@ -157,7 +167,7 @@ describe.skipIf(!existsSync(fixturePath))(
 				baseURL: origin,
 				basePath: realm.path,
 				trustedOrigins: [],
-				trustedIP: () => "192.0.2.9",
+				trustedIP: () => clientIP,
 				signingSecret: realm.secret,
 				policy: defaultAuthPolicy,
 				passwordChange: { checkPasswordSafety: async () => "allowed" },
@@ -239,6 +249,7 @@ describe.skipIf(!existsSync(fixturePath))(
 			const projectMigrations = [
 				"001-initial-auth",
 				"002-control-plane",
+				"004-webhooks",
 				"005-free-plugins",
 				"016-invitation-import-provenance",
 			];
@@ -308,7 +319,8 @@ describe.skipIf(!existsSync(fixturePath))(
 				secret: platformSecret,
 				prefix: "allauth-fixture-root",
 			});
-			native = await legacy(nativeDatabase(alpha.schemaName), {
+			nativeProjectDatabase = nativeDatabase(alpha.schemaName);
+			native = await legacy(nativeProjectDatabase, {
 				basePath: alpha.path,
 				secret: alpha.secret,
 				prefix: `allauth_project_${alpha.slug}`,
@@ -415,6 +427,187 @@ describe.skipIf(!existsSync(fixturePath))(
 					headers: new Headers({ cookie: realmCookie }),
 				}),
 			).toMatchObject({ user: { id: realmAdmin } });
+		});
+
+		it("preserves signed realm administrator outcomes on existing browser routes", async () => {
+			const endpoint = randomUUID();
+			const signingSecret = newWebhookSigningSecret();
+			const recipient = "https://admin-events.fixture.example/hook";
+			const target = "admin-webhook-fixture-target";
+			const scope = `"${alpha.schemaName}"`;
+			const candidate = engine();
+			await database.query(
+				`INSERT INTO ${scope}."allauthWebhookEndpoint" (id,url,"eventTypes","encryptedSecret")
+				 VALUES ($1,$2,'["admin.*"]',$3)`,
+				[
+					endpoint,
+					recipient,
+					await symmetricEncrypt({ key: alpha.secret, data: signingSecret }),
+				],
+			);
+
+			async function operate(
+				dispatch: (request: Request) => Promise<Response>,
+				checkGuards = false,
+			) {
+				await seedUser(alpha.schemaName, target);
+				const call = (path: string, session: string, body: object) =>
+					dispatch(request(alpha.path + path, session, body));
+				const started = await call(startPath, realmCookie, { userId: target });
+				expect(
+					started.status,
+					started.ok ? undefined : await started.clone().text(),
+				).toBe(200);
+				const support = cookie(started);
+				if (checkGuards) {
+					for (const path of [startPath, realmPath]) {
+						const forbidden = await call(path, support, { userId: target });
+						expect(forbidden.status).toBe(403);
+						expect(await forbidden.json()).toEqual({
+							message:
+								"Administrative actions are unavailable during impersonation.",
+						});
+					}
+					await database.query(
+						`UPDATE ${scope}."user" SET "emailVerified"=FALSE WHERE id=$1`,
+						[realmAdmin],
+					);
+					try {
+						for (const path of [startPath, realmPath]) {
+							const forbidden = await call(path, realmCookie, {
+								userId: target,
+							});
+							expect(forbidden.status).toBe(403);
+							expect(await forbidden.json()).toEqual({
+								message:
+									"Administrative actions require a verified email address.",
+							});
+						}
+						expect(await exists(alpha, target)).toBe(true);
+					} finally {
+						await database.query(
+							`UPDATE ${scope}."user" SET "emailVerified"=TRUE WHERE id=$1`,
+							[realmAdmin],
+						);
+					}
+				}
+				const stopped = await call(stopPath, support, {});
+				expect(
+					stopped.status,
+					stopped.ok ? undefined : await stopped.clone().text(),
+				).toBe(200);
+				expect((await call(stopPath, realmCookie, {})).status).toBe(400);
+				expect(
+					(await call(startPath, realmCookie, { userId: realmAdmin })).status,
+				).toBe(403);
+				expect(
+					(await call(startPath, rootCookie, { userId: target })).status,
+				).toBe(401);
+				expect(
+					(await call(realmPath, realmCookie, { userId: realmAdmin })).status,
+				).toBe(400);
+				expect(
+					(await call(realmPath, rootCookie, { userId: target })).status,
+				).toBe(401);
+				const removed = await call(realmPath, realmCookie, { userId: target });
+				expect(removed.status).toBe(200);
+				expect(
+					(await call(realmPath, realmCookie, { userId: target })).status,
+				).toBe(404);
+				expect(
+					(await call(startPath, realmCookie, { userId: target })).status,
+				).toBe(404);
+				const queued: { body: string; headers: Record<string, string> }[] = [];
+				const clock = new Date(Date.now() + 2_000);
+				const result = await deliverPendingWebhooks({
+					database: nativeProjectDatabase,
+					secret: alpha.secret,
+					now: () => clock,
+					maxDeliveries: 12,
+					resolver: async () => [{ address: "93.184.216.34", family: 4 }],
+					async transport({ destination, headers, body }) {
+						if (destination.url.href !== recipient) return 400;
+						queued.push({ body, headers });
+						return 204;
+					},
+				});
+				expect(result).toEqual({
+					claimed: queued.length,
+					delivered: queued.length,
+					retried: 0,
+					failed: 0,
+				});
+				return queued
+					.map(({ body, headers }) => {
+						expect(headers["webhook-signature"]).toBe(
+							`v1,${createHmac(
+								"sha256",
+								Buffer.from(signingSecret.slice(6), "base64"),
+							)
+								.update(
+									`${headers["webhook-id"]}.${headers["webhook-timestamp"]}.${body}`,
+								)
+								.digest("base64")}`,
+						);
+						expect(body).not.toContain(signingSecret);
+						expect(body).not.toContain(password);
+						const envelope = JSON.parse(body) as ControlWebhookEnvelope;
+						const { id, createdAt, ...event } = envelope.data.event;
+						expect(envelope).toEqual({
+							id,
+							type: event.type,
+							timestamp: createdAt,
+							data: { event: { id, createdAt, ...event } },
+						});
+						return event;
+					})
+					.sort(
+						(left, right) =>
+							left.type.localeCompare(right.type) ||
+							left.outcome.localeCompare(right.outcome) ||
+							String(left.metadata.errorCode ?? "").localeCompare(
+								String(right.metadata.errorCode ?? ""),
+							),
+					);
+			}
+
+			try {
+				const legacyEvents = await operate((incoming) =>
+					native.handler(incoming),
+				);
+				expect(
+					legacyEvents.map(({ type, outcome }) => [type, outcome]),
+				).toEqual([
+					["admin.impersonate-user", "failure"],
+					["admin.impersonate-user", "failure"],
+					["admin.impersonate-user", "failure"],
+					["admin.impersonate-user", "success"],
+					["admin.remove-user", "failure"],
+					["admin.remove-user", "failure"],
+					["admin.remove-user", "failure"],
+					["admin.remove-user", "success"],
+					["admin.stop-impersonating", "failure"],
+					["admin.stop-impersonating", "success"],
+				]);
+				expect(
+					await operate((incoming) => candidate.dispatch(incoming), true),
+				).toEqual(legacyEvents);
+				const audit = await database.query(
+					`SELECT action,"targetId" FROM ${scope}."allauthAudit"
+					 WHERE "actorId"=$1 AND ("targetId"=$2 OR action=$3) ORDER BY action`,
+					[realmAdmin, target, stopPath],
+				);
+				expect(audit.rows).toEqual([
+					{ action: startPath, targetId: target },
+					{ action: realmPath, targetId: target },
+					{ action: stopPath, targetId: null },
+				]);
+			} finally {
+				await database.query(
+					`DELETE FROM ${scope}."allauthWebhookEndpoint" WHERE id=$1`,
+					[endpoint],
+				);
+			}
 		});
 
 		it("preserves workspace user administration and live revocation across the selected writers", async () => {

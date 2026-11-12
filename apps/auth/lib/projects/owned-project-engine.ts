@@ -1985,8 +1985,12 @@ export function createOwnedProjectEngine(
 			basePath: options.basePath,
 			trustedOrigins: options.trustedOrigins,
 			requireMfa: policy.mfaMode === "required",
-			readRealmSession: (request, client) =>
-				currentSession(request.headers, client),
+			auditContext: browserEventContext,
+			async readRealmSession(request, client) {
+				const token = tokenFrom(request.headers);
+				const current = token ? await store.session(token, 0, client) : null;
+				return token && current ? { token, ...current } : null;
+			},
 			beforeDelete: accountLinks.beforeDelete,
 			async revokeSessions(client, request, userId, path, actorId) {
 				const removed = await store.revoke(
