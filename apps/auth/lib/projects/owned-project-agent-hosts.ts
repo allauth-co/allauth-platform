@@ -10,6 +10,7 @@ import {
 	createOwnedAgentHost,
 	enrollOwnedAgentHost,
 } from "./owned-project-agent-enrollment";
+import { readOwnedAgentStatus } from "./owned-project-agent-status";
 import type { createProjectEngineStore } from "./owned-project-engine-store";
 import { admitOwnedProjectNativeRoute } from "./owned-project-native-admission";
 
@@ -112,6 +113,7 @@ export function createOwnedProjectAgentHosts(options: BrowserHosts) {
 		const decision =
 			request.method === "POST" && path === "/agent/approve-capability";
 		const pending = request.method === "GET" && path === "/agent/ciba/pending";
+		const status = request.method === "GET" && path === "/agent/status";
 		const write =
 			decision ||
 			(request.method === "POST" &&
@@ -120,14 +122,18 @@ export function createOwnedProjectAgentHosts(options: BrowserHosts) {
 		const read =
 			request.method === "GET" &&
 			(path === "/host/get" || path === "/host/list");
-		if (!write && !read && !enroll && !pending) return;
+		if (!write && !read && !enroll && !pending && !status) return;
 		const limited = await options.store.transaction((client) =>
 			admitOwnedProjectNativeRoute(client, options.trustedIP(request), path, {
-				max: decision ? 5 : pending ? 300 : 100,
+				max: decision ? 5 : pending || status ? 300 : 100,
 				windowMs: 60_000,
 			}),
 		);
 		if (limited) return limited;
+		if (status)
+			return options.store.transaction((client) =>
+				readOwnedAgentStatus(client, request),
+			);
 		if (request.headers.has("authorization")) {
 			if (path === "/host/revoke" && request.headers.get("authorization"))
 				return forbidden(

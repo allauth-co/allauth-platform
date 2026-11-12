@@ -3,7 +3,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { oauthProvider } from "@better-auth/oauth-provider";
 import { admin, jwt } from "better-auth/plugins";
 import { getTestInstance } from "better-auth/test";
-import { exportJWK, generateKeyPair } from "jose";
+import { exportJWK, generateKeyPair, SignJWT } from "jose";
 import { Kysely, PostgresDialect } from "kysely";
 import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -28,6 +28,10 @@ const owner = {
 const peer = {
 	id: "agent-host-fixture-peer",
 	email: "peer@agent-hosts.fixture.example",
+};
+const machineOwner = {
+	id: "agent-host-fixture-machine-owner",
+	email: "machine-owner@agent-hosts.fixture.example",
 };
 
 function realm(slug: string) {
@@ -105,6 +109,7 @@ describe.skipIf(!existsSync(fixture))(
 		let disabled: ReturnType<typeof createOwnedProjectEngine>;
 		let ownerCookie: string;
 		let peerCookie: string;
+		let machineCookie: string;
 		let dependentKey: string;
 		let created = false;
 
@@ -181,7 +186,7 @@ describe.skipIf(!existsSync(fixture))(
 				pg.release();
 			}
 			const hash = await clerkCompatiblePasswords.hash(password);
-			for (const user of [owner, peer]) {
+			for (const user of [owner, peer, machineOwner]) {
 				await database.query(
 					`INSERT INTO "${alpha.schemaName}"."user" (id,name,email,"emailVerified",role) VALUES ($1,$1,$2,true,'user')`,
 					[user.id, user.email],
@@ -202,6 +207,7 @@ describe.skipIf(!existsSync(fixture))(
 			disabled = candidate(alpha, false);
 			ownerCookie = await signIn(owner.email);
 			peerCookie = await signIn(peer.email);
+			machineCookie = await signIn(machineOwner.email);
 			dependentKey = JSON.stringify(
 				await exportJWK(
 					(await generateKeyPair("EdDSA", { extractable: true })).publicKey,
@@ -1055,6 +1061,264 @@ describe.skipIf(!existsSync(fixture))(
 				{ status: "pending" },
 				{ status: "pending" },
 			]);
+		});
+
+		const agentAudience = `${origin}${alpha.basePath}`;
+		const statusPath = "/agent/status";
+		async function nativeMachine(label: string) {
+			const hostKey = await generateKeyPair("EdDSA", { extractable: true });
+			const agentKey = await generateKeyPair("EdDSA", { extractable: true });
+			const kid = `fixture-machine-${label}`;
+			const host = await legacy.handler(
+				request(alpha, "/host/create", machineCookie, {
+					name: label,
+					public_key: { ...(await exportJWK(hostKey.publicKey)), kid },
+				}),
+			);
+			expect(host.status).toBe(200);
+			const { hostId } = (await host.json()) as { hostId: string };
+			const registration = await new SignJWT({
+				agent_public_key: await exportJWK(agentKey.publicKey),
+			})
+				.setProtectedHeader({ alg: "EdDSA", typ: "host+jwt", kid })
+				.setIssuer(hostId)
+				.setAudience(agentAudience)
+				.setIssuedAt()
+				.setExpirationTime("45s")
+				.setJti(randomUUID())
+				.sign(hostKey.privateKey);
+			const agent = await legacy.handler(
+				request(
+					alpha,
+					"/agent/register",
+					"",
+					{ name: label, mode: "delegated" },
+					`Bearer ${registration}`,
+				),
+			);
+			expect(
+				agent.status,
+				agent.ok ? undefined : await agent.clone().text(),
+			).toBe(200);
+			const body = (await agent.json()) as { agent_id: string };
+			expect(body).toMatchObject({
+				status: "active",
+				host_id: hostId,
+				agent_capability_grants: [],
+			});
+			return { hostId, agentId: body.agent_id, hostKey, agentKey, kid };
+		}
+
+		function hostProof(
+			machine: Awaited<ReturnType<typeof nativeMachine>>,
+			issuer = machine.hostId,
+			audience = agentAudience,
+		) {
+			return new SignJWT({})
+				.setProtectedHeader({ alg: "EdDSA", typ: "host+jwt", kid: machine.kid })
+				.setIssuer(issuer)
+				.setAudience(audience)
+				.setIssuedAt()
+				.setExpirationTime("45s")
+				.sign(machine.hostKey.privateKey);
+		}
+
+		function agentProof(
+			machine: Awaited<ReturnType<typeof nativeMachine>>,
+			target = `${agentAudience}${statusPath}`,
+		) {
+			return new SignJWT({ htm: "GET", htu: target })
+				.setProtectedHeader({ alg: "EdDSA", typ: "agent+jwt" })
+				.setIssuer(machine.hostId)
+				.setSubject(machine.agentId)
+				.setAudience(agentAudience)
+				.setIssuedAt()
+				.setExpirationTime("45s")
+				.setJti(randomUUID())
+				.sign(machine.agentKey.privateKey);
+		}
+
+		it("validates native host status reads against its own inline host and projects legacy grants", async () => {
+			const machine = await nativeMachine("Status host");
+			const other = await nativeMachine("Other status host");
+			await database.query(
+				`INSERT INTO "${alpha.schemaName}"."agentCapabilityGrant" (id,"agentId",capability,"grantedBy",status,constraints,"createdAt","updatedAt")
+				VALUES ($1,$2,'fixture.read',$3,'revoked',NULL,now(),now()), ($4,$2,'fixture.read',$3,'active','{"scope":"fixture"}',now(),now()),
+				($5,$2,'fixture.consumed',$3,'consumed',NULL,now(),now())`,
+				[
+					randomUUID(),
+					machine.agentId,
+					machineOwner.id,
+					randomUUID(),
+					randomUUID(),
+				],
+			);
+			const proof = await hostProof(machine, machine.kid);
+			const path = `${statusPath}?agent_id=${machine.agentId}`;
+			const expected = await expectSame(
+				path,
+				"",
+				200,
+				undefined,
+				`Bearer ${proof}`,
+			);
+			expect(expected).toMatchObject({
+				agent_id: machine.agentId,
+				host_id: machine.hostId,
+				status: "active",
+				agent_capability_grants: [
+					{
+						capability: "fixture.read",
+						status: "active",
+						granted_by: machineOwner.id,
+						constraints: { scope: "fixture" },
+					},
+				],
+			});
+			expect(
+				await expectSame(path, "", 200, undefined, `Bearer ${proof}`),
+			).toEqual(expected);
+			await expectSame(statusPath, "", 400, undefined, `Bearer ${proof}`);
+			await expectSame(
+				`${statusPath}?agent_id=${other.agentId}`,
+				"",
+				403,
+				undefined,
+				`Bearer ${proof}`,
+			);
+			await expectSame(path, ownerCookie, 401);
+			const realmMismatch = await outside.dispatch(
+				request(beta, path, "", undefined, `Bearer ${proof}`),
+			);
+			expect(realmMismatch.status).toBe(401);
+			await database.query(
+				`UPDATE "${alpha.schemaName}"."agentHost" SET kid=$2 WHERE id=$1`,
+				[other.hostId, machine.kid],
+			);
+			const ambiguous = await owned.dispatch(
+				request(alpha, path, "", undefined, `Bearer ${proof}`),
+			);
+			expect(ambiguous.status).toBe(401);
+			const explicit = await hostProof(machine);
+			await expectSame(path, "", 200, undefined, `Bearer ${explicit}`);
+			const wrongAudience = await hostProof(
+				machine,
+				machine.hostId,
+				`${origin}${beta.basePath}`,
+			);
+			await expectSame(path, "", 401, undefined, `Bearer ${wrongAudience}`);
+			await database.query(
+				`UPDATE "${alpha.schemaName}"."agentHost" SET status='pending' WHERE id=$1`,
+				[machine.hostId],
+			);
+			await expectSame(path, "", 200, undefined, `Bearer ${explicit}`);
+		});
+
+		it("consumes native-format agent proofs once and retains the bounded heartbeat across writers", async () => {
+			const machine = await nativeMachine("Status agent");
+			await database.query(
+				`UPDATE "${alpha.schemaName}"."agent" SET "createdAt"=now()-interval '59 minutes',"activatedAt"=now()-interval '59 minutes',"expiresAt"=now()+interval '30 seconds' WHERE id=$1`,
+				[machine.agentId],
+			);
+			const nativeProof = await agentProof(machine);
+			const prior = await legacy.handler(
+				request(alpha, statusPath, "", undefined, `Bearer ${nativeProof}`),
+			);
+			expect(prior.status).toBe(200);
+			await expect
+				.poll(async () => {
+					const { rows } = await database.query<{ used: boolean }>(
+						`SELECT "lastUsedAt" IS NOT NULL AS used FROM "${alpha.schemaName}"."agent" WHERE id=$1`,
+						[machine.agentId],
+					);
+					return rows[0]?.used;
+				})
+				.toBe(true);
+			const baseline = (await prior.json()) as {
+				created_at: string;
+				activated_at: string;
+				expires_at: string;
+				last_used_at: string | null;
+			};
+			const proof = await agentProof(machine);
+			const poll = () =>
+				owned.dispatch(
+					request(alpha, statusPath, "", undefined, `Bearer ${proof}`),
+				);
+			const results = await Promise.all([poll(), poll()]);
+			expect(results.map(({ status }) => status).sort()).toEqual([200, 401]);
+			const rejected = results.find(({ status }) => status === 401);
+			expect(await rejected?.json()).toEqual({
+				error: "jti_replay",
+				message: "JWT has already been used",
+			});
+			expect(rejected?.headers.get("www-authenticate")).toBe(
+				`AgentAuth discovery="${origin}/.well-known/agent-configuration"`,
+			);
+			const { last_used_at, expires_at, ...rest } = (await results
+				.find(({ ok }) => ok)
+				?.json()) as typeof baseline;
+			const {
+				last_used_at: _priorUsed,
+				expires_at: _priorExpiry,
+				...previous
+			} = baseline;
+			expect(rest).toEqual(previous);
+			expect(last_used_at).toBeTruthy();
+			expect(Date.parse(expires_at) - Date.parse(rest.activated_at)).toBe(
+				3_600_000,
+			);
+			const durable = await candidate(alpha, true).dispatch(
+				request(alpha, statusPath, "", undefined, `Bearer ${proof}`),
+			);
+			expect(durable.status).toBe(401);
+			expect(await durable.json()).toMatchObject({ error: "jti_replay" });
+			const differentTarget = await agentProof(
+				machine,
+				`${agentAudience}/agent/session`,
+			);
+			await expectSame(
+				statusPath,
+				"",
+				401,
+				undefined,
+				`Bearer ${differentTarget}`,
+			);
+			legacy = await native(nativePool);
+			const observed = await legacy.handler(
+				request(
+					alpha,
+					`${statusPath}?agent_id=${machine.agentId}`,
+					"",
+					undefined,
+					`Bearer ${await hostProof(machine)}`,
+				),
+			);
+			expect(await observed.json()).toMatchObject({
+				last_used_at,
+				expires_at,
+				status: "active",
+			});
+			await database.query(
+				`UPDATE "${alpha.schemaName}"."agent" SET "expiresAt"=now()-interval '1 minute' WHERE id=$1`,
+				[machine.agentId],
+			);
+			const expired = await owned.dispatch(
+				request(
+					alpha,
+					statusPath,
+					"",
+					undefined,
+					`Bearer ${await agentProof(machine)}`,
+				),
+			);
+			expect(expired.status).toBe(401);
+			expect(await expired.json()).toMatchObject({ error: "agent_expired" });
+			const record = await database.query(
+				`SELECT status,"expiresAt"<now() AS expired FROM "${alpha.schemaName}"."agent" WHERE id=$1`,
+				[machine.agentId],
+			);
+			expect(record.rows).toEqual([{ status: "active", expired: true }]);
 		});
 	},
 );
