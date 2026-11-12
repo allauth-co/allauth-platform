@@ -67,7 +67,10 @@ import { observeProjectEngine, projectEngineMetricsSelected } from "./engine-met
 import { projectManagement } from "./management-plugin";
 import { projectOriginFingerprint } from "./origins";
 import type { OwnedProjectSCIMConsole } from "./owned-project-scim-console";
-import { selectInternalProjectEngine } from "./project-engine-internal-selection";
+import {
+	internalProjectEngineSelected,
+	selectInternalProjectEngine,
+} from "./project-engine-internal-selection";
 import { selectRehearsalProjectEngine } from "./project-engine-rehearsal-selection";
 import { localizeProjectErrors } from "./project-error-localization";
 import { verifiedProjectRequest } from "./proxy";
@@ -679,6 +682,25 @@ export function withHostedProjectAuth<T>(
 		environment,
 		`https://${hostname}`,
 		(entry, current) => callback(legacyInstance(entry), entry.env, current),
+	);
+}
+
+/** Check the immutable internal realm and its selected writer without dispatching a request. */
+export function confirmInternalProjectEngine(
+	project: Project,
+	env: AuthEnvironment,
+	hostname?: string,
+) {
+	if (!internalProjectEngineSelected(env, project))
+		throw new Error("The internal project selection changed.");
+	return withProjectEntry(
+		project,
+		env,
+		hostname ? `https://${hostname}` : undefined,
+		async (entry) => {
+			if (entry.kind !== "owned" || !internalProjectEngineSelected(env, entry.project))
+				throw new Error("The internal project writer is unavailable.");
+		},
 	);
 }
 

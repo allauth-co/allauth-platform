@@ -8,7 +8,7 @@ import {
 	internalProjectEngineSelected,
 } from "./project-engine-internal-selection";
 import { getProject } from "./registry";
-import { withHostedProjectAuthEngine, withProjectAuthEngine } from "./runtime";
+import { confirmInternalProjectEngine } from "./runtime";
 
 /** Resolve both selected transports before allowing a deployment to accept traffic. */
 export async function verifyInternalProjectEngineReadiness(
@@ -31,16 +31,16 @@ export async function verifyInternalProjectEngineReadiness(
 		);
 	const hostname = new URL(domainDefaults(project.slug, env).accounts).hostname;
 	const binding = await resolveHostedBinding(hostname, env);
-	if (binding?.kind !== "accounts" || binding.project.id !== project.id)
+	if (
+		binding?.kind !== "accounts" ||
+		!internalProjectEngineSelected(env, binding.project)
+	)
 		throw new Error("The internal project accounts hostname is unavailable.");
 
 	await Promise.all([
-		withProjectAuthEngine(project.slug, async () => undefined, env),
-		withHostedProjectAuthEngine(
-			binding.project,
-			binding.hostname,
-			async () => undefined,
-			env,
-		),
+		confirmInternalProjectEngine(project, env),
+		confirmInternalProjectEngine(binding.project, env, binding.hostname),
 	]);
+	if (!internalProjectEngineSelected(env, await getProject(project.slug, env)))
+		throw new Error("The internal project selection changed during readiness.");
 }

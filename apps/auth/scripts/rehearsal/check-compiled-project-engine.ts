@@ -459,6 +459,38 @@ try {
 		"Native sign-in through the verified hosted binding.",
 	);
 	const originalHostedCookie = sessionCookie(originalHosted);
+	const managedHost = `${owned.slug}-accounts.${portalDomain}`;
+	const managedApi = `${owned.slug}-api.${portalDomain}`;
+	let nativeManagedCookie: string | undefined;
+	let ownedManagedCookie: string | undefined;
+	if (internalSelection) {
+		const nativeManaged = await request("/api/auth/sign-in/email", {
+			host: managedHost,
+			clientIP: "192.0.2.56",
+			body: login,
+		});
+		expectStatus(
+			nativeManaged,
+			200,
+			"Native sign-in works on the managed accounts hostname.",
+		);
+		nativeManagedCookie = sessionCookie(nativeManaged);
+		assert.ok(
+			nativeManaged.cookies
+				.filter((cookie) => cookie.includes(".session_token="))
+				.every((cookie) => !/; domain=/i.test(cookie)),
+		);
+		const redirects = await query(
+			source,
+			`SELECT c."redirectUris"::text FROM public."oauthClient" c
+			 JOIN public."allauthProject" p ON p."brokerClientId"=c."clientId" WHERE p.id='${owned.id}'`,
+		);
+		assert.ok(
+			(JSON.parse(redirects) as string[]).includes(
+				`https://${managedHost}/api/auth/callback/allauth`,
+			),
+		);
+	}
 	expectStatus(
 		await request(`${direct}/not-installed`, { realm: owned }),
 		404,
@@ -541,6 +573,13 @@ try {
 			await request(`${controlPath}/not-installed`, { realm: control }),
 			404,
 			"An ineligible project fails readiness and retains the legacy writer.",
+		);
+		await stop(restored);
+		await start(
+			releaseImage,
+			restored,
+			{ ALLAUTH_PROJECT_ENGINE_INTERNAL_ID: owned.id },
+			503,
 		);
 		await stop(restored);
 		await start(releaseImage, restored, {
@@ -672,6 +711,41 @@ try {
 	});
 	expectStatus(ownedHosted, 200, "The AllAuth hosted route signs in.");
 	const ownedHostedCookie = sessionCookie(ownedHosted);
+	if (nativeManagedCookie) {
+		expectStatus(
+			await request("/api/auth/hosted-ui/sdk/config", { host: managedHost }),
+			200,
+			"The managed accounts hostname uses the first-party hosted API.",
+		);
+		expectStatus(
+			await request("/api/auth/hosted-ui/sdk/config", { host: managedApi }),
+			404,
+			"The frontend API hostname keeps its existing hosted UI boundary.",
+		);
+		assert.equal(
+			await currentSession("/api/auth/get-session", {
+				host: managedHost,
+				cookie: nativeManagedCookie,
+			}),
+			accountId,
+		);
+		const ownedManaged = await request("/api/auth/sign-in/email", {
+			host: managedHost,
+			clientIP: "192.0.2.56",
+			body: login,
+		});
+		expectStatus(
+			ownedManaged,
+			200,
+			"AllAuth sign-in works on the managed accounts hostname.",
+		);
+		assert.ok(
+			ownedManaged.cookies
+				.filter((cookie) => cookie.includes(".session_token="))
+				.every((cookie) => !/; domain=/i.test(cookie)),
+		);
+		ownedManagedCookie = sessionCookie(ownedManaged);
+	}
 	const createdKey = await request("/api/auth/api-key/create", {
 		host,
 		cookie: ownedHostedCookie,
@@ -727,6 +801,14 @@ try {
 		accountId,
 	);
 	await checkKey("/api/auth", { host, cookie: ownedHostedCookie });
+	if (ownedManagedCookie)
+		assert.equal(
+			await currentSession("/api/auth/get-session", {
+				host: managedHost,
+				cookie: ownedManagedCookie,
+			}),
+			accountId,
+		);
 	assert.equal(
 		await currentSession("/api/auth/get-session", {
 			host,

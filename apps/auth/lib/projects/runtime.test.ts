@@ -1,7 +1,10 @@
+import type { Pool } from "pg";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AuthEnvironment } from "../configuration";
 import type { Project } from "./registry";
+import { verifyInternalProjectEngineReadiness } from "./project-engine-internal-readiness";
 import { closeProjectInstances, withHostedProjectAuthEngine, withProjectAuth, withProjectAuthEngine } from "./runtime";
+import * as projectRuntime from "./runtime";
 import { platformWorkspaceId } from "../workspaces/types";
 import { defaultStoredAuthPolicy } from "../auth-policy/policy";
 
@@ -9,6 +12,7 @@ const fixture = vi.hoisted(() => {
 	const unexpectedDatabaseWrite = async () => { throw new Error("The runtime-cache fixture must not issue database writes."); };
 	return {
 		getProject: vi.fn(), readAuthPolicy: vi.fn(),
+		resolveHostedBinding: vi.fn(),
 		readGoogleProvider: vi.fn(async () => ({ version: 0, enabled: false, clientId: "", encryptedClientSecret: "", updatedAt: null as string | null })),
 		createOwned: vi.fn(async (_options: unknown) => ({
 			dispatch: async () => new Response(null, { status: 202 }),
@@ -25,6 +29,7 @@ const fixture = vi.hoisted(() => {
 });
 vi.mock("../project-providers/repository", () => ({ readGoogleProvider: fixture.readGoogleProvider, googleProviderCredentials: async (stored: { enabled: boolean; clientId: string }) => stored.enabled ? { clientId: stored.clientId, clientSecret: "fixture-direct-secret" } : undefined }));
 vi.mock("../auth-policy/storage", () => ({ readAuthPolicy: fixture.readAuthPolicy }));
+vi.mock("../domains/hosting", () => ({ resolveHostedBinding: fixture.resolveHostedBinding }));
 vi.mock("./owned-project-runtime-factory", () => ({
 	createOwnedProjectRuntimeCandidate: fixture.createOwned,
 }));
@@ -174,4 +179,42 @@ describe("protected internal project writer selection", () => {
 			transport: { kind: "hosted", origin: `https://${hostname}` },
 		});
 	});
+});
+
+it("rejects readiness when either verified transport loses the exact internal realm", async () => {
+	const id = "8d0da368-94b3-4897-988e-39c320a3e852";
+	const internal: Project = {
+		...project(),
+		id,
+		schemaName: `allauth_project_${id.replaceAll("-", "")}`,
+		workspaceId: platformWorkspaceId,
+		environment: "development",
+	};
+	const selected = { ...environment, ALLAUTH_PROJECT_ENGINE_INTERNAL_ID: id };
+	const database = {
+		query: vi.fn(async () => ({ rows: [{ slug: internal.slug }] })),
+	} as unknown as Pick<Pool, "query">;
+	const hostname = "fixture-app-accounts.allauth.co";
+	fixture.getProject.mockReset().mockResolvedValue(internal);
+	fixture.resolveHostedBinding.mockResolvedValueOnce({
+		kind: "accounts", hostname, project: { ...internal, schemaName: project().schemaName },
+	});
+	await expect(verifyInternalProjectEngineReadiness(database, selected)).rejects.toThrow(
+		"The internal project accounts hostname is unavailable.",
+	);
+	expect(fixture.createOwned).not.toHaveBeenCalled();
+	fixture.resolveHostedBinding.mockResolvedValueOnce({ kind: "accounts", hostname, project: internal });
+	fixture.getProject
+		.mockResolvedValueOnce(internal)
+		.mockResolvedValueOnce({ ...internal, id: "0953c4f5-a783-4e91-9055-a05ead278cd0" });
+	const confirm = vi.spyOn(projectRuntime, "confirmInternalProjectEngine").mockResolvedValue(undefined);
+	try {
+		await expect(verifyInternalProjectEngineReadiness(database, selected)).rejects.toThrow(
+			"The internal project selection changed during readiness.",
+		);
+		expect(confirm).toHaveBeenNthCalledWith(1, internal, selected);
+		expect(confirm).toHaveBeenNthCalledWith(2, internal, selected, hostname);
+	} finally {
+		confirm.mockRestore();
+	}
 });
