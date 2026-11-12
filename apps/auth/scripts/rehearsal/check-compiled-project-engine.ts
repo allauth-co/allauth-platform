@@ -526,6 +526,10 @@ try {
 	if (internalSelection) {
 		await start(releaseImage, restored, {
 			ALLAUTH_PROJECT_ENGINE_INTERNAL_ID: owned.id,
+			EMAIL_PROVIDER: "cloudflare",
+			EMAIL_FROM: "security@project-engine-rehearsal.invalid",
+			CLOUDFLARE_ACCOUNT_ID: run,
+			CLOUDFLARE_EMAIL_API_TOKEN: run,
 		});
 		expectStatus(
 			await request("/api/auth/hosted-ui/sdk/config", { host }),
@@ -601,6 +605,16 @@ try {
 	const fixturePassword = internalSelection ? oldPassword : newPassword;
 	async function switchDirectSession() {
 		if (internalSelection) {
+			const signedOut = await request("/api/auth/sign-out", {
+				host,
+				cookie: originalHostedCookie,
+				body: {},
+			});
+			expectStatus(
+				signedOut,
+				200,
+				"The AllAuth writer revokes the original hosted session.",
+			);
 			const loginResponse = await request(`${direct}/sign-in/email`, {
 				realm: owned,
 				body: login,
