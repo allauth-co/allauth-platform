@@ -34,6 +34,7 @@ import { signEdgeRequest } from "../domains/edge";
 import { resolveHostedBinding } from "../domains/hosting";
 import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
 import { createWorkspace } from "../workspaces/repository";
+import { ownedSCIMScopedKey } from "./owned-project-scim-authority";
 import type { OwnedProjectSCIMConsole } from "./owned-project-scim-console";
 import { createOwnedProjectSCIMConsole } from "./owned-project-scim-console";
 import type { Project } from "./registry";
@@ -739,6 +740,7 @@ describe.skipIf(!existsSync(fixturePath))(
 			const providers = [
 				"fixture-webhook-native",
 				"fixture-webhook-owned",
+				"fixture-webhook-in-progress",
 			] as const;
 			const native = await withProjectAuth(
 				alpha.slug,
@@ -976,6 +978,131 @@ describe.skipIf(!existsSync(fixturePath))(
 						targetId: old.id,
 					}),
 				]);
+				const issued = await create(
+					consoleRequest(alpha.slug, {
+						method: "POST",
+						cookie: rootCookie,
+						body: JSON.stringify({ providerId: providers[2] }),
+					}),
+					collection,
+				);
+				expect(issued.status, await issued.clone().text()).toBe(201);
+				const pending = (await issued.json()) as Issued;
+				const pendingId = pending.connection.connectionId;
+				expect(await deliveredEvents(1)).toEqual([
+					expect.objectContaining({
+						type: "directory.created",
+						targetId: pendingId,
+					}),
+				]);
+				const lease = randomUUID();
+				const leaseExpiry = new Date(Date.now() + 5 * 60_000);
+				const provisioningDomainId = `organization:${organizationId}`;
+				await registry!.query(
+					`INSERT INTO ${scope}."scimConnectionBinding" (id,"connectionId","connectionKey","provisioningDomainId","createdAt","decommissionStatus","decommissionedAt","decommissionCursorUserId","decommissionReconciledUserCount","decommissionBatchCount","decommissionRevision","decommissionLeaseId","decommissionLeaseExpiresAt")
+					 VALUES ($1,$2,$3,$4,now(),'reconciling',now(),'fixture-cursor',50,1,2,$5,$6)`,
+					[
+						randomUUID(),
+						pendingId,
+						ownedSCIMScopedKey(["scim-connection", pendingId]),
+						provisioningDomainId,
+						lease,
+						leaseExpiry,
+					],
+				);
+				// The underlying API installs the managed transition, without the HTTP console's event.
+				const started = await withProjectAuth(
+					alpha.slug,
+					(instance) =>
+						instance.api.decommissionSCIMManagedConnection({
+							body: {
+								connectionId: pendingId,
+								provisioningDomainId,
+								actorId: workspaceOwner,
+							},
+						}),
+					env,
+				);
+				expect(started.decommission).toMatchObject({
+					status: "reconciling",
+					reconciledUsers: 50,
+					batches: 1,
+				});
+				const pendingState = async () =>
+					(
+						await registry!.query(
+							`SELECT m.status,m.revision,b."decommissionLeaseId",b."decommissionLeaseExpiresAt",b."decommissionRevision",b."decommissionCursorUserId",
+					 (SELECT count(*)::int FROM ${scope}."scimManagedConnectionEvent" e WHERE e."connectionRecordId"=m.id) AS events
+					 FROM ${scope}."scimManagedConnection" m JOIN ${scope}."scimConnectionBinding" b ON b."connectionId"=m."connectionId"
+					 WHERE m."connectionId"=$1`,
+							[pendingId],
+						)
+					).rows[0];
+				const pendingAudits = async () =>
+					(
+						await registry!.query(
+							`SELECT id FROM ${scope}."allauthAudit" WHERE action='directory.decommissioned' AND "targetId"=$1`,
+							[pendingId],
+						)
+					).rowCount;
+				const preserved = await pendingState();
+				expect(preserved).toMatchObject({
+					status: "decommissioning",
+					decommissionLeaseId: lease,
+					decommissionLeaseExpiresAt: leaseExpiry,
+					decommissionRevision: 2,
+					decommissionCursorUserId: "fixture-cursor",
+				});
+				expect(await pendingAudits()).toBe(0);
+				const nativePending = await change(
+					pendingId,
+					"decommission",
+					{},
+					localAdminCookie,
+				);
+				expect(nativePending.status, await nativePending.clone().text()).toBe(
+					200,
+				);
+				const pendingResponse = await nativePending.json();
+				expect(pendingResponse).toMatchObject({
+					connection: { status: "decommissioning" },
+					decommission: {
+						status: "reconciling",
+						retryAfter: leaseExpiry.toISOString(),
+						reconciledUsers: 50,
+						batches: 1,
+					},
+				});
+				const pendingEvent = {
+					type: "directory.decommissioned",
+					targetId: pendingId,
+				};
+				const nativeDelivery = await deliveredEvents(1, localAdmin);
+				expect(nativeDelivery).toEqual([expect.objectContaining(pendingEvent)]);
+				expect(nativeDelivery[0]?.body).not.toContain(pending.token);
+				expect(await pendingState()).toEqual(preserved);
+				expect(await pendingAudits()).toBe(1);
+
+				fixtureConsoles.set(alpha.id, alphaConsole);
+				expect(
+					(await change(pendingId, "decommission", {}, outsiderCookie)).ok,
+				).toBe(false);
+				expect(await deliveredEvents(0)).toEqual([]);
+				const ownedPending = await change(
+					pendingId,
+					"decommission",
+					{},
+					localAdminCookie,
+				);
+				expect(ownedPending.status, await ownedPending.clone().text()).toBe(
+					200,
+				);
+				expect(await ownedPending.json()).toEqual(pendingResponse);
+				const ownedDelivery = await deliveredEvents(1, localAdmin);
+				expect(ownedDelivery).toEqual([expect.objectContaining(pendingEvent)]);
+				expect(ownedDelivery[0]?.body).not.toContain(pending.token);
+				expect(await pendingState()).toEqual(preserved);
+				expect(await pendingAudits()).toBe(1);
 				expect(
 					(
 						await registry!.query(

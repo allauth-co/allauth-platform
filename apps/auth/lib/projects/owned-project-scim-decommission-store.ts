@@ -153,13 +153,16 @@ export function ownedSCIMDecommissionStore(
 			binding.decommissionLeaseId &&
 			binding.decommissionLeaseExpiresAt &&
 			binding.decommissionLeaseExpiresAt > now
-		)
+		) {
+			// The legacy console emits an event for a successful response while the active worker keeps its lease.
+			await store.recordDirectoryEvent("directory.decommissioned", connectionId);
 			return {
 				response: {
 					...(await store.state(connection)),
 					decommission: ownedSCIMDecommissionResult(binding),
 				},
 			};
+		}
 		if (
 			binding.decommissionStatus !== "reconciling" &&
 			binding.decommissionStatus !== "active"

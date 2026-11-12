@@ -461,6 +461,14 @@ describe.skipIf(!existsSync(fixturePath))(
 						[retiring.connectionId],
 					)
 				).rowCount,
+			).toBe(1);
+			expect(
+				(
+					await database.query(
+						`SELECT id FROM "allauthAudit" WHERE action='directory.decommissioned' AND "targetId"=$1`,
+						[retiring.connectionId],
+					)
+				).rowCount,
 			).toBe(0);
 			await database.query(
 				`UPDATE "scimConnectionBinding" SET "decommissionLeaseExpiresAt" = now() - interval '1 minute' WHERE "connectionId" = $1`,
