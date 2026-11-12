@@ -46,7 +46,7 @@ describe("public SDK and platform release history", () => {
 			expect(html).toContain(`href="${release.sourceUrl}"`);
 			expect(html).toContain(release.sha256);
 			expect(release.downloadUrl).toBe(`${publicSiteOrigin}/sdk/allauth-react-${release.version}.tgz`);
-			expect(release.sourceUrl).toBe(`https://github.com/thegarty/allauth-sdk/tree/v${release.version}/packages/react`);
+			expect(release.sourceUrl).toBe(`${sdkReleaseRepositoryUrl(release)}/tree/v${release.version}/packages/react`);
 		}
 		expect(html).toContain('href="/sdk/quickstart"');
 	});
@@ -57,14 +57,12 @@ describe("public SDK and platform release history", () => {
 		expect(platformRepositoryUrl).toBe("https://github.com/allauth-co/allauth-platform");
 		for (const url of [sdkRepositoryUrl, `${sdkRepositoryUrl}/releases`, platformRepositoryUrl]) expect(html).toContain(`href="${url}"`);
 		for (const release of sdkReleases) {
-			const repository = "https://github.com/thegarty/allauth-sdk";
-			expect(sdkReleaseRepositoryUrl(release)).toBe(repository);
-			expect(releaseStructuredData(release)).toMatchObject({ codeRepository: repository });
+			expect(releaseStructuredData(release)).toMatchObject({ codeRepository: sdkReleaseRepositoryUrl(release) });
 		}
 		const latest = sdkReleases[0];
-		expect(html).toContain(`href="https://github.com/thegarty/allauth-sdk/releases/tag/v${latest.version}"`);
-		const future = { ...latest, sourceUrl: `${sdkRepositoryUrl}/tree/v9.0.0/packages/react` };
-		expect(sdkReleaseRepositoryUrl(future)).toBe(sdkRepositoryUrl);
+		expect(sdkReleaseRepositoryUrl(latest)).toBe(sdkRepositoryUrl);
+		expect(html).toContain(`href="${sdkRepositoryUrl}/releases/tag/v${latest.version}"`);
+		expect(html).toContain('href="https://github.com/thegarty/allauth-sdk/tree/v1.4.6/packages/react"');
 		expect(platformReleases.find(release => release.id === "platform-commercial-preview-2026-11-11")?.sourceUrl).toBe(`${platformRepositoryUrl}/tree/platform-commercial-preview-2026-11-11`);
 	});
 

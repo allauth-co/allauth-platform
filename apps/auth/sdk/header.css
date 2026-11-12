@@ -4,6 +4,7 @@
 .allauth button.allauth-header-trigger{display:inline-flex;align-items:center;gap:.6rem;min-height:2.4rem;padding:.25rem .45rem;border:1px solid transparent;background:transparent;color:var(--allauth-foreground);font-weight:500;border-radius:.55rem}
 .allauth button.allauth-header-trigger:hover,.allauth button.allauth-header-trigger[aria-expanded=true]{background:var(--allauth-footer-background);border-color:var(--allauth-border)}
 .allauth-active-org-name{max-width:12rem;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+.allauth-organization-chevron{flex:none}
 .allauth-avatar{display:inline-flex;align-items:center;justify-content:center;flex:none;width:2rem;height:2rem;border-radius:50%;overflow:hidden;background:var(--allauth-avatar-background,#f4d5ca);color:var(--allauth-avatar-foreground,#5c3227);font-size:.75rem;font-weight:650;line-height:1;vertical-align:middle}
 .allauth-avatar img{width:100%;height:100%;object-fit:cover}
 .allauth-avatar-square{border-radius:.4rem;background:var(--allauth-footer-background);border:1px solid var(--allauth-border)}
