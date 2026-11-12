@@ -3,6 +3,7 @@ import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { runWithEndpointContext } from "@better-auth/core/context";
 import type { AuthContext } from "@better-auth/core";
+import { hash } from "bcryptjs";
 import { getTestInstance } from "better-auth/test";
 import { admin } from "better-auth/plugins";
 import { Kysely, PostgresDialect } from "kysely";
@@ -14,9 +15,11 @@ import { auth } from "../auth";
 import type { AuthEnvironment } from "../configuration";
 import type { ControlDatabase } from "../control/types";
 import { defaultSecurityPolicy } from "../control/security";
+import { projectProxySecret } from "../projects/proxy";
 import { projectRegistryPool, provisionProject } from "../projects/registry";
 import type { Project } from "../projects/registry";
-import { closeProjectInstances, withHostedProjectAuth } from "../projects/runtime";
+import { closeProjectInstances, projectSecret, withHostedProjectAuth, withProjectAuth, withProjectAuthEngine } from "../projects/runtime";
+import { readProjectSessionPrincipal } from "../projects/session-principal";
 import { requireWorkspacePrincipal } from "../workspaces/authorization";
 import { createWorkspace } from "../workspaces/repository";
 import { proxy } from "../../proxy";
@@ -24,11 +27,19 @@ import { GET as configGET } from "../../app/api/config/route";
 import { GET as nativeGET, POST as nativePOST } from "../../app/api/auth/[...all]/route";
 import { GET as sessionsGET } from "../../app/api/account/sessions/route";
 import { POST as revokePOST } from "../../app/api/account/sessions/revoke/route";
+import { GET as projectGET, POST as projectPOST } from "../../app/api/projects/[slug]/auth/[...all]/route";
 import { GET as discoveryGET } from "../../app/.well-known/openid-configuration/route";
+import { createAllAuthClient } from "../../sdk/client";
+import { createAllAuthProxy } from "../../sdk/next";
 import { edgeHeaders, portalHeader, signEdgeRequest, signPortalBinding, verifyPortalBinding } from "./edge";
 import { hostedHeaders, portalSession, requestHostedBinding, resolveHostedBinding, withPortalHeaders, withPortalRequest } from "./hosting";
 import { defaultApplicationBranding } from "../branding/validation";
 import { portalBranding } from "../branding/portal";
+
+vi.mock("next/server", async (importOriginal) => ({
+	...await importOriginal<typeof import("next/server")>(),
+	after: vi.fn(),
+}));
 
 const fixturePath = new URL("../../../../.secrets/local-postgres.json", import.meta.url);
 const secret = "isolated-hosted-gateway-secret-longer-than-thirty-two";
@@ -61,14 +72,14 @@ describe.skipIf(!existsSync(fixturePath))("real PostgreSQL hosted authentication
 		const original = new Request(`https://${hostname}${path}`, { method, headers, body: options.body });
 		return new Request(`${railwayOrigin}${path}`, { method, body: options.body, headers: await signEdgeRequest(original, secret, hostname, options.ip || "192.0.2.84") });
 	}
-	async function seed(instance: AuthInstance, name: string) {
+	async function seed(instance: AuthInstance, name: string, email = sharedEmail, passwordHash?: string) {
 		const context = await instance.$context;
 		// Native Better Auth intentionally skips origin checks under NODE_ENV=test.
 		// Re-enable the production context defaults for this actual HTTP proof.
 		context.skipOriginCheck = false; context.skipCSRFCheck = false;
 		return runWithEndpointContext({ context: context as unknown as AuthContext, path: "/local-fixture-seed", headers: new Headers() }, async () => {
-			const user = await context.internalAdapter.createUser({ email: sharedEmail, name, emailVerified: true }, { method: "admin" });
-			await context.internalAdapter.linkAccount({ providerId: "credential", accountId: user.id, userId: user.id, password: await context.password.hash(password) });
+			const user = await context.internalAdapter.createUser({ email, name, emailVerified: true }, { method: "admin" });
+			await context.internalAdapter.linkAccount({ providerId: "credential", accountId: user.id, userId: user.id, password: passwordHash ?? await context.password.hash(password) });
 			return user.id;
 		});
 	}
@@ -89,7 +100,7 @@ describe.skipIf(!existsSync(fixturePath))("real PostgreSQL hosted authentication
 		for (const [key, value] of Object.entries(env)) vi.stubEnv(key, String(value));
 		for (const key of ["GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "GITHUB_CLIENT_ID", "GITHUB_CLIENT_SECRET", "MICROSOFT_CLIENT_ID", "MICROSOFT_CLIENT_SECRET", "CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_EMAIL_API_TOKEN", "EMAIL_FROM"]) vi.stubEnv(key, "");
 		const pool = projectRegistryPool(env);
-		for (const name of readdirSync(new URL("../../migrations", import.meta.url)).filter((name) => name.endsWith(".sql") && name <= "011-application-branding.sql").sort()) await pool.query(readFileSync(new URL(`../../migrations/${name}`, import.meta.url), "utf8"));
+		for (const name of readdirSync(new URL("../../migrations", import.meta.url)).filter((name) => name.endsWith(".sql")).sort()) await pool.query(readFileSync(new URL(`../../migrations/${name}`, import.meta.url), "utf8"));
 		database = new Kysely({ dialect: new PostgresDialect({ pool: new Pool({ connectionString: String(env.DATABASE_URL), max: 2 }) }) });
 		vi.spyOn(process, "cwd").mockReturnValue(fileURLToPath(new URL("../..", import.meta.url)));
 		vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -178,7 +189,9 @@ describe.skipIf(!existsSync(fixturePath))("real PostgreSQL hosted authentication
 			const response = await nativeGET(await signedRequest(host(alpha), "/api/auth/get-session", { headers: { cookie } })); expect(response.status).toBe(200); expect(await response.json()).toBeNull();
 		}
 		const own = await nativeGET(await signedRequest(host(alpha), "/api/auth/get-session", { headers: { cookie: `${rootCookie}; ${betaCookie}; ${alphaCookie}` } })); expect(await own.json()).toMatchObject({ user: { id: alphaUserId }, session: { id: alphaSessionId } });
-		const root = await native.auth.api.getSession({ headers: new Headers({ cookie: rootCookie }) }); expect(root?.user.id).toBe(rootUserId);
+		const root = await nativeGET(new Request(`${platformOrigin}/api/auth/get-session`, { headers: { cookie: rootCookie } }));
+		expect(root.headers.get("cache-control")).toBe("no-store");
+		expect(await root.json()).toMatchObject({ user: { id: rootUserId } });
 	});
 
 	it("reads real hosted config/discovery and never selects a different project from a query string", async () => {
@@ -252,6 +265,17 @@ describe.skipIf(!existsSync(fixturePath))("real PostgreSQL hosted authentication
 
 	it("keeps the same realm across its accounts/API defaults and exposes only safe account session fields", async () => {
 		const throughApiHost = await nativeGET(await signedRequest(host(alpha, "api"), "/api/auth/get-session", { headers: { cookie: alphaCookie } })); expect(await throughApiHost.json()).toMatchObject({ user: { id: alphaUserId }, session: { id: alphaSessionId } });
+		const probe = (cookie: string) => readProjectSessionPrincipal(
+			projectRegistryPool(env),
+			alpha,
+			new Headers({ cookie }),
+			{ signingSecret: projectSecret(env, alpha.id), secureCookies: true },
+		);
+		expect(await probe(`${rootCookie}; ${betaCookie}; ${alphaCookie}`)).toMatchObject({
+			user: { id: alphaUserId },
+			session: { id: alphaSessionId },
+		});
+		expect(await probe(alphaCookie.replaceAll("__Secure-", ""))).toBeNull();
 		const listing = await sessionsGET(await signedRequest(host(alpha), "/api/account/sessions", { headers: { cookie: `${rootCookie}; ${betaCookie}; ${alphaCookie}` } })); expect(listing.status).toBe(200);
 		const body = await listing.json() as { sessions: Record<string, unknown>[]; currentSessionId: string }; expect(body.currentSessionId).toBe(alphaSessionId); expect(body.sessions).toHaveLength(1); expect(body.sessions[0]?.id).toBe(alphaSessionId);
 		for (const session of body.sessions) for (const key of Object.keys(session)) expect(["id", "createdAt", "expiresAt", "ipAddress", "userAgent"]).toContain(key);
@@ -281,5 +305,140 @@ describe.skipIf(!existsSync(fixturePath))("real PostgreSQL hosted authentication
 		expect(await (await nativeGET(await signedRequest(host(alpha), "/api/auth/get-session", { headers: { cookie: alphaCookie } }))).json()).toBeNull();
 		expect(await (await nativeGET(await signedRequest(host(beta), "/api/auth/get-session", { headers: { cookie: betaCookie } }))).json()).toMatchObject({ user: { id: betaUserId }, session: { id: betaSession.session.id } });
 		expect((await native.auth.api.getSession({ headers: new Headers({ cookie: rootCookie }) }))?.user.id).toBe(rootUserId);
+	});
+
+	it("reads and revokes a legacy project session through the engine and isolates its admission store", async () => {
+		const email = "clerk-import@hosted.fixture.example";
+		const passwordHash = await hash(password, 4);
+		const userId = await withProjectAuth(alpha.slug, (instance) => seed(instance, "Imported fixture", email, passwordHash), env);
+		const base = `${platformOrigin}/api/projects/${alpha.slug}/auth`;
+		async function legacySessionHeaders() {
+			const legacyLogin = await withProjectAuth(alpha.slug, (instance) => instance.handler(new Request(`${base}/sign-in/email`, {
+				method: "POST",
+				headers: { "content-type": "application/json", "x-real-ip": "203.0.113.32", origin: platformOrigin },
+				body: JSON.stringify({ email, password }),
+			})), env);
+			expect(legacyLogin.status).toBe(200);
+			return new Headers({ cookie: cookies(legacyLogin), origin: platformOrigin });
+		}
+		const headers = await legacySessionHeaders();
+		const expiredHeaders = await legacySessionHeaders();
+		const request = new Request(`${base}/get-session`, { headers });
+		const key = `fixture-engine:${randomUUID()}`;
+		const registry = projectRegistryPool(env);
+		const probe = (project: Project, requestHeaders: Headers) =>
+			readProjectSessionPrincipal(registry, project, requestHeaders, {
+				signingSecret: projectSecret(env, project.id),
+				secureCookies: false,
+			});
+		const id = await withProjectAuthEngine(alpha.slug, async ({ engine, consumeAdmission }) => {
+			const principal = await engine.readPrincipal(headers);
+			expect(principal).toMatchObject({
+				user: { id: userId },
+				session: { id: expect.any(String), userId },
+			});
+			expect(await probe(alpha, headers)).toEqual(principal);
+			expect(await (await engine.readSession(request)).json()).toMatchObject({
+				user: { id: userId },
+				session: { id: principal!.session.id, userId },
+			});
+			expect(await consumeAdmission(key)).toEqual({ allowed: true, retryAfter: 0 });
+			const expiring = await probe(alpha, expiredHeaders);
+			expect(expiring?.user.id).toBe(userId);
+			const expiredSession = await registry.query(
+				`UPDATE "${alpha.schemaName}"."session" SET "expiresAt" = NOW() - INTERVAL '1 minute' WHERE id = $1`,
+				[expiring!.session.id],
+			);
+			expect(expiredSession.rowCount).toBe(1);
+			expect(await probe(alpha, expiredHeaders)).toBeNull();
+			expect((await registry.query(
+				`SELECT id FROM "${alpha.schemaName}"."session" WHERE id = $1`,
+				[expiring!.session.id],
+			)).rowCount).toBe(1);
+			expect(await engine.readPrincipal(expiredHeaders)).toBeNull();
+			return principal!.session.id;
+		}, env);
+
+		await withProjectAuthEngine(beta.slug, async ({ engine }) => {
+			expect(await engine.readPrincipal(headers)).toBeNull();
+			expect(await probe(beta, headers)).toBeNull();
+			const renamed = new Headers({ cookie: headers.get("cookie")!.replaceAll(
+				`allauth_project_${alpha.slug}.`,
+				`allauth_project_${beta.slug}.`,
+			) });
+			expect(await engine.readPrincipal(renamed)).toBeNull();
+			expect(await probe(beta, renamed)).toBeNull();
+		}, env);
+		expect((await registry.query(`SELECT id FROM "${alpha.schemaName}"."rateLimit" WHERE "key"=$1`, [key])).rowCount).toBe(1);
+		expect((await registry.query(`SELECT id FROM "${beta.schemaName}"."rateLimit" WHERE "key"=$1`, [key])).rowCount).toBe(0);
+
+		await withProjectAuthEngine(alpha.slug, async ({ engine }) => {
+			const revoked = await engine.revokeAccountSession(headers, { id });
+			expect(await revoked.json()).toEqual({ success: true });
+			expect(await engine.readPrincipal(headers)).toBeNull();
+			expect(await probe(alpha, headers)).toBeNull();
+		}, env);
+	});
+
+	it("signs in, manages an organization and signs out through the first-party SDK and signed project proxy", async () => {
+		const appProxy = createAllAuthProxy({
+			appOrigin: alpha.primaryOrigin,
+			allauthURL: platformOrigin,
+			project: alpha.slug,
+			proxySecret: projectProxySecret(alpha, env),
+			getClientIP: () => "198.51.100.29",
+		});
+		const previousFetch = globalThis.fetch;
+		const jar = new Map<string, string>();
+		const client = createAllAuthClient("/api/allauth", () => {
+			throw new Error("The verified test account has no second factor.");
+		});
+		vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+			const request = input instanceof Request ? input : new Request(input, init);
+			const url = new URL(request.url);
+			if (url.origin === "http://localhost" && url.pathname.startsWith("/api/allauth/")) {
+				const headers = new Headers(request.headers);
+				headers.set("origin", alpha.primaryOrigin);
+				headers.set("cookie", [...jar].map(([name, value]) => `${name}=${value}`).join("; "));
+				const response = await appProxy(new Request(new URL(url.pathname + url.search, alpha.primaryOrigin), {
+					method: request.method,
+					headers,
+					body: request.method === "POST" ? await request.text() : undefined,
+				}), { params: Promise.resolve({ all: url.pathname.slice("/api/allauth/".length).split("/") }) });
+				for (const cookie of response.headers.getSetCookie()) {
+					const pair = cookie.split(";", 1)[0]!;
+					const separator = pair.indexOf("=");
+					const name = pair.slice(0, separator);
+					const value = pair.slice(separator + 1);
+					if (value) jar.set(name, value);
+					else jar.delete(name);
+				}
+				return response;
+			}
+			if (url.origin === platformOrigin && url.pathname.startsWith(`/api/projects/${alpha.slug}/auth/`)) {
+				const handler = request.method === "POST" ? projectPOST : projectGET;
+				return handler(request, { params: Promise.resolve({ slug: alpha.slug }) });
+			}
+			return previousFetch(input, init);
+		});
+		try {
+			expect(await client.getSession()).toEqual({ data: null, error: null });
+			const signedIn = await client.signIn.email({ email: sharedEmail, password });
+			expect(signedIn).toMatchObject({ error: null, data: { user: { id: alphaUserId } } });
+			expect(signedIn.data).not.toHaveProperty("token");
+			const session = await client.getSession();
+			expect(session).toMatchObject({ error: null, data: { session: { userId: alphaUserId } } });
+			expect(session.data?.session).not.toHaveProperty("token");
+			expect(await client.organization.create({ name: "SDK fixture organization", slug: "sdk-fixture-organization" })).toMatchObject({
+				error: null, data: { slug: "sdk-fixture-organization" },
+			});
+			expect(await client.organization.list()).toMatchObject({
+				error: null, data: [{ slug: "sdk-fixture-organization" }],
+			});
+			expect(await client.signOut()).toMatchObject({ error: null });
+			expect(await client.getSession()).toEqual({ data: null, error: null });
+		} finally {
+			vi.stubGlobal("fetch", previousFetch);
+		}
 	});
 });

@@ -16,6 +16,9 @@ const published = {
 
 test("release publication requires the immutable public tag and exact package digest", () => {
 	assert.equal(verifyPublicSdkReleases(integrity, [published], archiveSizes), 1);
+	const canonical = { ...published, html_url: "https://github.com/allauth-co/allauth-sdk/releases/tag/v1.4.3" };
+	assert.equal(verifyPublicSdkReleases(integrity, [canonical], archiveSizes), 1);
+	assert.throws(() => verifyPublicSdkReleases(integrity, [{ ...canonical, html_url: "https://github.com/example/allauth-sdk/releases/tag/v1.4.3" }], archiveSizes), /SDK publication/);
 });
 
 test("repository transfer accepts canonical and retained release URLs without trusting another repository or tag", () => {

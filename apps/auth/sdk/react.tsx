@@ -7,6 +7,7 @@ import {
 	useEffect,
 	useId,
 	useMemo,
+	useRef,
 	useState,
 } from "react";
 import type { CSSProperties, FormEvent, ReactNode } from "react";
@@ -536,8 +537,14 @@ function TwoFactorChallenge({ afterSignInUrl, logo }: { afterSignInUrl: string; 
 	);
 }
 
+/** Sign-in appearance and optional passkey sign-in. */
+export type SignInProps = AuthAppearance & {
+	/** Offer passkey sign-in for an application that has enabled it. */
+	passkeySignIn?: boolean;
+};
+
 /** Inline email-first password sign-in, configured social providers, and native MFA challenges. */
-export function SignIn({ className = "", style, afterSignInUrl: target, signUpUrl, forgotPasswordUrl, title, subtitle, logo }: AuthAppearance) {
+export function SignIn({ className = "", style, afterSignInUrl: target, signUpUrl, forgotPasswordUrl, title, subtitle, logo, passkeySignIn = false }: SignInProps) {
 	const context = useAllAuth();
 	const { client, capabilities, challenge, branding, publicBranding } = context;
 	const { targetPath, intent } = useAuthReturnTo(target, context.afterSignInUrl, context.basePath);
@@ -548,7 +555,13 @@ export function SignIn({ className = "", style, afterSignInUrl: target, signUpUr
 	const [busy, setBusy] = useState(false);
 	const [connecting, setConnecting] = useState(false);
 	const [error, setError] = useState("");
+	const passkeyAttempt = useRef<AbortController | null>(null);
 	const name = branding?.name?.trim();
+	useEffect(() => () => passkeyAttempt.current?.abort(), [client, targetPath]);
+	function finishSignIn(data: unknown) {
+		if (data && typeof data === "object" && "twoFactorRedirect" in data && data.twoFactorRedirect) return;
+		window.location.assign(targetPath);
+	}
 	async function signIn(event: FormEvent<HTMLFormElement>) {
 		event.preventDefault();
 		if (!event.currentTarget.reportValidity()) return;
@@ -563,12 +576,32 @@ export function SignIn({ className = "", style, afterSignInUrl: target, signUpUr
 			const response = await client.signIn.email({ email: email.trim(), password, callbackURL: appCallback(targetPath, window.location.origin) });
 			if (response.error) throw response.error;
 			setPassword("");
-			if (response.data && "twoFactorRedirect" in response.data && response.data.twoFactorRedirect) return;
-			window.location.assign(targetPath);
+			finishSignIn(response.data);
 		} catch (error) {
 			setError(authError(error));
 		} finally {
 			setBusy(false);
+		}
+	}
+	async function signInWithPasskey() {
+		if (passkeyAttempt.current && !passkeyAttempt.current.signal.aborted) return;
+		const controller = new AbortController();
+		passkeyAttempt.current = controller;
+		setBusy(true);
+		setError("");
+		try {
+			const response = await client.signIn.passkey({ fetchOptions: { signal: controller.signal } });
+			if (controller.signal.aborted) return;
+			if (response.error) throw response.error;
+			if (!response.data) throw new Error("Passkey sign-in could not be confirmed. Please try again.");
+			finishSignIn(response.data);
+		} catch (error) {
+			if (!controller.signal.aborted) setError(authError(error));
+		} finally {
+			if (passkeyAttempt.current === controller) {
+				passkeyAttempt.current = null;
+				setBusy(false);
+			}
 		}
 	}
 	async function social(provider: "google" | "apple" | "microsoft") {
@@ -594,7 +627,8 @@ export function SignIn({ className = "", style, afterSignInUrl: target, signUpUr
 						{capabilities.apple && !passwordStep && <AppleButton busy={busy} onClick={() => void social("apple")} />}
 						{capabilities.google && !passwordStep && <GoogleButton busy={busy} connecting={connecting} onClick={() => void social("google")} />}
 						{capabilities.microsoft && !passwordStep && <MicrosoftButton busy={busy} onClick={() => void social("microsoft")} />}
-						{(capabilities.google || capabilities.apple || capabilities.microsoft) && capabilities.emailPassword && !passwordStep && <div className="allauth-divider"><span>or</span></div>}
+						{passkeySignIn && !passwordStep && <button type="button" className="allauth-secondary" disabled={busy} onClick={() => void signInWithPasskey()}><KeyRound size={16} aria-hidden="true" />Sign in with a passkey</button>}
+						{(capabilities.google || capabilities.apple || capabilities.microsoft || passkeySignIn) && capabilities.emailPassword && !passwordStep && <div className="allauth-divider"><span>or</span></div>}
 						{capabilities.emailPassword && <form className="allauth-auth-form" onSubmit={signIn}>
 							{passwordStep ? <>
 								<div className="allauth-email-summary"><span>{email}</span><button type="button" className="allauth-back-button" disabled={busy} onClick={() => { setPasswordStep(false); setPassword(""); setError(""); }}><ChevronLeft size={16} aria-hidden="true" />Change email</button></div>
@@ -606,7 +640,7 @@ export function SignIn({ className = "", style, afterSignInUrl: target, signUpUr
 							</Field>}
 							<button type="submit" className="allauth-primary" disabled={busy}>{busy ? "Signing in…" : "Continue"}<ArrowRight size={16} aria-hidden="true" /></button>
 						</form>}
-						{!capabilities.emailPassword && !capabilities.google && !capabilities.apple && !capabilities.microsoft && <Notice message="No sign-in methods are enabled for this app." />}
+						{!capabilities.emailPassword && !capabilities.google && !capabilities.apple && !capabilities.microsoft && !passkeySignIn && <Notice message="No sign-in methods are enabled for this app." />}
 					</>}
 				</div>
 				<AuthFooter>{signUpUrl && capabilities?.signUpEnabled !== false && <p>Don’t have an account? <a href={withAuthReturnTo(signUpUrl, intent)}>Sign up</a></p>}</AuthFooter>

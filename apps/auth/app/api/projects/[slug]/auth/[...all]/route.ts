@@ -1,4 +1,3 @@
-import { runWithAdapter } from "@better-auth/core/context";
 import { APIError } from "better-auth";
 import { after } from "next/server";
 import * as z from "zod";
@@ -7,16 +6,9 @@ import { getAuthEnvironment } from "@/lib/auth";
 import { recordSdkVersionObservation } from "@/lib/notifications/repository";
 import { backendCredentialRepository } from "@/lib/projects/backend-credentials";
 import { projectRegistryPool } from "@/lib/projects/registry";
-import {
-	projectInstance,
-	projectSecret,
-	withProjectAuth,
-} from "@/lib/projects/runtime";
+import { projectSecret, withProjectAuthEngine } from "@/lib/projects/runtime";
 import { handleServiceDirectoryRequest } from "@/lib/projects/service-directory-transport";
-import {
-	consumeProxySessionCheck,
-	handleProjectAuthentication,
-} from "@/lib/projects/session-introspection";
+import { handleProjectAuthentication } from "@/lib/projects/session-introspection";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -27,11 +19,9 @@ async function handle(
 	try {
 		const { slug } = await context.params;
 		const environment = await getAuthEnvironment();
-		const response = await withProjectAuth(
+		const response = await withProjectAuthEngine(
 			slug,
-			async (instance, _env, project) => {
-				const entry = projectInstance(instance);
-				if (!entry) throw new Error("Project instance is unavailable.");
+			async ({ engine, consumeAdmission }, _env, project) => {
 				const directory = await handleServiceDirectoryRequest(
 					request,
 					project,
@@ -40,16 +30,9 @@ async function handle(
 							backendCredentialRepository(
 								projectRegistryPool(environment),
 							).authorize(project.id, headers),
-						consume: (key) => consumeProxySessionCheck(entry.pool, key),
-						read: async (operation, headers, query) =>
-							runWithAdapter((await instance.$context).adapter, async () => {
-								const endpoint: unknown = Reflect.get(instance.api, operation);
-								if (typeof endpoint !== "function")
-									throw new Error("Directory endpoint is unavailable.");
-								return Reflect.apply(endpoint, instance.api, [
-									{ headers, query, asResponse: true },
-								]) as Promise<Response>;
-							}),
+						consume: consumeAdmission,
+						read: (operation, headers, query) =>
+							engine.readDirectory(operation, headers, query),
 					},
 				);
 				if (directory) return directory;
@@ -59,18 +42,10 @@ async function handle(
 					environment,
 					projectSecret(environment, project.id),
 					{
-						scope: instance,
-						consume: (key) => consumeProxySessionCheck(entry.pool, key),
-						session: async (headers, verified) =>
-							runWithAdapter((await instance.$context).adapter, () =>
-								instance.api.getSession({
-									headers,
-									request: verified,
-									query: { disableCookieCache: true },
-									asResponse: true,
-								}),
-							),
-						fallback: (verified) => instance.handler(verified),
+						scope: engine,
+						consume: consumeAdmission,
+						session: (_headers, verified) => engine.readSession(verified),
+						fallback: (verified) => engine.dispatch(verified),
 					},
 				);
 				const version = request.headers.get("x-allauth-sdk-version");

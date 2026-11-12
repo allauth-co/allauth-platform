@@ -8,7 +8,7 @@ import { platformReleases, sdkReleases } from "./releases";
 describe("customer SDK release emails", () => {
 	it("renders platform branding, compatibility guidance, release notes and preference recovery in HTML and text", async () => {
 		const element = createElement(ReleaseNotificationEmail, {
-			release: sdkReleases[0],
+			release: { ...sdkReleases[0], compatibility: "backward-compatible" },
 			notificationsUrl: "https://allauth.co/admin/notifications",
 		});
 		const [html, text] = await Promise.all([
@@ -23,6 +23,15 @@ describe("customer SDK release emails", () => {
 			expect(body).toContain("keeps working");
 			expect(body).toContain("does not change");
 		}
+	});
+	it("labels major SDK upgrades and gives customers control of the migration", async () => {
+		const html = await render(createElement(ReleaseNotificationEmail, {
+			release: { ...sdkReleases[0], version: "2.0.0", compatibility: "migration-required" },
+			notificationsUrl: "https://allauth.co/admin/notifications",
+		}));
+		expect(html).toContain("major SDK upgrade requires application changes");
+		expect(html).toContain("Your installed version keeps working");
+		expect(html).not.toContain("backward-compatible SDK update");
 	});
 	it("renders an announced platform update without SDK installation claims", async () => {
 		const release: AnnouncedPlatformRelease = {
@@ -54,7 +63,7 @@ describe("customer SDK release emails", () => {
 			expect(release.downloadUrl).toBe(
 				`https://allauth.co/sdk/allauth-react-${release.version}.tgz`,
 			);
-			expect(release.compatibility).toBe("backward-compatible");
+			expect(["backward-compatible", "migration-required"]).toContain(release.compatibility);
 		}
 	});
 });

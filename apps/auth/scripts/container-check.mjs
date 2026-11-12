@@ -71,16 +71,18 @@ async function checkProjectProvisioning(origin) {
 	const owner = await fetch(`${origin}/api/auth/get-session`, { headers });
 	assert.equal(owner.status, 200, "The native signed fixture cookie must authenticate in the compiled image");
 	assert.equal((await owner.json())?.user.id, userId);
+	const jsonHeaders = { ...headers, "content-type": "application/json" };
 	const workspaceResponse = await fetch(`${origin}/api/workspaces`, {
-		method: "POST", headers: { ...headers, "content-type": "application/json" },
+		method: "POST", headers: jsonHeaders,
 		body: JSON.stringify({ name: "Container Fixture", slug: `container-workspace-${suffix}` }),
 	});
 	assert.equal(workspaceResponse.status, 201, "Create an explicit owner workspace before provisioning an application");
 	const { workspace } = await workspaceResponse.json();
+	assert.match(workspace.id, /^[a-f\d-]{36}$/);
 	const slug = `container-fixture-${suffix}`;
 	const projectResponse = await fetch(`${origin}/api/admin/projects`, {
-		method: "POST", headers: { ...headers, "content-type": "application/json" },
-		body: JSON.stringify({ name: "Container Fixture", slug, workspaceId: workspace.id, primaryOrigin: "https://app.fixture.example", origins: [] }),
+		method: "POST", headers: jsonHeaders,
+		body: JSON.stringify({ name: "Container Fixture", slug, primaryOrigin: "https://app.fixture.example", origins: [], workspaceId: workspace.id }),
 	});
 	assert.equal(projectResponse.status, 201, "The compiled project route must provision all packaged runtime migrations");
 	const { project } = await projectResponse.json();
@@ -96,8 +98,8 @@ async function checkProjectProvisioning(origin) {
 		assert.equal(await query(`SELECT COUNT(*) FROM "${schema}"."allauthMigrations" WHERE name='${name}' AND length(checksum)=64`), "1", `${name} must be packaged for a fresh environment`);
 	}
 	const developmentResponse = await fetch(`${origin}/api/admin/projects`, {
-		method: "POST", headers: { ...headers, "content-type": "application/json" },
-		body: JSON.stringify({ name: "Container Fixture", slug: `${slug}-dev`, workspaceId: workspace.id, primaryOrigin: "http://localhost:3300", origins: [], applicationId: project.applicationId, environment: "development" }),
+		method: "POST", headers: jsonHeaders,
+		body: JSON.stringify({ name: "Container Fixture", slug: `${slug}-dev`, primaryOrigin: "http://localhost:3300", origins: [], applicationId: project.applicationId, environment: "development", workspaceId: workspace.id }),
 	});
 	assert.equal(developmentResponse.status, 201, "A sibling environment must provision a separate realm");
 	const { project: development } = await developmentResponse.json();
@@ -107,8 +109,8 @@ async function checkProjectProvisioning(origin) {
 	assert.notEqual(developmentSchema, schema);
 	assert.equal(await query(`SELECT COUNT(*) FROM "${developmentSchema}"."user"`), "0");
 	const duplicateEnvironment = await fetch(`${origin}/api/admin/projects`, {
-		method: "POST", headers: { ...headers, "content-type": "application/json" },
-		body: JSON.stringify({ name: "Duplicate", slug: `${slug}-duplicate`, workspaceId: workspace.id, primaryOrigin: "http://localhost:3301", origins: [], applicationId: project.applicationId, environment: "development" }),
+		method: "POST", headers: jsonHeaders,
+		body: JSON.stringify({ name: "Duplicate", slug: `${slug}-duplicate`, primaryOrigin: "http://localhost:3301", origins: [], applicationId: project.applicationId, environment: "development", workspaceId: workspace.id }),
 	});
 	assert.equal(duplicateEnvironment.status, 409, "Each application may have only one realm per environment");
 	assert.equal(await query('SELECT COUNT(*) FROM public."allauthProject"'), "2", "Rejected duplicate environments must roll back");

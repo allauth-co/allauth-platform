@@ -6,7 +6,7 @@ AllAuth's managed workspace subscriptions use a separate server-only Stripe clie
 
 The inventory follows the [official plugin index](https://www.better-auth.com/docs/plugins) and the individual documentation files in this repository. Provider-maintained integrations listed there are identified separately below. Versions and licenses were checked against published npm metadata and package/repository license files during this implementation; they are pinned in `package.json` and the lockfile. New plugin code must pass migrations, native flow checks and release verification before it is described as deployed.
 
-The hosted authentication and account pages use the MIT-licensed [Better Auth UI](https://better-auth-ui.com) shadcn registry with `@better-auth-ui/core` and `@better-auth-ui/react` **1.7.27**. This is a frontend component layer. Source and retained licenses are documented in [ATTRIBUTION.md](./components/better-auth-ui/ATTRIBUTION.md); embedding applications can use the [optional SDK provider recipe](./sdk/BETTER_AUTH_UI.md). Session controls use opaque IDs, and unconfigured uploads remain hidden.
+The hosted authentication and account pages use the MIT-licensed [Better Auth UI](https://better-auth-ui.com) shadcn registry with `@better-auth-ui/core` and `@better-auth-ui/react` **1.7.27**. This is a frontend component layer. Source and retained licenses are documented in [ATTRIBUTION.md](./components/better-auth-ui/ATTRIBUTION.md). For embedding applications using the optional v1 registry provider, see the [SDK v2 UI upgrade guide](./sdk/UI_UPGRADE.md). Session controls use opaque IDs, and unconfigured uploads remain hidden.
 
 ## Authentication and administration
 

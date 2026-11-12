@@ -18,16 +18,21 @@ export function ReleaseDate({ release }: { release: PublicRelease }) {
 	return date ? <time dateTime={date}>{new Date(date).toLocaleDateString("en", { year: "numeric", month: "long", day: "numeric", timeZone: "UTC" })}</time> : <span>Original publication date unverified</span>;
 }
 
+export function ReleaseCompatibility({ release }: { release: PublicRelease }) {
+	if (release.compatibility === "historical" || release.compatibility === "platform-update") return null;
+	return <span className="public-docs-compatibility">{release.compatibility === "migration-required" ? "Migration required" : "Backward compatible"}</span>;
+}
+
 export function ReleaseLinks({ release }: { release: SdkRelease }) {
 	return <div className="public-docs-links"><a href={release.downloadUrl}>Download {release.version}</a><a href={release.sourceUrl}>Source at v{release.version}</a><a href={`${sdkReleaseRepositoryUrl(release)}/releases/tag/v${release.version}`}>GitHub release</a></div>;
 }
 
 export function ReleaseSummary({ release }: { release: PublicRelease }) {
 	return <article id={release.slug} className="public-release-summary">
-		<div className="public-release-meta"><span className="public-docs-version">{release.kind === "sdk" ? `SDK ${release.version}` : "Platform update"}</span><ReleaseDate release={release} />{release.compatibility === "backward-compatible" && <span className="public-docs-compatibility">Backward compatible</span>}</div>
+		<div className="public-release-meta"><span className="public-docs-version">{release.kind === "sdk" ? `SDK ${release.version}` : "Platform update"}</span><ReleaseDate release={release} /><ReleaseCompatibility release={release} /></div>
 		<h2><Link href={new URL(publicReleaseUrl(release)).pathname}>{release.title}</Link></h2>
 		<p>{release.summary}</p>
-		{release.kind === "sdk" && !release.announce && <p className="public-docs-note">Historical notes reconstructed from preserved SDK archives.</p>}
+		{release.kind === "sdk" && release.dateConfidence === "unknown" && <p className="public-docs-note">Historical notes reconstructed from preserved SDK archives.</p>}
 		<div className="public-docs-links"><Link href={`/releases/${release.slug}`}>Read release notes</Link>{release.kind === "sdk" && <><a href={release.downloadUrl}>Download {release.version}</a><a href={release.sourceUrl}>Versioned source</a></>}</div>
 	</article>;
 }

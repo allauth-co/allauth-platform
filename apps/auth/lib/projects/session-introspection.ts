@@ -1,7 +1,8 @@
-import { createHash, createHmac, timingSafeEqual } from "node:crypto";
+import { createHash } from "node:crypto";
 import { APIError } from "better-auth";
 import { getSessionCookie } from "better-auth/cookies";
 import type { AuthEnvironment } from "../configuration";
+import { verifyLegacySessionCookie } from "./legacy-session-cookie";
 import { verifiedProjectRequest } from "./proxy";
 import type { Project } from "./registry";
 import type { SessionCheckCoordinator } from "./session-check-coordinator";
@@ -81,20 +82,8 @@ function authenticSessionCookie(
 			cookiePrefix: `allauth_project_${project.slug}`,
 		});
 		if (!serialized || serialized.length > 1024) return null;
-		const value = decodeURIComponent(serialized),
-			separator = value.lastIndexOf(".");
-		if (separator < 1) return null;
-		const token = value.slice(0, separator),
-			signature = value.slice(separator + 1);
-		if (!/^[A-Za-z0-9+/]{43}=$/.test(signature)) return null;
-		const actual = Uint8Array.from(atob(signature), (character) =>
-			character.charCodeAt(0),
-		);
-		const expected = createHmac("sha256", secret).update(token).digest();
-		return actual.length === expected.length &&
-			timingSafeEqual(actual, expected)
-			? value
-			: null;
+		const value = decodeURIComponent(serialized);
+		return verifyLegacySessionCookie(value, secret) ? value : null;
 	} catch {
 		return null;
 	}

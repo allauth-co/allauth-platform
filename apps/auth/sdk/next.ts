@@ -82,6 +82,65 @@ const privateResponseKeys = new Set([
 	"apikey",
 ]);
 
+function appContinuation(value: string, app: URL): URL | undefined {
+	try {
+		const destination = new URL(value, app.origin);
+		if (
+			destination.origin === app.origin &&
+			!destination.username &&
+			!destination.password
+		)
+			return destination;
+	} catch {
+		return;
+	}
+}
+
+/** Translate native redirects for SDK requests while keeping ordinary browser links intact. */
+function sdkContinuation(
+	request: Request,
+	endpoint: string,
+	upstream: Response,
+	app: URL,
+) {
+	const location = upstream.headers.get("location");
+	if (
+		upstream.status !== 302 ||
+		request.headers.get("accept") !== "application/json" ||
+		!location
+	)
+		return;
+	const destination = appContinuation(location, app);
+	if (!destination) return;
+	if (
+		request.method === "POST" &&
+		(endpoint === "sign-in/email" || endpoint === "sign-in/username")
+	) {
+		if (
+			destination.pathname === "/sign-in" &&
+			destination.searchParams.getAll("challenge").join() === "two-factor"
+		)
+			return { twoFactorRedirect: true };
+		return;
+	}
+	if (request.method !== "GET" || endpoint !== "verify-email") return;
+	const callbacks = new URL(request.url).searchParams.getAll("callbackURL");
+	if (callbacks.length !== 1 || !callbacks[0]) return;
+	const callback = appContinuation(callbacks[0], app);
+	if (!callback) return;
+	if (destination.href === callback.href)
+		return { status: true, user: null, redirect: true, url: destination.href };
+	const code = destination.searchParams.getAll("error").at(-1);
+	if (!code || !/^[A-Z][A-Z0-9_]*$/.test(code)) return;
+	const error = new URLSearchParams({ error: code });
+	const query = callback.search;
+	callback.search = query
+		? `${query}${query.endsWith("&") ? "" : "&"}${error}`
+		: error.toString();
+	if (destination.href === callback.href)
+		return { status: false, user: null, redirect: true, url: destination.href };
+}
+
 async function boundedRequestBody(
 	request: Request,
 ): Promise<Uint8Array<ArrayBuffer> | null> {
@@ -409,6 +468,12 @@ export function createAllAuthProxy(options: AllAuthProxyOptions) {
 			}
 			for (const cookie of cookieHeaders(upstream))
 				resultHeaders.append("set-cookie", cookie);
+			const sdkRedirect = sdkContinuation(request, endpoint, upstream, app);
+			if (sdkRedirect) {
+				resultHeaders.delete("location");
+				resultHeaders.set("content-type", "application/json");
+				return Response.json(sdkRedirect, { headers: resultHeaders });
+			}
 			if (upstream.headers.get("content-type")?.includes("application/json")) {
 				const body = await upstream.text();
 				if (!body.trim())

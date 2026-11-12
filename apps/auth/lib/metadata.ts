@@ -1,4 +1,5 @@
 import type { Metadata } from "next/types";
+import { setting } from "./configuration";
 
 export function createMetadata(override: Metadata): Metadata {
 	return {
@@ -20,4 +21,4 @@ export function createMetadata(override: Metadata): Metadata {
 }
 
 export const baseUrl =
-	new URL(process.env.BETTER_AUTH_URL || "https://allauth.co");
+	new URL(setting({}, "ALLAUTH_AUTH_URL") || "https://allauth.co");

@@ -9,7 +9,9 @@ import {
 	getAuthEnvironment,
 	postgresDatabase,
 	withAuth,
+	withAuthEngine,
 } from "../auth";
+import type { AuthEngine, ProjectAuthScope } from "../auth-engine";
 import type { AuthPolicy } from "../auth-policy/policy";
 import { readAuthPolicy } from "../auth-policy/storage";
 import { guardAvatarUserDeletion } from "../avatars/deletion";
@@ -35,6 +37,7 @@ import {
 	revokeAuthenticationChallenges,
 	revokeUserGrants,
 } from "../enterprise";
+import { legacyAuthEngine } from "../legacy-auth-engine";
 import {
 	nativePasskeyCapability,
 	selectedNativePasskeys,
@@ -69,6 +72,7 @@ import {
 	projectBrokerSecret,
 	projectRegistryPool,
 } from "./registry";
+import { consumeProxySessionCheck } from "./session-introspection-admission";
 import { checkedProjectSchema } from "./validation";
 
 type Instance = ReturnType<typeof createAuth>;
@@ -87,11 +91,11 @@ const instances = new WeakMap<Instance, Entry>();
 export async function platformProjectAdministrator(
 	headers: Headers,
 ): Promise<ControlPrincipal | null> {
-	const current = await runWithAdapter((await auth.$context).adapter, () =>
-		auth.api.getSession({ headers, query: { disableCookieCache: true } }),
+	const current = await withAuthEngine((engine) =>
+		engine.readPrincipal(headers),
 	);
 	return current && isPlatformAdmin(current.user, current.session)
-		? (current as ControlPrincipal)
+		? current
 		: null;
 }
 export const projectInstance = (instance: Instance) => instances.get(instance);
@@ -139,9 +143,11 @@ async function build(
 	pool.on("error", () =>
 		console.error("AllAuth project database connection error."),
 	);
+	const secret = projectSecret(environment, project.id);
 	const env = {
 		...environment,
-		BETTER_AUTH_SECRET: projectSecret(environment, project.id),
+		ALLAUTH_AUTH_SECRET: secret,
+		BETTER_AUTH_SECRET: secret,
 		SCIM_CREDENTIAL_HASH_SECRET: createHmac(
 			"sha256",
 			setting(environment, "SCIM_CREDENTIAL_HASH_SECRET"),
@@ -387,6 +393,34 @@ export async function closeProjectInstances() {
 	await entries.close();
 }
 
+/** Pair dispatch and admission with the same checked PostgreSQL project schema. */
+export function withProjectAuthEngine<T>(
+	slug: string,
+	callback: (
+		scope: ProjectAuthScope,
+		env: AuthEnvironment,
+		project: Project,
+	) => Promise<T>,
+	environment?: AuthEnvironment,
+): Promise<T> {
+	return withProjectAuth(
+		slug,
+		(instance, env, project) => {
+			const entry = instances.get(instance);
+			if (!entry) throw new Error("Project instance is unavailable.");
+			return callback(
+				{
+					engine: legacyAuthEngine(instance),
+					consumeAdmission: (key) => consumeProxySessionCheck(entry.pool, key),
+				},
+				env,
+				project,
+			);
+		},
+		environment,
+	);
+}
+
 /** Callers must supply a hostname from the verified gateway/domain lookup, never a request Host alone. */
 export async function withHostedProjectAuth<T>(
 	project: Project,
@@ -410,5 +444,20 @@ export async function withHostedProjectAuth<T>(
 		() =>
 			build(project, environment, configured.policy, googleProvider, origin),
 		(entry) => callback(entry.auth, entry.env, project),
+	);
+}
+
+/** Use the same verified custom hostname binding and project pool as hosted auth. */
+export function withHostedProjectAuthEngine<T>(
+	project: Project,
+	hostname: string,
+	callback: (engine: AuthEngine, env: AuthEnvironment) => Promise<T>,
+	environment: AuthEnvironment,
+): Promise<T> {
+	return withHostedProjectAuth(
+		project,
+		hostname,
+		(instance, env) => callback(legacyAuthEngine(instance), env),
+		environment,
 	);
 }

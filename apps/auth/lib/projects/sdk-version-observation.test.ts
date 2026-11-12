@@ -4,15 +4,15 @@ import { GET } from "../../app/api/projects/[slug]/auth/[...all]/route";
 const state = vi.hoisted(() => ({
 	after: vi.fn(), record: vi.fn(async () => {}),
 	handle: vi.fn(async () => Response.json({ ok: true })),
-	instance: { $context: Promise.resolve({ adapter: {} }), api: { getSession: vi.fn() }, handler: vi.fn() },
+	scope: { engine: { dispatch: vi.fn(), readSession: vi.fn(), readDirectory: vi.fn() }, consumeAdmission: vi.fn() },
 }));
 vi.mock("next/server", () => ({ after: state.after }));
 vi.mock("@/lib/auth", () => ({ getAuthEnvironment: async () => ({}) }));
 vi.mock("@/lib/projects/runtime", () => ({
-	withProjectAuth: async (_slug: string, callback: (instance: typeof state.instance, env: object, project: { id: string }) => Promise<Response>) => callback(state.instance, {}, { id: "fixture-project" }),
-	projectInstance: () => ({ pool: {} }), projectSecret: () => "fixture-secret",
+	withProjectAuthEngine: async (_slug: string, callback: (scope: typeof state.scope, env: object, project: { id: string }) => Promise<Response>) => callback(state.scope, {}, { id: "fixture-project" }),
+	projectSecret: () => "fixture-secret",
 }));
-vi.mock("@/lib/projects/session-introspection", () => ({ handleProjectAuthentication: state.handle, consumeProxySessionCheck: vi.fn() }));
+vi.mock("@/lib/projects/session-introspection", () => ({ handleProjectAuthentication: state.handle }));
 vi.mock("@/lib/notifications/repository", () => ({ recordSdkVersionObservation: state.record }));
 afterEach(() => { vi.clearAllMocks(); });
 

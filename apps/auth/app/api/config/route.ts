@@ -1,4 +1,4 @@
-import { authConfiguration, projectEmailEnvironment } from "@/lib/configuration";
+import { authConfiguration, authOrigin, projectEmailEnvironment } from "@/lib/configuration";
 import { emailConfigured } from "@/lib/email/send";
 import { json } from "@/lib/api";
 import { withPortalRequest } from "@/lib/domains/hosting";
@@ -27,6 +27,6 @@ export async function GET(request: Request) {
 		const branding = await readPublicApplicationBranding(binding.project.id, env);
 		const directGoogle = Boolean(instance.options.socialProviders?.google);
 		const googleProvider = directGoogle ? "google" : configured.google ? "allauth" : null;
-		return json({ ...configured, google: Boolean(googleProvider), googleProvider, github: false, broker: !directGoogle, realmName: branding.name, branding, platformOrigin: new URL(String(env.BETTER_AUTH_URL || process.env.BETTER_AUTH_URL || "https://allauth.co")).origin });
+		return json({ ...configured, google: Boolean(googleProvider), googleProvider, github: false, broker: !directGoogle, realmName: branding.name, branding, platformOrigin: authOrigin(env) });
 	});
 }

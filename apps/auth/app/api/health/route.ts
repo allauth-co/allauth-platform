@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import { Pool } from "pg";
+import { setting } from "@/lib/configuration";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -11,23 +12,23 @@ let readinessPool: Pool | undefined;
 export async function GET() {
 	const connectionString = process.env.DATABASE_URL;
 	const headers = { "Cache-Control": "no-store" };
-	if (
-		!connectionString ||
-		(process.env.BETTER_AUTH_SECRET?.length || 0) < 32 ||
-		(process.env.SCIM_CREDENTIAL_HASH_SECRET?.length || 0) < 32
-	)
-		return Response.json({ status: "unavailable" }, { status: 503, headers });
-
-	const pool = (readinessPool ??= new Pool({
-		connectionString,
-		max: 1,
-		connectionTimeoutMillis: 3000,
-		idleTimeoutMillis: 1000,
-		allowExitOnIdle: true,
-		query_timeout: 3000,
-		statement_timeout: 3000,
-	}));
 	try {
+		if (
+			!connectionString ||
+			setting({}, "ALLAUTH_AUTH_SECRET").length < 32 ||
+			setting({}, "SCIM_CREDENTIAL_HASH_SECRET").length < 32
+		) {
+			return Response.json({ status: "unavailable" }, { status: 503, headers });
+		}
+		const pool = (readinessPool ??= new Pool({
+			connectionString,
+			max: 1,
+			connectionTimeoutMillis: 3000,
+			idleTimeoutMillis: 1000,
+			allowExitOnIdle: true,
+			query_timeout: 3000,
+			statement_timeout: 3000,
+		}));
 		const directory = path.join(process.cwd(), "migrations");
 		const names = (await readdir(directory))
 			.filter((name) => name.endsWith(".sql"))

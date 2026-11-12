@@ -192,9 +192,7 @@ Organization actions use actual membership and owner/admin permission checks.
 Include Google, Apple and Microsoft in every new application's setup review.
 Use the shared `SignIn` and `SignUp` components without hardcoded capability
 flags or a manually maintained provider list. They load the exact environment's
-enabled providers and handle return paths and native MFA automatically. The
-optional `AllAuthUIProvider` also discovers providers when its `socialProviders`
-prop is omitted; an explicit array remains an override.
+enabled providers and handle return paths and native MFA automatically.
 
 Configure direct Google under User & authentication → Social connections. Apple
 requires an Apple Services ID, signing key and HTTPS return URL. Microsoft requires
@@ -273,9 +271,9 @@ The new components require React DOM matching the supported React version.
 The hosted pages use the official Better Auth UI shadcn components, version
 1.7.27. Sign-in, account/security and organization surfaces share the management
 console's AllAuth styling and responsive navigation; native authentication and
-session actions remain functional. For an application that wants those same
-registry components, see [the optional UI provider recipe](./sdk/BETTER_AUTH_UI.md).
-It uses the same server proxy and isolates its UI query cache by project.
+session actions remain functional. Applications using the optional v1 registry
+provider can follow the [SDK v2 UI upgrade guide](./sdk/UI_UPGRADE.md) when they
+upgrade to the first-party components.
 The administration console supports organization creation and profile management,
 members, invitations, teams and custom permission roles within the selected
 environment. Creation requires an existing verified owner in that environment.
@@ -467,7 +465,7 @@ level from it or assume an `amr` claim is present.
 
 The SDK 1.4.0 candidate supports opt-in connected-application support sessions.
 Enable `supportAccess: { enabled: true }` on `createAllAuthProxy`, enable
-`supportAccess` on the shared `AllAuthProvider` (or `AllAuthUIProvider`), then
+`supportAccess` on the shared `AllAuthProvider`, then
 register the exact application proxy `/support/callback` URL in the selected
 environment's User & authentication → Support access settings. Custom proxy
 mounts must set the same `basePath` on both server and provider. All three steps

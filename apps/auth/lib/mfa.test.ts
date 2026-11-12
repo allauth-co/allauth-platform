@@ -1,6 +1,8 @@
+import { createEmailVerificationToken } from "better-auth/api";
 import { makeSignature, symmetricDecrypt } from "better-auth/crypto";
 import { getTestInstance } from "better-auth/test";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { createAllAuthProxy } from "../sdk/next";
 import { createAuthOptions } from "./auth";
 import { applicationMfaCallback } from "./mfa";
 import type { AuthRealm } from "./auth";
@@ -64,6 +66,72 @@ async function fixture(publicOrigin?: string, platformAccount = false, enroll = 
 
 /** @see https://better-auth.com/docs/plugins/2fa */
 describe("hosted authentication challenge origin",()=>{
+	it("continues actual native password MFA through the SDK's signed JSON proxy", async () => {
+		const state = await fixture();
+		const proxy = createAllAuthProxy({
+			appOrigin: application,
+			allauthURL: platform,
+			project: "fixture",
+			proxySecret: "a".repeat(64),
+		});
+		const payload = { email: "mfa@fixture.example", password, callbackURL: `${application}/account` };
+		const transport = vi.spyOn(globalThis, "fetch").mockImplementationOnce(async (input, init) => {
+			const request = new Request(input, init);
+			expect(new URL(request.url).pathname).toBe("/api/projects/fixture/auth/sign-in/email");
+			expect(request.headers.get("allauth-proxy-signature")).toMatch(/^[0-9a-f]{64}$/);
+			expect(await request.json()).toEqual(payload);
+			const response = await state.request("/sign-in/email", payload);
+			expect(response.status).toBe(302);
+			expect(response.headers.get("location")).toBe(`${application}/sign-in?challenge=two-factor&callbackUrl=%2Faccount`);
+			return response;
+		});
+		try {
+			const response = await proxy(new Request(`${application}/api/allauth/sign-in/email`, {
+				method: "POST",
+				headers: { origin: application, accept: "application/json", "content-type": "application/json" },
+				body: JSON.stringify(payload),
+			}), { params: Promise.resolve({ all: ["sign-in", "email"] }) });
+			expect(response.status).toBe(200);
+			expect(await response.json()).toEqual({ twoFactorRedirect: true });
+			expect(response.headers.getSetCookie()).toEqual(expect.arrayContaining([expect.stringContaining("allauth_project_fixture.two_factor=")]));
+			expect(await (await state.request("/get-session")).json()).toBeNull();
+			expect((await state.request("/two-factor/verify-totp", { code: state.code })).status).toBe(200);
+			expect(await (await state.request("/get-session")).json()).toMatchObject({ user: { id: state.userId } });
+		} finally {
+			transport.mockRestore();
+		}
+	});
+	it("keeps actual native email verification's requested callback in SDK JSON", async () => {
+		const state = await fixture(undefined, false, false);
+		const token = await createEmailVerificationToken(secret, "mfa@fixture.example");
+		const callbackURL = `${application}/account?from=verification`;
+		const query = new URLSearchParams({ token, callbackURL });
+		const proxy = createAllAuthProxy({
+			appOrigin: application,
+			allauthURL: platform,
+			project: "fixture",
+			proxySecret: "a".repeat(64),
+		});
+		const transport = vi.spyOn(globalThis, "fetch").mockImplementationOnce(async (input, init) => {
+			const request = new Request(input, init);
+			const url = new URL(request.url);
+			expect(url.pathname).toBe("/api/projects/fixture/auth/verify-email");
+			expect(request.headers.get("allauth-proxy-signature")).toMatch(/^[0-9a-f]{64}$/);
+			const response = await state.request(`/verify-email${url.search}`);
+			expect(response.status).toBe(302);
+			expect(response.headers.get("location")).toBe(callbackURL);
+			return response;
+		});
+		try {
+			const response = await proxy(new Request(`${application}/api/allauth/verify-email?${query}`, {
+				headers: { accept: "application/json" },
+			}), { params: Promise.resolve({ all: ["verify-email"] }) });
+			expect(response.status).toBe(200);
+			expect(await response.json()).toEqual({ status: true, user: null, redirect: true, url: callbackURL });
+		} finally {
+			transport.mockRestore();
+		}
+	});
 	it("signs a credentialless migrated account in with a captured email code", async () => {
 		const state = await fixture(hosted, false, false);
 		await (await state.native.auth.$context).adapter.deleteMany({ model: "account", where: [{ field: "userId", value: state.userId }, { field: "providerId", value: "credential" }] });

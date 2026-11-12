@@ -49,7 +49,9 @@ import { defaultApplicationBranding } from "./branding/validation";
 import {guardOwnedAvatarProfileImage} from "./avatars/profile";
 import { clerkCompatiblePasswords } from "./clerk-password";
 import { projectEmailAliases, projectEmailAliasVariable } from "./project-email-aliases";
+import type { AuthEngine } from "./auth-engine";
 import { guardCommercialAdapter, readWorkspaceEntitlements } from "./billing/entitlements";
+import { legacyAuthEngine } from "./legacy-auth-engine";
 
 export { authConfiguration, isPlatformAdmin, validateRedirectUris } from "./configuration";
 export type { AuthEnvironment } from "./configuration";
@@ -316,8 +318,15 @@ export async function withAuth<T>(callback: (auth: Auth, env: AuthEnvironment) =
 	finally { await pool.end(); }
 }
 
+/** Resolve the platform engine inside its existing connection lifetime. */
+export function withAuthEngine<T>(
+	callback: (engine: AuthEngine, env: AuthEnvironment) => Promise<T>,
+): Promise<T> {
+	return withAuth((instance, env) => callback(legacyAuthEngine(instance), env));
+}
+
 const deferredAPI = new Proxy({} as Auth["api"], { get(_target, property) { return (...args: unknown[]) => withAuth(async (instance) => { const endpoint: unknown = Reflect.get(instance.api, property); if (typeof endpoint !== "function") throw new Error("Unknown authentication endpoint."); return Reflect.apply(endpoint, instance.api, args); }); } });
-const handler = (request: Request) => withAuth((instance) => instance.handler(request));
+const handler = (request: Request) => withAuthEngine((engine) => engine.dispatch(request));
 export const auth = { handler, fetch: handler, api: deferredAPI, options: { baseURL: authOrigin({}), basePath: "/api/auth" }, get $context() { return withAuth((instance) => instance.$context); } } as Auth;
 export type Session = typeof auth.$Infer.Session;
 export type ActiveOrganization = typeof auth.$Infer.ActiveOrganization;

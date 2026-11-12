@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { sdkReleases } from "../lib/notifications/releases";
 import { sdkRepositoryUrl } from "../lib/public-site";
-import sdkPackage from "../sdk/package.json";
+import sdkPackage from "../lib/published-sdk.json";
 
 const sdkVersionsBeforeRepositoryTransfer = /^1\.(?:[0-3]\.\d+|4\.[0-6])$/;
 
@@ -14,7 +14,7 @@ test("the default SDK release has immutable download metadata and customer-facin
 	assert.equal(sdkReleases[0]?.version, sdkPackage.version);
 	const archive = await readFile(new URL(`../public/sdk/allauth-react-${sdkPackage.version}.tgz`, import.meta.url));
 	assert.equal(release.sha256, createHash("sha256").update(archive).digest("hex"));
-	assert.equal(release.compatibility, "backward-compatible");
+	assert.ok(release.compatibility === "backward-compatible" || release.compatibility === "migration-required");
 	assert.equal(release.announce, true, "the default SDK requires a customer announcement");
 	assert.ok(release.publishedAt && Number.isFinite(Date.parse(release.publishedAt)));
 	assert.equal(release.downloadUrl, `https://allauth.co/sdk/allauth-react-${sdkPackage.version}.tgz`);

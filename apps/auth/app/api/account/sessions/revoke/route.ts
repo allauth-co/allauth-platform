@@ -1,7 +1,7 @@
-import { withPortalRequest } from "@/lib/domains/hosting";
+import { withPortalAuthEngine } from "@/lib/domains/hosting";
 
 export async function POST(request: Request) {
-	return withPortalRequest(request,async (auth,_env,request)=>{
+	return withPortalAuthEngine(request,async (engine,_env,request)=>{
 	const length = request.headers.get("content-length");
 	if (length && Number(length) > 1024) return Response.json({ error: "Request too large." }, { status: 413 });
 	const reader = request.body?.getReader();
@@ -25,6 +25,6 @@ export async function POST(request: Request) {
 	let body: unknown;
 	try { body = JSON.parse(text); }
 	catch { return Response.json({ error: "Invalid request." }, { status: 400 }); }
-	return auth.api.accountRevokeSession({ headers: request.headers, body: body as { id: string }, asResponse: true });
+	return engine.revokeAccountSession(request.headers, body as { id: string });
 	});
 }

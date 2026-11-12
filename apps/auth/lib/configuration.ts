@@ -7,7 +7,24 @@ export interface AuthEnvironment extends EmailEnvironment {
 }
 
 export function setting(env: AuthEnvironment, name: string): string {
+	if (name === "ALLAUTH_AUTH_SECRET" || name === "BETTER_AUTH_SECRET") {
+		return aliasedSetting(env, "ALLAUTH_AUTH_SECRET", "BETTER_AUTH_SECRET");
+	}
+	if (name === "ALLAUTH_AUTH_URL" || name === "BETTER_AUTH_URL") {
+		return aliasedSetting(env, "ALLAUTH_AUTH_URL", "BETTER_AUTH_URL");
+	}
 	const value = env[name] ?? process.env[name];
+	return typeof value === "string" ? value : "";
+}
+
+function aliasedSetting(env: AuthEnvironment, current: string, legacy: string): string {
+	const scope = env[current] != null || env[legacy] != null ? env : process.env;
+	const currentValue = scope[current];
+	const legacyValue = scope[legacy];
+	if (currentValue != null && legacyValue != null && currentValue !== legacyValue) {
+		throw new Error(`${current} and ${legacy} must match when both are set.`);
+	}
+	const value = currentValue ?? legacyValue;
 	return typeof value === "string" ? value : "";
 }
 
@@ -27,13 +44,13 @@ export function projectEmailEnvironment(env: AuthEnvironment, projectSlug?: stri
 }
 
 export function authOrigin(env: AuthEnvironment): string {
-	const url = new URL(setting(env, "BETTER_AUTH_URL") || "https://allauth.co");
+	const url = new URL(setting(env, "ALLAUTH_AUTH_URL") || "https://allauth.co");
 	if (url.pathname !== "/" || url.search || url.hash || url.username || url.password) {
-		throw new Error("BETTER_AUTH_URL must be an origin without a path or credentials.");
+		throw new Error("ALLAUTH_AUTH_URL must be an origin without a path or credentials.");
 	}
 	const local = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
 	if (url.protocol !== "https:" && !(url.protocol === "http:" && local && process.env.NODE_ENV !== "production")) {
-		throw new Error("BETTER_AUTH_URL requires HTTPS outside local development.");
+		throw new Error("ALLAUTH_AUTH_URL requires HTTPS outside local development.");
 	}
 	return url.origin;
 }

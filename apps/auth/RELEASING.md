@@ -17,6 +17,8 @@ Current repository links use the `allauth-co` organisation. An ownership transfe
 
 For platform source publication, prepare a reviewed export containing the service, required packages, tests and self-host deployment files. Exclude secrets, private operational evidence, customer fixtures and account-specific deployment configuration. Use the public service overview instead of internal operations notes. Public CI must be independent of production credentials and package-publishing workflows. Verify a clean install/build and self-hosting instructions before recording publication as complete.
 
+During SDK development, pack to a local directory outside `public/sdk` and run `pnpm --dir apps/auth verify:sdk-artifact --candidate /absolute/path/to/archive.tgz`. The platform build verifies the served SDK separately. Keep `lib/published-sdk.json` on the manifest of the current served archive until its replacement passes the release gates. Mark major SDK upgrades `migration-required` and link the upgrade instructions before enabling announcements.
+
 ## Release checks
 
 ```sh

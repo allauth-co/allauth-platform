@@ -9,7 +9,7 @@ import { Pool } from "pg";
 import { symmetricDecrypt } from "better-auth/crypto";
 import { parseSetCookieHeader } from "better-auth/cookies";
 import { createAuth, postgresDatabase } from "../lib/auth";
-import { isPlatformAdmin, validateRedirectUris } from "../lib/configuration";
+import { isPlatformAdmin, setting, validateRedirectUris } from "../lib/configuration";
 import { resolveEnterpriseUser } from "../lib/enterprise";
 import type { SSOUserResolutionContext } from "@better-auth/sso";
 import { createDirectory, listDirectories, mutateDirectory } from "../lib/scim-management";
@@ -23,7 +23,7 @@ assert.ok(process.env.DATABASE_URL?.includes("127.0.0.1:55445"), "Auth checks mu
 const pool = new Pool({ connectionString: process.env.DATABASE_URL, max: 3 });
 const outbox: { to: string; subject: string; text: string }[] = [];
 const env = { ...process.env, GITHUB_CLIENT_ID: "allauth-local-fixture", GITHUB_CLIENT_SECRET: randomBytes(32).toString("hex"), EMAIL_FROM: "security@allauth.co", EMAIL: { async send(message: { to: string; subject: string; text: string }) { outbox.push(message); } } };
-const origin = process.env.BETTER_AUTH_URL || "http://localhost:3002";
+const origin = setting(env, "ALLAUTH_AUTH_URL") || "http://localhost:3002";
 const service = createAuth(postgresDatabase(pool), env);
 const context = await service.$context;
 const database = context.adapter;
