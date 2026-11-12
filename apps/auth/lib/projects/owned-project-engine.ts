@@ -1173,6 +1173,22 @@ export function createOwnedProjectEngine(
 		});
 	}
 
+	async function providerCallback(
+		request: Request,
+		endpoint:
+			| "/callback/:id"
+			| "/sso/callback/:providerId"
+			| "/sso/saml2/sp/acs/:providerId",
+		handle: () => Promise<Response>,
+	) {
+		const response = await handle();
+		if (controlResponseFailure(response, response.headers).failed)
+			await store.transaction((client) =>
+				security.failed(client, request, endpoint),
+			);
+		return response;
+	}
+
 	async function signIn(
 		request: Request,
 		field: "email" | "username" = "email",
@@ -2857,7 +2873,9 @@ export function createOwnedProjectEngine(
 				security.admit(client, request),
 			);
 			if (denied) return securityBlocked();
-			return sso.callback(request, provider);
+			return providerCallback(request, "/sso/callback/:providerId", () =>
+				sso.callback(request, provider),
+			);
 		}
 		const samlCallbackPath = "/sso/saml2/sp/acs/";
 		if (
@@ -2874,7 +2892,9 @@ export function createOwnedProjectEngine(
 			if (denied) return securityBlocked();
 			// The IdP posts cross-site. The SAML service validates the signed response
 			// against the stored, single-use request for this realm and provider.
-			return sso.samlCallback(request, provider);
+			return providerCallback(request, "/sso/saml2/sp/acs/:providerId", () =>
+				sso.samlCallback(request, provider),
+			);
 		}
 		if (emailChange && path === "/change-email" && request.method === "POST") {
 			if (!trustedRequest(request.headers, true)) return forbidden();
@@ -2967,7 +2987,9 @@ export function createOwnedProjectEngine(
 					security.admit(client, request),
 				);
 				if (denied) return securityBlocked();
-				return oauth.callback(request, provider.data);
+				return providerCallback(request, "/callback/:id", () =>
+					oauth.callback(request, provider.data),
+				);
 			}
 		}
 		if (passkeyHttp && path.startsWith("/passkey/")) {

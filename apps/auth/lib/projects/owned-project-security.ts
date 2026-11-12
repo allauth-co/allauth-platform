@@ -1,6 +1,10 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import type { PoolClient } from "pg";
 import {
+	controlEventAttributes,
+	sanitizeControlMetadata,
+} from "../control/event-metadata";
+import {
 	canonicalDomain,
 	canonicalIP,
 	defaultSecurityPolicy,
@@ -45,6 +49,11 @@ export function createOwnedProjectSecurity(options: SecurityOptions) {
 		metadata: Record<string, unknown>,
 		userId?: string,
 	) {
+		const identity = controlEventAttributes({
+			userId,
+			ipAddress: trustedIP(request),
+			userAgent: request.headers.get("user-agent"),
+		});
 		await client.query(
 			`INSERT INTO "allauthEvent" (id, type, outcome, "userId", "ipAddress", "userAgent", "createdAt", metadata)
 			 VALUES ($1, $2, $3, $4, $5, $6, statement_timestamp(), $7)`,
@@ -52,10 +61,10 @@ export function createOwnedProjectSecurity(options: SecurityOptions) {
 				randomUUID(),
 				type,
 				outcome,
-				userId ?? null,
-				trustedIP(request),
-				request.headers.get("user-agent")?.slice(0, 512) ?? null,
-				metadata,
+				identity.userId ?? null,
+				identity.ipAddress ?? null,
+				identity.userAgent ?? null,
+				sanitizeControlMetadata(metadata),
 			],
 		);
 	}
