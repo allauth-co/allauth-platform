@@ -7,6 +7,7 @@ import { admin, anonymous } from "better-auth/plugins";
 import { getTestInstance } from "better-auth/test";
 import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import type { AuthInstance } from "../api";
 import { postgresDatabase } from "../auth";
 import { defaultAuthPolicy } from "../auth-policy/policy";
 import { allauthControl } from "../control";
@@ -15,6 +16,7 @@ import type { ControlWebhookEnvelope } from "../control/webhooks";
 import { deliverPendingWebhooks } from "../control/webhooks";
 import { featureBoundaries } from "../features/server";
 import { productionTwoFactor } from "../mfa";
+import { requireWorkspacePrincipal } from "../workspaces/authorization";
 import { createOwnedProjectEngine } from "./owned-project-engine";
 import { readLegacySessionCookie } from "./legacy-session-cookie";
 import { projectPasskeyStore } from "./passkey-store";
@@ -1069,6 +1071,7 @@ describe.skipIf(!existsSync(fixturePath))("project passkey PostgreSQL interopera
 		if (!pool || !nativeDatabase)
 			throw new Error("Missing PostgreSQL fixture.");
 		const { auth } = await legacyFixture(nativeDatabase, true);
+		const nativeDatabaseAdapter = nativeDatabase.db;
 		const policy = { ...defaultAuthPolicy, requireEmailVerification: false };
 		const candidate = ownedHttpFixture(pool, policy);
 		const sibling = createOwnedProjectEngine({
@@ -1083,6 +1086,8 @@ describe.skipIf(!existsSync(fixturePath))("project passkey PostgreSQL interopera
 		});
 		const native = (request: Request) => auth.handler(request);
 		const owned = (request: Request) => candidate.dispatch(request);
+		let ipAddress = "192.0.2.106";
+		const userAgent = "Synthetic passkey role fixture";
 		function send(
 			dispatch: typeof native,
 			path: string,
@@ -1095,7 +1100,8 @@ describe.skipIf(!existsSync(fixturePath))("project passkey PostgreSQL interopera
 					headers: {
 						origin,
 						cookie,
-						"x-real-ip": "192.0.2.106",
+						"x-real-ip": ipAddress,
+						"user-agent": userAgent,
 						...(body ? { "content-type": "application/json" } : {}),
 					},
 					body: body ? JSON.stringify(body) : undefined,
@@ -1246,6 +1252,282 @@ describe.skipIf(!existsSync(fixturePath))("project passkey PostgreSQL interopera
 				expect(await deniedSibling.json()).toBeNull();
 			}
 		}
+		const endpointId = randomUUID();
+		const endpoint = "https://passkey-role-webhook.fixture.example/receive";
+		const signingKey = newWebhookSigningSecret();
+		const administratorKey = virtualCredential();
+		const adminOptions = await send(
+			native,
+			"passkey/generate-register-options",
+			adminCookie,
+		);
+		expect(adminOptions.status).toBe(200);
+		const adminChallenge = (await adminOptions.json()) as {
+			challenge: string;
+		};
+		const adminCredential = await send(
+			native,
+			"passkey/verify-registration",
+			`${adminCookie}; ${cookieFrom(adminOptions, "better-auth-passkey")}`,
+			{ response: administratorKey.registration(adminChallenge.challenge) },
+		);
+		expect(adminCredential.status).toBe(200);
+		const { id: administratorPasskeyId } =
+			(await adminCredential.json()) as StoredProjectPasskey;
+		await pool.query(
+			`INSERT INTO "${primary}"."allauthWebhookEndpoint" (id,url,"eventTypes","encryptedSecret") VALUES ($1,$2,'["passkey.*"]',$3)`,
+			[
+				endpointId,
+				endpoint,
+				await symmetricEncrypt({ key: fixtureSecret, data: signingKey }),
+			],
+		);
+		const eventContext = { actorId: user.id, userId: user.id, userAgent };
+		type Event = Omit<
+			ControlWebhookEnvelope["data"]["event"],
+			"id" | "createdAt"
+		>;
+		const expectedEvents: Event[] = [];
+		try {
+			for (const [index, role] of [
+				"guest",
+				"user",
+				"project-editor",
+				"admin",
+			].entries()) {
+				ipAddress = `192.0.2.${110 + index}`;
+				const changed = await send(native, "admin/set-role", adminCookie, {
+					userId: user.id,
+					role,
+				});
+				expect(changed.status).toBe(200);
+				const identity = {
+					id: user.id,
+					role,
+					emailVerified: true,
+					isAnonymous: true,
+				};
+				const context = { ...eventContext, ipAddress };
+				const expectedAdminStatus = role === "admin" ? 200 : 403;
+				for (const [writer, reader] of [
+					[native, owned],
+					[owned, native],
+				] as const) {
+					const baseline = await send(
+						writer,
+						"admin/list-users",
+						restoredCookie,
+					);
+					expect(baseline.status).toBe(expectedAdminStatus);
+					const next = virtualCredential();
+					const options = await send(
+						reader,
+						"passkey/generate-register-options",
+						restoredCookie,
+					);
+					expect(options.status).toBe(200);
+					const { challenge } = (await options.json()) as {
+						challenge: string;
+					};
+					const created = await send(
+						writer,
+						"passkey/verify-registration",
+						`${restoredCookie}; ${cookieFrom(options, "better-auth-passkey")}`,
+						{ response: next.registration(challenge), createSession: true },
+					);
+					expect(
+						created.status,
+						`${role} registration in ${writer === native ? "native" : "owned"}`,
+					).toBe(200);
+					const credential = (await created.json()) as StoredProjectPasskey;
+					expect(credential).toMatchObject({
+						user: identity,
+						userId: user.id,
+						session: { userId: user.id },
+					});
+					const cookie = cookieFrom(created, "session_token");
+					expect(cookie).toBeTruthy();
+					const session = await send(reader, "get-session", cookie);
+					expect(await session.json()).toMatchObject({ user: identity });
+					expect(
+						(await send(reader, "admin/list-users", cookie)).status,
+					).toBe(expectedAdminStatus);
+					expect(
+						(
+							await send(owned, "organization/set-active", cookie, {
+								organizationId,
+							})
+						).status,
+					).toBe(403);
+					expect(
+						await (
+							await send(
+								(request) => sibling.dispatch(request),
+								"get-session",
+								cookie,
+							)
+						).json(),
+					).toBeNull();
+					const name = "Synthetic renamed credential";
+					const renamed = await send(
+						writer,
+						"passkey/update-passkey",
+						cookie,
+						{ id: credential.id, name },
+					);
+					expect(renamed.status).toBe(200);
+					expect(await renamed.json()).toMatchObject({
+						passkey: { id: credential.id, userId: user.id, name },
+					});
+					const list = await send(
+						reader,
+						"passkey/list-user-passkeys",
+						cookie,
+					);
+					expect(await list.json()).toContainEqual(
+						expect.objectContaining({ id: credential.id, name }),
+					);
+					const removed = await send(
+						reader,
+						"passkey/delete-passkey",
+						cookie,
+						{ id: credential.id },
+					);
+					expect(removed.status).toBe(200);
+					expect(await removed.json()).toEqual({ status: true });
+					expect(await store.findCredential(next.id)).toBeNull();
+					expectedEvents.push(
+						{
+							...context,
+							type: "passkey.registered",
+							outcome: "success",
+							metadata: { path: "/passkey/verify-registration" },
+						},
+						{
+							...context,
+							type: "passkey.updated",
+							outcome: "success",
+							targetId: credential.id,
+							metadata: { path: "/passkey/update-passkey" },
+						},
+						{
+							...context,
+							type: "passkey.deleted",
+							outcome: "success",
+							targetId: credential.id,
+							metadata: { path: "/passkey/delete-passkey" },
+						},
+					);
+					const restored = await authenticate(writer, ++counter);
+					expect(restored.status).toBe(200);
+					expect(await restored.json()).toMatchObject({
+						user: identity,
+						session: { userId: user.id },
+					});
+					restoredCookie = cookieFrom(restored, "session_token");
+					expect(
+						(await send(reader, "admin/list-users", restoredCookie)).status,
+					).toBe(expectedAdminStatus);
+					if (role === "admin") {
+						await expect(
+							requireWorkspacePrincipal(
+								auth as unknown as AuthInstance,
+								new Headers({ origin, cookie: restoredCookie }),
+							),
+						).rejects.toMatchObject({ status: "FORBIDDEN" });
+						expect(
+							await (
+								await send(
+									(request) => sibling.dispatch(request),
+									"get-session",
+									restoredCookie,
+								)
+							).json(),
+						).toBeNull();
+						const denied = await send(
+							writer,
+							"passkey/update-passkey",
+							restoredCookie,
+							{ id: administratorPasskeyId, name },
+						);
+						expect(denied.status).toBe(writer === native ? 401 : 404);
+						expectedEvents.push({
+							...context,
+							type: "passkey.updated",
+							outcome: "failure",
+							targetId: administratorPasskeyId,
+							metadata: {
+								path: "/passkey/update-passkey",
+								errorCode: "PASSKEY_NOT_FOUND",
+							},
+						});
+						expect(
+							await store.findCredential(administratorKey.id),
+						).toMatchObject({
+							id: administratorPasskeyId,
+							userId: administrator.id,
+							name: null,
+						});
+					}
+				}
+			}
+			const events: Event[] = [];
+			for (let offset = 0; offset < expectedEvents.length; offset += 20) {
+				const batchSize = Math.min(20, expectedEvents.length - offset);
+				const delivery = await deliverPendingWebhooks({
+					database: nativeDatabaseAdapter,
+					secret: fixtureSecret,
+					resolver: async () => [{ address: "93.184.216.34", family: 4 }],
+					now: () => new Date(Date.now() + 1_000),
+					maxDeliveries: batchSize,
+					transport: async ({ destination, body, headers }) => {
+						expect(destination.url.href).toBe(endpoint);
+						expect(headers["webhook-signature"]).toBe(
+							await webhookSignature(
+								signingKey,
+								headers["webhook-id"],
+								headers["webhook-timestamp"],
+								body,
+							),
+						);
+						const { data, id, type, timestamp } = JSON.parse(
+							body,
+						) as ControlWebhookEnvelope;
+						expect(data.user).toBeUndefined();
+						for (const privateValue of [
+							proof.id,
+							user.email,
+							signingKey,
+							"Synthetic renamed credential",
+						])
+							expect(body).not.toContain(privateValue);
+						expect(data.event).toMatchObject({
+							id,
+							type,
+							createdAt: timestamp,
+						});
+						const { id: _id, createdAt: _createdAt, ...event } = data.event;
+						events.push(event);
+						return 204;
+					},
+				});
+				expect(delivery.delivered).toBe(batchSize);
+			}
+			function sort(events: Event[]) {
+				const key = (event: Event) =>
+					`${event.ipAddress}:${event.type}:${event.targetId ?? ""}`;
+				return events.sort((left, right) =>
+					key(left).localeCompare(key(right)),
+				);
+			}
+			expect(sort(events)).toEqual(sort(expectedEvents));
+		} finally {
+			await pool.query(
+				`DELETE FROM "${primary}"."allauthWebhookEndpoint" WHERE id=$1`,
+				[endpointId],
+			);
+		}
+		ipAddress = "192.0.2.114";
 		const enabled = await send(
 			owned,
 			"two-factor/enable",
@@ -1296,32 +1578,86 @@ describe.skipIf(!existsSync(fixturePath))("project passkey PostgreSQL interopera
 			expect(await completed.json()).toMatchObject({
 				user: {
 					id: user.id,
-					role: "user",
+					role: "admin",
 					emailVerified: true,
 					isAnonymous: true,
 				},
 			});
+			expect(
+				(
+					await send(
+						writer,
+						"admin/list-users",
+						cookieFrom(completed, "session_token"),
+					)
+				).status,
+			).toBe(200);
 		}
 		const stored = await pool.query(
 			`SELECT role,"isAnonymous","emailVerified", (SELECT count(*)::int FROM "${primary}"."member" WHERE "userId"=$1) AS memberships,
-		 (SELECT count(*)::int FROM "${primary}"."account" WHERE "userId"=$1) AS accounts
-		 FROM "${primary}"."user" WHERE id=$1`,
+	 (SELECT count(*)::int FROM "${primary}"."account" WHERE "userId"=$1) AS accounts
+	 FROM "${primary}"."user" WHERE id=$1`,
 			[user.id],
 		);
 		expect(stored.rows).toEqual([
 			{
-				role: "user",
+				role: "admin",
 				isAnonymous: true,
 				emailVerified: true,
 				memberships: 0,
 				accounts: 0,
 			},
 		]);
-		const privileged = await send(native, "admin/set-role", adminCookie, {
-			userId: user.id,
-			role: "admin",
+		const pending = await authenticate(owned, ++counter);
+		expect(await pending.json()).toEqual({
+			twoFactorRedirect: true,
+			twoFactorMethods: ["totp"],
 		});
-		expect(privileged.status).toBe(200);
+		const demoted = await send(native, "admin/set-role", adminCookie, {
+			userId: user.id,
+			role: "project-editor",
+		});
+		expect(demoted.status).toBe(200);
+		const completed = await send(
+			owned,
+			"two-factor/verify-backup-code",
+			cookieFrom(pending, "two_factor"),
+			{ code: backupCodes[2] },
+		);
+		expect(await completed.json()).toMatchObject({
+			user: {
+				id: user.id,
+				role: "project-editor",
+				emailVerified: true,
+				isAnonymous: true,
+			},
+		});
+		expect(
+			(
+				await send(
+					native,
+					"admin/list-users",
+					cookieFrom(completed, "session_token"),
+				)
+			).status,
+		).toBe(403);
+		for (const flag of ["directoryManaged", "directoryDisabled"] as const) {
+			await pool.query(
+				`UPDATE "${primary}"."user" SET "${flag}"=true WHERE id=$1`,
+				[user.id],
+			);
+			const denied = await authenticate(owned, counter + 1);
+			expect(denied.status).toBe(401);
+			expect(cookieFrom(denied, "session_token")).toBe("");
+			await pool.query(
+				`UPDATE "${primary}"."user" SET "${flag}"=false WHERE id=$1`,
+				[user.id],
+			);
+		}
+		const banned = await send(native, "admin/ban-user", adminCookie, {
+			userId: user.id,
+		});
+		expect(banned.status).toBe(200);
 		const denied = await authenticate(owned, counter + 1);
 		expect(denied.status).toBe(401);
 		expect(cookieFrom(denied, "session_token")).toBe("");
