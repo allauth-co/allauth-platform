@@ -11,13 +11,13 @@ import { HostedAccountHeader } from "@/components/hosted-account-header";
 import { HostedOrganizationProvider } from "@/components/hosted-organization-client";
 
 const state = vi.hoisted(() => ({
-	nativeClientLoaded: vi.fn(),
+	nativeClientLoaded: false,
 	toast: vi.fn(),
 	query: "",
 	pathname: "/organization/people",
 }));
 vi.mock("@/lib/auth-client", () => {
-	state.nativeClientLoaded();
+	state.nativeClientLoaded = true;
 	return { authClient: {} };
 });
 vi.mock("@/components/theme-toggle", () => ({
@@ -169,7 +169,7 @@ it("renders verified hosted identity and workspace navigation with the original 
 		["state", "fixture-state"],
 		["callbackUrl", "/account"],
 	]);
-	expect(state.nativeClientLoaded).not.toHaveBeenCalled();
+	expect(state.nativeClientLoaded).toBe(false);
 });
 
 it("restores the actor only through the existing impersonation stop operation", async () => {
@@ -214,7 +214,7 @@ it("restores the actor only through the existing impersonation stop operation", 
 	confirmed = true;
 	await act(async () => button.click());
 	expect(assign).toHaveBeenCalledExactlyOnceWith("/admin/users");
-	expect(state.nativeClientLoaded).not.toHaveBeenCalled();
+	expect(state.nativeClientLoaded).toBe(false);
 });
 
 it("retains the local authentication callback when the hosted header has no session", async () => {
@@ -232,7 +232,7 @@ it("retains the local authentication callback when the hosted header has no sess
 	expect(url.pathname).toBe("/sign-in");
 	expect(url.searchParams.get("callbackUrl")).toBe("/account/security");
 	expect(calls).toHaveBeenCalledOnce();
-	expect(state.nativeClientLoaded).not.toHaveBeenCalled();
+	expect(state.nativeClientLoaded).toBe(false);
 });
 
 it("leaves retry continuation on the verified error page instead of propagating raw header query fields", async () => {
