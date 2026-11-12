@@ -85,6 +85,7 @@ export interface LinkedAccountGrant {
 	id: string;
 	providerId: string;
 	accountId: string;
+	scope: string | null;
 	accessToken: string | null;
 	accessTokenExpiresAt: Date | null;
 	refreshToken: string | null;
@@ -100,6 +101,15 @@ type RotatedAccountGrant = Pick<
 	| "refreshTokenExpiresAt"
 	| "idToken"
 >;
+
+export function linkedAccountScopes(scope: string | null) {
+	return (
+		scope
+			?.split(",")
+			.map((value) => value.trim())
+			.filter(Boolean) ?? []
+	);
+}
 
 export function linkedAccessTokenNearExpiry(account: LinkedAccountGrant) {
 	return Boolean(
@@ -171,11 +181,7 @@ export function createOwnedProjectLinkedAccounts(
 				status: "listed" as const,
 				accounts: accounts.rows.map(({ scope, ...row }) => ({
 					...row,
-					scopes:
-						scope
-							?.split(",")
-							.map((value) => value.trim())
-							.filter(Boolean) ?? [],
+					scopes: linkedAccountScopes(scope),
 				})),
 			};
 		});
@@ -184,14 +190,16 @@ export function createOwnedProjectLinkedAccounts(
 	async function info(
 		request: Request,
 		token: string | null,
-		accountId: string,
-		refresh?: (account: LinkedAccountGrant) => Promise<RotatedAccountGrant>,
+		accountId: string | null,
+		refresh?: (
+			account: LinkedAccountGrant,
+		) => Promise<RotatedAccountGrant | undefined>,
 	) {
 		return store.transaction(async (client) => {
 			const authority = await lockAuthority(client, request, token, "info");
 			if (authority.status === "rejected") return authority;
 			const read = await client.query<LinkedAccountGrant>(
-				`SELECT id,"providerId","accountId","accessToken","accessTokenExpiresAt","refreshToken","refreshTokenExpiresAt","idToken"
+				`SELECT id,"providerId","accountId",scope,"accessToken","accessTokenExpiresAt","refreshToken","refreshTokenExpiresAt","idToken"
 				 FROM "${schema}"."account" WHERE "userId"=$1 AND id=$2${refresh ? " FOR UPDATE" : ""}`,
 				[authority.user.id, accountId],
 			);
@@ -199,6 +207,7 @@ export function createOwnedProjectLinkedAccounts(
 			if (!account) return rejected("notFound");
 			if (refresh && linkedAccessTokenNearExpiry(account)) {
 				const rotated = await refresh(account);
+				if (!rotated) return { status: "found" as const, account };
 				const persisted = await client.query(
 					`UPDATE "${schema}"."account" SET "accessToken"=$3,"accessTokenExpiresAt"=$4,"refreshToken"=$5,"refreshTokenExpiresAt"=$6,"idToken"=$7,"updatedAt"=statement_timestamp()
 					 WHERE "userId"=$1 AND id=$2`,

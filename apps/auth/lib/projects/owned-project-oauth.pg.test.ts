@@ -23,6 +23,10 @@ import { createOwnedProjectEngine } from "./owned-project-engine";
 import { createProjectEngineStore } from "./owned-project-engine-store";
 import type { OwnedProjectOAuthOptions } from "./owned-project-oauth";
 import { createOwnedProjectOAuth } from "./owned-project-oauth";
+import { createProjectOAuthStore } from "./owned-project-oauth-store";
+import { projectProxySecret } from "./proxy";
+import type { Project } from "./registry";
+import { prepareProjectAuthentication } from "./session-introspection";
 
 const fixturePath = new URL(
 	"../../../../.secrets/local-postgres.json",
@@ -112,12 +116,14 @@ async function legacyProject(
 		policy: typeof defaultAuthPolicy;
 		brokerOnly: boolean;
 		controlSecurity?: boolean;
+		basePath?: string;
 	},
 ) {
 	return (
 		await getTestInstance(
 			{
 				baseURL: origin,
+				basePath: settings?.basePath,
 				secret: key,
 				logger: { disabled: true },
 				database: {
@@ -576,12 +582,13 @@ describe.skipIf(!existsSync(fixturePath))(
 		function ownedProviderEngine(
 			policy = defaultAuthPolicy,
 			brokerOnly = false,
+			basePath = "/api/auth",
 		) {
 			return createOwnedProjectEngine({
 				database,
 				project: { schemaName: schema, slug },
 				baseURL: origin,
-				basePath: "/api/auth",
+				basePath,
 				signingSecret: key,
 				trustedOrigins: [],
 				trustedIP: (request) =>
@@ -1890,6 +1897,287 @@ describe.skipIf(!existsSync(fixturePath))(
 			const bearer = accountRequest("/list-accounts", owner.cookie);
 			bearer.headers.set("authorization", "Bearer fixture-browser-bearer");
 			expect((await owned().listAccounts(bearer)).status).toBe(403);
+		});
+
+		it("serves only the owning account's provider access token through either browser and signed project route", async () => {
+			const owner = await accountOwner();
+			const peer = await accountOwner();
+			const providerAccounts = await Promise.all([
+				persistedAccount(owner.userId, "google"),
+				persistedAccount(owner.userId, "allauth"),
+			]);
+			const project: Project = {
+				id: randomUUID(),
+				name: "Provider access fixture",
+				slug,
+				schemaName: schema,
+				applicationId: randomUUID(),
+				workspaceId: randomUUID(),
+				environment: "development",
+				primaryOrigin: origin,
+				origins: [origin],
+				brokerClientId: config.clientId,
+				brokerSecret: "unused-fixture-value",
+				proxyVersion: randomUUID(),
+				createdBy: owner.userId,
+				createdAt: new Date(),
+				updatedAt: new Date(),
+			};
+			const basePath = `/api/projects/${slug}/auth`;
+			const direct = await legacyProject(nativeDatabase!, config, {
+				policy: defaultAuthPolicy,
+				brokerOnly: false,
+				basePath,
+			});
+			const candidate = ownedProviderEngine(defaultAuthPolicy, false, basePath);
+			const environment = { ALLAUTH_AUTH_SECRET: key };
+			async function send(
+				input: unknown,
+				cookie: string,
+				signed: boolean,
+				writer: "legacy" | "owned" = "legacy",
+			) {
+				const path = `${basePath}/get-access-token`;
+				const body = JSON.stringify(input);
+				const headers = new Headers({
+					cookie,
+					"content-type": "application/json",
+				});
+				if (signed) {
+					const timestamp = String(Math.floor(Date.now() / 1000));
+					const payload = [
+						timestamp,
+						"POST",
+						path,
+						origin,
+						"",
+						createHash("sha256").update(body).digest("hex"),
+					].join("\n");
+					headers.set("allauth-proxy-timestamp", timestamp);
+					headers.set("allauth-proxy-origin", origin);
+					headers.set(
+						"allauth-proxy-signature",
+						createHmac("sha256", projectProxySecret(project, environment))
+							.update(payload)
+							.digest("hex"),
+					);
+				} else {
+					headers.set("origin", origin);
+				}
+				const request = new Request(`${origin}${path}`, {
+					method: "POST",
+					body,
+					headers,
+				});
+				const prepared = await prepareProjectAuthentication(
+					request,
+					project,
+					environment,
+					{ consumeBody: true },
+				);
+				return prepared.dispatch(key, {
+					async consume() {
+						throw new Error("Unexpected session introspection");
+					},
+					async session() {
+						throw new Error("Unexpected session introspection");
+					},
+					fallback: writer === "legacy" ? direct.handler : candidate.dispatch,
+				});
+			}
+			const accessTokenExpiresAt = new Date(Date.now() + 600_000).toISOString();
+			for (const account of providerAccounts) {
+				const accessToken = `fixture-${account.providerId}-access`;
+				await database.query(
+					`UPDATE "${schema}"."account" SET "accessToken"=$2,"refreshToken"=$3,"idToken"=$4,"accessTokenExpiresAt"=$5 WHERE id=$1`,
+					[
+						account.id,
+						await symmetricEncrypt({ key, data: accessToken }),
+						await symmetricEncrypt({
+							key,
+							data: "fixture-never-returned-refresh",
+						}),
+						"fixture-provider-id-token",
+						accessTokenExpiresAt,
+					],
+				);
+				for (const writer of ["legacy", "owned"] as const) {
+					for (const signed of [false, true]) {
+						const response = await send(
+							{ accountId: account.id, userId: peer.userId },
+							owner.cookie,
+							signed,
+							writer,
+						);
+						expect(response.status, await response.clone().text()).toBe(200);
+						if (writer === "owned")
+							expect(response.headers.get("cache-control")).toBe("no-store");
+						expect(await response.json()).toEqual({
+							accessToken,
+							accessTokenExpiresAt,
+							scopes: ["openid", "profile"],
+							idToken: "fixture-provider-id-token",
+						});
+						const forbidden = await send(
+							{ accountId: account.id, userId: owner.userId },
+							peer.cookie,
+							signed,
+							writer,
+						);
+						expect(forbidden.status).toBe(400);
+						expect(await forbidden.json()).toMatchObject({
+							code: "ACCOUNT_NOT_FOUND",
+						});
+					}
+				}
+			}
+			const account = providerAccounts[0]!;
+			for (const writer of ["legacy", "owned"] as const) {
+				expect(
+					(await send({ accountId: account.id }, "", true, writer)).status,
+				).toBe(401);
+				const withoutAccountCookie = await send(
+					{ useAccountCookie: true },
+					owner.cookie,
+					true,
+					writer,
+				);
+				expect(withoutAccountCookie.status).toBe(400);
+				expect(await withoutAccountCookie.json()).toMatchObject({
+					code: "ACCOUNT_NOT_FOUND",
+				});
+			}
+
+			const expire = () =>
+				database.query(
+					`UPDATE "${schema}"."account" SET "accessTokenExpiresAt"=now()-interval '1 second' WHERE id=$1`,
+					[account.id],
+				);
+			await expire();
+			const providerFetch = vi.fn(
+				async (input: URL | RequestInfo, init?: RequestInit) => {
+					const request = new Request(input, init);
+					expect(request.url).toBe("https://oauth2.googleapis.com/token");
+					const form = new URLSearchParams(await request.text());
+					expect(form.get("grant_type")).toBe("refresh_token");
+					expect(form.get("refresh_token")).toBe("fixture-callback-refresh");
+					return Response.json({
+						token_type: "Bearer",
+						access_token: "fixture-rotated-access",
+						refresh_token: "fixture-rotated-refresh",
+						expires_in: 600,
+						scope: "narrow",
+					});
+				},
+			);
+			externalNetwork = providerFetch;
+			try {
+				// The provider callback uses this same storage path after verifying its response.
+				const callbackStore = createProjectOAuthStore(database, schema, {
+					secret: key,
+				});
+				const callbackWrote = Promise.withResolvers<void>();
+				const commitCallback = Promise.withResolvers<void>();
+				const callback = callbackStore.transaction(async (client) => {
+					const result = await callbackStore.bind(
+						client,
+						{
+							provider: "google",
+							subject: account.accountId,
+							email: `${owner.userId}@fixture.example`,
+							emailVerified: true,
+							name: "Callback fixture",
+							accessToken: "fixture-callback-access",
+							refreshToken: "fixture-callback-refresh",
+							idToken: "fixture-callback-id-token",
+							accessTokenExpiresAt: new Date(accessTokenExpiresAt),
+						},
+						{ signUpEnabled: true, requireEmailVerification: true },
+					);
+					expect(result).toMatchObject({
+						user: { id: owner.userId },
+						existingBinding: true,
+					});
+					callbackWrote.resolve();
+					await commitCallback.promise;
+				});
+				void callback.catch(callbackWrote.reject);
+				let pending: Promise<Response> | undefined;
+				try {
+					await callbackWrote.promise;
+					pending = send(
+						{ accountId: account.id },
+						owner.cookie,
+						true,
+						"owned",
+					);
+					void pending.catch(() => {});
+					await expect
+						.poll(
+							async () => {
+								const { rows } = await database.query<{ waiting: boolean }>(
+									`SELECT EXISTS (SELECT FROM pg_stat_activity WHERE datname=current_database()
+							 AND wait_event_type='Lock' AND query LIKE $1 AND query LIKE '%FOR UPDATE OF u') AS waiting`,
+									[`%"${schema}"."user" u%`],
+								);
+								return rows[0]?.waiting;
+							},
+							{ timeout: 3000 },
+						)
+						.toBe(true);
+				} finally {
+					commitCallback.resolve();
+					await callback;
+				}
+				const afterCallback = await pending!;
+				expect(afterCallback.status).toBe(200);
+				expect(await afterCallback.json()).toEqual({
+					accessToken: "fixture-callback-access",
+					accessTokenExpiresAt,
+					scopes: ["openid", "profile"],
+					idToken: "fixture-callback-id-token",
+				});
+				expect(providerFetch).not.toHaveBeenCalled();
+
+				await expire();
+				const refreshed = await Promise.all(
+					[false, true].map((signed) =>
+						send({ accountId: account.id }, owner.cookie, signed, "owned"),
+					),
+				);
+				for (const response of refreshed) expect(response.status).toBe(200);
+				const responses = await Promise.all(
+					refreshed.map((response) => response.json()),
+				);
+				expect(providerFetch).toHaveBeenCalledOnce();
+				expect(responses[0]).toEqual({
+					accessToken: "fixture-rotated-access",
+					accessTokenExpiresAt: expect.any(String),
+					scopes: ["openid", "profile"],
+					idToken: "fixture-callback-id-token",
+				});
+				expect(responses[1]).toEqual(responses[0]);
+				const stored = (
+					await database.query<{ refreshToken: string }>(
+						`SELECT "refreshToken" FROM "${schema}"."account" WHERE id=$1`,
+						[account.id],
+					)
+				).rows[0]!;
+				expect(stored.refreshToken).not.toBe("fixture-rotated-refresh");
+				expect(await symmetricDecrypt({ key, data: stored.refreshToken })).toBe(
+					"fixture-rotated-refresh",
+				);
+				const rollback = await send(
+					{ accountId: account.id },
+					owner.cookie,
+					true,
+				);
+				expect(rollback.status).toBe(200);
+				expect(await rollback.json()).toEqual(responses[0]);
+				expect(providerFetch).toHaveBeenCalledOnce();
+			} finally {
+				externalNetwork = undefined;
+			}
 		});
 
 		it("reads linked Google profiles with opaque ownership and writes a rotated grant the native engine can still read", async () => {

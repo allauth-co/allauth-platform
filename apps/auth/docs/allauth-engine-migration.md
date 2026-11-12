@@ -1,5 +1,7 @@
 # AllAuth engine migration
 
+<!-- cspell:ignore OAEP -->
+
 The project migration uses the existing PostgreSQL schemas, project IDs, key derivation and auth URLs. The React SDK and signed app proxy can be upgraded separately. Production project requests and the shared issuer still use the existing engine.
 
 ## Verify in a development realm
@@ -31,6 +33,8 @@ The comparison sums counts and histogram buckets for each operation and transpor
 The records cover sign-in and second-factor requests, provider callbacks, session reads and refreshes, and OAuth token exchanges and refreshes. HTTP redirects have a separate outcome, while known error redirects count as rejected. Compare these response outcomes with the realm's authentication event counts when assessing completed sign-ins. Check gateway and readiness evidence for requests that fail before engine dispatch, and exercise each configured accounts hostname separately. The metric records contain the project ID and fixed labels and counts.
 
 Baseline metrics also count the legacy project `/get-access-token` and `/refresh-token` operations on direct and hosted transports. The comparison shows these groups when it observes them. Investigate successful calls and confirm the project's configured clients before selecting its writer. Missing observations describe the sampled interval only.
+
+The candidate preserves `/get-access-token` for owning browser sessions on the direct project and verified signed proxy routes. It selects the stored local account ID, returns the provider access and ID token fields with `Cache-Control: no-store`, and retains the refresh token in encrypted storage. Isolated PostgreSQL checks cover Google and the project broker, including concurrent refresh and rollback. Check for callers that use server bearer authentication or `/refresh-token` before enrolling a project.
 
 ## Project cutover
 

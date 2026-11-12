@@ -3599,6 +3599,18 @@ export function createOwnedProjectEngine(
 			return oauth.listAccounts(request);
 		if (oauth && path === "/account-info" && request.method === "GET")
 			return oauth.accountInfo(request);
+		if (oauth && path === "/get-access-token" && request.method === "POST") {
+			const limited = await store.transaction((client) =>
+				admitOwnedProjectNativeRoute(client, options.trustedIP(request), path, {
+					max: 100,
+					windowMs: 60_000,
+				}),
+			);
+			return (
+				limited ??
+				oauth.providerAccessToken(request, () => requestBody(request, 8192))
+			);
+		}
 		if (oauth && path === "/unlink-account" && request.method === "POST") {
 			if (!trustedRequest(request.headers, true)) return forbidden();
 			const body = ownedProjectOAuthUnlinkInput.safeParse(

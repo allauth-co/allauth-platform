@@ -31,6 +31,7 @@ import type {
 import {
 	createOwnedProjectLinkedAccounts,
 	linkedAccessTokenNearExpiry,
+	linkedAccountScopes,
 } from "./owned-project-linked-accounts";
 
 export { ownedProjectOAuthUnlinkInput } from "./owned-project-linked-accounts";
@@ -1232,6 +1233,103 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 		};
 	}
 
+	const accessTokenSelection = z.union([
+		z.strictObject({
+			accountId: z.string(),
+			userId: z.string().optional(),
+		}),
+		z.strictObject({
+			useAccountCookie: z.literal(true),
+			userId: z.string().optional(),
+		}),
+	]);
+	const accessTokenRefreshFailed = Symbol(
+		"Linked provider access token refresh failed",
+	);
+
+	function configuredLinkedProvider(account: LinkedAccountGrant) {
+		const provider = projectOAuthProvider.safeParse(account.providerId);
+		if (!provider.success) return;
+		const config = credentials(provider.data);
+		if (config) return { provider: provider.data, config };
+	}
+
+	function accessTokenFailure() {
+		return publicFailure(
+			"FAILED_TO_GET_ACCESS_TOKEN",
+			"Failed to get a valid access token",
+			400,
+		);
+	}
+
+	async function providerAccessToken(
+		request: Request,
+		readBody: () => Promise<unknown>,
+	) {
+		if (!browserRequest(request, "get-access-token", "POST"))
+			return publicFailure(
+				"FORBIDDEN",
+				"This authentication request is not permitted.",
+				403,
+			);
+		const selection = accessTokenSelection.safeParse(await readBody());
+		if (!selection.success)
+			return publicFailure("VALIDATION_ERROR", "[body] Invalid input", 400);
+		// This PostgreSQL realm uses the owning live session and local row ID. Its
+		// native engine did not enable the stateless provider account cookie.
+		const accountId =
+			"accountId" in selection.data ? selection.data.accountId : null;
+		const loaded = await linked
+			.info(request, browserToken(request), accountId, async (account) => {
+				const configured = configuredLinkedProvider(account);
+				if (!configured) return;
+				try {
+					const { provider, config } = configured;
+					const rotated = await refreshLinkedAccount(
+						provider,
+						config,
+						await metadata(provider),
+						account,
+					);
+					return {
+						...rotated,
+						accessTokenExpiresAt:
+							rotated.accessTokenExpiresAt ?? account.accessTokenExpiresAt,
+					};
+				} catch {
+					throw accessTokenRefreshFailed;
+				}
+			})
+			.catch((error: unknown) => {
+				if (error === accessTokenRefreshFailed) return null;
+				throw error;
+			});
+		if (!loaded) return accessTokenFailure();
+		if (loaded.status === "rejected") return rejectedResponse(loaded);
+		const { account } = loaded;
+		if (!configuredLinkedProvider(account))
+			return publicFailure(
+				"PROVIDER_NOT_SUPPORTED",
+				`Provider ${account.providerId} is not supported.`,
+				400,
+			);
+		try {
+			return publicJSON(
+				{
+					accessToken:
+						readLinkedOAuthToken(account.accessToken, tokenKeys) ?? "",
+					accessTokenExpiresAt: account.accessTokenExpiresAt ?? undefined,
+					scopes: linkedAccountScopes(account.scope),
+					idToken: account.idToken ?? undefined,
+				},
+				200,
+				new Headers({ "referrer-policy": "no-referrer" }),
+			);
+		} catch {
+			return accessTokenFailure();
+		}
+	}
+
 	async function accountInfo(request: Request) {
 		if (!browserRequest(request, "account-info", "GET"))
 			return publicFailure(
@@ -1286,11 +1384,7 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 			}
 			accessToken = readLinkedOAuthToken(account.accessToken, tokenKeys);
 		} catch {
-			return publicFailure(
-				"FAILED_TO_GET_ACCESS_TOKEN",
-				"Failed to get a valid access token",
-				400,
-			);
+			return accessTokenFailure();
 		}
 		if (!accessToken)
 			return publicFailure(
@@ -1655,6 +1749,7 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 		startLink,
 		listAccounts,
 		accountInfo,
+		providerAccessToken,
 		unlinkAccount,
 		callback,
 	};
