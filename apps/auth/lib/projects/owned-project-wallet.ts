@@ -1,4 +1,4 @@
-import { randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import type { PoolClient } from "pg";
 import { getAddress, verifyMessage } from "viem";
 import { parseSiweMessage, validateSiweMessage } from "viem/siwe";
@@ -10,9 +10,10 @@ import {
 	accountLinkJson,
 } from "./owned-project-account-links";
 import type { OwnedProjectEmailAliases } from "./owned-project-email-aliases";
-import type {
-	createProjectEngineStore,
-	ProjectUser,
+import {
+	checkpointOwnedProjectWrites,
+	type createProjectEngineStore,
+	type ProjectUser,
 } from "./owned-project-engine-store";
 
 const nonceInput = z.strictObject({});
@@ -28,6 +29,7 @@ const noncePattern = /^[A-Za-z0-9]{8,250}$/;
 const addressPattern = /^0x[0-9a-fA-F]{40}$/;
 type Store = ReturnType<typeof createProjectEngineStore>;
 type Wallet = { address: `0x${string}`; chainId: number };
+type WalletSignup = { rollback?: () => Promise<void> };
 
 const mismatch = () =>
 	accountLinkError(
@@ -59,8 +61,19 @@ export function createOwnedProjectWallet(options: {
 	admit(
 		client: PoolClient,
 		request: Request,
-		email?: string,
+		operation: { kind: "nonce" } | { kind: "verification"; email: string },
 	): Promise<Response | null>;
+	denyProvisioning(
+		client: PoolClient,
+		request: Request,
+		email: string,
+	): Promise<boolean>;
+	recordFailure(
+		client: PoolClient,
+		request: Request,
+		email: string,
+		response: Response,
+	): Promise<void>;
 	complete(
 		client: PoolClient,
 		request: Request,
@@ -71,7 +84,13 @@ export function createOwnedProjectWallet(options: {
 	const { store } = options;
 	const origin = new URL(options.signingOrigin);
 
-	async function bind(client: PoolClient, wallet: Wallet, email: string) {
+	async function bind(
+		client: PoolClient,
+		request: Request,
+		wallet: Wallet,
+		email: string,
+		signup: WalletSignup,
+	) {
 		const { address, chainId } = wallet;
 		await client.query(
 			"SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
@@ -85,32 +104,47 @@ export function createOwnedProjectWallet(options: {
 		const owner = owners.rows[0]?.userId;
 		let userId = owner;
 		if (!userId) {
-			if (!options.signUpEnabled)
-				return accountLinkError(
-					403,
-					"FORBIDDEN",
-					"New account registration is disabled for this application.",
-				);
 			const id = randomUUID();
 			const placeholder = `${address.toLowerCase()}@siwe.placeholder.invalid`;
+			await client.query(
+				"SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+				[`${options.schemaName}\nwallet-email\n${email}`],
+			);
+			const priorClaim = createHash("sha256")
+				.update(`reserve:siwe-email-claim-${email}`)
+				.digest("base64url");
 			for (const candidate of new Set([email, placeholder])) {
-				if (options.emailAliases?.reserved(candidate)) {
-					// A claimed caller email falls back to the wallet address before user creation.
-					if (
-						candidate !== placeholder &&
-						(
-							await client.query('SELECT 1 FROM "user" WHERE email=$1', [
-								candidate,
-							])
-						).rowCount
-					)
-						continue;
+				// A claimed contact address or native reservation chooses the wallet placeholder.
+				if (
+					candidate !== placeholder &&
+					(
+						await client.query(
+							`SELECT id FROM "user" WHERE email=$1
+						 UNION ALL SELECT id FROM "verification" WHERE id=$2 LIMIT 1`,
+							[candidate, priorClaim],
+						)
+					).rowCount
+				)
+					continue;
+				if (await options.denyProvisioning(client, request, candidate))
+					return accountLinkError(
+						403,
+						"validation_failed",
+						"User validation failed",
+					);
+				if (!options.signUpEnabled)
+					return accountLinkError(
+						403,
+						"FORBIDDEN",
+						"New account registration is disabled for this application.",
+					);
+				if (options.emailAliases?.reserved(candidate))
 					return accountLinkError(
 						reservedProjectEmailError.status,
 						reservedProjectEmailError.code,
 						reservedProjectEmailError.message,
 					);
-				}
+				signup.rollback = await checkpointOwnedProjectWrites(client);
 				const result = await client.query(
 					`INSERT INTO "user" (id,name,email,image,role,"emailVerified","isAnonymous")
 					 VALUES ($1,$2,$3,'','user',FALSE,FALSE)
@@ -121,6 +155,8 @@ export function createOwnedProjectWallet(options: {
 					userId = id;
 					break;
 				}
+				// ON CONFLICT made no write. The fallback gets its own native admission.
+				signup.rollback = undefined;
 			}
 		}
 		const user = userId ? await store.lockUser(client, userId) : null;
@@ -154,7 +190,7 @@ export function createOwnedProjectWallet(options: {
 				[randomUUID(), user.id, subject],
 			);
 		}
-		return user;
+		return { user, linked: !recorded.rowCount };
 	}
 
 	async function issue(request: Request) {
@@ -168,7 +204,7 @@ export function createOwnedProjectWallet(options: {
 				"Invalid wallet sign-in request.",
 			);
 		return store.transaction(async (client) => {
-			const blocked = await options.admit(client, request);
+			const blocked = await options.admit(client, request, { kind: "nonce" });
 			if (blocked) return blocked;
 			const nonce = randomBytes(16).toString("hex");
 			await client.query(
@@ -180,21 +216,14 @@ export function createOwnedProjectWallet(options: {
 		});
 	}
 
-	async function verify(request: Request) {
-		const input = verifyInput.safeParse(await options.readBody(request));
-		if (!input.success)
-			return accountLinkError(
-				400,
-				"INVALID_BODY",
-				"Invalid wallet sign-in request.",
-			);
-		const { message, signature, email } = input.data;
+	async function verifyProof(
+		request: Request,
+		{ message, signature, email }: z.infer<typeof verifyInput>,
+	) {
 		const parsed = parseSiweMessage(message);
 		const { nonce, domain, scheme, uri, chainId, address: rawAddress } = parsed;
 		if (!nonce || !noncePattern.test(nonce)) return mismatch();
 		const refusal = await store.transaction(async (client) => {
-			const blocked = await options.admit(client, request, email);
-			if (blocked) return blocked;
 			const consumed = await client.query(
 				`DELETE FROM "verification" WHERE identifier=$1 AND value=$2
 				 AND "expiresAt">statement_timestamp() RETURNING id`,
@@ -248,23 +277,66 @@ export function createOwnedProjectWallet(options: {
 			return invalidSignature();
 		}
 		const wallet = { address, chainId };
-		try {
-			return await store.transaction(async (client) => {
-				const user = await bind(client, wallet, email);
-				if (user instanceof Response) throw user;
-				const result = await options.complete(client, request, user, wallet);
-				if (result.status >= 400) throw result;
-				return result;
-			});
-		} catch (error) {
-			return error instanceof Response
+		const failure = (error: unknown) =>
+			error instanceof Response
 				? error
 				: accountLinkError(
 						503,
 						"SERVICE_UNAVAILABLE",
 						"Wallet sign-in is temporarily unavailable.",
 					);
+		try {
+			return await store.transaction(async (client) => {
+				const signup: WalletSignup = {};
+				try {
+					const binding = await bind(client, request, wallet, email, signup);
+					if (binding instanceof Response) {
+						if (signup.rollback) throw binding;
+						return binding;
+					}
+					const result = await options.complete(
+						client,
+						request,
+						binding.user,
+						wallet,
+					);
+					// For an existing binding, keep a session-policy denial's audit record.
+					if (
+						result.status >= 400 &&
+						(result.status !== 429 || binding.linked || signup.rollback)
+					)
+						throw result;
+					return result;
+				} catch (error) {
+					if (!signup.rollback) throw error;
+					await signup.rollback();
+					return failure(error);
+				}
+			});
+		} catch (error) {
+			return failure(error);
 		}
+	}
+
+	async function verify(request: Request) {
+		const input = verifyInput.safeParse(await options.readBody(request));
+		if (!input.success)
+			return accountLinkError(
+				400,
+				"INVALID_BODY",
+				"Invalid wallet sign-in request.",
+			);
+		const { email } = input.data;
+		const blocked = await store.transaction((client) =>
+			options.admit(client, request, { kind: "verification", email }),
+		);
+		if (blocked) return blocked;
+		const response = await verifyProof(request, input.data);
+		if (response.status >= 400 && response.status < 500)
+			await store.transaction((client) =>
+				options.recordFailure(client, request, email, response),
+			);
+		return response;
 	}
 
 	return (path: string, request: Request) =>

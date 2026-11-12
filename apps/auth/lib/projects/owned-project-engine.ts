@@ -2393,10 +2393,29 @@ export function createOwnedProjectEngine(
 			signingOrigin: options.walletOrigin,
 			signUpEnabled: policy.signUpEnabled,
 			readBody: requestBody,
-			async admit(client, request, email) {
-				return (await security.admit(client, request, { email }))
+			denyProvisioning: security.denyStandaloneSignup,
+			async admit(client, request, operation) {
+				const identity =
+					operation.kind === "nonce"
+						? { message: true }
+						: { email: operation.email };
+				return (await security.admit(client, request, identity))
 					? securityBlocked()
 					: null;
+			},
+			async recordFailure(client, request, email, response) {
+				const body: unknown = await response.clone().json().catch(() => null);
+				const code =
+					body &&
+					typeof body === "object" &&
+					"code" in body &&
+					typeof body.code === "string" &&
+					/^[a-zA-Z0-9_-]{1,100}$/.test(body.code)
+						? body.code
+						: "AUTHENTICATION_FAILED";
+				if (code !== projectSecurityBlockedCode)
+					await security.failed(client, request, "/siwe/verify", { email });
+				await recordPrimaryFailure(client, request, "/siwe/verify", code);
 			},
 			complete(client, request, user, wallet) {
 				return primaryResult(
