@@ -2612,11 +2612,7 @@ export function createOwnedProjectEngine(
 				android: false,
 			},
 			emailPassword: policy.emailAndPasswordEnabled,
-			signUpEnabled: Boolean(
-				options.signUp &&
-					policy.emailAndPasswordEnabled &&
-					policy.signUpEnabled,
-			),
+			signUpEnabled: policy.signUpEnabled,
 			emailVerificationRequired: policy.requireEmailVerification,
 			passwordPolicy: policy.passwordPolicy,
 			google: googleProvider !== null,

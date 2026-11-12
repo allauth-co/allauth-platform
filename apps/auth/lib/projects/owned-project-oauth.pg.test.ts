@@ -14,6 +14,7 @@ import { productionTwoFactor } from "../mfa";
 import { appleIntegrity } from "../project-providers/apple";
 import { microsoftIntegrity } from "../project-providers/microsoft";
 import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
+import { projectManagement } from "./management-plugin";
 import { createOwnedProjectEngine } from "./owned-project-engine";
 import { createProjectEngineStore } from "./owned-project-engine-store";
 import type { OwnedProjectOAuthOptions } from "./owned-project-oauth";
@@ -103,6 +104,10 @@ async function nativeBroker() {
 async function legacyProject(
 	db: LegacyDatabase,
 	config: OwnedProjectOAuthOptions["broker"],
+	settings?: {
+		policy: typeof defaultAuthPolicy;
+		brokerOnly: boolean;
+	},
 ) {
 	return (
 		await getTestInstance(
@@ -111,20 +116,32 @@ async function legacyProject(
 				secret: key,
 				logger: { disabled: true },
 				database: { db, type: "postgres" },
-				socialProviders: {
-					google,
-					microsoft: {
-						...microsoft,
-						disableProfilePhoto: true,
-						disableDefaultScope: true,
-						scope: ["openid", "profile", "email"],
-					},
-					apple: {
-						...apple,
-						clientId: [apple.clientId, apple.appBundleIdentifier],
-						audience: [apple.clientId, apple.appBundleIdentifier],
-					},
-				},
+				...(settings
+					? {
+							emailAndPassword: {
+								enabled: settings.policy.emailAndPasswordEnabled,
+								disableSignUp: !settings.policy.signUpEnabled,
+								requireEmailVerification:
+									settings.policy.requireEmailVerification,
+							},
+						}
+					: {}),
+				socialProviders: settings?.brokerOnly
+					? {}
+					: {
+							google,
+							microsoft: {
+								...microsoft,
+								disableProfilePhoto: true,
+								disableDefaultScope: true,
+								scope: ["openid", "profile", "email"],
+							},
+							apple: {
+								...apple,
+								clientId: [apple.clientId, apple.appBundleIdentifier],
+								audience: [apple.clientId, apple.appBundleIdentifier],
+							},
+						},
 				trustedOrigins: [appleIssuer],
 				account: {
 					encryptOAuthTokens: true,
@@ -139,6 +156,18 @@ async function legacyProject(
 					},
 				},
 				plugins: [
+					...(settings
+						? [
+								projectManagement({
+									projectId: randomUUID(),
+									projectSlug: slug,
+									baseURL: origin,
+									async requirePlatformAdmin() {
+										throw new Error("No fixture platform principal.");
+									},
+								}),
+							]
+						: []),
 					microsoftIntegrity(),
 					appleIntegrity(),
 					productionTwoFactor(origin),
@@ -229,6 +258,7 @@ describe.skipIf(!existsSync(fixturePath))(
 						"001-initial-auth.sql",
 						"002-control-plane.sql",
 						"005-free-plugins.sql",
+						"016-invitation-import-provenance.sql",
 					]) {
 						await client.query(
 							readFileSync(
@@ -522,7 +552,10 @@ describe.skipIf(!existsSync(fixturePath))(
 			return new Request(callback, { headers: { cookie: cookiePairs(start) } });
 		}
 
-		function ownedProviderEngine() {
+		function ownedProviderEngine(
+			policy = defaultAuthPolicy,
+			brokerOnly = false,
+		) {
 			return createOwnedProjectEngine({
 				database,
 				project: { schemaName: schema, slug },
@@ -531,18 +564,22 @@ describe.skipIf(!existsSync(fixturePath))(
 				signingSecret: key,
 				trustedOrigins: [],
 				trustedIP: () => "203.0.113.16",
-				policy: defaultAuthPolicy,
+				policy,
 				oauth: {
 					broker: config,
-					google,
-					microsoft,
-					apple: {
-						...apple,
-						clientSecret: async (clientId) =>
-							clientId === apple.appBundleIdentifier
-								? appleBundleSecret
-								: apple.clientSecret,
-					},
+					...(brokerOnly
+						? {}
+						: {
+								google,
+								microsoft,
+								apple: {
+									...apple,
+									clientSecret: async (clientId: string) =>
+										clientId === apple.appBundleIdentifier
+											? appleBundleSecret
+											: apple.clientSecret,
+								},
+							}),
 					defaultErrorURL: `${origin}/auth-error`,
 					fetch: network,
 				},
@@ -713,7 +750,7 @@ describe.skipIf(!existsSync(fixturePath))(
 			const configuration = await response.json();
 			expect(configuration).toMatchObject({
 				emailPassword: defaultAuthPolicy.emailAndPasswordEnabled,
-				signUpEnabled: false,
+				signUpEnabled: defaultAuthPolicy.signUpEnabled,
 				emailVerificationRequired: defaultAuthPolicy.requireEmailVerification,
 				passwordPolicy: defaultAuthPolicy.passwordPolicy,
 				google: true,
@@ -731,6 +768,52 @@ describe.skipIf(!existsSync(fixturePath))(
 			expect(JSON.stringify(configuration)).not.toMatch(
 				/clientSecret|signingSecret|tenantId|fixture-secret/,
 			);
+		});
+
+		it.each([
+			{
+				mode: "broker-only",
+				brokerOnly: true,
+				signUpEnabled: true,
+				googleProvider: null,
+			},
+			{
+				mode: "direct social",
+				brokerOnly: false,
+				signUpEnabled: true,
+				googleProvider: "google",
+			},
+			{
+				mode: "registration disabled",
+				brokerOnly: true,
+				signUpEnabled: false,
+				googleProvider: null,
+			},
+		])("matches native SDK registration policy with passwords disabled for $mode", async ({
+			brokerOnly,
+			signUpEnabled,
+			googleProvider,
+		}) => {
+			if (!nativeDatabase)
+				throw new Error("The native OAuth fixture database is unavailable.");
+			const policy = {
+				...defaultAuthPolicy,
+				emailAndPasswordEnabled: false,
+				signUpEnabled,
+			};
+			const previous = await legacyProject(nativeDatabase, config, {
+				policy,
+				brokerOnly,
+			});
+			const candidate = ownedProviderEngine(policy, brokerOnly);
+			const request = () => new Request(`${origin}/api/auth/sdk/config`);
+			const legacy = await previous.handler(request());
+			const owned = await candidate.dispatch(request());
+			expect(legacy.status).toBe(200);
+			expect(owned.status).toBe(200);
+			const expected = { emailPassword: false, signUpEnabled, googleProvider };
+			expect(await legacy.json()).toMatchObject(expected);
+			expect(await owned.json()).toMatchObject(expected);
 		});
 
 		it("switches Microsoft callbacks both ways without changing the existing object-ID binding", async () => {
