@@ -23,7 +23,10 @@ import {
 import { canonicalIP } from "../control/security-policy";
 import { authenticationEmail } from "../email/authentication";
 import { emailConfigured, sendAuthEmail } from "../email/send";
-import { projectEmailAliasVariable } from "../project-email-aliases";
+import {
+	parseProjectEmailAliases,
+	projectEmailAliasVariable,
+} from "../project-email-alias-config";
 import {
 	nativePasskeyCapability,
 	realmPasskeyOptions,
@@ -108,6 +111,11 @@ const authAdmission = {
 	"sign-in/magic-link": [5, 60_000],
 	"magic-link/verify": [5, 60_000],
 	"email-otp/send-verification-otp": [3, 60_000],
+	"email-otp/check-verification-otp": [3, 60_000],
+	"email-otp/verify-email": [3, 60_000],
+	"email-otp/request-password-reset": [3, 60_000],
+	"email-otp/reset-password": [3, 60_000],
+	"forget-password/email-otp": [3, 60_000],
 	"sign-in/email-otp": [3, 60_000],
 	"request-password-reset": [3, 60_000],
 	"send-verification-email": [3, 60_000],
@@ -364,15 +372,9 @@ function projectSupport(options: Options, platformOrigin: string) {
 /** Assemble an explicitly selected internal development realm. This function does not select a runtime. */
 export async function createOwnedProjectRuntimeCandidate(options: Options) {
 	const { database, project, env, policy, defer } = options;
-	if (
-		setting(
-			env,
-			projectEmailAliasVariable(projectSlug.parse(project.slug)),
-		).trim()
-	)
-		throw new Error(
-			"Configured project email aliases require the legacy writer.",
-		);
+	const emailAliases = parseProjectEmailAliases(
+		setting(env, projectEmailAliasVariable(projectSlug.parse(project.slug))),
+	);
 	const { signingSecret, encryptionKeys } = readLegacyProjectKeyring(
 		options.signingSecret,
 		process.env.BETTER_AUTH_SECRETS,
@@ -571,6 +573,7 @@ export async function createOwnedProjectRuntimeCandidate(options: Options) {
 		database,
 		project,
 		policy,
+		emailAliases,
 		baseURL: origin,
 		basePath,
 		signingSecret,

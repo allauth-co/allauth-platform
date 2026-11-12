@@ -1,6 +1,7 @@
 import type { Pool } from "pg";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AuthEnvironment } from "../configuration";
+import { projectEmailAliasVariable } from "../project-email-alias-config";
 import type { Project } from "./registry";
 import { verifyInternalProjectEngineReadiness } from "./project-engine-internal-readiness";
 import { closeProjectInstances, withHostedProjectAuthEngine, withProjectAuth, withProjectAuthEngine } from "./runtime";
@@ -146,6 +147,34 @@ describe("native passkey policy cache isolation", () => {
 });
 
 describe("protected internal project writer selection", () => {
+	it("rebuilds the active candidate when the project's configured aliases change", async () => {
+		const id = "8d0da368-94b3-4897-988e-39c320a3e852";
+		const internal: Project = {
+			...project(),
+			id,
+			schemaName: `allauth_project_${id.replaceAll("-", "")}`,
+			workspaceId: platformWorkspaceId,
+			environment: "development",
+		};
+		const aliasSetting = projectEmailAliasVariable(internal.slug);
+		const selected = {
+			...environment,
+			ALLAUTH_PROJECT_ENGINE_INTERNAL_ID: id,
+			[aliasSetting]: '{"old@example.test":"first-fixture-user"}',
+		};
+		fixture.getProject.mockResolvedValue(internal);
+		fixture.readAuthPolicy.mockResolvedValue(defaultStoredAuthPolicy());
+		fixture.admitted = { writer: "allauth", revision: 1 };
+		const engine = (env: AuthEnvironment) => withProjectAuthEngine(
+			internal.slug, async ({ engine }) => engine, env,
+		);
+		const initial = await engine(selected);
+		expect(await engine({ ...selected })).toBe(initial);
+		const updated = await engine({ ...selected, [aliasSetting]: '{"old@example.test":"second-fixture-user"}' });
+		expect(updated).not.toBe(initial);
+		expect(fixture.createOwned).toHaveBeenCalledTimes(2);
+	});
+
 	it("selects the exact development realm and its verified hosted transport, then restores legacy", async () => {
 		const id = "8d0da368-94b3-4897-988e-39c320a3e852";
 		const internal: Project = {

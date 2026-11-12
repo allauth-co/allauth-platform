@@ -54,6 +54,7 @@ import {
 import { createOwnedProjectClerkImport } from "./owned-project-clerk-import";
 import { createOwnedProjectEmailAliases } from "./owned-project-email-aliases";
 import { createOwnedProjectEmailChange } from "./owned-project-email-change";
+import { createOwnedProjectEmailOtpVerification } from "./owned-project-email-otp-verification";
 import type { OwnedProjectEmailSignInOptions } from "./owned-project-email-sign-in";
 import { createOwnedProjectEmailSignIn } from "./owned-project-email-sign-in";
 import type { ProjectSession, ProjectUser } from "./owned-project-engine-store";
@@ -904,6 +905,7 @@ export function createOwnedProjectEngine(
 			(path.startsWith("/sign-in/") ||
 				path.startsWith("/callback/") ||
 				path === "/verify-email" ||
+				path === "/email-otp/verify-email" ||
 				path === "/magic-link/verify" ||
 				path === "/passkey/verify-authentication")
 		) {
@@ -933,6 +935,8 @@ export function createOwnedProjectEngine(
 		}
 		if (path === "/sign-in/email-otp")
 			return json({ token, user: value }, 200, headers);
+		if (path === "/email-otp/verify-email")
+			return json({ status: true, token, user: value }, 200, headers);
 		if (path === "/sign-in/social")
 			return json({ redirect: false, token, user: value }, 200, headers);
 		if (providerProof?.wallet)
@@ -1884,6 +1888,47 @@ export function createOwnedProjectEngine(
 				);
 			},
 		});
+	const emailOtpVerification =
+		emailSignIn &&
+		createOwnedProjectEmailOtpVerification({
+			database: options.database,
+			project: options.project,
+			baseURL: origin,
+			basePath: options.basePath,
+			trustedOrigins: options.trustedOrigins,
+			emailAliases,
+			email: emailSignIn.email,
+			defer: emailSignIn.defer,
+			onDeliveryFailure: () =>
+				emailSignIn.onDeliveryFailure?.("email-otp/send-verification-otp"),
+			auditContext: browserEventContext,
+			async admit(request, operation, email) {
+				if (operation !== "email-otp/check-verification-otp") {
+					const denied = await store.transaction((client) =>
+						security.admit(client, request, {
+							email,
+							message: operation === "email-otp/send-verification-otp",
+						}),
+					);
+					if (denied) return securityBlocked();
+				}
+				return emailSignIn.admit(request, operation, email);
+			},
+			completeVerification({ client, user, request }) {
+				return primaryResult(
+					client,
+					user,
+					request,
+					true,
+					"/email-otp/verify-email",
+				);
+			},
+			onVerificationFailure({ client, request, email }) {
+				return security.failed(client, request, "/email-otp/verify-email", {
+					email,
+				});
+			},
+		});
 	const recoveryOptions = options.recovery;
 	const recoveryHttp =
 		recoveryOptions &&
@@ -1901,6 +1946,8 @@ export function createOwnedProjectEngine(
 			async admit(request, operation, email) {
 				if (
 					operation === "request-password-reset" ||
+					operation === "email-otp/request-password-reset" ||
+					operation === "email-otp/send-verification-otp" ||
 					operation === "send-verification-email"
 				) {
 					const denied = await store.transaction((client) =>
@@ -2965,8 +3012,20 @@ export function createOwnedProjectEngine(
 			if (denied) return denied;
 			return accountDeletion.confirm(request);
 		}
+		if (
+			emailOtpVerification &&
+			request.method === "POST" &&
+			(path === "/email-otp/request-email-change" || path === "/email-otp/change-email")
+		) {
+			if (!trustedRequest(request.headers, true)) return forbidden();
+			if (!(await currentSession(request.headers)))
+				return failure(401, "UNAUTHORIZED", "Unauthorized");
+			return json({ message: "Change email with OTP is disabled" }, 400);
+		}
 		const recovery = await recoveryHttp?.(request);
 		if (recovery) return recovery;
+		const emailVerification = await emailOtpVerification?.(request);
+		if (emailVerification) return emailVerification;
 		const registration = await signUpHttp?.(request);
 		if (registration) return registration;
 		const emailSignIn = await emailSignInHttp?.(request);

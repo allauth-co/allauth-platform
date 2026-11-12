@@ -1,7 +1,7 @@
 import { Pool } from "pg";
 import { describe, expect, it, vi } from "vitest";
 import { defaultAuthPolicy } from "../auth-policy/policy";
-import { projectEmailAliasVariable } from "../project-email-aliases";
+import { projectEmailAliasVariable } from "../project-email-alias-config";
 import { createOwnedProjectRuntimeCandidate } from "./owned-project-runtime-factory";
 import type { Project } from "./registry";
 
@@ -9,7 +9,7 @@ describe("internal candidate feature admission", () => {
 	it.each([
 		"direct",
 		"hosted",
-	] as const)("rejects configured legacy email aliases before opening the %s writer", async (kind) => {
+	] as const)("rejects malformed project email aliases before opening the %s writer", async (kind) => {
 		const slug = "alias-fixture";
 		const project: Project = {
 			id: "35a18272-5155-4a0e-8fdb-cc74e761734c",
@@ -41,7 +41,7 @@ describe("internal candidate feature admission", () => {
 						EMAIL_PROVIDER: "resend",
 						RESEND_API_KEY: "",
 						[projectEmailAliasVariable(slug)]:
-							'{"reserved@alias-fixture.example":"fixture-user"}',
+							'{"reserved@alias-fixture.example":"invalid fixture ID"}',
 					},
 					transport:
 						kind === "hosted"
@@ -53,7 +53,7 @@ describe("internal candidate feature admission", () => {
 					defer: () => {},
 				}),
 			).rejects.toThrow(
-				/^Configured project email aliases require the legacy writer\.$/,
+				/^The project email alias configuration is invalid\.$/,
 			);
 			expect(query).not.toHaveBeenCalled();
 		} finally {

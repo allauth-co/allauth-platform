@@ -9,6 +9,8 @@ import type { EmailEnvironment } from "../email/send";
 import { emailConfigured, sendAuthEmail } from "../email/send";
 import type { OwnedProjectEmailAliases } from "./owned-project-email-aliases";
 import { scheduleOwnedEmailDelivery } from "./owned-project-email-delivery";
+import type { ProjectEmailOtpVerificationOperation } from "./owned-project-email-otp-verification";
+import { readProjectEmailProofBody, readSharedProjectEmailOtpBody } from "./owned-project-email-proof-body";
 import type { CompleteProjectEmailSignIn } from "./owned-project-email-sign-in-store";
 import { createProjectEmailSignInStore } from "./owned-project-email-sign-in-store";
 import type { Project } from "./registry";
@@ -43,8 +45,8 @@ const otpSignIn = z.object({
 export type ProjectEmailSignInOperation =
 	| "sign-in/magic-link"
 	| "magic-link/verify"
-	| "email-otp/send-verification-otp"
-	| "sign-in/email-otp";
+	| "sign-in/email-otp"
+	| ProjectEmailOtpVerificationOperation;
 
 export interface OwnedProjectEmailSignInOptions {
 	database: Pool;
@@ -130,42 +132,6 @@ function redirectError(callback: URL, code: string) {
 		status: 302,
 		headers: privateHeaders(new Headers({ Location: callback.href })),
 	});
-}
-
-async function readBody(request: Request): Promise<unknown> {
-	const mime = request.headers
-		.get("content-type")
-		?.split(";", 1)[0]
-		?.trim()
-		.toLowerCase();
-	const form = mime === "application/x-www-form-urlencoded";
-	if (!form && mime !== "application/json") return undefined;
-	const reader = request.body?.getReader();
-	if (!reader) return undefined;
-	const decoder = new TextDecoder("utf-8", { fatal: true });
-	let length = 0;
-	let content = "";
-	try {
-		while (true) {
-			const { done, value } = await reader.read();
-			if (done) break;
-			length += value.byteLength;
-			if (length > 8192) {
-				void reader.cancel().catch(() => {});
-				return undefined;
-			}
-			content += decoder.decode(value, { stream: true });
-		}
-		content += decoder.decode();
-		if (!form) return JSON.parse(content);
-		const fields = new URLSearchParams(content);
-		if (new Set(fields.keys()).size !== fields.size) return undefined;
-		return Object.fromEntries(fields);
-	} catch {
-		return undefined;
-	} finally {
-		reader.releaseLock();
-	}
 }
 
 /** Cookie-only project sign-in backed by the existing five-minute email challenge rows. */
@@ -283,7 +249,7 @@ export function createOwnedProjectEmailSignIn(
 	}
 
 	async function proofBody(request: Request) {
-		const raw = await readBody(request);
+		const raw = await readProjectEmailProofBody(request);
 		return options.emailAliases?.normalizeInput(raw) ?? raw;
 	}
 
@@ -338,7 +304,8 @@ export function createOwnedProjectEmailSignIn(
 	}
 
 	async function sendOtp(request: Request) {
-		const parsed = otpSend.safeParse(await proofBody(request));
+		const body = await readSharedProjectEmailOtpBody(request);
+		const parsed = otpSend.safeParse(options.emailAliases?.normalizeInput(body) ?? body);
 		if (!parsed.success)
 			return failure(
 				400,

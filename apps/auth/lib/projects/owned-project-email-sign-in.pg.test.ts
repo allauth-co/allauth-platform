@@ -7,10 +7,15 @@ import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { defaultAuthPolicy } from "../auth-policy/policy";
 import { clerkCompatiblePasswords } from "../clerk-password";
+import { productionTwoFactor } from "../mfa";
 import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
+import { sealLegacyMfaRecord } from "./legacy-mfa-record";
 import { createOwnedProjectEmailAliases } from "./owned-project-email-aliases";
+import type { OwnedProjectEmailOtpVerificationOptions } from "./owned-project-email-otp-verification";
+import { createOwnedProjectEmailOtpVerification } from "./owned-project-email-otp-verification";
 import type { OwnedProjectEmailSignInOptions } from "./owned-project-email-sign-in";
 import { createOwnedProjectEmailSignIn } from "./owned-project-email-sign-in";
+import { createOwnedProjectEngine } from "./owned-project-engine";
 import {
 	createProjectEngineStore,
 	projectUserResponse,
@@ -49,6 +54,7 @@ async function legacyFixture(
 				password: clerkCompatiblePasswords,
 			},
 			plugins: [
+				productionTwoFactor(appOrigin),
 				magicLink({
 					expiresIn: 300,
 					storeToken: "hashed",
@@ -248,6 +254,425 @@ describe.skipIf(!existsSync(fixturePath))(
 				);
 			return user;
 		}
+
+		function verificationFixture(
+			overrides: Partial<OwnedProjectEmailOtpVerificationOptions> = {},
+		) {
+			const queued: (() => Promise<void>)[] = [];
+			const deliveries: { to: string; html: string }[] = [];
+			const options: OwnedProjectEmailOtpVerificationOptions = {
+				database,
+				project: { schemaName: schema, slug },
+				baseURL: origin,
+				basePath,
+				trustedOrigins: [appOrigin],
+				email: {
+					environment: {
+						EMAIL_FROM: "no-reply@email-proof-fixture.example",
+						EMAIL: {
+							async send(message) {
+								deliveries.push(message);
+							},
+						},
+					},
+				},
+				async admit() {
+					return { allowed: true, retryAfter: 0 };
+				},
+				defer(work) {
+					queued.push(work);
+				},
+				...overrides,
+			};
+			return {
+				handler: createOwnedProjectEmailOtpVerification(options),
+				options,
+				queued,
+				deliveries,
+				async flush() {
+					for (const work of queued.splice(0)) await work();
+				},
+			};
+		}
+
+		function proofState(email: string, purpose = "email-verification") {
+			return database.query<{ id: string; value: string; expiresAt: Date }>(
+				`SELECT id, value, "expiresAt" FROM "${schema}"."verification"
+					WHERE identifier=$1 ORDER BY "createdAt" DESC`,
+				[`${purpose}-otp-${email}`],
+			);
+		}
+
+		it("persists a uniform verification send before mail and lets the native writer check and consume it", async () => {
+			const email = "owned-verification@email-proof-fixture.example";
+			const unknown = "unknown-verification@email-proof-fixture.example";
+			const user = await seed(email, false);
+			const writer = new Pool({ connectionString: databaseURL, max: 1 });
+			const owned = verificationFixture({ database: writer });
+			try {
+				for (const address of [email.toUpperCase(), unknown]) {
+					const sent = await owned.handler(
+						post("email-otp/send-verification-otp", {
+							email: address,
+							type: "email-verification",
+						}),
+					);
+					expect(await sent?.json()).toEqual({ success: true });
+				}
+				expect(owned.queued).toHaveLength(2);
+				expect(owned.deliveries).toHaveLength(0);
+				expect((await proofState(email)).rowCount).toBe(1);
+				expect((await proofState(unknown)).rowCount).toBe(0);
+			} finally {
+				await writer.end();
+			}
+			await owned.flush();
+			expect(owned.deliveries.map((message) => message.to)).toEqual([email]);
+			const otp = otpFromEmail(owned.deliveries[0].html);
+			const row = (await proofState(email)).rows[0];
+			expect(row.value).toBe(
+				`${createHash("sha256").update(otp).digest("base64url")}:0`,
+			);
+			const body = { email, type: "email-verification" as const, otp };
+			await expect(
+				native.auth.api.checkVerificationOTP({ body }),
+			).resolves.toEqual({ success: true });
+			await expect(
+				native.auth.api.checkVerificationOTP({ body }),
+			).resolves.toEqual({ success: true });
+			expect((await proofState(email)).rows).toEqual([row]);
+			await expect(
+				native.auth.api.verifyEmailOTP({ body: { email, otp } }),
+			).resolves.toMatchObject({
+				status: true,
+				token: null,
+				user: { id: user.id, emailVerified: true },
+			});
+			expect((await proofState(email)).rowCount).toBe(0);
+		});
+
+		it("shares wrong-attempt budgets with the native writer and keeps successful checks non-consuming", async () => {
+			const email = "legacy-verification@email-proof-fixture.example";
+			const user = await seed(email, false);
+			const owned = verificationFixture();
+			await native.auth.api.sendVerificationOTP({
+				body: { email, type: "email-verification" },
+			});
+			const otp = nativeCodes.pop()!;
+			const wrong = otp === "000000" ? "111111" : "000000";
+			const original = (await proofState(email)).rows[0];
+			const body = { email, type: "email-verification" as const };
+			for (let attempt = 1; attempt <= 2; attempt++) {
+				const result = await owned.handler(
+					post("email-otp/check-verification-otp", { ...body, otp: wrong }),
+				);
+				expect(await result?.json()).toMatchObject({ code: "INVALID_OTP" });
+				const state = (await proofState(email)).rows[0];
+				expect(state.value).toBe(`${original.value.split(":")[0]}:${attempt}`);
+				expect(state.expiresAt).toEqual(original.expiresAt);
+			}
+			await expect(
+				native.auth.api.checkVerificationOTP({ body: { ...body, otp: wrong } }),
+			).rejects.toMatchObject({
+				statusCode: 400,
+				body: { code: "INVALID_OTP" },
+			});
+			const exhausted = await owned.handler(
+				post("email-otp/verify-email", { email, otp }),
+			);
+			expect(exhausted?.status).toBe(403);
+			expect(await exhausted?.json()).toMatchObject({
+				code: "TOO_MANY_ATTEMPTS",
+			});
+			expect((await proofState(email)).rowCount).toBe(0);
+
+			await native.auth.api.sendVerificationOTP({ body });
+			const replacement = nativeCodes.pop()!;
+			expect(
+				await (
+					await owned.handler(
+						post("email-otp/check-verification-otp", {
+							...body,
+							otp: replacement,
+						}),
+					)
+				)?.json(),
+			).toEqual({ success: true });
+			expect((await proofState(email)).rowCount).toBe(1);
+			const verified = await Promise.all(
+				[0, 1].map(() =>
+					owned.handler(
+						post("email-otp/verify-email", { email, otp: replacement }),
+					),
+				),
+			);
+			expect(verified.map((reply) => reply?.status).sort()).toEqual([200, 400]);
+			const success = verified.find((reply) => reply?.ok);
+			expect(await success?.json()).toMatchObject({
+				status: true,
+				token: null,
+				user: { id: user.id, emailVerified: true },
+			});
+			expect((await proofState(email)).rowCount).toBe(0);
+			const audit = await database.query(
+				`SELECT id FROM "${schema}"."allauthEvent" WHERE "userId"=$1
+					AND type='user.email-verified' AND metadata->>'path'='/email-otp/verify-email'`,
+				[user.id],
+			);
+			expect(audit.rowCount).toBe(1);
+		});
+
+		it("checks login and recovery aliases without rewriting an email-verification address", async () => {
+			const email = "otp-canonical@email-proof-fixture.example";
+			const alias = "otp-alternate@email-proof-fixture.example";
+			const user = await seed(email);
+			const owned = verificationFixture({
+				emailAliases: createOwnedProjectEmailAliases(database, schema, {
+					[alias]: user.id,
+				}),
+			});
+			for (const purpose of [
+				"sign-in",
+				"forget-password",
+				"email-verification",
+			] as const) {
+				await native.auth.api.sendVerificationOTP({
+					body: { email, type: purpose },
+				});
+				const otp = nativeCodes.pop()!;
+				const response = await owned.handler(
+					post("email-otp/check-verification-otp", {
+						email: alias,
+						type: purpose,
+						otp,
+					}),
+				);
+				if (purpose === "email-verification") {
+					expect(await response?.json()).toMatchObject({ code: "INVALID_OTP" });
+					const verified = await owned.handler(
+						post("email-otp/verify-email", { email: alias, otp }),
+					);
+					expect(await verified?.json()).toMatchObject({ code: "INVALID_OTP" });
+				} else {
+					expect(await response?.json()).toEqual({ success: true });
+				}
+				expect(
+					(await proofState(email, purpose)).rows[0].value.endsWith(":0"),
+				).toBe(true);
+			}
+			const sent = await owned.handler(
+				post("email-otp/send-verification-otp", {
+					email: alias,
+					type: "email-verification",
+				}),
+			);
+			expect(await sent?.json()).toEqual({ success: true });
+			await owned.flush();
+			expect(owned.deliveries).toHaveLength(0);
+		});
+
+		it("expires a native verification code and accepts a freshly issued replacement", async () => {
+			const email = "otp-expired@email-proof-fixture.example";
+			const user = await seed(email);
+			let completions = 0;
+			const owned = verificationFixture({
+				async completeVerification() {
+					completions++;
+					return undefined;
+				},
+			});
+			const type = "email-verification";
+			await native.auth.api.sendVerificationOTP({ body: { email, type } });
+			const otp = nativeCodes.pop()!;
+			await database.query(
+				`UPDATE "${schema}"."verification" SET "expiresAt"=statement_timestamp()-interval '1 second'
+				 WHERE identifier=$1`,
+				[`${type}-otp-${email}`],
+			);
+			const expired = await owned.handler(
+				post("email-otp/check-verification-otp", { email, type, otp }),
+			);
+			expect(await expired?.json()).toMatchObject({ code: "OTP_EXPIRED" });
+			expect((await proofState(email)).rowCount).toBe(0);
+			await native.auth.api.sendVerificationOTP({ body: { email, type } });
+			const verified = await owned.handler(
+				post("email-otp/verify-email", { email, otp: nativeCodes.pop()! }),
+			);
+			expect(await verified?.json()).toMatchObject({
+				status: true,
+				token: null,
+				user: { id: user.id, emailVerified: true },
+			});
+			expect(verified?.headers.has("set-cookie")).toBe(false);
+			expect(completions).toBe(1);
+		});
+
+		it("preserves the installed refusals for email changes by code", async () => {
+			const email = "otp-change-refusal@email-proof-fixture.example";
+			await seed(email);
+			const signedIn = await native.auth.handler(post("sign-in/email", { email, password }));
+			const cookie = signedIn.headers.getSetCookie()
+				.find((value) => value.includes(".session_token="))?.split(";", 1)[0];
+			expect(cookie).toBeTruthy();
+			const candidate = verificationEngine();
+			const type = "change-email";
+			for (const [path, body, status, authorized] of [
+				["send-verification-otp", { email, type }, 400, false],
+				["check-verification-otp", { email, type, otp: "012345" }, 400, false],
+				["request-email-change", { newEmail: email }, 401, false],
+				["request-email-change", { newEmail: email }, 400, true],
+				["change-email", { newEmail: email, otp: "012345" }, 400, true],
+			] as const) {
+				const attempt = () => {
+					const request = post(`email-otp/${path}`, body);
+					if (authorized) request.headers.set("cookie", cookie!);
+					return request;
+				};
+				const legacy = await native.auth.handler(attempt());
+				const owned = await candidate.dispatch(attempt());
+				expect(legacy.status, await legacy.clone().text()).toBe(status);
+				expect(owned.status).toBe(status);
+				expect(await owned.json()).toEqual(await legacy.json());
+			}
+		});
+
+		function verificationEngine() {
+			const fixture = verificationFixture();
+			return createOwnedProjectEngine({
+				database,
+				project: { schemaName: schema, slug },
+				baseURL: origin,
+				basePath,
+				trustedOrigins: [appOrigin],
+				signingSecret,
+				policy: defaultAuthPolicy,
+				trustedIP: () => "192.0.2.42",
+				emailSignIn: {
+					publicLinkBaseURL: `${appOrigin}/api/allauth`,
+					callbackURLs: [destination],
+					email: fixture.options.email,
+					async admit() {
+						return { allowed: true, retryAfter: 0 };
+					},
+					defer: fixture.options.defer,
+				},
+			});
+		}
+
+		it("returns an authoritative new session for a verified account with an existing native session", async () => {
+			const email = "otp-existing-session@email-proof-fixture.example";
+			const user = await seed(email);
+			const signedIn = await native.auth.handler(
+				post("sign-in/email", { email, password }),
+			);
+			expect(signedIn.status).toBe(200);
+			const oldCookie = signedIn.headers
+				.getSetCookie()
+				.find((cookie) => cookie.includes(".session_token="))
+				?.split(";", 1)[0];
+			expect(oldCookie).toBeTruthy();
+			await native.auth.api.sendVerificationOTP({
+				body: { email, type: "email-verification" },
+			});
+			const request = post("email-otp/verify-email", {
+				email,
+				otp: nativeCodes.pop()!,
+			});
+			request.headers.set("cookie", oldCookie!);
+			const response = await verificationEngine().dispatch(request);
+			expect(response.status).toBe(200);
+			const result = await response.json();
+			expect(result).toMatchObject({
+				status: true,
+				token: expect.any(String),
+				user: { id: user.id, emailVerified: true },
+			});
+			const cookie = response.headers
+				.getSetCookie()
+				.find(
+					(item) =>
+						item.includes(".session_token=") && !item.includes("Max-Age=0"),
+				)
+				?.split(";", 1)[0];
+			expect(cookie).toBeTruthy();
+			expect(cookie).not.toBe(oldCookie);
+			await expect(
+				native.auth.api.getSession({
+					headers: new Headers({ cookie: cookie! }),
+				}),
+			).resolves.toMatchObject({
+				user: { id: user.id, emailVerified: true },
+			});
+		});
+
+		it("requires the existing second factor without a provisional bearer after email verification", async () => {
+			const email = "otp-mfa@email-proof-fixture.example";
+			const user = await seed(email, false);
+			const totpSecret = "isolated-fixture-authenticator-secret";
+			await database.query(
+				`UPDATE "${schema}"."user" SET "twoFactorEnabled"=true WHERE id=$1`,
+				[user.id],
+			);
+			await database.query(
+				`INSERT INTO "${schema}"."twoFactor"(id,"userId",secret,"backupCodes",verified)
+				 VALUES($1,$2,$3,$4,true)`,
+				[
+					randomUUID(),
+					user.id,
+					sealLegacyMfaRecord(totpSecret, { secret: signingSecret }),
+					sealLegacyMfaRecord("[]", { secret: signingSecret }),
+				],
+			);
+			await native.auth.api.sendVerificationOTP({
+				body: { email, type: "email-verification" },
+			});
+			const otp = nativeCodes.pop()!;
+			const owner = verificationEngine();
+			const pending = await owner.dispatch(
+				post("email-otp/verify-email", { email, otp }),
+			);
+			expect(pending.status).toBe(200);
+			expect(await pending.json()).toEqual({
+				twoFactorRedirect: true,
+				twoFactorMethods: ["totp"],
+			});
+			const challenge = pending.headers
+				.getSetCookie()
+				.find((cookie) => cookie.includes(".two_factor="))
+				?.split(";", 1)[0];
+			expect(challenge).toBeTruthy();
+			expect(
+				pending.headers
+					.getSetCookie()
+					.some((cookie) => cookie.includes(".session_token=")),
+			).toBe(false);
+			expect(
+				(
+					await database.query(
+						`SELECT id FROM "${schema}"."session" WHERE "userId"=$1`,
+						[user.id],
+					)
+				).rowCount,
+			).toBe(0);
+			const { code } = await native.auth.api.generateTOTP({
+				body: { secret: totpSecret },
+			});
+			const factor = post("two-factor/verify-totp", { code });
+			factor.headers.set("cookie", challenge!);
+			const completed = await owner.dispatch(factor);
+			expect(completed.status).toBe(200);
+			const session = completed.headers
+				.getSetCookie()
+				.find((cookie) => cookie.includes(".session_token="))
+				?.split(";", 1)[0];
+			await expect(
+				native.auth.api.getSession({
+					headers: new Headers({ cookie: session! }),
+				}),
+			).resolves.toMatchObject({
+				user: { id: user.id, emailVerified: true },
+			});
+		});
 
 		it("consumes an existing native magic link once and leaves a native-readable session", async () => {
 			const email = "legacy-link@email-proof-fixture.example";

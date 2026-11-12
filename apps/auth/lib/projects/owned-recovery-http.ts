@@ -18,6 +18,12 @@ import {
 import type { OwnedEmailCallbackPolicy } from "./owned-project-email-callback";
 import type { OwnedProjectEmailAliases, ProjectEmailIdentity } from "./owned-project-email-aliases";
 import { scheduleOwnedEmailDelivery } from "./owned-project-email-delivery";
+import type {
+	EmailOTPRecoveryIssueOperation,
+	EmailOTPRecoveryOperation,
+} from "./owned-project-email-otp-recovery";
+import { createOwnedEmailOTPRecovery } from "./owned-project-email-otp-recovery";
+import { readProjectEmailProofBody, readSharedProjectEmailOtpBody } from "./owned-project-email-proof-body";
 import { createProjectEngineStore } from "./owned-project-engine-store";
 import type { Project } from "./registry";
 import type { SessionCheckAdmission } from "./session-introspection-admission";
@@ -41,7 +47,8 @@ export type RecoveryOperation =
 	| "reset-password-callback"
 	| "reset-password"
 	| "send-verification-email"
-	| "verify-email";
+	| "verify-email"
+	| EmailOTPRecoveryOperation;
 
 export interface RecoveryHttpOptions {
 	database: Pool;
@@ -73,7 +80,10 @@ export interface RecoveryHttpOptions {
 	/** Schedule the callback after the response without awaiting delivery in the request. */
 	defer(delivery: () => Promise<void>): void;
 	onDeliveryFailure?(
-		operation: "request-password-reset" | "send-verification-email",
+		operation:
+			| "request-password-reset"
+			| "send-verification-email"
+			| EmailOTPRecoveryIssueOperation,
 	): void;
 	completeVerification?: CompleteOwnedEmailVerification;
 }
@@ -213,6 +223,11 @@ export function createOwnedRecoveryHttp(options: RecoveryHttpOptions) {
 	const reset = createOwnedPasswordReset({
 		...options,
 		schemaName: options.project.schemaName,
+	});
+	const emailOTP = createOwnedEmailOTPRecovery({
+		...options,
+		schemaName: options.project.schemaName,
+		admit: admission,
 	});
 	const verification = createOwnedEmailVerification({
 		...options,
@@ -471,8 +486,20 @@ export function createOwnedRecoveryHttp(options: RecoveryHttpOptions) {
 		if (!url.pathname.startsWith(`${options.basePath}/`)) return null;
 		const path = url.pathname.slice(options.basePath.length);
 		const resetToken = path.match(/^\/reset-password\/([^/]+)$/)?.[1];
+		const sharedOtpSend =
+			path === "/email-otp/send-verification-otp" && request.method === "POST";
+		const otpOperation =
+			path === "/email-otp/request-password-reset"
+				? "email-otp/request-password-reset"
+				: path === "/forget-password/email-otp"
+					? "forget-password/email-otp"
+					: path === "/email-otp/reset-password"
+						? "email-otp/reset-password"
+						: undefined;
 		if (
 			!resetToken &&
+			!sharedOtpSend &&
+			!otpOperation &&
 			![
 				"/request-password-reset",
 				"/reset-password",
@@ -498,6 +525,23 @@ export function createOwnedRecoveryHttp(options: RecoveryHttpOptions) {
 				(!caller || request.headers.get("sec-fetch-site") === "cross-site"))
 		)
 			return forbidden();
+		if (sharedOtpSend) {
+			const input = await readSharedProjectEmailOtpBody(request);
+			if (
+				!input ||
+				typeof input !== "object" ||
+				!("type" in input) ||
+				input.type !== "forget-password"
+			)
+				return null;
+			return emailOTP(request, "email-otp/send-verification-otp", input);
+		}
+		if (otpOperation)
+			return emailOTP(
+				request,
+				otpOperation,
+				await readProjectEmailProofBody(request),
+			);
 
 		if (
 			path === "/request-password-reset" ||

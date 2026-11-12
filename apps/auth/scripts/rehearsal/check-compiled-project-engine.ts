@@ -8,6 +8,7 @@ import { getCookies } from "better-auth/cookies";
 import { createLocalJWKSet, jwtVerify, type JSONWebKeySet } from "jose";
 import { clerkCompatiblePasswords } from "../../lib/clerk-password";
 import { signEdgeRequest } from "../../lib/domains/edge";
+import { projectEmailAliasVariable } from "../../lib/project-email-alias-config";
 import { platformWorkspaceId } from "../../lib/workspaces/types";
 import { createRailwayProjectEngineTransport } from "./railway-project-engine-transport";
 
@@ -55,6 +56,8 @@ const oldPassword = `Rehearsal-original-${randomUUID()}!`;
 const newPassword = `Rehearsal-updated-${randomUUID()}!`;
 const accountId = randomUUID();
 const accountEmail = "account@project-engine-rehearsal.invalid";
+const alternateEmail = "alias@project-engine-rehearsal.invalid";
+const ownedSlug = "compiled-engine-owned";
 
 interface Realm {
 	id: string;
@@ -320,6 +323,11 @@ async function start(
 	values: Record<string, string> = {},
 	readiness = 200,
 ) {
+	if (internalSelection)
+		values = {
+			...values,
+			[projectEmailAliasVariable(ownedSlug)]: JSON.stringify({ [alternateEmail]: accountId }),
+		};
 	if (railway) await railway.start(image, db, values);
 	else
 		await docker(
@@ -441,7 +449,7 @@ async function seed() {
 	}
 	const control = await create("compiled-engine-control", "production");
 	const owned = await create(
-		"compiled-engine-owned",
+		ownedSlug,
 		"development",
 		control.applicationId,
 	);
@@ -516,9 +524,10 @@ try {
 		ALLAUTH_REHEARSAL_DATABASE_NONCE: databaseNonce,
 	};
 	const login = { email: accountEmail, password: oldPassword };
+	const ownedLogin = internalSelection ? { ...login, email: alternateEmail } : login;
 	const original = await request(`${direct}/sign-in/email`, {
 		realm: owned,
-		body: login,
+		body: ownedLogin,
 	});
 	expectStatus(
 		original,
@@ -528,7 +537,7 @@ try {
 	const originalCookie = sessionCookie(original);
 	const originalHosted = await request("/api/auth/sign-in/email", {
 		host,
-		body: login,
+		body: ownedLogin,
 	});
 	expectStatus(
 		originalHosted,
@@ -545,7 +554,7 @@ try {
 		const nativeManaged = await request("/api/auth/sign-in/email", {
 			host: managedHost,
 			clientIP: "192.0.2.56",
-			body: login,
+			body: ownedLogin,
 		});
 		expectStatus(
 			nativeManaged,
@@ -779,13 +788,15 @@ try {
 			);
 			const loginResponse = await request(`${direct}/sign-in/email`, {
 				realm: owned,
-				body: login,
+				body: ownedLogin,
 			});
 			expectStatus(
 				loginResponse,
 				200,
 				"The internal project signs in through the AllAuth writer.",
 			);
+			assert.equal(JSON.parse(loginResponse.body).user.id, accountId);
+			assert.equal(JSON.parse(loginResponse.body).user.email, accountEmail);
 			return sessionCookie(loginResponse);
 		}
 		const changed = await request(`${direct}/change-password`, {
@@ -814,7 +825,7 @@ try {
 	const ownedCookie = await switchDirectSession();
 	const ownedHosted = await request("/api/auth/sign-in/email", {
 		host,
-		body: { ...login, password: fixturePassword },
+		body: { ...ownedLogin, password: fixturePassword },
 	});
 	expectStatus(ownedHosted, 200, "The AllAuth hosted route signs in.");
 	const ownedHostedCookie = sessionCookie(ownedHosted);
@@ -839,7 +850,7 @@ try {
 		const ownedManaged = await request("/api/auth/sign-in/email", {
 			host: managedHost,
 			clientIP: "192.0.2.56",
-			body: login,
+			body: ownedLogin,
 		});
 		expectStatus(
 			ownedManaged,
@@ -955,7 +966,7 @@ try {
 	expectStatus(
 		await request(`${direct}/sign-in/email`, {
 			realm: owned,
-			body: { ...login, password: fixturePassword },
+			body: { ...ownedLogin, password: fixturePassword },
 		}),
 		200,
 		"Native reads the project password after rollback.",
@@ -980,6 +991,16 @@ try {
 		200,
 		"The sibling realm retains its password.",
 	);
+	if (internalSelection)
+		expectStatus(
+			await request(`${controlPath}/sign-in/email`, {
+				realm: control,
+				body: ownedLogin,
+				clientIP: "192.0.2.57",
+			}),
+			401,
+			"The sibling realm declines the other project's configured alias.",
+		);
 	await stop(restored);
 	console.log(
 		internalSelection
