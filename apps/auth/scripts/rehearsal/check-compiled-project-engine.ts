@@ -473,23 +473,21 @@ async function startConnectedDevice(realm: Realm, client: string) {
 				session: { id: string };
 			};
 			assert.match(session.id, /^[A-Za-z0-9_-]+$/);
-			const originalCreatedAt = await query(
-				restored,
-				`SELECT "createdAt"::text FROM "${schema}"."session" WHERE id='${session.id}'`,
-			);
-			assert.match(originalCreatedAt, /^[\d:. +Z-]+$/);
+			const shiftFixtureSessionAge = (direction: "-" | "+") =>
+				query(restored, `
+					BEGIN;
+					SET LOCAL allauth.project_engine_project_id = '${realm.id}';
+					SET LOCAL allauth.project_engine_writer = 'allauth';
+					SET LOCAL allauth.project_engine_writer_revision = '1';
+					UPDATE "${schema}"."session" SET "createdAt"="createdAt" ${direction} interval '6 minutes' WHERE id='${session.id}';
+					COMMIT;
+				`);
 			let handoff: Awaited<ReturnType<typeof request>>;
-			await query(
-				restored,
-				`UPDATE "${schema}"."session" SET "createdAt"=now()-interval '6 minutes' WHERE id='${session.id}'`,
-			);
+			await shiftFixtureSessionAge("-");
 			try {
 				handoff = await request(publicPath, { cookie: apexCookies });
 			} finally {
-				await query(
-					restored,
-					`UPDATE "${schema}"."session" SET "createdAt"='${originalCreatedAt}' WHERE id='${session.id}'`,
-				);
+				await shiftFixtureSessionAge("+");
 			}
 			expectStatus(
 				handoff,
