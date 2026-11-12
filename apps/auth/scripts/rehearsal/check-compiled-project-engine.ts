@@ -1,8 +1,12 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { createRequire } from "node:module";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { setTimeout } from "node:timers/promises";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { getCookies } from "better-auth/cookies";
 import type { JSONWebKeySet } from "jose";
@@ -12,6 +16,7 @@ import { clerkCompatiblePasswords } from "../../lib/clerk-password";
 import { signEdgeRequest } from "../../lib/domains/edge";
 import { hostedMagicLinkCallbacks } from "../../lib/domains/hosted-sdk-policy";
 import { projectEmailAliasVariable } from "../../lib/project-email-alias-config";
+import { verifyLegacySessionCookie } from "../../lib/projects/legacy-session-cookie";
 import { signProjectIssuerQuery } from "../../lib/projects/owned-project-issuer-authorization-query";
 import { projectSecret } from "../../lib/projects/project-secret";
 import { platformWorkspaceId } from "../../lib/workspaces/types";
@@ -63,6 +68,7 @@ const restored =
 	`allauth_engine_rehearsal_${randomUUID().replaceAll("-", "")}`;
 const authSecret =
 	railway?.profile.authSecret ?? randomBytes(32).toString("hex");
+const sessionKeyRing = `7:${authSecret},2:${randomBytes(32).toString("hex")}`;
 const edgeSecret =
 	railway?.profile.edgeSecret ?? randomBytes(32).toString("hex");
 const credentialSecret = randomBytes(32).toString("hex");
@@ -90,6 +96,66 @@ interface Realm {
 	primaryOrigin: string;
 	environment: string;
 	proxyVersion: string;
+}
+
+type ProxyFactory = typeof import("../../sdk/next").createAllAuthProxy;
+const sdkFolders: string[] = [];
+
+function proxyKey(realm: Realm) {
+	return createHmac("sha256", authSecret)
+		.update(`allauth:proxy:${realm.id}:${realm.proxyVersion}`)
+		.digest("hex");
+}
+
+async function archivedProxy(realm: Realm, version: "1.0.0" | "2.0.0") {
+	const directory = new URL("../../public/sdk/", import.meta.url);
+	const name = `allauth-react-${version}.tgz`;
+	const archive = new URL(name, directory);
+	const checksums = JSON.parse(
+		await readFile(new URL("integrity.json", directory), "utf8"),
+	) as Record<string, string>;
+	assert.equal(
+		createHash("sha256")
+			.update(await readFile(archive))
+			.digest("hex"),
+		checksums[name],
+	);
+	const folder = await mkdtemp(join(tmpdir(), "allauth-compiled-sdk-"));
+	sdkFolders.push(folder);
+	await execute("tar", ["-xzf", fileURLToPath(archive), "-C", folder]);
+	const { createAllAuthProxy } = (await import(
+		pathToFileURL(join(folder, "package/next.ts")).href
+	)) as { createAllAuthProxy: ProxyFactory };
+	const handler = createAllAuthProxy({
+		project: realm.slug,
+		proxySecret: proxyKey(realm),
+		appOrigin: realm.primaryOrigin,
+		allauthURL: platform,
+	});
+	return async (
+		endpoint: "sign-in/email" | "get-session",
+		body?: object,
+		cookie?: string,
+	) => {
+		const response = await handler(
+			new Request(`${realm.primaryOrigin}/api/allauth/${endpoint}`, {
+				method: body ? "POST" : "GET",
+				headers: {
+					origin: realm.primaryOrigin,
+					...(body ? { "content-type": "application/json" } : {}),
+					...(cookie ? { cookie } : {}),
+				},
+				body: body ? JSON.stringify(body) : undefined,
+			}),
+			{ params: Promise.resolve({ all: endpoint.split("/") }) },
+		);
+		return {
+			status: response.status,
+			cookies: response.headers.getSetCookie(),
+			location: response.headers.get("location"),
+			body: await response.text(),
+		};
+	};
 }
 
 async function docker(...args: string[]) {
@@ -187,16 +253,13 @@ async function request(
 		);
 	} else if (realm) {
 		const time = String(Math.floor(Date.now() / 1000));
-		const key = createHmac("sha256", authSecret)
-			.update(`allauth:proxy:${realm.id}:${realm.proxyVersion}`)
-			.digest("hex");
 		const digest = createHash("sha256").update(data).digest("hex");
 		ingress.set("allauth-proxy-timestamp", time);
 		ingress.set("allauth-proxy-origin", realm.primaryOrigin);
 		ingress.set("allauth-proxy-ip", clientIP);
 		ingress.set(
 			"allauth-proxy-signature",
-			createHmac("sha256", key)
+			createHmac("sha256", proxyKey(realm))
 				.update(
 					[time, method, path, realm.primaryOrigin, clientIP, digest].join(
 						"\n",
@@ -204,6 +267,8 @@ async function request(
 				)
 				.digest("hex"),
 		);
+		// The Docker fixture connects through loopback without a hosting ingress.
+		if (!railway && !clientIP) ingress.set("x-real-ip", "192.0.2.60");
 	} else if (!railway) {
 		ingress.set("x-real-ip", clientIP);
 	}
@@ -403,6 +468,26 @@ function sessionCookie(response: Awaited<ReturnType<typeof request>>) {
 	return cookie.split(";", 1)[0];
 }
 
+function deviceCookie(
+	response: Awaited<ReturnType<typeof request>>,
+	realm: Realm,
+) {
+	const name = `__Secure-allauth_project_${realm.slug}.control_device=`;
+	const cookie = response.cookies
+		.find((item) => item.startsWith(name))
+		?.split(";", 1)[0];
+	assert.ok(cookie, "The compiled route must issue its known-device cookie.");
+	const secret = projectSecret({ ALLAUTH_AUTH_SECRET: authSecret }, realm.id);
+	assert.ok(
+		verifyLegacySessionCookie(
+			decodeURIComponent(cookie.slice(name.length)),
+			secret,
+		),
+		"The known-device cookie uses the stable project key.",
+	);
+	return cookie;
+}
+
 async function start(
 	image: string,
 	db: string,
@@ -412,6 +497,7 @@ async function start(
 	if (fencedSelection)
 		values = {
 			...values,
+			BETTER_AUTH_SECRETS: sessionKeyRing,
 			[projectEmailAliasVariable(ownedSlug)]: JSON.stringify({ [alternateEmail]: accountId }),
 		};
 	if (railway) await railway.start(image, db, values);
@@ -654,16 +740,53 @@ try {
 	};
 	const login = { email: accountEmail, password: oldPassword };
 	const ownedLogin = fencedSelection ? { ...login, email: alternateEmail } : login;
-	const original = await request(`${direct}/sign-in/email`, {
-		realm: owned,
-		body: ownedLogin,
-	});
+	const sdk =
+		railway && fencedSelection
+			? {
+					v1: await archivedProxy(owned, "1.0.0"),
+					v2: await archivedProxy(owned, "2.0.0"),
+				}
+			: undefined;
+	function signInThroughProxy(
+		version: "v1" | "v2",
+		body: typeof ownedLogin,
+		cookie?: string,
+	) {
+		return sdk
+			? sdk[version]("sign-in/email", body, cookie)
+			: request(`${direct}/sign-in/email`, {
+					realm: owned,
+					body,
+					cookie,
+					clientIP: fencedSelection ? "" : undefined,
+				});
+	}
+	async function expectArchivedSession(version: "v1" | "v2", cookie: string) {
+		if (!sdk) return;
+		const response = await sdk[version]("get-session", undefined, cookie);
+		expectStatus(
+			response,
+			200,
+			"The published SDK reads a session through the signed app proxy.",
+		);
+		assert.equal(JSON.parse(response.body)?.user?.id, accountId);
+	}
+	async function deviceCount(db: string) {
+		const schema = `allauth_project_${owned.id.replaceAll("-", "")}`;
+		return query(
+			db,
+			`SELECT count(*) FROM "${schema}"."allauthKnownDevice" WHERE "userId"='${accountId}'`,
+		);
+	}
+	const original = await signInThroughProxy("v1", ownedLogin);
 	expectStatus(
 		original,
 		200,
 		"Native sign-in through the signed project proxy.",
 	);
 	const originalCookie = sessionCookie(original);
+	const originalDevice = fencedSelection ? deviceCookie(original, owned) : undefined;
+	await expectArchivedSession("v2", originalCookie);
 	const originalHosted = await request("/api/auth/sign-in/email", {
 		host,
 		body: ownedLogin,
@@ -914,8 +1037,7 @@ try {
 		if (!railway && connected) {
 			const authorization = new URLSearchParams(connected.queryString);
 			authorization.set("state", `${"signed-application-state".repeat(171)}+one&two`);
-			const secret = projectSecret({ ALLAUTH_AUTH_SECRET: authSecret }, owned.id);
-			const destination = `/oauth2/continue?${signProjectIssuerQuery(authorization, secret)}`;
+			const destination = `/oauth2/continue?${signProjectIssuerQuery(authorization, authSecret)}`;
 			const body = {
 				email: "unregistered@project-engine-rehearsal.invalid",
 				...hostedMagicLinkCallbacks(destination, `https://${host}`),
@@ -1054,10 +1176,12 @@ try {
 				200,
 				"The AllAuth writer revokes the original hosted session.",
 			);
-			const loginResponse = await request(`${direct}/sign-in/email`, {
-				realm: owned,
-				body: ownedLogin,
-			});
+			const known = await deviceCount(restored);
+			const loginResponse = await signInThroughProxy(
+				"v2",
+				ownedLogin,
+				originalDevice,
+			);
 			expectStatus(
 				loginResponse,
 				200,
@@ -1065,6 +1189,15 @@ try {
 			);
 			assert.equal(JSON.parse(loginResponse.body).user.id, accountId);
 			assert.equal(JSON.parse(loginResponse.body).user.email, accountEmail);
+			assert.ok(
+				deviceCookie(loginResponse, owned) === originalDevice,
+				"AllAuth retains the same known-device cookie.",
+			);
+			assert.equal(
+				await deviceCount(restored),
+				known,
+				"AllAuth keeps the existing device record.",
+			);
 			return sessionCookie(loginResponse);
 		}
 		const changed = await request(`${direct}/change-password`, {
@@ -1091,6 +1224,7 @@ try {
 		return sessionCookie(changed);
 	}
 	const ownedCookie = await switchDirectSession();
+	await expectArchivedSession("v1", ownedCookie);
 	const ownedHosted = await request(
 		fencedSelection ? "/api/auth/hosted-ui/sign-in/email" : "/api/auth/sign-in/email",
 		{
@@ -1240,15 +1374,35 @@ try {
 		}),
 		null,
 	);
+	const known = fencedSelection ? await deviceCount(restored) : undefined;
+	const rolledBack = fencedSelection
+		? await signInThroughProxy(
+				"v1",
+				{ ...ownedLogin, password: fixturePassword },
+				originalDevice,
+			)
+		: await request(`${direct}/sign-in/email`, {
+				realm: owned,
+				clientIP: "192.0.2.59",
+				body: { ...ownedLogin, password: fixturePassword },
+			});
 	expectStatus(
-		await request(`${direct}/sign-in/email`, {
-			realm: owned,
-			clientIP: "192.0.2.59",
-			body: { ...ownedLogin, password: fixturePassword },
-		}),
+		rolledBack,
 		200,
 		"Native reads the project password after rollback.",
 	);
+	if (fencedSelection) {
+		assert.ok(
+			deviceCookie(rolledBack, owned) === originalDevice,
+			"Rollback retains the same known-device cookie.",
+		);
+		assert.equal(
+			await deviceCount(restored),
+			known,
+			"Rollback keeps the existing device record.",
+		);
+	}
+	await expectArchivedSession("v2", ownedCookie);
 	if (!fencedSelection) {
 		expectStatus(
 			// A second synthetic browser has its own admission bucket.
@@ -1314,9 +1468,13 @@ try {
 				: "Compiled project rehearsal passed from legacy to AllAuth and back.",
 	);
 } finally {
-	await railway?.stop();
-	if (networkCreated) {
-		await docker("rm", "-f", application, database).catch(() => undefined);
-		await docker("network", "rm", network);
+	try {
+		await railway?.stop();
+		if (networkCreated) {
+			await docker("rm", "-f", application, database).catch(() => undefined);
+			await docker("network", "rm", network);
+		}
+	} finally {
+		await Promise.all(sdkFolders.map((folder) => rm(folder, { recursive: true, force: true })));
 	}
 }
