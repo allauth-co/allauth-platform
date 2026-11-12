@@ -1,4 +1,4 @@
-import { createPrivateKey } from "node:crypto";
+import { createPrivateKey, type KeyObject, X509Certificate } from "node:crypto";
 import type {
 	Document as XmlDocument,
 	Element as XmlElement,
@@ -175,6 +175,7 @@ function configuredServiceMetadata(xml: string) {
 		.filter((item) => item.getAttribute("Binding") === post)
 		.map((item) => item.getAttribute("Location") ?? "");
 	return {
+		descriptor,
 		entityID,
 		postLocations,
 		consumerCount: consumers.length,
@@ -183,8 +184,11 @@ function configuredServiceMetadata(xml: string) {
 	};
 }
 
-/** The configured transport may admit one signed, plaintext POST receiver from saved custom SP metadata. */
-export function declaredSignedSamlAcs(value: unknown) {
+/** Resolve one signed POST receiver, with encryption limited to the fixture admission. */
+export function declaredSignedSamlAcs(
+	value: unknown,
+	allowEncrypted?: boolean,
+) {
 	const saved = config.parse(value);
 	const metadata = saved.spMetadata?.metadata;
 	if (metadata === undefined) return undefined;
@@ -193,8 +197,9 @@ export function declaredSignedSamlAcs(value: unknown) {
 		!custom.requestsSigned ||
 		custom.consumerCount !== 1 ||
 		custom.postLocations.length !== 1 ||
-		saved.idpMetadata.isAssertionEncrypted ||
-		saved.spMetadata?.isAssertionEncrypted
+		(!allowEncrypted &&
+			(saved.idpMetadata.isAssertionEncrypted ||
+				saved.spMetadata?.isAssertionEncrypted))
 	)
 		invalid();
 	return custom.postLocations[0]!;
@@ -234,7 +239,31 @@ function decryptionKey(
 		(privateKey.asymmetricKeyDetails?.modulusLength ?? 0) < 2048
 	)
 		invalid();
-	return privateKey.export({ type: "pkcs8", format: "pem" });
+	return privateKey;
+}
+
+function validateCustomEncryptionCertificate(
+	descriptor: XmlElement,
+	serviceCertificate: string | string[] | null,
+	privateKey: KeyObject,
+) {
+	const keys = children(descriptor, metadataNS, "KeyDescriptor").filter(
+		(item) => item.getAttribute("use") === "encryption",
+	);
+	if (keys.length !== 1 || typeof serviceCertificate !== "string") invalid();
+	const info = child(keys[0]!, signatureNS, "KeyInfo");
+	const data = child(info, signatureNS, "X509Data");
+	const certificate = text(child(data, signatureNS, "X509Certificate")).replace(
+		/\s/g,
+		"",
+	);
+	if (certificate !== serviceCertificate.replace(/\s/g, "")) invalid();
+	if (
+		!new X509Certificate(
+			`-----BEGIN CERTIFICATE-----\n${certificate}\n-----END CERTIFICATE-----`,
+		).checkPrivateKey(privateKey)
+	)
+		invalid();
 }
 
 /** The configured SP/IdP pair, built with the same library as legacy SSO. */
@@ -250,7 +279,7 @@ export function configureOwnedSaml(
 	const saved = config.parse(value);
 	const sp = saved.spMetadata;
 	const idp = saved.idpMetadata;
-	const encPrivateKey = decryptionKey(idp, sp, options.allowEncrypted);
+	const encryptionKey = decryptionKey(idp, sp, options.allowEncrypted);
 	const spMetadata = sp?.metadata;
 	if (options.generatedSPOnly && spMetadata !== undefined) invalid();
 	const custom =
@@ -293,7 +322,12 @@ export function configureOwnedSaml(
 				.getMetadata(),
 		privateKey: requestPrivateKey,
 		privateKeyPass: sp?.privateKeyPass,
-		...(encPrivateKey ? { isAssertionEncrypted: true, encPrivateKey } : {}),
+		...(encryptionKey
+			? {
+					isAssertionEncrypted: true,
+					encPrivateKey: encryptionKey.export({ type: "pkcs8", format: "pem" }),
+				}
+			: {}),
 		allowCreate: true,
 		relayState: options.relayState,
 	});
@@ -304,6 +338,12 @@ export function configureOwnedSaml(
 		(custom && service.entityMeta.getEntityID() !== custom.entityID)
 	)
 		invalid();
+	if (custom && encryptionKey)
+		validateCustomEncryptionCertificate(
+			custom.descriptor,
+			service.entityMeta.getX509Certificate("encryption"),
+			encryptionKey,
+		);
 	if (idp.metadata) metadataDescriptor(idp.metadata, "IDPSSODescriptor");
 	const configuredCerts = idp.cert ?? saved.cert;
 	const certs =
@@ -311,12 +351,12 @@ export function configureOwnedSaml(
 	if (!idp.metadata && (!idp.entityID || !certs?.length)) invalid();
 	const idpEntity = saml.IdentityProvider(
 		idp.metadata
-			? { metadata: idp.metadata, isAssertionEncrypted: Boolean(encPrivateKey) }
+			? { metadata: idp.metadata, isAssertionEncrypted: Boolean(encryptionKey) }
 			: {
 					entityID: idp.entityID,
 					signingCert: certs?.map((cert) => pem(cert)!),
 					wantAuthnRequestsSigned: saved.authnRequestsSigned === true,
-					isAssertionEncrypted: Boolean(encPrivateKey),
+					isAssertionEncrypted: Boolean(encryptionKey),
 					singleSignOnService: idp.singleSignOnService ?? [
 						{ Binding: redirect, Location: saved.entryPoint ?? "" },
 					],
@@ -332,7 +372,7 @@ export function configureOwnedSaml(
 		idp: idpEntity,
 		wantAssertion,
 		requestsSigned,
-		encrypted: Boolean(encPrivateKey),
+		encrypted: Boolean(encryptionKey),
 		postLocations,
 		recipients: new Set([...postLocations, acs]),
 		saved,

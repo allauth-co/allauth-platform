@@ -1,5 +1,11 @@
 import { execFile, fork } from "node:child_process";
-import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
+import {
+	createHash,
+	createHmac,
+	createPrivateKey,
+	randomBytes,
+	randomUUID,
+} from "node:crypto";
 import { once } from "node:events";
 import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -4680,6 +4686,350 @@ describe.skipIf(!existsSync(fixture))(
 						}),
 					}),
 				).rejects.toThrow(unsupported);
+			} finally {
+				try {
+					await service?.stop();
+				} finally {
+					try {
+						await database?.end();
+						if (created) await dropClosedFixtureDatabase(admin, name);
+					} finally {
+						await admin.end();
+					}
+				}
+			}
+		}, 90_000);
+
+		it("rehearses native-stored GCM configuration at the verified custom SAML receiver", async () => {
+			const local: { container: string; DATABASE_URL: string } = JSON.parse(
+				readFileSync(fixture, "utf8"),
+			);
+			const base = new URL(local.DATABASE_URL);
+			if (
+				local.container !== "allauth-production-test-20261007" ||
+				base.hostname !== "127.0.0.1" ||
+				base.port !== "55445"
+			)
+				throw new Error("Custom encrypted SAML requires isolated PostgreSQL.");
+			const name = `allauth_hosted_${randomUUID().replaceAll("-", "")}`;
+			const databaseURL = new URL(`/${name}`, base).href;
+			const admin = new Pool({ connectionString: base.href, max: 1 });
+			let created = false;
+			let database: Pool | undefined;
+			let service: Awaited<ReturnType<typeof openProcess>> | undefined;
+			try {
+				await admin.query(`CREATE DATABASE "${name}"`);
+				created = true;
+				const { alpha, samlKeys } = await seed(databaseURL);
+				const encryption = await createRuntimeSamlKeys();
+				const passphrase = "synthetic-persisted-saml-key-passphrase";
+				const encryptedKey = createPrivateKey(encryption.privateKey).export({
+					type: "pkcs8",
+					format: "pem",
+					cipher: "aes-256-cbc",
+					passphrase,
+				});
+				database = new Pool({ connectionString: databaseURL });
+				const scope = `"${alpha.schemaName}"."ssoProvider"`;
+				const domain = "runtime-encrypted-saml-fixture.net";
+				const host = `accounts.${domain}`;
+				const defaultHost = `${alpha.slug}-accounts.allauth.co`;
+				const callback = `/api/auth/sso/saml2/sp/acs/${runtimeSamlProvider}`;
+				const acs = `https://${host}${callback}`;
+				const pair = randomUUID();
+				await database.query(
+					`INSERT INTO public."allauthDomainPair" (id,"projectId",domain) VALUES ($1,$2,$3)`,
+					[pair, alpha.id, domain],
+				);
+				for (const [kind, hostname] of [
+					["accounts", host],
+					["frontend-api", `api.${domain}`],
+				]) {
+					await database.query(
+						`INSERT INTO public."allauthCustomHostname" (id,"pairId","projectId",kind,hostname,"proofToken","ownershipVerifiedAt","providerStatus","sslStatus","routingVerifiedAt")
+						 VALUES ($1,$2,$3,$4,$5,'fixture-domain-proof',now(),'active','active',now())`,
+						[randomUUID(), pair, alpha.id, kind, hostname],
+					);
+				}
+				// Keep the seeded account link but replace its provider row through the real native endpoint.
+				await database.query(`DELETE FROM ${scope} WHERE "providerId"=$1`, [
+					runtimeSamlProvider,
+				]);
+				const metadata = runtimeSamlSPMetadata(acs, encryption.certificate);
+				const { issuer, ...signing } = runtimeSamlConfiguration(samlKeys);
+				const algorithmHints = {
+					dataEncryptionAlgorithm: "http://www.w3.org/2009/xmlenc11#aes256-gcm",
+					keyEncryptionAlgorithm:
+						"http://www.w3.org/2001/04/xmlenc#rsa-oaep-mgf1p",
+				};
+				service = await openProcess(databaseURL, alpha, false);
+				const login = await service.request("/api/auth/sign-in/email", {
+					host: defaultHost,
+					clientIP: "192.0.2.182",
+					body: {
+						email: credentials.realmAdmin.email,
+						password: credentials.password,
+					},
+				});
+				expect(login.status).toBe(200);
+				const administrator = cookie(login);
+				const registered = await service.request("/api/auth/sso/register", {
+					host: defaultHost,
+					cookie: administrator,
+					clientIP: "192.0.2.182",
+					body: {
+						providerId: runtimeSamlProvider,
+						issuer,
+						domain: "runtime.fixture.example",
+						samlConfig: {
+							...signing,
+							...algorithmHints,
+							idpMetadata: {
+								...signing.idpMetadata,
+								...algorithmHints,
+								isAssertionEncrypted: true,
+							},
+							spMetadata: {
+								...algorithmHints,
+								metadata,
+								isAssertionEncrypted: true,
+								encPrivateKey: encryption.privateKey,
+							},
+						},
+					},
+				});
+				expect(registered.status).toBe(200);
+				async function savedProvider() {
+					const result = await database!.query<{
+						id: string;
+						providerId: string;
+						issuer: string;
+						domain: string;
+						organizationId: string | null;
+						samlConfig: string;
+					}>(
+						`SELECT id,"providerId",issuer,domain,"organizationId","samlConfig" FROM ${scope} WHERE "providerId"=$1`,
+						[runtimeSamlProvider],
+					);
+					const row = result.rows[0]!;
+					const samlConfig: Record<string, unknown> & {
+						idpMetadata: Record<string, unknown>;
+						spMetadata: Record<string, unknown>;
+					} = JSON.parse(row.samlConfig);
+					return { ...row, samlConfig };
+				}
+				function checkStoredEncryption(
+					provider: Awaited<ReturnType<typeof savedProvider>>,
+					key: string,
+					password?: string,
+				) {
+					const { samlConfig } = provider;
+					for (const record of [
+						samlConfig,
+						samlConfig.idpMetadata,
+						samlConfig.spMetadata,
+					]) {
+						for (const name of Object.keys(algorithmHints))
+							expect(Object.hasOwn(record, name)).toBe(false);
+					}
+					expect(samlConfig.idpMetadata.isAssertionEncrypted).toBe(true);
+					expect(samlConfig.spMetadata.isAssertionEncrypted).toBe(true);
+					expect(samlConfig.spMetadata.metadata).toBe(metadata);
+					expect(samlConfig.spMetadata.encPrivateKey === key).toBe(true);
+					expect(samlConfig.spMetadata.encPrivateKeyPass === password).toBe(
+						true,
+					);
+				}
+				checkStoredEncryption(await savedProvider(), encryption.privateKey);
+				const updated = await service.request("/api/auth/sso/update-provider", {
+					host: defaultHost,
+					cookie: administrator,
+					clientIP: "192.0.2.182",
+					body: {
+						providerId: runtimeSamlProvider,
+						samlConfig: {
+							...algorithmHints,
+							spMetadata: {
+								...algorithmHints,
+								encPrivateKey: encryptedKey,
+								encPrivateKeyPass: passphrase,
+							},
+						},
+					},
+				});
+				expect(updated.status).toBe(200);
+				const provider = await savedProvider();
+				checkStoredEncryption(provider, encryptedKey, passphrase);
+				await database.query(
+					`UPDATE ${scope} SET "domainVerified"=TRUE WHERE id=$1`,
+					[provider.id],
+				);
+				const admission = {
+					projectId: alpha.id,
+					schemaName: alpha.schemaName,
+					providerId: provider.providerId,
+					recordId: provider.id,
+					configurationDigest:
+						encryptedSamlFixtureConfigurationDigest(provider),
+				};
+				const directPrefix = `/api/projects/${alpha.slug}/auth`;
+				const direct: SamlTransport = {
+					prefix: directPrefix,
+					baseURL: `${platformOrigin}${directPrefix}`,
+					destination: `${platformOrigin}/account?from=custom-encrypted-direct`,
+					clientIP: "192.0.2.184",
+				};
+				const hosted: SamlTransport = {
+					prefix: "/api/auth",
+					host,
+					baseURL: `https://${host}/api/auth`,
+					destination: `https://${host}/account?from=custom-encrypted-hosted`,
+					clientIP: "192.0.2.185",
+				};
+				const starts = (writer: Awaited<ReturnType<typeof openProcess>>) =>
+					Promise.all([
+						startRuntimeSaml(writer, direct, acs),
+						startRuntimeSaml(writer, hosted, acs),
+					]);
+				const finish = async (
+					writer: Awaited<ReturnType<typeof openProcess>>,
+					pending: Awaited<ReturnType<typeof startRuntimeSaml>>,
+					checkAlternate = false,
+				) => {
+					const form = await runtimeSamlResponse(
+						samlKeys,
+						pending.flow,
+						credentials.project.email,
+						{
+							certificate: encryption.certificate,
+							dataAlgorithm: pending.transport.host
+								? algorithmHints.dataEncryptionAlgorithm
+								: "http://www.w3.org/2009/xmlenc11#aes128-gcm",
+						},
+					);
+					if (checkAlternate) {
+						const alternate = await writer.request(callback, {
+							host: defaultHost,
+							clientIP: "192.0.2.186",
+							origin: runtimeSamlOrigin,
+							body: form,
+						});
+						expect(alternate.status).toBe(400);
+						expect(cookie(alternate)).toBe("");
+					}
+					const completed = await writer.request(callback, {
+						host,
+						clientIP: pending.transport.clientIP,
+						origin: runtimeSamlOrigin,
+						body: form,
+					});
+					expect(completed.status, await completed.clone().text()).toBe(302);
+					expect(completed.headers.get("location")).toBe(
+						pending.transport.destination,
+					);
+					const session = await writer.request("/api/auth/get-session", {
+						host,
+						cookie: cookie(completed),
+					});
+					expect(await session.json()).toMatchObject({
+						user: credentials.project,
+					});
+				};
+				const nativePending = await starts(service);
+				await service.stop();
+				service = undefined;
+				const unsupported =
+					"configured SAML provider outside the candidate scope";
+				await expect(openProcess(databaseURL, alpha, true)).rejects.toThrow(
+					unsupported,
+				);
+				const mismatched = {
+					...provider.samlConfig,
+					spMetadata: {
+						...provider.samlConfig.spMetadata,
+						metadata: runtimeSamlSPMetadata(acs, samlKeys.certificate),
+					},
+				};
+				const setConfiguration = (value: object) =>
+					database!.query(`UPDATE ${scope} SET "samlConfig"=$1 WHERE id=$2`, [
+						JSON.stringify(value),
+						provider.id,
+					]);
+				await setConfiguration(mismatched);
+				await expect(
+					openProcess(databaseURL, alpha, true, alpha.slug, undefined, {
+						...admission,
+						configurationDigest: encryptedSamlFixtureConfigurationDigest({
+							...provider,
+							samlConfig: mismatched,
+						}),
+					}),
+				).rejects.toThrow(unsupported);
+				await setConfiguration(provider.samlConfig);
+				service = await openProcess(
+					databaseURL,
+					alpha,
+					true,
+					alpha.slug,
+					undefined,
+					admission,
+				);
+				for (const transport of [direct, hosted]) {
+					const published = await service.request(
+						`${transport.prefix}/sso/saml2/sp/metadata?providerId=${runtimeSamlProvider}`,
+						{ host: transport.host },
+					);
+					expect(published.status).toBe(200);
+					expect(await published.text()).toBe(metadata);
+				}
+				const view = await service.request(
+					`/api/auth/sso/get-provider?providerId=${runtimeSamlProvider}`,
+					{
+						host: defaultHost,
+						cookie: administrator,
+					},
+				);
+				expect(view.status).toBe(200);
+				const publicRecord = await view.text();
+				for (const privateValue of [
+					"encPrivateKey",
+					"BEGIN ENCRYPTED PRIVATE KEY",
+					passphrase,
+				])
+					expect(publicRecord.includes(privateValue)).toBe(false);
+				for (const pending of nativePending)
+					await finish(service, pending, true);
+				const ownedPending = await starts(service);
+				await service.stop();
+				service = undefined;
+				service = await openProcess(databaseURL, alpha, false);
+				for (const pending of ownedPending) await finish(service, pending);
+				await service.stop();
+				service = undefined;
+				service = await openProcess(
+					databaseURL,
+					alpha,
+					true,
+					alpha.slug,
+					undefined,
+					admission,
+				);
+				await database.query(
+					`DELETE FROM public."allauthDomainPair" WHERE id=$1 AND "projectId"=$2`,
+					[pair, alpha.id],
+				);
+				const removed = await service.request(`${directPrefix}/sign-in/sso`, {
+					clientIP: "192.0.2.189",
+					body: {
+						providerId: runtimeSamlProvider,
+						providerType: "saml",
+						callbackURL: direct.destination,
+					},
+				});
+				expect(removed.status).toBe(400);
+				expect(await removed.json()).toMatchObject({
+					code: "INVALID_SAML_CONFIGURATION",
+				});
 			} finally {
 				try {
 					await service?.stop();

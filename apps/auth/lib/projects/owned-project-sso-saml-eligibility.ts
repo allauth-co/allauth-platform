@@ -24,7 +24,7 @@ type StoredSamlProvider = {
 	samlConfig: Record<string, unknown>;
 };
 
-/** Check that a persisted plaintext SAML provider can serve the exact selected transport. */
+/** Check that a persisted SAML provider can serve the exact selected transport. */
 export function checkProjectSamlConfiguration(
 	provider: StoredSamlProvider,
 	acs: string,
@@ -56,10 +56,10 @@ export async function configureProjectSamlTransport(
 		validateAll?: boolean;
 	},
 ) {
-	const authorize = options.allowEncrypted
-		? undefined
-		: options.customTransport?.authorizeAcs;
-	const declared = authorize && declaredSignedSamlAcs(provider.samlConfig);
+	const authorize = options.customTransport?.authorizeAcs;
+	const declared =
+		authorize &&
+		declaredSignedSamlAcs(provider.samlConfig, options.allowEncrypted);
 	if (
 		authorize &&
 		declared !== undefined &&

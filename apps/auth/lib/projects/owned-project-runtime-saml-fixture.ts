@@ -80,7 +80,7 @@ export function runtimeSamlAuthnRequest(location: URL) {
 	return { id, acs, relay };
 }
 
-export function runtimeSamlSPMetadata(acs: string) {
+export function runtimeSamlSPMetadata(acs: string, encryptCert?: string) {
 	return saml
 		.SPMetadata({
 			entityID: runtimeSamlEntity,
@@ -92,6 +92,7 @@ export function runtimeSamlSPMetadata(acs: string) {
 			],
 			wantAssertionsSigned: true,
 			authnRequestsSigned: true,
+			encryptCert,
 		})
 		.getMetadata();
 }
