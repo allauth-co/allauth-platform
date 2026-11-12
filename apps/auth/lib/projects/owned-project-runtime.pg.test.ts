@@ -2020,6 +2020,61 @@ describe.skipIf(!existsSync(fixture))(
 					slug: "fixture-organization",
 					ownerId: credentials.project.id,
 				};
+				const initialCatalog = await service.request(management(alpha), {
+					cookie: rootCookie,
+				});
+				expect(initialCatalog.status).toBe(200);
+				expect(await initialCatalog.json()).toMatchObject({
+					organizations: [{ id: directoryOrg }],
+					total: 1,
+					limit: 25,
+					offset: 0,
+				});
+				const projectPrincipal = await service.request(management(alpha), {
+					cookie: legacyCookie,
+					body: organization,
+				});
+				expect(projectPrincipal.status).toBe(401);
+				const foreignOrigin = await service.request(management(alpha), {
+					cookie: rootCookie,
+					origin: alpha.primaryOrigin,
+					body: organization,
+				});
+				expect(foreignOrigin.status).toBe(403);
+				const foreignOwner = await service.request(management(alpha), {
+					cookie: rootCookie,
+					body: { ...organization, ownerId: credentials.platform.id },
+				});
+				expect(foreignOwner.status).toBe(404);
+				const consoleCreated = await service.request(management(alpha), {
+					cookie: rootCookie,
+					body: organization,
+				});
+				expect(consoleCreated.status, await consoleCreated.clone().text()).toBe(
+					201,
+				);
+				expect(consoleCreated.headers.get("cache-control")).toBe("no-store");
+				const { organization: ownedOrganization } =
+					(await consoleCreated.json()) as { organization: { id: string } };
+				expect(ownedOrganization).toMatchObject({
+					id: expect.any(String),
+					name: organization.name,
+					slug: organization.slug,
+					createdAt: expect.any(String),
+					memberCount: 1,
+					teamCount: 0,
+					logo: null,
+				});
+				const ownedCatalog = await service.request(
+					`${management(alpha)}&search=${ownedOrganization.id}&limit=1`,
+					{ cookie: rootCookie },
+				);
+				expect(await ownedCatalog.json()).toEqual({
+					organizations: [ownedOrganization],
+					total: 1,
+					limit: 1,
+					offset: 0,
+				});
 				expect(
 					(
 						await service.request(management(alpha), {
@@ -2027,15 +2082,87 @@ describe.skipIf(!existsSync(fixture))(
 							body: organization,
 						})
 					).status,
-				).toBe(503);
-				expect(
-					(
-						await service.request(management(beta), {
-							cookie: rootCookie,
-							body: organization,
-						})
-					).status,
-				).toBe(201);
+				).toBe(409);
+				const consoleAuthority = new Pool({
+					connectionString: url(restored),
+					max: 1,
+				});
+				const otherOwner = randomUUID();
+				try {
+					const membership = [alpha.workspaceId, credentials.platform.id];
+					await consoleAuthority.query(
+						`INSERT INTO public."user" (id,name,email,"emailVerified") VALUES ($1,'Synthetic Backup Owner',$2,TRUE)`,
+						[otherOwner, `${otherOwner}@runtime.fixture.example`],
+					);
+					await consoleAuthority.query(
+						`INSERT INTO public."allauthWorkspaceMember" (id,"workspaceId","userId",role) VALUES ($1,$2,$3,'owner')`,
+						[randomUUID(), alpha.workspaceId, otherOwner],
+					);
+					await consoleAuthority.query(
+						`UPDATE public."allauthWorkspaceMember" SET role='member' WHERE "workspaceId"=$1 AND "userId"=$2`,
+						membership,
+					);
+					try {
+						expect(
+							(
+								await service.request(management(alpha), {
+									cookie: rootCookie,
+									body: {
+										...organization,
+										slug: "denied-fixture-organization",
+									},
+								})
+							).status,
+						).toBe(401);
+					} finally {
+						await consoleAuthority.query(
+							`UPDATE public."allauthWorkspaceMember" SET role='owner' WHERE "workspaceId"=$1 AND "userId"=$2`,
+							membership,
+						);
+					}
+					const audit = await consoleAuthority.query(
+						`SELECT e.type,e."actorId",e."userId",m.role FROM "${alpha.schemaName}"."allauthEvent" e
+						 JOIN "${alpha.schemaName}"."member" m ON m."organizationId"=e."organizationId" AND m."userId"=e."userId"
+						 WHERE e."targetId"=$1`,
+						[ownedOrganization.id],
+					);
+					expect(audit.rows).toEqual([
+						{
+							type: "organization.created",
+							actorId: credentials.platform.id,
+							userId: credentials.project.id,
+							role: "owner",
+						},
+					]);
+				} finally {
+					try {
+						await consoleAuthority.query(
+							'DELETE FROM public."user" WHERE id=$1',
+							[otherOwner],
+						);
+					} finally {
+						await consoleAuthority.end();
+					}
+				}
+				const controlCreated = await service.request(management(beta), {
+					cookie: rootCookie,
+					body: organization,
+				});
+				expect(controlCreated.status).toBe(201);
+				expect(await controlCreated.json()).toMatchObject({
+					organization: {
+						id: expect.not.stringMatching(ownedOrganization.id),
+						slug: organization.slug,
+					},
+				});
+				const controlIsolation = await service.request(
+					`${management(beta)}&search=${ownedOrganization.id}`,
+					{ cookie: rootCookie },
+				);
+				expect(await controlIsolation.json()).toMatchObject({
+					organizations: [],
+					total: 0,
+				});
 				const ownedConfig = await service.request("/api/config", {
 					host: alphaHost,
 				});
@@ -2565,7 +2692,11 @@ describe.skipIf(!existsSync(fixture))(
 				});
 				expect(catalog.status).toBe(200);
 				expect(await catalog.json()).toMatchObject({
-					organizations: [{ id: directoryOrg }],
+					organizations: expect.arrayContaining([
+						expect.objectContaining({ id: directoryOrg }),
+						ownedOrganization,
+					]),
+					total: 2,
 				});
 				const control = await service.request(management(beta), {
 					cookie: rootCookie,

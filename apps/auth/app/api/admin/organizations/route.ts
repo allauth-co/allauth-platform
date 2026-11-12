@@ -1,13 +1,56 @@
-import { apiRoute, json, requireSameOrigin } from "@/lib/api";
-import { consoleBody, consoleDatabase, requireConsoleAdministrator } from "@/lib/console/database";
-import { createConsoleOrganization, listConsoleOrganizations } from "@/lib/console/organizations";
+import type { AuthInstance } from "@/lib/api";
+import { apiResponse, apiRoute, json, requireSameOrigin } from "@/lib/api";
+import type { AuthEnvironment } from "@/lib/configuration";
+import {
+	consoleBody,
+	consoleDatabase,
+	requireConsoleAdministrator,
+} from "@/lib/console/database";
+import {
+	consoleOrganizationListQuery,
+	createConsoleOrganization,
+	listConsoleOrganizations,
+} from "@/lib/console/organizations";
+import { withProjectOrganizationConsole } from "@/lib/projects/runtime";
 
-export const GET = (request: Request) => apiRoute(request, async (instance) => {
-	await requireConsoleAdministrator(instance, request.headers);
-	const query = new URL(request.url).searchParams;
-	return json(await listConsoleOrganizations(await consoleDatabase(instance), { search: query.get("search") || "", limit: query.get("limit") || 25, offset: query.get("offset") || 0 }));
-});
-export const POST = (request: Request) => apiRoute(request, async (instance, env) => {
-	requireSameOrigin(request, env); const actor = await requireConsoleAdministrator(instance, request.headers);
-	return json(await createConsoleOrganization(await consoleDatabase(instance), await consoleBody(request), actor.user.id), 201);
-});
+async function legacy(
+	request: Request,
+	instance: AuthInstance,
+	env: AuthEnvironment,
+) {
+	const writing = request.method === "POST";
+	if (writing) requireSameOrigin(request, env);
+	const actor = await requireConsoleAdministrator(instance, request.headers);
+	const database = await consoleDatabase(instance);
+	if (writing)
+		return json(
+			await createConsoleOrganization(
+				database,
+				await consoleBody(request),
+				actor.user.id,
+			),
+			201,
+		);
+	const query = consoleOrganizationListQuery(new URL(request.url).searchParams);
+	return json(await listConsoleOrganizations(database, query));
+}
+
+function organizations(request: Request) {
+	const slug = new URL(request.url).searchParams.get("project");
+	if (!slug)
+		return apiRoute(request, (instance, env) => legacy(request, instance, env));
+	return apiResponse((selectWorkspace) =>
+		withProjectOrganizationConsole(
+			slug,
+			async (manage, native, env, project) => {
+				selectWorkspace(project.workspaceId);
+				if (!manage) return legacy(request, native(), env);
+				const result = await manage(request, () => consoleBody(request));
+				return json(result.body, result.status);
+			},
+		),
+	);
+}
+
+export const GET = organizations;
+export const POST = organizations;

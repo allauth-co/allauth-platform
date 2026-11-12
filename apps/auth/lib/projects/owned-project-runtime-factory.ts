@@ -56,6 +56,7 @@ import { createOwnedProjectEmailCallbackPolicy } from "./owned-project-email-cal
 import { createOwnedProjectEngine } from "./owned-project-engine";
 import { createProjectEngineStore } from "./owned-project-engine-store";
 import { admitOwnedProjectNativeRoute } from "./owned-project-native-admission";
+import { createOwnedProjectOrganizationConsole } from "./owned-project-organization-console";
 import { createOwnedProjectInvitationEmail } from "./owned-project-organization-email";
 import { createOwnedProjectPasswordSafety } from "./owned-project-password-safety";
 import { createOwnedProjectSCIMConsole } from "./owned-project-scim-console";
@@ -511,6 +512,12 @@ export async function createOwnedProjectRuntimeCandidate(options: Options) {
 	});
 	const readWorkspacePrincipal = (headers: Headers) =>
 		withAuthEngine((root) => root.readPrincipal(headers));
+	const manageOrganizationConsole = createOwnedProjectOrganizationConsole({
+		database,
+		project,
+		managementOrigin: platform,
+		readWorkspacePrincipal,
+	});
 	const manageSCIMConsole = createOwnedProjectSCIMConsole({
 		database,
 		env,
@@ -553,6 +560,7 @@ export async function createOwnedProjectRuntimeCandidate(options: Options) {
 		},
 		scim: { credentialHashSecret: options.credentialHashSecret },
 		manageSCIMConsole,
+		manageOrganizationConsole,
 		backchannelLogout: { defer, post: options.postBackchannelLogout },
 		support: projectSupport(options, platform),
 		walletOrigin: browserOrigin,

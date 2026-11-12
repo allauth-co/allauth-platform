@@ -220,6 +220,7 @@ interface OwnedProjectEngineOptions {
 	>;
 	scim?: { credentialHashSecret: string };
 	manageSCIMConsole?: AuthEngine["manageSCIMConsole"];
+	manageOrganizationConsole?: AuthEngine["manageOrganizationConsole"];
 	support?: Omit<
 		OwnedProjectSupportOptions,
 		| "database"
@@ -2899,6 +2900,7 @@ export function createOwnedProjectEngine(
 			issuer ? issuer.readContext(request) : unsupported(),
 		issueOneTimeToken: oneTimeToken.issue,
 		manageSCIMConsole: options.manageSCIMConsole,
+		manageOrganizationConsole: options.manageOrganizationConsole,
 		listAccountSessions,
 		revokeAccountSession,
 		readDirectory: async (operation, headers, query) =>

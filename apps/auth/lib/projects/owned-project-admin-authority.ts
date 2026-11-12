@@ -1,11 +1,15 @@
-import type { PoolClient } from "pg";
 import { rolesInclude } from "../configuration";
 import type { ControlPrincipal } from "../control/types";
 import type { Project } from "./registry";
 
 /** Bind the current platform session and workspace authority to the selected immutable project. */
 export async function lockOwnedProjectWorkspaceAdministrator(
-	client: PoolClient,
+	client: {
+		query<Row extends Record<string, unknown>>(
+			text: string,
+			values: unknown[],
+		): Promise<{ rows: Row[] }>;
+	},
 	project: Pick<Project, "id" | "schemaName" | "slug" | "workspaceId">,
 	principal: ControlPrincipal,
 ) {

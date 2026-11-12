@@ -570,6 +570,26 @@ export function withProjectSCIMConsole(
 	);
 }
 
+/** The console uses the selected project engine and only opens a native instance in a legacy realm. */
+export function withProjectOrganizationConsole(
+	slug: string,
+	callback: (
+		manage: AuthEngine["manageOrganizationConsole"],
+		readLegacy: () => Instance,
+		env: AuthEnvironment,
+		project: Project,
+	) => Promise<Response>,
+) {
+	return withDirectProjectEntry(slug, (entry, project) =>
+		callback(
+			entry.engine.manageOrganizationConsole,
+			() => legacyInstance(entry),
+			entry.env,
+			project,
+		),
+	);
+}
+
 export async function closeProjectInstances() {
 	await entries.close();
 }

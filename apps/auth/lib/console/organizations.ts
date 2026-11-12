@@ -35,8 +35,8 @@ async function organizationLock(database: ControlDatabase, id: string) {
 	if (!current) throw new APIError("NOT_FOUND", { message: "This organization does not exist in the selected environment." });
 	return current;
 }
-async function validUser(database: ControlDatabase, id: string) {
-	const user = (await sql<{ id: string; name: string; email: string; emailVerified: boolean; banned: boolean | null; directoryDisabled: boolean | null }>`SELECT id,name,email,"emailVerified",banned,"directoryDisabled" FROM "user" WHERE id=${id}`.execute(database)).rows[0];
+async function validUser(database: ControlDatabase, id: string, lock = false) {
+	const user = (await sql<{ id: string; name: string; email: string; emailVerified: boolean; banned: boolean | null; directoryDisabled: boolean | null }>`SELECT id,name,email,"emailVerified",banned,"directoryDisabled" FROM "user" WHERE id=${id}${lock ? sql` FOR SHARE` : sql``}`.execute(database)).rows[0];
 	if (!user) throw new APIError("NOT_FOUND", { message: "Select a user from this application's environment." });
 	if (!user.emailVerified || user.banned || user.directoryDisabled === true) throw new APIError("BAD_REQUEST", { message: "Organization members must have a verified, active account." });
 	return user;
@@ -63,6 +63,10 @@ export async function listConsoleOrganizations(database: ControlDatabase, raw: u
 	const query = page.parse(raw); const match = wildcard(query.search); const where = query.search ? sql`(o.name ILIKE ${match} ESCAPE '\\' OR o.slug ILIKE ${match} ESCAPE '\\' OR o.id=${query.search})` : sql`true`;
 	const [rows, count] = await Promise.all([sql<Record<string, unknown>>`SELECT o.id,o.name,o.slug,o.logo,o."createdAt",(SELECT count(*)::int FROM member WHERE "organizationId"=o.id) AS "memberCount",(SELECT count(*)::int FROM team WHERE "organizationId"=o.id) AS "teamCount" FROM organization o WHERE ${where} ORDER BY o."createdAt" DESC,o.id LIMIT ${query.limit} OFFSET ${query.offset}`.execute(database), sql<{ count: number }>`SELECT count(*)::int AS count FROM organization o WHERE ${where}`.execute(database)]);
 	return { organizations: rows.rows, total: count.rows[0]?.count || 0, limit: query.limit, offset: query.offset };
+}
+
+export function consoleOrganizationListQuery(query: URLSearchParams) {
+	return { search: query.get("search") || "", limit: query.get("limit") || 25, offset: query.get("offset") || 0 };
 }
 
 const memberPage = page.extend({
@@ -147,15 +151,16 @@ export async function getConsoleOrganization(database: ControlDatabase, organiza
 }
 export async function createConsoleOrganization(database: ControlDatabase, raw: unknown, actorId: string) {
 	const input = createOrganizationInput.parse(raw);
-	return database.transaction().execute(async (transaction) => {
-		await validUser(transaction, input.ownerId);
+	async function create(transaction: ControlDatabase) {
+		await validUser(transaction, input.ownerId, true);
 		if ((await sql`SELECT id FROM organization WHERE slug=${input.slug}`.execute(transaction)).rows.length) throw new APIError("CONFLICT", { message: "This organization slug is already in use." });
 		const id = randomUUID();
 		const organization = (await sql<Record<string, unknown>>`INSERT INTO organization (id,name,slug,logo,"createdAt") VALUES (${id},${input.name},${input.slug},${input.logo || null},CURRENT_TIMESTAMP) RETURNING id,name,slug,logo,"createdAt"`.execute(transaction)).rows[0]!;
 		await sql`INSERT INTO member (id,"organizationId","userId",role,"createdAt") VALUES (${randomUUID()},${id},${input.ownerId},'owner',CURRENT_TIMESTAMP)`.execute(transaction);
 		await audit(transaction, actorId, "organization.created", id, id, input.ownerId);
 		return { organization: { ...organization, memberCount: 1, teamCount: 0 } as Record<string, unknown> };
-	});
+	}
+	return database.isTransaction ? create(database) : database.transaction().execute(create);
 }
 export async function updateConsoleOrganization(database: ControlDatabase, organizationId: string, raw: unknown, actorId: string) {
 	const input = updateOrganizationInput.parse(raw);
