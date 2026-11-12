@@ -179,7 +179,9 @@ describe("hosted SDK transport", () => {
 		);
 		const reads = [
 			"get-full-organization",
+			"get-active-member-role",
 			"list-members",
+			"list-invitations",
 			"list-team-members",
 			"list-teams",
 			"list-user-teams",
@@ -201,6 +203,7 @@ describe("hosted SDK transport", () => {
 			"add-team-member",
 			"remove-team-member",
 			"create-role",
+			"update-role",
 			"delete-role",
 		];
 		for (const operation of reads) {

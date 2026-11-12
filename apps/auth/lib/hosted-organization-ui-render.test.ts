@@ -111,12 +111,25 @@ afterEach(async () => {
 	vi.unstubAllGlobals();
 });
 
-type View = "invitation" | "list" | "switch" | "manager" | "settings" | "teams";
+type View =
+	| "invitation"
+	| "list"
+	| "switch"
+	| "manager"
+	| "settings"
+	| "teams"
+	| "people"
+	| "roles";
 
 function Preview({ view }: { view: View }) {
 	const client = useHostedOrganizationClient();
 	if (view === "manager") return createElement(OrganizationManager);
-	if (view === "settings" || view === "teams")
+	if (
+		view === "settings" ||
+		view === "teams" ||
+		view === "people" ||
+		view === "roles"
+	)
 		return createElement(HostedOrganizationDetail, {
 			view,
 			children: createElement("p", null, "Legacy organization detail"),
@@ -707,4 +720,231 @@ it("keeps team roster access tied to membership and renames the selected hosted 
 		data: { name: "Renamed Team", organizationId: organization.id },
 	});
 	expect(container.textContent).toContain("Renamed Team");
+});
+
+it("edits a dynamic role through verified organization permissions and protects assigned roles", async () => {
+	let role = {
+		id: "fixture-reviewer",
+		organizationId: organization.id,
+		role: "reviewer",
+		permission: { team: ["update"] },
+	};
+	const update = vi.fn();
+	const check = vi.fn();
+	network(async (path, request) => {
+		const query = new URL(request.url).searchParams;
+		switch (path) {
+			case "get-session":
+				return session;
+			case "organization/get-full-organization":
+				return organization;
+			case "organization/has-permission": {
+				const body = (await request.json()) as {
+					organizationId: string;
+					permissions: { team?: string[] };
+				};
+				expect(body.organizationId).toBe(organization.id);
+				check(body.permissions);
+				return { success: body.permissions.team?.[0] !== "delete" };
+			}
+			case "organization/list-roles":
+				expect(query.get("organizationId")).toBe(organization.id);
+				return [role];
+			case "organization/list-members":
+				expect(query.get("organizationId")).toBe(organization.id);
+				expect(query.get("filterValue")).toBe(role.role);
+				return { total: 1, members: [] };
+			case "organization/update-role": {
+				const body = (await request.json()) as {
+					organizationId: string;
+					roleId: string;
+					data: { roleName: string };
+				};
+				update(body);
+				role = { ...role, role: body.data.roleName };
+				return { success: true, roleData: role };
+			}
+			default:
+				throw new Error(`Unexpected organization operation ${path}`);
+		}
+	});
+	const container = await render("roles");
+	await act(async () => new Promise<void>((resolve) => setTimeout(resolve, 0)));
+	const assigned = [...container.querySelectorAll("button")].find(
+		(button) => button.getAttribute("aria-label") === "Delete reviewer",
+	)!;
+	expect(assigned.disabled).toBe(true);
+	const edit = [...container.querySelectorAll("button")].find(
+		(button) => button.getAttribute("aria-label") === "Edit reviewer",
+	)!;
+	await act(async () => edit.click());
+	await act(async () => new Promise<void>((resolve) => setTimeout(resolve, 0)));
+	const dialog = document.querySelector('[role="dialog"]')!;
+	const team = [...dialog.querySelectorAll("fieldset")].find(
+		(fieldset) => fieldset.querySelector("legend")?.textContent === "team",
+	)!;
+	const cannotGrant = [...team.querySelectorAll("label")].find(
+		(label) => label.textContent === "delete",
+	)!;
+	expect(cannotGrant.querySelector("input")!.disabled).toBe(true);
+	await act(async () => setInput(dialog.querySelector("input")!, "auditor"));
+	await act(async () =>
+		dialog
+			.querySelector("form")!
+			.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })),
+	);
+	expect(check).toHaveBeenCalledWith({ team: ["update"] });
+	expect(update).toHaveBeenCalledExactlyOnceWith({
+		organizationId: organization.id,
+		roleId: role.id,
+		data: { roleName: "auditor", permission: { team: ["update"] } },
+	});
+	expect(container.textContent).toContain("auditor");
+});
+
+it("manages hosted people, multi-role membership and invitation actions in the selected organization", async () => {
+	const owner = {
+		id: "owner-membership",
+		organizationId: organization.id,
+		userId: session.user.id,
+		role: "owner",
+		user: session.user,
+	};
+	const teammate = {
+		id: "fixture-member",
+		organizationId: organization.id,
+		userId: "member-user",
+		role: "member",
+		user: { name: "Fixture Member", email: "member@fixture.example" },
+	};
+	const role = {
+		id: "fixture-reviewer",
+		organizationId: organization.id,
+		role: "reviewer",
+		permission: {},
+	};
+	const team = {
+		id: "fixture-team",
+		organizationId: organization.id,
+		name: "Platform Team",
+	};
+	const pending = {
+		...invitation,
+		role: "member,reviewer",
+		createdAt: "2026-05-01T00:00:00Z",
+	};
+	const roles = vi.fn();
+	const invites = vi.fn();
+	const teamLookup = vi.fn();
+	network(async (path, request) => {
+		const query = new URL(request.url).searchParams;
+		switch (path) {
+			case "get-session":
+				return session;
+			case "organization/get-full-organization":
+				return organization;
+			case "organization/get-active-member-role":
+				expect(query.get("organizationId")).toBe(organization.id);
+				return { role: "owner" };
+			case "organization/has-permission":
+				return { success: true };
+			case "organization/list-members":
+				expect(query.get("organizationId")).toBe(organization.id);
+				return query.get("filterValue") === "owner"
+					? { members: [owner], total: 1 }
+					: { members: [owner, teammate], total: 2 };
+			case "organization/list-user-teams":
+				expect(query.get("organizationId")).toBe(organization.id);
+				teamLookup(query.get("userId"));
+				return [team];
+			case "organization/list-roles":
+				return [role];
+			case "organization/list-invitations":
+				expect(query.get("organizationId")).toBe(organization.id);
+				return [pending];
+			case "organization/list-teams":
+				return [team];
+			case "organization/update-member-role": {
+				const body = (await request.json()) as { role: string[] };
+				roles(body);
+				teammate.role = body.role.join(",");
+				return teammate;
+			}
+			case "organization/invite-member":
+				invites(await request.json());
+				return pending;
+			default:
+				throw new Error(`Unexpected organization operation ${path}`);
+		}
+	});
+	const container = await render("people");
+	await vi.waitFor(async () => {
+		await act(
+			async () => new Promise<void>((resolve) => setTimeout(resolve, 0)),
+		);
+		expect(teamLookup).toHaveBeenCalledWith(teammate.userId);
+		expect(container.textContent).toContain(team.name);
+	});
+	const leave = [...container.querySelectorAll("button")].find(
+		(button) => button.textContent === "Leave organization",
+	)!;
+	expect(leave.disabled).toBe(true);
+	const edit = [...container.querySelectorAll("button")].find(
+		(button) =>
+			button.getAttribute("aria-label") ===
+			`Change role for ${teammate.user.email}`,
+	)!;
+	await act(async () => edit.click());
+	let dialog = document.querySelector('[role="dialog"]')!;
+	const reviewer = [...dialog.querySelectorAll("label")].find(
+		(label) => label.textContent === "reviewer",
+	)!;
+	await act(async () => reviewer.querySelector("input")!.click());
+	await act(async () =>
+		dialog
+			.querySelector("form")!
+			.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })),
+	);
+	expect(roles).toHaveBeenCalledExactlyOnceWith({
+		organizationId: organization.id,
+		memberId: teammate.id,
+		role: ["member", "reviewer"],
+	});
+	const resend = [...container.querySelectorAll("button")].find(
+		(button) =>
+			button.getAttribute("aria-label") ===
+			`Resend invitation to ${pending.email}`,
+	)!;
+	await act(async () => resend.click());
+	expect(invites).toHaveBeenCalledExactlyOnceWith({
+		organizationId: organization.id,
+		email: pending.email,
+		role: pending.role,
+		resend: true,
+	});
+	const create = [...container.querySelectorAll("button")].find(
+		(button) => button.textContent === "Invite member",
+	)!;
+	await act(async () => create.click());
+	await act(async () => new Promise<void>((resolve) => setTimeout(resolve, 0)));
+	dialog = document.querySelector('[role="dialog"]')!;
+	const inviteEmail = "new-person@fixture.example";
+	await act(async () => {
+		setInput(dialog.querySelector("input")!, inviteEmail);
+		const teams = dialog.querySelector("select")!;
+		teams.value = team.id;
+		teams.dispatchEvent(new Event("change", { bubbles: true }));
+	});
+	await act(async () =>
+		dialog
+			.querySelector("form")!
+			.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })),
+	);
+	expect(invites).toHaveBeenLastCalledWith({
+		organizationId: organization.id,
+		email: inviteEmail,
+		role: ["member"],
+		teamId: team.id,
+	});
+	expect(legacy.useSession).not.toHaveBeenCalled();
 });

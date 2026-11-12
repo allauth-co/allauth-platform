@@ -10,6 +10,8 @@ import type { AllAuthClient, AllAuthOrganization } from "@/sdk/client";
 import { authError } from "@/sdk/helpers";
 import { useHostedOrganizationClient } from "./hosted-organization-client";
 import { useHostedOrganizationPermission } from "./hosted-organization-management";
+import { HostedOrganizationPeople } from "./hosted-organization-people";
+import { HostedOrganizationRoles } from "./hosted-organization-roles";
 import { HostedOrganizationTeams } from "./hosted-organization-teams";
 import {
 	AlertDialog,
@@ -34,7 +36,7 @@ const views = {
 	people: "People",
 } as const;
 
-type DetailView = "settings" | "teams";
+type DetailView = keyof typeof views;
 
 /** First-party management for the organization selected in the verified hosted session. */
 export function HostedOrganizationDetail({
@@ -71,7 +73,16 @@ function OrganizationDetail({
 			return result.data?.id === organizationId ? result.data : null;
 		},
 	});
-	const settingsOrg = view === "settings" ? organizationId : undefined;
+	const roles = useHostedOrganizationPermission(
+		client,
+		userId,
+		organizationId,
+		"ac",
+		"read",
+	);
+	const selectedView =
+		view === "roles" && !roles.isPending && !roles.data ? "settings" : view;
+	const settingsOrg = selectedView === "settings" ? organizationId : undefined;
 	const update = useHostedOrganizationPermission(
 		client,
 		userId,
@@ -85,13 +96,6 @@ function OrganizationDetail({
 		settingsOrg,
 		"organization",
 		"delete",
-	);
-	const roles = useHostedOrganizationPermission(
-		client,
-		userId,
-		organizationId,
-		"ac",
-		"read",
 	);
 	useEffect(() => {
 		if (session.isPending || session.error) return;
@@ -132,13 +136,13 @@ function OrganizationDetail({
 					) : (
 						<Button
 							key={item}
-							variant={item === view ? "secondary" : "ghost"}
+							variant={item === selectedView ? "secondary" : "ghost"}
 							size="sm"
 							asChild
 						>
 							<Link
 								href={`/organization/${item}`}
-								aria-current={item === view ? "page" : undefined}
+								aria-current={item === selectedView ? "page" : undefined}
 							>
 								{label}
 							</Link>
@@ -151,7 +155,7 @@ function OrganizationDetail({
 					{accessError}
 				</p>
 			)}
-			{view === "teams" ? (
+			{selectedView === "teams" && (
 				<HostedOrganizationTeams
 					key={organization.data.id}
 					client={client}
@@ -160,7 +164,31 @@ function OrganizationDetail({
 					activeTeamId={session.data?.session.activeTeamId}
 					refreshSession={session.refetch}
 				/>
-			) : (
+			)}
+			{selectedView === "roles" &&
+				(roles.data ? (
+					<HostedOrganizationRoles
+						key={organization.data.id}
+						client={client}
+						organizationId={organization.data.id}
+						userId={userId}
+					/>
+				) : (
+					<p role="status" className="text-sm text-muted-foreground">
+						Checking role access…
+					</p>
+				))}
+			{selectedView === "people" && (
+				<HostedOrganizationPeople
+					key={organization.data.id}
+					client={client}
+					organizationId={organization.data.id}
+					userId={userId}
+					canReadRoles={roles.data === true}
+					departed={() => router.replace(organizationListPath)}
+				/>
+			)}
+			{selectedView === "settings" && (
 				<OrganizationProfile
 					key={organization.data.id}
 					client={client}

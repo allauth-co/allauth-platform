@@ -10,7 +10,13 @@ export default async function Page({
 	params: Promise<{ view: string }>;
 }) {
 	const { view } = await params;
-	if (!["settings", "people", "teams", "roles"].includes(view)) notFound();
+	if (
+		view !== "settings" &&
+		view !== "people" &&
+		view !== "teams" &&
+		view !== "roles"
+	)
+		notFound();
 	const session = await portalSession(await headers());
 	if (!session) redirect("/sign-in");
 	const legacy = <Organization path={view} className="account-settings" />;
@@ -20,13 +26,7 @@ export default async function Page({
 				title="Organization"
 				description="Manage organization settings, members, teams and access roles."
 			/>
-			{view === "settings" || view === "teams" ? (
-				<HostedOrganizationDetail view={view}>
-					{legacy}
-				</HostedOrganizationDetail>
-			) : (
-				legacy
-			)}
+			<HostedOrganizationDetail view={view}>{legacy}</HostedOrganizationDetail>
 		</div>
 	);
 }
