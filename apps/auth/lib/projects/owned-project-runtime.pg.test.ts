@@ -2070,7 +2070,7 @@ describe.skipIf(!existsSync(fixture))(
 
 				expect(
 					(await service.request("/oauth/login", { host: alphaHost })).status,
-				).toBe(503);
+				).toBe(400);
 				expect(
 					(await service.request("/oauth/login", { host: betaHost })).status,
 				).toBe(400);

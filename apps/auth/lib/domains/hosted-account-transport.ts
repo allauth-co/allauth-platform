@@ -8,7 +8,13 @@ type AccountEndpoint =
 	| "api-key/delete"
 	| "account-info"
 	| "delete-user"
-	| "unlink-account";
+	| "unlink-account"
+	| "sso/providers"
+	| "sso/register"
+	| "sso/update-provider"
+	| "sso/request-domain-verification"
+	| "sso/verify-domain"
+	| "sso/delete-provider";
 
 /** Use the verified accounts gateway for browser operations outside the published SDK types. */
 export async function hostedAccountRequest(

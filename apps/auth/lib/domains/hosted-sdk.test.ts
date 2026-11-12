@@ -487,6 +487,65 @@ describe("hosted SDK transport", () => {
 		expect(await dispatched.text()).toBe("{}");
 	});
 
+	it("confines hosted enterprise management to the verified browser and DNS proof operations", async () => {
+		verifiedFixture();
+		const proof = "fixture-dns-domain-proof";
+		gateway.dispatch.mockImplementation(async (incoming: Request) => {
+			const path = new URL(incoming.url).pathname;
+			const body = incoming.method === "POST" ? await incoming.json() : null;
+			return Response.json(
+				{
+					path,
+					providerId: "enterprise-fixture",
+					domainVerificationToken: proof,
+					oidcConfig: {
+						clientId: "public-id",
+						clientSecret: "synthetic-private-credential",
+					},
+					nested: { domainVerificationToken: proof },
+					body,
+				},
+				{ status: path.endsWith("verify-domain") ? 400 : 200 },
+			);
+		});
+		const catalog = await GET(request("sso/providers"));
+		expect(await catalog.json()).toMatchObject({
+			path: "/api/auth/sso/providers",
+			oidcConfig: { clientId: "public-id" },
+			nested: {},
+		});
+		const register = await POST(
+			request("sso/register", "POST", {
+				origin,
+				body: { providerId: "enterprise-fixture" },
+			}),
+		);
+		expect(await register.json()).toEqual({
+			path: "/api/auth/sso/register",
+			providerId: "enterprise-fixture",
+			domainVerificationToken: proof,
+			oidcConfig: { clientId: "public-id" },
+			nested: {},
+			body: { providerId: "enterprise-fixture" },
+		});
+		const denied = await POST(request("sso/verify-domain", "POST", { origin }));
+		expect(denied.status).toBe(400);
+		expect(await denied.json()).not.toHaveProperty("domainVerificationToken");
+		const bearer = request("sso/providers");
+		bearer.headers.set("authorization", "Bearer synthetic");
+		expect((await GET(bearer)).status).toBe(403);
+		expect(
+			(
+				await POST(
+					request("sso/delete-provider", "POST", {
+						origin: "https://other.example",
+					}),
+				)
+			).status,
+		).toBe(403);
+		expect((await GET(request("sso/update-provider"))).status).toBe(404);
+	});
+
 	it("ends a valid native hosted impersonation with the actor's restored cookie and a public identity", async () => {
 		const { auth } = await getTestInstance(
 			{

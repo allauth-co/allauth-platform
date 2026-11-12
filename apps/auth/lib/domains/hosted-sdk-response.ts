@@ -19,6 +19,7 @@ const privateFields = new Set([
 	"clientsecret",
 	"privatekey",
 	"encryptedprivatekey",
+	"domainverificationtoken",
 	"apikey",
 ]);
 
@@ -222,6 +223,23 @@ export async function hostedSdkResponse(
 
 	try {
 		const data: unknown = await response.json();
+		if (
+			response.ok &&
+			(endpoint === "sso/register" ||
+				endpoint === "sso/request-domain-verification") &&
+			data &&
+			typeof data === "object" &&
+			"domainVerificationToken" in data &&
+			typeof data.domainVerificationToken === "string"
+		) {
+			return Response.json(
+				{
+					...record(browserValue(data)),
+					domainVerificationToken: data.domainVerificationToken,
+				},
+				{ status: response.status, headers },
+			);
+		}
 		// The hosted page has a dedicated AllAuth broker control, independent of Google readiness.
 		if (
 			endpoint === "sdk/config" &&

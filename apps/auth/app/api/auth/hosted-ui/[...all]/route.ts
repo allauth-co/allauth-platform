@@ -71,6 +71,8 @@ async function handle(request: Request) {
 			bound.headers.has("authorization")
 		)
 			return hostedSdkFailure(403, "A browser session is required.");
+		if (endpoint.startsWith("sso/") && request.headers.has("authorization"))
+			return hostedSdkFailure(403, "A browser session is required.");
 
 		// The gateway verifies the original URL and body before this dispatch.
 		url.pathname = `/api/auth/${endpoint}`;
