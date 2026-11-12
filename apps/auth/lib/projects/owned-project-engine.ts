@@ -1990,6 +1990,19 @@ export function createOwnedProjectEngine(
 				return headers;
 			},
 		});
+	async function clearAdminAuthentication(client: PoolClient, userId: string) {
+		await client.query('DELETE FROM "oauthAccessToken" WHERE "userId"=$1', [
+			userId,
+		]);
+		await client.query('DELETE FROM "oauthRefreshToken" WHERE "userId"=$1', [
+			userId,
+		]);
+		await client.query(
+			`DELETE FROM "verification" WHERE value=$1
+			 AND (starts_with(identifier,'trust-device-') OR starts_with(identifier,'2fa-'))`,
+			[userId],
+		);
+	}
 	async function revokeAdminSessions(
 		client: PoolClient,
 		request: Request,
@@ -2005,20 +2018,8 @@ export function createOwnedProjectEngine(
 			actorId,
 		);
 		if (!removed) throw unavailableLogout;
-		if ("userId" in selector) {
-			const { userId } = selector;
-			await client.query('DELETE FROM "oauthAccessToken" WHERE "userId"=$1', [
-				userId,
-			]);
-			await client.query('DELETE FROM "oauthRefreshToken" WHERE "userId"=$1', [
-				userId,
-			]);
-			await client.query(
-				`DELETE FROM "verification" WHERE value=$1
-				 AND (starts_with(identifier,'trust-device-') OR starts_with(identifier,'2fa-'))`,
-				[userId],
-			);
-		}
+		if ("userId" in selector)
+			await clearAdminAuthentication(client, selector.userId);
 		deliverLogoutAfterCommit(client, request, removed.targets);
 	}
 	const adminProject = options.adminDeletion && {
@@ -2546,6 +2547,9 @@ export function createOwnedProjectEngine(
 			renewAuthorizedSession(request, current, client, headers, false),
 		trustedIP: security.trustedIP,
 		requireMfa: policy.mfaMode === "required",
+		passwordPolicy: policy.passwordPolicy,
+		checkPasswordSafety: passwordSafety,
+		clearUserAuthentication: clearAdminAuthentication,
 		revoke: revokeAdminSessions,
 	});
 	const realmImpersonation = createOwnedProjectRealmImpersonation({

@@ -2,6 +2,13 @@ import type { AuthEngine } from "../auth-engine";
 import messages from "./legacy-auth-error-messages.json";
 
 const catalog: Record<string, Readonly<Record<string, string>>> = messages;
+const beforeHookErrors = new WeakSet<Response>();
+
+/** Preserve an error that the native pre-handler returns before localization. */
+export function preserveProjectBeforeHookError(response: Response) {
+	beforeHookErrors.add(response);
+	return response;
+}
 
 /** Preserve the existing header-only negotiation and English default. */
 function preferredLocale(acceptLanguage: string | null) {
@@ -20,6 +27,7 @@ function preferredLocale(acceptLanguage: string | null) {
 
 async function localizeError(request: Request, response: Response) {
 	if (
+		beforeHookErrors.has(response) ||
 		response.status < 400 ||
 		!response.headers.get("content-type")?.includes("application/json")
 	)

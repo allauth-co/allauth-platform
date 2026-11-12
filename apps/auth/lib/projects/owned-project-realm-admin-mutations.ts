@@ -1,5 +1,7 @@
 import type { PoolClient } from "pg";
 import * as z from "zod";
+import type { PasswordPolicy } from "../auth-policy/password";
+import { passwordPolicyError } from "../auth-policy/password";
 import {
 	accountLinkError,
 	accountLinkHeaders,
@@ -12,6 +14,14 @@ import {
 	recordOwnedRealmAdminEvent,
 } from "./owned-project-realm-admin-audit";
 import { readRealmAdminUser } from "./owned-project-realm-admin-directory";
+import type { RealmAdminPasswordSafety } from "./owned-project-realm-admin-password";
+import {
+	prepareRealmAdminPassword,
+	realmAdminPasswordPath,
+	realmAdminPasswordUnavailable,
+	writeRealmAdminPassword,
+} from "./owned-project-realm-admin-password";
+import { preserveProjectBeforeHookError } from "./project-error-localization";
 
 const singlePath = "/admin/revoke-user-session";
 const bulkPath = "/admin/revoke-user-sessions";
@@ -39,6 +49,12 @@ const inputs = {
 	[unbanPath]: z
 		.object({ userId })
 		.transform((data) => ({ ...data, path: unbanPath }) as const),
+	[realmAdminPasswordPath]: z
+		.object({
+			userId: userId.nonempty("userId cannot be empty"),
+			newPassword: z.string(),
+		})
+		.transform((data) => ({ ...data, path: realmAdminPasswordPath }) as const),
 };
 const revokeDenied = [
 	"YOU_ARE_NOT_ALLOWED_TO_REVOKE_USERS_SESSIONS",
@@ -57,12 +73,20 @@ const permissionDenied = {
 	],
 	[banPath]: banDenied,
 	[unbanPath]: banDenied,
+	[realmAdminPasswordPath]: [
+		"YOU_ARE_NOT_ALLOWED_TO_SET_USERS_PASSWORD",
+		"You are not allowed to set users password",
+	],
 };
 
 type MutationPath = keyof typeof inputs;
 type RevocationSelector = { tokens: string[] } | { userId: string };
 type Store = ReturnType<typeof createProjectEngineStore>;
 type RealmSession = NonNullable<Awaited<ReturnType<Store["session"]>>>;
+type PasswordAuthority = { sessionId: string; targetCreatedAt: number };
+type PasswordAttempt = PasswordAuthority & {
+	result: Awaited<ReturnType<typeof prepareRealmAdminPassword>>;
+};
 
 /** Accept only a verified browser administrator from the selected project realm. */
 export function createOwnedProjectRealmAdminMutations(options: {
@@ -80,6 +104,9 @@ export function createOwnedProjectRealmAdminMutations(options: {
 	): Promise<void>;
 	trustedIP(request: Request): string | null;
 	requireMfa: boolean;
+	passwordPolicy: PasswordPolicy;
+	checkPasswordSafety?: RealmAdminPasswordSafety;
+	clearUserAuthentication(client: PoolClient, userId: string): Promise<void>;
 	revoke(
 		client: PoolClient,
 		request: Request,
@@ -109,6 +136,8 @@ export function createOwnedProjectRealmAdminMutations(options: {
 					.join("; "),
 			);
 		const mutation = input.data;
+		const password =
+			mutation.path === realmAdminPasswordPath ? mutation.newPassword : null;
 		// The native endpoint coerces the selector, but its after-hook audits the raw ID.
 		const targetId =
 			path !== singlePath &&
@@ -120,8 +149,11 @@ export function createOwnedProjectRealmAdminMutations(options: {
 				: undefined;
 		const token = options.readCookie(request.headers);
 		const ipAddress = options.trustedIP(request) ?? undefined;
-		return store.transaction(async (client) => {
-			if (ipAddress) {
+		async function perform(
+			client: PoolClient,
+			attempt?: PasswordAttempt,
+		): Promise<Response | PasswordAuthority> {
+			if (ipAddress && !attempt) {
 				const limited = await admitOwnedProjectNativeRoute(
 					client,
 					ipAddress,
@@ -141,6 +173,22 @@ export function createOwnedProjectRealmAdminMutations(options: {
 					{ message: "Use your signed-in browser session for this action." },
 					403,
 				);
+			if (password !== null && !attempt) {
+				const rules = options.passwordPolicy;
+				const message = passwordPolicyError(password, rules);
+				if (message)
+					return preserveProjectBeforeHookError(
+						accountLinkError(
+							400,
+							password.length < rules.minLength
+								? "PASSWORD_TOO_SHORT"
+								: password.length > rules.maxLength
+									? "PASSWORD_TOO_LONG"
+									: "PASSWORD_REQUIREMENTS_NOT_MET",
+							message,
+						),
+					);
+			}
 			const requireEnrollment = () =>
 				accountLinkJson(
 					{
@@ -207,6 +255,11 @@ export function createOwnedProjectRealmAdminMutations(options: {
 			if (options.requireMfa && !administrator.twoFactorEnabled)
 				return requireEnrollment();
 			if (!administrator.role?.split(",").includes("admin")) return denied();
+			if (password !== null && target && !attempt)
+				return {
+					sessionId: current.session.id,
+					targetCreatedAt: new Date(target.createdAt).getTime(),
+				};
 			await options.renew(request, { ...current, token }, client, headers);
 			if (mutation.path === singlePath || mutation.path === bulkPath) {
 				const selector =
@@ -222,6 +275,38 @@ export function createOwnedProjectRealmAdminMutations(options: {
 				return accountLinkJson({ code, message }, status, headers);
 			};
 			if (!target) return reject(404, "USER_NOT_FOUND", "User not found");
+			if (mutation.path === realmAdminPasswordPath) {
+				if (!attempt)
+					throw new Error(
+						"A prepared realm administrator password was expected.",
+					);
+				if (
+					current.session.id !== attempt.sessionId ||
+					new Date(target.createdAt).getTime() !== attempt.targetCreatedAt
+				)
+					return reject(
+						409,
+						"PASSWORD_CHANGE_UNAVAILABLE",
+						"The account changed while preparing the password. Try again.",
+					);
+				if (attempt.result.failure) {
+					const { status, code, message } = attempt.result.failure;
+					return reject(status, code, message);
+				}
+				if (
+					!(await writeRealmAdminPassword(client, store, {
+						userId: target.id,
+						actorId: administrator.id,
+						hash: attempt.result.hash,
+					}))
+				) {
+					const { status, code, message } = realmAdminPasswordUnavailable;
+					return reject(status, code, message);
+				}
+				await options.clearUserAuthentication(client, target.id);
+				await record();
+				return accountLinkJson({ status: true }, 200, headers);
+			}
 			if (mutation.path === rolePath) {
 				const role =
 					typeof mutation.role === "string"
@@ -281,6 +366,19 @@ export function createOwnedProjectRealmAdminMutations(options: {
 				throw new Error("The updated realm account could not be read.");
 			await record();
 			return accountLinkJson({ user }, 200, headers);
-		});
+		}
+		const first = await store.transaction((client) => perform(client));
+		if (first instanceof Response) return first;
+		if (password === null) throw new Error("A password mutation was expected.");
+		const result = await prepareRealmAdminPassword(
+			password,
+			options.checkPasswordSafety,
+		);
+		const committed = await store.transaction((client) =>
+			perform(client, { ...first, result }),
+		);
+		if (!(committed instanceof Response))
+			throw new Error("The realm administrator password was not finalized.");
+		return committed;
 	};
 }

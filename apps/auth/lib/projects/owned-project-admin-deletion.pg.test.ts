@@ -1,6 +1,7 @@
-import { createHmac, randomUUID } from "node:crypto";
+import { createHash, createHmac, randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { runWithAdapter } from "@better-auth/core/context";
+import { hash as hashBcrypt } from "bcryptjs";
 import { betterAuth } from "better-auth";
 import { symmetricEncrypt } from "better-auth/crypto";
 import { admin } from "better-auth/plugins";
@@ -15,7 +16,7 @@ import {
 } from "jose";
 import { Kysely, PostgresDialect, sql } from "kysely";
 import { Pool } from "pg";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { createAuthOptions } from "../auth";
 import { defaultAuthPolicy } from "../auth-policy/policy";
 import { clerkCompatiblePasswords } from "../clerk-password";
@@ -29,6 +30,7 @@ import { projectManagement } from "./management-plugin";
 import type { OwnedProjectAdminDeletionOptions } from "./owned-project-admin-deletion";
 import { createOwnedProjectAppleDeletion } from "./owned-project-apple-deletion";
 import { createOwnedProjectEngine } from "./owned-project-engine";
+import { createOwnedProjectPasswordSafety } from "./owned-project-password-safety";
 import { localizeProjectErrors } from "./project-error-localization";
 
 const fixturePath = new URL(
@@ -46,6 +48,7 @@ const bulkRevocationPath = "/admin/revoke-user-sessions";
 const rolePath = "/admin/set-role";
 const banPath = "/admin/ban-user";
 const unbanPath = "/admin/unban-user";
+const passwordPath = "/admin/set-user-password";
 const clientIP = "192.0.2.9";
 const userAgent = "AllAuth project administrator fixture";
 const platformSecret = "isolated-root-administrator-deletion-fixture-secret";
@@ -179,6 +182,9 @@ describe.skipIf(!existsSync(fixturePath))(
 			backchannelLogout?: Parameters<
 				typeof createOwnedProjectEngine
 			>[0]["backchannelLogout"],
+			checkPasswordSafety: ReturnType<
+				typeof createOwnedProjectPasswordSafety
+			> = async () => "allowed",
 		) {
 			return createOwnedProjectEngine({
 				database,
@@ -191,7 +197,7 @@ describe.skipIf(!existsSync(fixturePath))(
 				policy: defaultAuthPolicy,
 				issuer: Boolean(backchannelLogout),
 				backchannelLogout,
-				passwordChange: { checkPasswordSafety: async () => "allowed" },
+				passwordChange: { checkPasswordSafety },
 				accountLinks: {
 					publicLinkBaseURL: `${origin}${realm.path}`,
 					defer() {},
@@ -1371,6 +1377,398 @@ describe.skipIf(!existsSync(fixturePath))(
 					`DELETE FROM ${scope}."allauthWebhookEndpoint" WHERE id=$1`,
 					[endpoint],
 				);
+			}
+		});
+
+		it("interchanges administrator-set credentials and preserves the native grant and session contract", async () => {
+			const stock = await stockRealm();
+			const scope = `"${alpha.schemaName}"`;
+			const id = "realm-admin-password-fixture-user";
+			const linkedIds = ["native-linked-fixture", "owned-linked-fixture"];
+			const relyingParty = "realm-admin-password-fixture-client";
+			const compromised = "Synthetic-fixture-breach-9!";
+			const breachDigest = createHash("sha1")
+				.update(compromised)
+				.digest("hex")
+				.toUpperCase();
+			const breachFetch = vi
+				.spyOn(globalThis, "fetch")
+				.mockImplementation(async (input) => {
+					const url = new URL(input instanceof Request ? input.url : input);
+					expect(url.origin).toBe("https://api.pwnedpasswords.com");
+					expect(url.pathname).toMatch(/^\/range\/[0-9A-F]{5}$/);
+					return new Response(
+						url.pathname.endsWith(breachDigest.slice(0, 5))
+							? `${breachDigest.slice(5)}:7\r\n`
+							: `${"0".repeat(35)}:0\r\n`,
+					);
+				});
+			try {
+				const candidate = localizeProjectErrors(
+					engine(
+						alpha,
+						undefined,
+						undefined,
+						createOwnedProjectPasswordSafety(),
+					),
+				);
+				await seedUser(alpha.schemaName, id);
+				await seedUser(beta.schemaName, id);
+				await database.query(
+					`UPDATE ${scope}."account" SET password=$2 WHERE "userId"=$1 AND "providerId"='credential'`,
+					[id, await hashBcrypt(password, 4)],
+				);
+				for (const linkedId of linkedIds) {
+					await seedUser(alpha.schemaName, linkedId);
+					await database.query(
+						`UPDATE ${scope}."account" SET "providerId"='google',"accountId"=$2,password=NULL WHERE "userId"=$1`,
+						[linkedId, `synthetic-provider-${linkedId}`],
+					);
+				}
+				await database.query(
+					`INSERT INTO ${scope}."oauthClient" (id,"clientId","redirectUris") VALUES ($1,$1,'[]')`,
+					[relyingParty],
+				);
+				const ordinary = await login(native, alpha.path, id);
+				const identity = await native.api.getSession({
+					headers: new Headers({ cookie: ordinary }),
+				});
+				if (!identity)
+					throw new Error("Expected a live fixture credential session.");
+				type Dispatch = (incoming: Request) => Promise<Response>;
+				const call = (
+					dispatch: Dispatch,
+					userId: string,
+					newPassword: string,
+					proof = realmCookie,
+				) =>
+					dispatch(
+						request(alpha.path + passwordPath, proof, { userId, newPassword }),
+					);
+				const responseShape = async (response: Response) => {
+					const body = await response.text();
+					return {
+						status: response.status,
+						body: body ? JSON.parse(body) : null,
+						cookies: response.headers.getSetCookie(),
+					};
+				};
+				const expectedRejections = [
+					{
+						userId: id,
+						newPassword: "Synthetic-unavailable-caller-8!",
+						cookie: rootCookie,
+						status: 401,
+					},
+					{
+						userId: id,
+						newPassword: "Synthetic-unprivileged-caller-8!",
+						cookie: ordinary,
+						status: 403,
+						code: "YOU_ARE_NOT_ALLOWED_TO_SET_USERS_PASSWORD",
+					},
+					{
+						userId: "missing-password-fixture-user",
+						newPassword: "Synthetic-missing-caller-8!",
+						status: 404,
+						code: "USER_NOT_FOUND",
+					},
+					{
+						userId: id,
+						newPassword: "weak",
+						status: 400,
+						code: "PASSWORD_TOO_SHORT",
+					},
+					{
+						userId: id,
+						newPassword: "",
+						status: 400,
+						code: "PASSWORD_TOO_SHORT",
+					},
+					{
+						userId: id,
+						newPassword: "x".repeat(129),
+						status: 400,
+						code: "PASSWORD_TOO_LONG",
+					},
+					{
+						userId: id,
+						newPassword: compromised,
+						status: 400,
+						code: "PASSWORD_COMPROMISED",
+					},
+				];
+				const events = async () =>
+					(
+						await database.query<{ id: string; [key: string]: unknown }>(
+							`SELECT id,outcome,"actorId","userId","targetId","ipAddress","userAgent",metadata
+					 FROM ${scope}."allauthEvent" WHERE type='admin.set-user-password'`,
+						)
+					).rows;
+				const newEvents = (
+					next: Awaited<ReturnType<typeof events>>,
+					prior: Awaited<ReturnType<typeof events>>,
+				) => {
+					const seen = new Set(prior.map(({ id }) => id));
+					return next
+						.filter(({ id }) => !seen.has(id))
+						.map(({ id, ...event }) => event);
+				};
+				for (const rejection of expectedRejections) {
+					const before = await events();
+					const count = breachFetch.mock.calls.length;
+					const expected = await responseShape(
+						await call(
+							stock.handler,
+							rejection.userId,
+							rejection.newPassword,
+							rejection.cookie,
+						),
+					);
+					expect(expected.status).toBe(rejection.status);
+					if (rejection.code)
+						expect(expected.body).toMatchObject({ code: rejection.code });
+					const afterNative = await events();
+					expect(
+						await responseShape(
+							await call(
+								candidate.dispatch,
+								rejection.userId,
+								rejection.newPassword,
+								rejection.cookie,
+							),
+						),
+					).toEqual(expected);
+					expect(newEvents(await events(), afterNative)).toEqual(
+						newEvents(afterNative, before),
+					);
+					expect(breachFetch.mock.calls.length - count).toBe(
+						rejection.newPassword === compromised ? 2 : 0,
+					);
+				}
+				const credential = async (userId: string) =>
+					(
+						await database.query<{
+							id: string;
+							password: string;
+							accountId: string;
+						}>(
+							`SELECT id,password,"accountId" FROM ${scope}."account" WHERE "userId"=$1 AND "providerId"='credential'`,
+							[userId],
+						)
+					).rows;
+				const [original] = await credential(id);
+				expect(original?.password).toMatch(/^\$2[aby]\$/);
+				const writers = [
+					[
+						stock.handler,
+						candidate.dispatch,
+						"Synthetic-native-admin-credential-8!",
+						linkedIds[0]!,
+					],
+					[
+						candidate.dispatch,
+						stock.handler,
+						"Synthetic-owned-admin-credential-8!",
+						linkedIds[1]!,
+					],
+				] as const;
+				let previous = password;
+				for (const [write, rollback, replacement, linked] of writers) {
+					for (const table of ["oauthAccessToken", "oauthRefreshToken"])
+						await database.query(
+							`INSERT INTO ${scope}."${table}" (id,token,"clientId","sessionId","userId","expiresAt","createdAt",scopes)
+							 VALUES ($1,$2,$3,$4,$5,now()+interval '1 hour',now(),'["openid","offline_access"]')`,
+							[
+								randomUUID(),
+								randomUUID(),
+								relyingParty,
+								identity.session.id,
+								id,
+							],
+						);
+					for (const identifier of [
+						"trust-device-admin-fixture",
+						"2fa-admin-fixture",
+						"unrelated-admin-fixture",
+					])
+						await database.query(
+							`INSERT INTO ${scope}."verification" (id,identifier,value,"expiresAt") VALUES ($1,$2,$3,now()+interval '1 hour')`,
+							[randomUUID(), identifier, id],
+						);
+					for (const userId of [id, linked]) {
+						expect(
+							await responseShape(await call(write, userId, replacement)),
+						).toEqual({ status: 200, body: { status: true }, cookies: [] });
+						const records = await credential(userId);
+						expect(records).toHaveLength(1);
+						const [account] = records;
+						expect(account?.accountId).toBe(userId);
+						expect(account?.password).toMatch(/^[a-f0-9]{32}:[a-f0-9]{128}$/);
+						if (userId === id) expect(account?.id).toBe(original?.id);
+						const signedIn = await rollback(
+							request(`${alpha.path}/sign-in/email`, undefined, {
+								email: `${userId}@fixture.example`,
+								password: replacement,
+							}),
+						);
+						expect(signedIn.status, await signedIn.clone().text()).toBe(200);
+					}
+					const stale = await rollback(
+						request(`${alpha.path}/sign-in/email`, undefined, {
+							email: `${id}@fixture.example`,
+							password: previous,
+						}),
+					);
+					expect(stale.status).toBe(401);
+					previous = replacement;
+					const session = await rollback(
+						request(`${alpha.path}/get-session`, ordinary),
+					);
+					expect(await session.json()).toMatchObject({
+						session: { id: identity.session.id },
+					});
+					for (const table of ["oauthAccessToken", "oauthRefreshToken"])
+						expect(
+							(
+								await database.query(
+									`SELECT id FROM ${scope}."${table}" WHERE "userId"=$1`,
+									[id],
+								)
+							).rows,
+						).toEqual([]);
+					expect(
+						(
+							await database.query(
+								`SELECT identifier FROM ${scope}."verification" WHERE value=$1`,
+								[id],
+							)
+						).rows,
+					).toEqual([{ identifier: "unrelated-admin-fixture" }]);
+					await database.query(
+						`DELETE FROM ${scope}."verification" WHERE value=$1`,
+						[id],
+					);
+				}
+				const audit = await database.query(
+					`SELECT "actorId","targetId" FROM ${scope}."allauthAudit" WHERE action=$1 ORDER BY "targetId"`,
+					[passwordPath],
+				);
+				expect(audit.rows).toEqual(
+					[linkedIds[0], linkedIds[1], id, id].map((targetId) => ({
+						actorId: realmAdmin,
+						targetId,
+					})),
+				);
+				const links = await database.query(
+					`SELECT "actorId","userId",metadata FROM ${scope}."allauthEvent" WHERE type='account.linked' AND metadata->>'path'=$1 ORDER BY "userId"`,
+					[passwordPath],
+				);
+				expect(links.rows).toEqual(
+					linkedIds.map((userId) => ({
+						actorId: realmAdmin,
+						userId,
+						metadata: { path: passwordPath, provider: "credential" },
+					})),
+				);
+				const [sibling] = (
+					await database.query(
+						`SELECT password FROM "${beta.schemaName}"."account" WHERE "userId"=$1`,
+						[id],
+					)
+				).rows;
+				expect(sibling?.password).toBe(hash);
+				const settled = await credential(id);
+				breachFetch.mockResolvedValueOnce(new Response(null, { status: 503 }));
+				const unavailable = await call(
+					candidate.dispatch,
+					id,
+					"Synthetic-unavailable-corpus-9!",
+				);
+				expect(unavailable.status).toBe(503);
+				expect(await unavailable.json()).toMatchObject({
+					code: "PASSWORD_CHANGE_UNAVAILABLE",
+				});
+				expect(await credential(id)).toEqual(settled);
+
+				const grantId = randomUUID();
+				await database.query(
+					`INSERT INTO ${scope}."oauthAccessToken" (id,token,"clientId","sessionId","userId","expiresAt","createdAt",scopes)
+					 VALUES ($1,$2,$3,$4,$5,now()+interval '1 hour',now(),'["openid"]')`,
+					[grantId, randomUUID(), relyingParty, identity.session.id, id],
+				);
+				await database.query(
+					`CREATE FUNCTION ${scope}."rejectFixturePasswordGrantRemoval"() RETURNS trigger LANGUAGE plpgsql AS $$
+					 BEGIN RAISE EXCEPTION 'Synthetic grant deletion failure'; END; $$`,
+				);
+				await database.query(
+					`CREATE TRIGGER "rejectFixturePasswordGrantRemoval" BEFORE DELETE ON ${scope}."oauthAccessToken"
+					 FOR EACH ROW EXECUTE FUNCTION ${scope}."rejectFixturePasswordGrantRemoval"()`,
+				);
+				try {
+					await expect(
+						call(candidate.dispatch, id, "Synthetic-atomic-credential-9!"),
+					).rejects.toMatchObject({ code: "P0001" });
+					expect(await credential(id)).toEqual(settled);
+					expect(
+						(
+							await database.query(
+								`SELECT id FROM ${scope}."oauthAccessToken" WHERE id=$1`,
+								[grantId],
+							)
+						).rowCount,
+					).toBe(1);
+					expect(
+						(
+							await database.query(
+								`SELECT id FROM ${scope}."allauthAudit" WHERE action=$1`,
+								[passwordPath],
+							)
+						).rowCount,
+					).toBe(4);
+				} finally {
+					await database.query(
+						`DROP TRIGGER "rejectFixturePasswordGrantRemoval" ON ${scope}."oauthAccessToken"`,
+					);
+					await database.query(
+						`DROP FUNCTION ${scope}."rejectFixturePasswordGrantRemoval"()`,
+					);
+				}
+
+				const checking = Promise.withResolvers<void>();
+				const complete = Promise.withResolvers<void>();
+				const racing = engine(alpha, undefined, undefined, async () => {
+					checking.resolve();
+					await complete.promise;
+					return "allowed";
+				});
+				const pending = call(
+					racing.dispatch,
+					id,
+					"Synthetic-revoked-authority-9!",
+				);
+				await checking.promise;
+				try {
+					await database.query(
+						`UPDATE ${scope}."user" SET role='user' WHERE id=$1`,
+						[realmAdmin],
+					);
+					complete.resolve();
+					const denied = await pending;
+					expect(denied.status).toBe(403);
+					expect(await denied.json()).toMatchObject({
+						code: "YOU_ARE_NOT_ALLOWED_TO_SET_USERS_PASSWORD",
+					});
+					expect(await credential(id)).toEqual(settled);
+				} finally {
+					complete.resolve();
+					await database.query(
+						`UPDATE ${scope}."user" SET role='admin' WHERE id=$1`,
+						[realmAdmin],
+					);
+				}
+			} finally {
+				breachFetch.mockRestore();
 			}
 		});
 
