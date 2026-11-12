@@ -182,6 +182,10 @@ const getEndpoints = new Set([
 	"sdk/config",
 	"get-session",
 	"organization/list",
+	"organization/get-full-organization",
+	"organization/list-members",
+	"organization/list-team-members",
+	"organization/list-roles",
 	"organization/list-user-invitations",
 	"organization/get-invitation",
 	"passkey/generate-authenticate-options",
@@ -192,6 +196,16 @@ const postEndpoints = new Set([
 	"organization/set-active",
 	"organization/accept-invitation",
 	"organization/reject-invitation",
+	"organization/invite-member",
+	"organization/cancel-invitation",
+	"organization/update-member-role",
+	"organization/remove-member",
+	"organization/create-team",
+	"organization/remove-team",
+	"organization/add-team-member",
+	"organization/remove-team-member",
+	"organization/create-role",
+	"organization/delete-role",
 	"sign-out",
 	"sign-in/email",
 	"sign-in/username",
@@ -209,7 +223,7 @@ const postEndpoints = new Set([
 	"two-factor/verify-backup-code",
 ]);
 
-/** Keep the browser transport limited to the endpoints used by the hosted SDK forms. */
+/** Keep the browser transport limited to endpoints used by the hosted SDK views. */
 export function hostedSdkEndpoint(pathname: string, method: string) {
 	if (!pathname.startsWith(hostedSdkBasePath + "/")) return null;
 	const endpoint = pathname.slice(hostedSdkBasePath.length + 1);

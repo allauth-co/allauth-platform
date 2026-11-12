@@ -1,5 +1,5 @@
 import { execFile, fork } from "node:child_process";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
 import { once } from "node:events";
 import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -14,6 +14,8 @@ import {
 } from "jose";
 import { Pool } from "pg";
 import { describe, expect, it, vi } from "vitest";
+import { defaultAuthPolicy } from "../auth-policy/policy";
+import { authPolicyRepository } from "../auth-policy/storage";
 import { clerkCompatiblePasswords } from "../clerk-password";
 import { defaultSecurityPolicy } from "../control/security-policy";
 import type { ControlPrincipal } from "../control/types";
@@ -32,6 +34,7 @@ import {
 	runtimeFixtureMicrosoft,
 	runtimeProviderFixtureCode,
 } from "./owned-project-runtime-provider-fixture";
+import { projectProxySecret } from "./proxy";
 import type { Project } from "./registry";
 import { projectRegistryPool, provisionProject } from "./registry";
 
@@ -51,6 +54,9 @@ const versionedSigningSecret = "isolated-runtime-fixture-current-key-version";
 const versionedEncryption = `7:${versionedSigningSecret},2:isolated-runtime-fixture-previous-key-version`;
 const oauthClientId = "runtime-issuer-fixture-client";
 const oauthRedirectURI = "https://rp.runtime.fixture.example/callback";
+const supportOrigin = "https://support.runtime.fixture.example";
+const supportCallback = `${supportOrigin}/api/allauth/support/callback`;
+const supportTarget = "fixture-support-target";
 const credentials = {
 	platform: { id: "fixture-owner", email: "owner@runtime.fixture.example" },
 	project: {
@@ -182,6 +188,7 @@ async function openProcess(
 					host?: string;
 					origin?: string;
 					clientIP?: string;
+					proxy?: Project;
 				} = {},
 			) {
 				const origin = options.host
@@ -202,6 +209,30 @@ async function openProcess(
 						form ? "application/x-www-form-urlencoded" : "application/json",
 					);
 				const method = body === undefined ? "GET" : "POST";
+				if (options.proxy) {
+					const proxyOrigin = headers.get("origin")!;
+					const timestamp = Math.floor(Date.now() / 1000).toString();
+					const signature = createHmac(
+						"sha256",
+						projectProxySecret(options.proxy, childEnvironment()),
+					)
+						.update(
+							[
+								timestamp,
+								method,
+								path,
+								proxyOrigin,
+								"",
+								createHash("sha256")
+									.update(body ?? "")
+									.digest("hex"),
+							].join("\n"),
+						)
+						.digest("hex");
+					headers.set("allauth-proxy-signature", signature);
+					headers.set("allauth-proxy-origin", proxyOrigin);
+					headers.set("allauth-proxy-timestamp", timestamp);
+				}
 				const forwarded = options.host
 					? await signEdgeRequest(
 							new Request(`${origin}${path}`, { headers, method, body }),
@@ -630,13 +661,13 @@ async function seed(databaseURL: string) {
 			{ name: "Project Runtime Fixture", slug: "runtime-fixture" },
 			env,
 		);
-		async function provision(slug: string) {
+		async function provision(slug: string, origins: string[] = []) {
 			const project = await provisionProject(
 				{
 					name: slug,
 					slug,
 					primaryOrigin: `https://${slug}.runtime.fixture.example`,
-					origins: [],
+					origins,
 					environment: "development",
 				},
 				{
@@ -659,8 +690,21 @@ async function seed(databaseURL: string) {
 			);
 			return project;
 		}
-		const alpha = await provision("runtime-owned-fixture");
+		const alpha = await provision("runtime-owned-fixture", [supportOrigin]);
 		const beta = await provision("runtime-control-fixture");
+		await database.query(
+			`INSERT INTO "${alpha.schemaName}"."user" (id,name,email,"emailVerified",role) VALUES ($1,'Fixture Support Target',$2,true,'user')`,
+			[supportTarget, "support-target@runtime.fixture.example"],
+		);
+		await authPolicyRepository(database).update(
+			alpha.id,
+			0,
+			{
+				...defaultAuthPolicy,
+				supportAccess: { enabled: true, callbackUrl: supportCallback },
+			},
+			owner.user.id,
+		);
 		await googleProviderRepository(database, env).update(
 			alpha,
 			{
@@ -759,6 +803,30 @@ describe.skipIf(!existsSync(fixture))(
 				});
 				expect(rootLogin.status).toBe(200);
 				const rootCookie = cookie(rootLogin);
+				const impersonation = await service.request(
+					`${alphaPath}/project-admin/impersonate-user`,
+					{
+						cookie: rootCookie,
+						body: { userId: supportTarget },
+					},
+				);
+				expect(impersonation.status).toBe(200);
+				const impersonationId = (
+					(await impersonation.json()) as { session: { id: string } }
+				).session.id;
+				const supportCookies = `${rootCookie}; ${cookie(impersonation)}`;
+				const nativeLaunch = await service.request(
+					`${alphaPath}/project-admin/support/launch`,
+					{
+						cookie: supportCookies,
+						body: {},
+					},
+				);
+				expect(nativeLaunch.status).toBe(200);
+				const nativeLaunchURL = new URL(
+					((await nativeLaunch.json()) as { url: string }).url,
+				);
+				expect(nativeLaunchURL.origin).toBe(supportOrigin);
 				const directLogin = await service.request(
 					`${alphaPath}/sign-in/email`,
 					{ body: login },
@@ -830,6 +898,78 @@ describe.skipIf(!existsSync(fixture))(
 
 				service = await open(restored, true);
 				expect((await service.request("/api/health")).status).toBe(200);
+				const supportStatus = await service.request(
+					`${alphaPath}/project-admin/support/status`,
+					{ cookie: supportCookies },
+				);
+				expect(await supportStatus.json()).toEqual({
+					enabled: true,
+					callbackUrl: supportCallback,
+					launchAvailable: true,
+				});
+				const supportSession = await service.request(
+					`${alphaPath}/get-session`,
+					{ cookie: supportCookies },
+				);
+				expect(await supportSession.json()).toMatchObject({
+					session: {
+						id: impersonationId,
+						impersonatedBy: credentials.platform.id,
+					},
+					user: { id: supportTarget },
+				});
+				expect(
+					await (
+						await service.request(`${alphaPath}/get-session`, {
+							cookie: cookie(impersonation),
+						})
+					).json(),
+				).toBeNull();
+				const state = randomBytes(32).toString("base64url");
+				const codeVerifier = randomBytes(32).toString("base64url");
+				const supportQuery = new URLSearchParams({
+					launch: nativeLaunchURL.searchParams.get("launch")!,
+					state,
+					codeChallenge: createHash("sha256")
+						.update(codeVerifier)
+						.digest("base64url"),
+				});
+				const supported = await fixtureRedirect(
+					await service.request(
+						`${alphaPath}/project-admin/support/authorize?${supportQuery}`,
+						{ cookie: supportCookies },
+					),
+				);
+				expect(supported.href.split("?", 1)[0]).toBe(supportCallback);
+				expect(supported.searchParams.get("state")).toBe(state);
+				const signedSupport = { origin: supportOrigin, proxy: alpha };
+				const exchangedSupport = await service.request(
+					`${alphaPath}/sdk/support/exchange`,
+					{
+						...signedSupport,
+						body: {
+							code: supported.searchParams.get("code"),
+							state,
+							codeVerifier,
+							callbackUrl: supportCallback,
+						},
+					},
+				);
+				expect(
+					exchangedSupport.status,
+					exchangedSupport.ok
+						? undefined
+						: await exchangedSupport.clone().text(),
+				).toBe(200);
+				expect(await exchangedSupport.json()).toMatchObject({
+					session: { id: impersonationId },
+					user: { id: supportTarget },
+					actor: { id: credentials.platform.id },
+				});
+				const connectedSupport = {
+					...signedSupport,
+					cookie: cookie(exchangedSupport),
+				};
 				const switchedApple = await finishFixtureApple(service, nativeApple);
 				expect(switchedApple.headers.get("location")).toBe(
 					hostedProvider.destination,
@@ -1388,6 +1528,30 @@ describe.skipIf(!existsSync(fixture))(
 
 				service = await open(restored, false);
 				expect((await service.request("/api/health")).status).toBe(200);
+				const restoredSupport = await service.request(
+					`${alphaPath}/sdk/support/session`,
+					connectedSupport,
+				);
+				expect(await restoredSupport.json()).toMatchObject({
+					session: { id: impersonationId },
+					user: { id: supportTarget },
+				});
+				expect(
+					(
+						await service.request(`${alphaPath}/sdk/support/stop`, {
+							...connectedSupport,
+							body: {},
+						})
+					).status,
+				).toBe(200);
+				expect(
+					await (
+						await service.request(
+							`${alphaPath}/sdk/support/session`,
+							connectedSupport,
+						)
+					).json(),
+				).toBeNull();
 				const rolledBackApple = await finishFixtureApple(service, ownedApple);
 				expect(rolledBackApple.headers.get("location")).toBe(
 					directProvider.destination,

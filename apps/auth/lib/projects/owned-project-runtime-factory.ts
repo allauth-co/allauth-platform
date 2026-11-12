@@ -1,6 +1,7 @@
 import type { Pool } from "pg";
 import { withAuth, withAuthEngine } from "../auth";
 import type { AuthPolicy } from "../auth-policy/policy";
+import { readAuthPolicy } from "../auth-policy/storage";
 import {
 	eraseOwnedAvatarsBeforeDelete,
 	ownedAvatarReady,
@@ -43,6 +44,7 @@ import {
 	googleProviderCredentials,
 	googleProviderRepository,
 } from "../project-providers/repository";
+import { projectAdministrator } from "../workspaces/authorization";
 import { backendCredentialRepository } from "./backend-credentials";
 import { projectBrokerTwoFactor } from "./broker-two-factor";
 import { readLegacyProjectKeyring } from "./legacy-project-keyring";
@@ -94,13 +96,11 @@ const authAdmission = {
 } as const;
 
 async function readSupportedProviders(options: Options) {
-	const { database, project, policy, env } = options;
+	const { database, project, env } = options;
 	if (
 		project.environment !== "development" ||
 		!/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(project.id) ||
-		project.schemaName !==
-			`allauth_project_${project.id.replaceAll("-", "")}` ||
-		policy.supportAccess?.enabled
+		project.schemaName !== `allauth_project_${project.id.replaceAll("-", "")}`
 	)
 		throw new Error(
 			"This development project's configuration requires adapters outside the candidate scope.",
@@ -173,7 +173,6 @@ async function readSupportedProviders(options: Options) {
 		 EXISTS (SELECT 1 FROM "${schema}"."walletAddress") OR
 		 EXISTS (SELECT 1 FROM "${schema}"."agentHost") OR
 		 EXISTS (SELECT 1 FROM "${schema}"."user" WHERE "isAnonymous" IS TRUE) OR
-		 EXISTS (SELECT 1 FROM "${schema}"."session" WHERE "impersonatedBy" IS NOT NULL AND "expiresAt" > now()) OR
 		 EXISTS (SELECT 1 FROM "${schema}"."allauthWebhookEndpoint") OR
 		 (NOT $2::boolean AND EXISTS (SELECT 1 FROM "${schema}"."allauthAvatarAsset" WHERE state <> 'deleted')) OR
 		 EXISTS (SELECT 1 FROM "${schema}"."account" WHERE "providerId" <> ALL($1::text[])) OR
@@ -188,6 +187,66 @@ async function readSupportedProviders(options: Options) {
 			"This development project has stored features outside the candidate scope.",
 		);
 	return { google, microsoft, apple };
+}
+
+function projectSupport(options: Options, platformOrigin: string) {
+	const { project, env } = options;
+	async function currentBinding() {
+		const current = await getProject(project.slug, env);
+		return current.id === project.id &&
+			current.schemaName === project.schemaName &&
+			current.workspaceId === project.workspaceId
+			? current
+			: null;
+	}
+
+	return {
+		projectId: project.id,
+		workspaceId: project.workspaceId,
+		platformOrigin,
+		async configuration() {
+			const current = await currentBinding();
+			if (!current) return null;
+			const { supportAccess } = (await readAuthPolicy(current.id, env)).policy;
+			if (
+				!supportAccess?.enabled ||
+				!current.origins.includes(new URL(supportAccess.callbackUrl).origin)
+			)
+				return null;
+			return {
+				callbackUrl: supportAccess.callbackUrl,
+				proxyVersion: current.proxyVersion,
+				...(supportAccess.applicationInitiated && {
+					applicationInitiated: {
+						...supportAccess.applicationInitiated,
+						primaryOrigin: current.primaryOrigin,
+					},
+				}),
+			};
+		},
+		async authorizePlatformRequest(request) {
+			const current = await currentBinding();
+			if (!current || request.headers.has("authorization")) return null;
+			const principal = await withAuthEngine((root) =>
+				root.readPrincipal(request.headers),
+			);
+			return projectAdministrator(current, principal, env);
+		},
+		async authorizeStoredActor(principal) {
+			const current = await currentBinding();
+			return Boolean(
+				current && (await projectAdministrator(current, principal, env)),
+			);
+		},
+		async verifyProxy(request) {
+			if (!request.headers.has("allauth-proxy-signature")) return null;
+			const current = await currentBinding();
+			if (!current) return null;
+			const verified = await verifiedProjectRequest(request, current, env);
+			const origin = verified.headers.get("allauth-proxy-origin");
+			return origin ? { origin, proxyVersion: current.proxyVersion } : null;
+		},
+	} satisfies NonNullable<EngineOptions["support"]>;
 }
 
 /** Assemble an explicitly selected internal development realm. This function does not select a runtime. */
@@ -376,6 +435,7 @@ export async function createOwnedProjectRuntimeCandidate(options: Options) {
 		},
 		issuer: { platformOrigin: platform, errorURL: `${platform}/auth-error` },
 		backchannelLogout: { defer, post: options.postBackchannelLogout },
+		support: projectSupport(options, platform),
 		oauth: {
 			tokenKeys: encryptionKeys,
 			defaultErrorURL: `${platform}/auth-error`,

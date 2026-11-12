@@ -15,6 +15,15 @@ import {
 	HostedOrganizationSwitcher,
 } from "@/components/hosted-organizations";
 import { HostedProjectInvitation } from "@/components/hosted-project-invitation";
+import { OrganizationManager } from "@/components/organization-manager";
+
+const legacy = vi.hoisted(() => ({ useSession: vi.fn(), list: vi.fn() }));
+vi.mock("@/lib/auth-client", () => ({
+	authClient: {
+		useSession: legacy.useSession,
+		organization: { list: legacy.list },
+	},
+}));
 
 vi.mock("next/navigation", () => ({
 	usePathname: () => "/account/organizations",
@@ -23,7 +32,7 @@ vi.mock("next/link", () => ({
 	default: ({ children, href }: { children: ReactNode; href: string }) =>
 		createElement("a", { href }, children),
 }));
-vi.mock("sonner", () => ({ toast: { success: vi.fn() } }));
+vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
 vi.mock("@/components/ui/app-select", () => ({
 	AppSelect: ({
 		children,
@@ -87,6 +96,8 @@ let disposal: (() => Promise<void>) | undefined;
 
 beforeEach(() => {
 	vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+	legacy.useSession.mockReset();
+	legacy.list.mockReset();
 });
 
 afterEach(async () => {
@@ -96,8 +107,11 @@ afterEach(async () => {
 	vi.unstubAllGlobals();
 });
 
-function Preview({ view }: { view: "invitation" | "list" | "switch" }) {
+type View = "invitation" | "list" | "switch" | "manager";
+
+function Preview({ view }: { view: View }) {
 	const client = useHostedOrganizationClient();
+	if (view === "manager") return createElement(OrganizationManager);
 	if (!client) return createElement("p", null, "Standard portal");
 	if (view === "list")
 		return createElement(HostedOrganizationSettings, { client });
@@ -106,7 +120,7 @@ function Preview({ view }: { view: "invitation" | "list" | "switch" }) {
 	return createElement(HostedProjectInvitation, { client, invitationId });
 }
 
-async function render(view: "invitation" | "list" | "switch", enabled = true) {
+async function render(view: View, enabled = true) {
 	const client = new QueryClient({
 		defaultOptions: { queries: { retry: false } },
 	});
@@ -271,4 +285,138 @@ it("clears the active organization through the personal account option", async (
 	});
 	expect(select).toHaveBeenCalledExactlyOnceWith({ organizationId: null });
 	expect(picker.value).toBe("");
+});
+
+it("runs hosted organization member, team and role management through the first-party client", async () => {
+	const owner = {
+		id: "fixture-owner",
+		userId: session.user.id,
+		role: "owner",
+		user: session.user,
+	};
+	const member = {
+		id: "fixture-member",
+		userId: "fixture-member-user",
+		role: "member",
+		user: { name: "Fixture Member", email: "member@fixture.example" },
+	};
+	const team = {
+		id: "fixture-team",
+		name: "Operations",
+		organizationId: organization.id,
+	};
+	const dynamic = {
+		id: "fixture-role",
+		role: "analyst",
+		permission: { team: ["update"] },
+	};
+	const update = vi.fn();
+	const remove = vi.fn();
+	const loadMembers = vi.fn();
+	const other = {
+		id: "other-organization",
+		name: "Other organization",
+		slug: "other-organization",
+	};
+	network(async (path, request) => {
+		const query = new URL(request.url).searchParams;
+		switch (path) {
+			case "get-session":
+				return session;
+			case "organization/list":
+				return [other, organization];
+			case "organization/get-full-organization":
+				expect(query.get("organizationId")).toBe(organization.id);
+				return {
+					...organization,
+					members: [owner],
+					invitations: [],
+					teams: [team],
+				};
+			case "organization/list-members":
+				expect(query.get("organizationId")).toBe(organization.id);
+				if (query.has("filterValue")) {
+					expect(query.get("filterField")).toBe("userId");
+					expect(query.get("filterValue")).toBe(session.user.id);
+					return { members: [owner], total: 1 };
+				}
+				loadMembers(query.get("offset"), query.get("limit"));
+				return { members: [owner, member], total: 2 };
+			case "organization/list-roles":
+				expect(query.get("organizationId")).toBe(organization.id);
+				return [dynamic];
+			case "organization/list-team-members":
+				expect(query.get("teamId")).toBe(team.id);
+				return [
+					{ id: "fixture-team-member", teamId: team.id, userId: member.userId },
+				];
+			case "organization/update-member-role":
+				update(await request.json());
+				return { ...member, role: "analyst" };
+			case "organization/remove-team-member":
+				remove(await request.json());
+				return { message: "Team member removed successfully." };
+			default:
+				throw new Error(`Unexpected organization operation ${path}`);
+		}
+	});
+	const confirm = vi.fn(() => true);
+	vi.stubGlobal("confirm", confirm);
+	const container = await render("manager");
+	await act(async () => new Promise<void>((resolve) => setTimeout(resolve, 0)));
+	expect(container.querySelector("h2")?.textContent).toBe(organization.name);
+	expect(container.textContent).toContain(member.user.name);
+	expect(loadMembers).toHaveBeenCalledWith("0", "25");
+	const role = [...container.querySelectorAll("select")].find(
+		(element) =>
+			element.getAttribute("aria-label") === `Role for ${member.user.email}`,
+	)!;
+	expect([...role.options].map((option) => option.value)).toContain(
+		dynamic.role,
+	);
+	await act(async () => {
+		role.value = dynamic.role;
+		role.dispatchEvent(new Event("change", { bubbles: true }));
+	});
+	expect(confirm).toHaveBeenCalledExactlyOnceWith(
+		`Change ${member.user.email}'s role to ${dynamic.role}?`,
+	);
+	expect(update).toHaveBeenCalledExactlyOnceWith({
+		memberId: member.id,
+		role: dynamic.role,
+		organizationId: organization.id,
+	});
+	const roster = [...container.querySelectorAll("button")].find(
+		(button) => button.textContent === team.name,
+	)!;
+	await act(async () => roster.click());
+	await act(async () => new Promise<void>((resolve) => setTimeout(resolve, 0)));
+	const rosterEmail = [...container.querySelectorAll("span")].find(
+		(text) => text.textContent === member.user.email,
+	)!;
+	const removeMember = rosterEmail.parentElement!.querySelector("button")!;
+	await act(async () => removeMember.click());
+	expect(remove).toHaveBeenCalledExactlyOnceWith({
+		teamId: team.id,
+		userId: member.userId,
+		organizationId: organization.id,
+	});
+	expect(legacy.useSession).not.toHaveBeenCalled();
+	expect(legacy.list).not.toHaveBeenCalled();
+});
+
+it("keeps the ordinary organization manager on the legacy client outside the preview", async () => {
+	legacy.useSession.mockReturnValue({ data: session });
+	legacy.list.mockResolvedValue({ data: [], error: null });
+	const requests = network(() => {
+		throw new Error("Hosted network must remain disabled");
+	});
+	const container = await render("manager", false);
+	expect(container.textContent).toContain("People, teams and access");
+	expect(container.textContent).toContain(
+		"You do not belong to an organization yet.",
+	);
+	expect(legacy.useSession).toHaveBeenCalled();
+	expect(legacy.list).toHaveBeenCalledOnce();
+	expect(requests).not.toHaveBeenCalled();
 });

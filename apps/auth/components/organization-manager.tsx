@@ -7,7 +7,11 @@ import { useEffect, useState } from "react";
 import { toast } from "sonner";
 import { authClient } from "@/lib/auth-client";
 import { errorMessage } from "@/lib/shared";
-import { selectHostedOrganization, useHostedOrganizationClient } from "./hosted-organization-client";
+import type { AllAuthClient } from "@/sdk/client";
+import {
+	selectHostedOrganization,
+	useHostedOrganizationClient,
+} from "./hosted-organization-client";
 import {
 	Card,
 	CardContent,
@@ -22,8 +26,54 @@ import { Button } from "./ui/button";
 type Result = { error?: { message?: string } | null };
 const MEMBER_PAGE_SIZE = 25;
 export function OrganizationManager() {
-	const { data: session } = authClient.useSession();
 	const hosted = useHostedOrganizationClient();
+	return hosted ? (
+		<HostedOrganizationManager client={hosted} />
+	) : (
+		<LegacyOrganizationManager />
+	);
+}
+
+function HostedOrganizationManager({ client }: { client: AllAuthClient }) {
+	const { data: session, isPending } = client.useSession();
+	return (
+		<OrganizationManagerBody
+			organizationClient={client.organization}
+			session={session}
+			sessionPending={isPending}
+			hosted={client}
+		/>
+	);
+}
+
+function LegacyOrganizationManager() {
+	const { data: session } = authClient.useSession();
+	return (
+		<OrganizationManagerBody
+			organizationClient={authClient.organization}
+			session={session}
+		/>
+	);
+}
+
+function OrganizationManagerBody({
+	organizationClient,
+	session,
+	sessionPending,
+	hosted,
+}: {
+	organizationClient:
+		| AllAuthClient["organization"]
+		| typeof authClient.organization;
+	session: {
+		user: { id: string };
+		session: { activeOrganizationId?: string | null };
+	} | null;
+	sessionPending?: boolean;
+	hosted?: AllAuthClient;
+}) {
+	const queryKey = (name: string, ...scope: (string | number | undefined)[]) =>
+		hosted ? [name, "hosted", ...scope] : [name, ...scope];
 	const queryClient = useQueryClient();
 	const [selected, setSelected] = useState("");
 	const [memberOffset, setMemberOffset] = useState(0);
@@ -38,35 +88,42 @@ export function OrganizationManager() {
 	const [roleName, setRoleName] = useState("");
 	const [permissions, setPermissions] = useState<Record<string, string[]>>({});
 	const organizations = useQuery({
-		queryKey: hosted ? ["organizations", "hosted"] : ["organizations"],
+		queryKey: queryKey("organizations"),
 		queryFn: async () => {
-			const { data, error } = await (hosted ?? authClient).organization.list();
+			const { data, error } = await organizationClient.list();
 			if (error) throw new Error(error.message);
 			return data || [];
 		},
 	});
 	useEffect(() => {
-		if (!selected && organizations.data?.length)
-			setSelected(
-				session?.session.activeOrganizationId || organizations.data[0].id,
-			);
-	}, [organizations.data, selected, session?.session.activeOrganizationId]);
+		if (selected || sessionPending || !organizations.data?.length) return;
+		const active = session?.session.activeOrganizationId;
+		const canSelectActive =
+			!hosted || organizations.data.some((item) => item.id === active);
+		setSelected((canSelectActive && active) || organizations.data[0].id);
+	}, [
+		hosted,
+		organizations.data,
+		selected,
+		sessionPending,
+		session?.session.activeOrganizationId,
+	]);
 	const organization = useQuery({
-		queryKey: ["organization", selected],
+		queryKey: queryKey("organization", selected),
 		enabled: Boolean(selected),
 		queryFn: async () => {
-			const { data, error } = await authClient.organization.getFullOrganization(
-				{ query: { organizationId: selected, membersLimit: 1 } },
-			);
+			const { data, error } = await organizationClient.getFullOrganization({
+				query: { organizationId: selected, membersLimit: 1 },
+			});
 			if (error) throw new Error(error.message);
 			return data;
 		},
 	});
 	const members = useQuery({
-		queryKey: ["organization-members", selected, memberOffset],
+		queryKey: queryKey("organization-members", selected, memberOffset),
 		enabled: Boolean(selected),
 		queryFn: async () => {
-			const { data, error } = await authClient.organization.listMembers({
+			const { data, error } = await organizationClient.listMembers({
 				query: {
 					organizationId: selected,
 					limit: MEMBER_PAGE_SIZE,
@@ -80,10 +137,10 @@ export function OrganizationManager() {
 		},
 	});
 	const ownMembership = useQuery({
-		queryKey: ["organization-member-self", selected, session?.user.id],
+		queryKey: queryKey("organization-member-self", selected, session?.user.id),
 		enabled: Boolean(selected && session?.user.id),
 		queryFn: async () => {
-			const { data, error } = await authClient.organization.listMembers({
+			const { data, error } = await organizationClient.listMembers({
 				query: {
 					organizationId: selected,
 					filterField: "userId",
@@ -110,10 +167,10 @@ export function OrganizationManager() {
 		.split(",")
 		.some((role) => role.trim() === "owner" || role.trim() === "admin");
 	const roles = useQuery({
-		queryKey: ["roles", selected],
+		queryKey: queryKey("roles", selected),
 		enabled: Boolean(selected && manager),
 		queryFn: async () => {
-			const { data, error } = await authClient.organization.listRoles({
+			const { data, error } = await organizationClient.listRoles({
 				query: { organizationId: selected },
 			});
 			if (error) throw new Error(error.message);
@@ -121,10 +178,10 @@ export function OrganizationManager() {
 		},
 	});
 	const teamMembers = useQuery({
-		queryKey: ["team-members", teamId],
+		queryKey: queryKey("team-members", teamId),
 		enabled: Boolean(teamId),
 		queryFn: async () => {
-			const { data, error } = await authClient.organization.listTeamMembers({
+			const { data, error } = await organizationClient.listTeamMembers({
 				query: { teamId },
 			});
 			if (error) throw new Error(error.message);
@@ -213,7 +270,7 @@ export function OrganizationManager() {
 							onSubmit={(e) => {
 								e.preventDefault();
 								void run(async () => {
-									const result = await (hosted ?? authClient).organization.create({
+									const result = await organizationClient.create({
 										name,
 										slug,
 									});
@@ -272,7 +329,7 @@ export function OrganizationManager() {
 										() =>
 											hosted
 												? selectHostedOrganization(hosted, selected)
-												: authClient.organization.setActive({
+												: organizationClient.setActive({
 														organizationId: selected,
 													}),
 										"Active organization updated",
@@ -340,7 +397,7 @@ export function OrganizationManager() {
 													)
 														void run(
 															() =>
-																authClient.organization.updateMemberRole({
+																organizationClient.updateMemberRole({
 																	memberId: person.id,
 																	role: next,
 																	organizationId: selected,
@@ -373,7 +430,7 @@ export function OrganizationManager() {
 													)
 														void run(
 															() =>
-																authClient.organization.removeMember({
+																organizationClient.removeMember({
 																	memberIdOrEmail: person.id,
 																	organizationId: selected,
 																}),
@@ -438,7 +495,7 @@ export function OrganizationManager() {
 										e.preventDefault();
 										void run(
 											() =>
-												authClient.organization.inviteMember({
+												organizationClient.inviteMember({
 													email,
 													role,
 													organizationId: selected,
@@ -501,7 +558,7 @@ export function OrganizationManager() {
 												onClick={() =>
 													void run(
 														() =>
-															authClient.organization.cancelInvitation({
+															organizationClient.cancelInvitation({
 																invitationId: invite.id,
 															}),
 														"Invitation revoked",
@@ -548,7 +605,7 @@ export function OrganizationManager() {
 													if (window.confirm(`Delete the ${team.name} team?`))
 														void run(
 															() =>
-																authClient.organization.removeTeam({
+																organizationClient.removeTeam({
 																	teamId: team.id,
 																	organizationId: selected,
 																}),
@@ -572,7 +629,7 @@ export function OrganizationManager() {
 										e.preventDefault();
 										void run(
 											() =>
-												authClient.organization.createTeam({
+												organizationClient.createTeam({
 													name: teamName,
 													organizationId: selected,
 												}),
@@ -618,7 +675,7 @@ export function OrganizationManager() {
 													onClick={() =>
 														void run(
 															() =>
-																authClient.organization.removeTeamMember({
+																organizationClient.removeTeamMember({
 																	teamId,
 																	userId: person.userId,
 																	organizationId: selected,
@@ -639,7 +696,7 @@ export function OrganizationManager() {
 												e.preventDefault();
 												void run(
 													() =>
-														authClient.organization.addTeamMember({
+														organizationClient.addTeamMember({
 															teamId,
 															userId: teamUserId,
 															organizationId: selected,
@@ -708,7 +765,7 @@ export function OrganizationManager() {
 													if (window.confirm(`Delete the ${role.role} role?`))
 														void run(
 															() =>
-																authClient.organization.deleteRole({
+																organizationClient.deleteRole({
 																	roleId: role.id,
 																	organizationId: selected,
 																}),
@@ -728,7 +785,7 @@ export function OrganizationManager() {
 											e.preventDefault();
 											void run(
 												() =>
-													authClient.organization.createRole({
+													organizationClient.createRole({
 														role: roleName,
 														permission: permissions,
 														organizationId: selected,

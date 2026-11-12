@@ -169,6 +169,75 @@ describe("hosted SDK transport", () => {
 		expect(gateway.dispatch).toHaveBeenCalledTimes(1);
 	});
 
+	it("dispatches only the manager's hosted organization operations for the verified project and origin", async () => {
+		verifiedFixture();
+		gateway.dispatch.mockImplementation(async (incoming: Request) =>
+			Response.json({
+				url: incoming.url,
+				body: incoming.method === "POST" ? await incoming.json() : null,
+			}),
+		);
+		const reads = [
+			"get-full-organization",
+			"list-members",
+			"list-team-members",
+			"list-roles",
+		];
+		const writes = [
+			"invite-member",
+			"cancel-invitation",
+			"update-member-role",
+			"remove-member",
+			"create-team",
+			"remove-team",
+			"add-team-member",
+			"remove-team-member",
+			"create-role",
+			"delete-role",
+		];
+		for (const operation of reads) {
+			const path = `organization/${operation}?organizationId=fixture-organization`;
+			const result = await GET(request(path));
+			expect(result.status).toBe(200);
+			expect(await result.json()).toMatchObject({
+				url: `${origin}/api/auth/${path}`,
+			});
+		}
+		for (const operation of writes) {
+			const path = `organization/${operation}`;
+			const body = { organizationId: "fixture-organization" };
+			const result = await POST(request(path, "POST", { origin, body }));
+			expect(result.status).toBe(200);
+			expect(await result.json()).toEqual({
+				url: `${origin}/api/auth/${path}`,
+				body,
+			});
+		}
+		expect(
+			(
+				await GET(
+					request("organization/list-members", "GET", { signed: false }),
+				)
+			).status,
+		).toBe(404);
+		expect((await GET(request("organization/create-team"))).status).toBe(404);
+		expect(
+			(
+				await POST(
+					request("organization/remove-team", "POST", {
+						origin: "https://other.example",
+					}),
+				)
+			).status,
+		).toBe(403);
+		expect(
+			(await POST(request("organization/delete", "POST", { origin }))).status,
+		).toBe(404);
+		expect(gateway.dispatch).toHaveBeenCalledTimes(
+			reads.length + writes.length,
+		);
+	});
+
 	it.each([
 		["", "accounts", id, "development"],
 		[id, "frontend-api", id, "development"],

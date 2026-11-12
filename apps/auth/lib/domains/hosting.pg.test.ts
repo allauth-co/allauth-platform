@@ -495,6 +495,23 @@ describe.skipIf(!existsSync(fixturePath))("real PostgreSQL hosted authentication
 			expect(await (await organizationUI("list", recipientCookie)).json()).toMatchObject([{ id: organization.id }]);
 			expect(await (await organizationUI("set-active", recipientCookie, { organizationId: null })).json()).toBeNull();
 			expect(await (await organizationUI("set-active", recipientCookie, { organizationId: organization.id })).json()).toMatchObject({ id: organization.id });
+
+			const organizationQuery = `organizationId=${organization.id}`;
+			const details = await organizationUI(`get-full-organization?${organizationQuery}&membersLimit=1`, recipientCookie);
+			expect(details.status).toBe(200);
+			expect(await details.json()).toMatchObject({ id: organization.id, name: organization.name });
+			const members = await organizationUI(`list-members?${organizationQuery}&filterField=userId&filterValue=${recipient}`, recipientCookie);
+			expect(members.status).toBe(200);
+			expect(await members.json()).toMatchObject({ total: 1, members: [{ userId: recipient, role: "member" }] });
+			const team = await organizationUI("create-team", cookies(newUI), { organizationId: organization.id, name: "Hosted operations" });
+			expect(team.status).toBe(200);
+			const { id: teamId } = await team.json() as { id: string };
+			const added = await organizationUI("add-team-member", cookies(newUI), { organizationId: organization.id, teamId, userId: recipient });
+			expect(added.status).toBe(200);
+			const roster = await organizationUI(`list-team-members?teamId=${teamId}`, recipientCookie);
+			expect(roster.status).toBe(200);
+			expect(await roster.json()).toMatchObject([{ teamId, userId: recipient }]);
+			expect((await organizationUI(`list-team-members?teamId=${teamId}`, rootCookie)).status).toBe(401);
 		} finally {
 			info.mockRestore();
 			vi.stubGlobal("fetch", previousFetch);
