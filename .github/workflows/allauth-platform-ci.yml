@@ -76,6 +76,7 @@ jobs:
           lib/domains/portal-session.test.ts lib/app-entry.test.ts lib/console-entry.test.ts
           lib/oauth-picker-portal.test.ts lib/oauth-picker-render.test.ts
           lib/projects/legacy-mfa-record.test.ts lib/projects/session-shadow.test.ts
+          lib/projects/legacy-project-keyring.test.ts
           lib/projects/owned-project-engine.pg.test.ts lib/projects/owned-project-rollback.pg.test.ts
           lib/projects/owned-project-runtime.pg.test.ts
           lib/projects/owned-project-password-safety.test.ts

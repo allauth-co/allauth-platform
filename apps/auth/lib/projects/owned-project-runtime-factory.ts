@@ -41,6 +41,7 @@ import {
 } from "../project-providers/repository";
 import { backendCredentialRepository } from "./backend-credentials";
 import { projectBrokerTwoFactor } from "./broker-two-factor";
+import { readLegacyProjectKeyring } from "./legacy-project-keyring";
 import { createOwnedEmailVerification } from "./owned-email-verification";
 import { createOwnedProjectAppleDeletion } from "./owned-project-apple-deletion";
 import { createOwnedProjectEmailCallbackPolicy } from "./owned-project-email-callback";
@@ -186,7 +187,11 @@ async function readSupportedProviders(options: Options) {
 
 /** Assemble an explicitly selected internal development realm. This function does not select a runtime. */
 export async function createOwnedProjectRuntimeCandidate(options: Options) {
-	const { database, project, env, policy, signingSecret, defer } = options;
+	const { database, project, env, policy, defer } = options;
+	const { signingSecret, encryptionKeys } = readLegacyProjectKeyring(
+		options.signingSecret,
+		process.env.BETTER_AUTH_SECRETS,
+	);
 	projectSlug.parse(project.slug);
 	const platform = authOrigin(env);
 	const transport = options.transport;
@@ -302,7 +307,7 @@ export async function createOwnedProjectRuntimeCandidate(options: Options) {
 	const revokeAppleGrants = createOwnedProjectAppleDeletion({
 		database,
 		schemaName: project.schemaName,
-		keys: { secret: signingSecret },
+		keys: encryptionKeys,
 		configured: readProjectAppleProvider(env, project.slug),
 	});
 	const engine = createOwnedProjectEngine({
@@ -312,6 +317,7 @@ export async function createOwnedProjectRuntimeCandidate(options: Options) {
 		baseURL: origin,
 		basePath,
 		signingSecret,
+		mfaKeys: encryptionKeys,
 		trustedOrigins,
 		trustedIP,
 		appName: project.name,
@@ -330,6 +336,7 @@ export async function createOwnedProjectRuntimeCandidate(options: Options) {
 		issuer: { platformOrigin: platform, errorURL: `${platform}/auth-error` },
 		backchannelLogout: { defer, post: options.postBackchannelLogout },
 		oauth: {
+			tokenKeys: encryptionKeys,
 			defaultErrorURL: `${platform}/auth-error`,
 			...(google
 				? { google: { ...google, redirectURI: googleCallbackURL(callbacks) } }

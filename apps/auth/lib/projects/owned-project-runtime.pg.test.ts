@@ -26,7 +26,6 @@ import {
 } from "./owned-project-runtime-provider-fixture";
 import type { Project } from "./registry";
 import { projectRegistryPool, provisionProject } from "./registry";
-import { projectSecret } from "./runtime";
 
 const fixture = new URL(
 	"../../../../.secrets/local-postgres.json",
@@ -40,6 +39,8 @@ const platformOrigin = "https://project-runtime-fixture.example";
 const edgeSecret = "disposable-project-runtime-fixture-edge-signing-secret";
 const platformSecret =
 	"disposable-project-runtime-fixture-platform-signing-secret";
+const versionedSigningSecret = "isolated-runtime-fixture-current-key-version";
+const versionedEncryption = `7:${versionedSigningSecret},2:isolated-runtime-fixture-previous-key-version`;
 const oauthClientId = "runtime-issuer-fixture-client";
 const oauthRedirectURI = "https://rp.runtime.fixture.example/callback";
 const credentials = {
@@ -62,6 +63,7 @@ function childEnvironment(microsoftProject?: string): NodeJS.ProcessEnv {
 		ALLAUTH_AUTH_SECRET: platformSecret,
 		BETTER_AUTH_URL: platformOrigin,
 		BETTER_AUTH_SECRET: platformSecret,
+		BETTER_AUTH_SECRETS: versionedEncryption,
 		TRUSTED_ORIGINS: "",
 		EMAIL_FROM: "",
 		SCIM_CREDENTIAL_HASH_SECRET:
@@ -1050,7 +1052,7 @@ describe.skipIf(!existsSync(fixture))(
 				try {
 					expiredOAuth = signProjectIssuerQuery(
 						fixtureAuthorizationQuery(),
-						projectSecret({ ALLAUTH_AUTH_SECRET: platformSecret }, alpha.id),
+						versionedSigningSecret,
 					);
 				} finally {
 					oldClock.mockRestore();
