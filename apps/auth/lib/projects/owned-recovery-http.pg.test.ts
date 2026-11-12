@@ -1,16 +1,23 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, createHmac, randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { oauthProvider } from "@better-auth/oauth-provider";
+import { betterAuth } from "better-auth";
+import { symmetricEncrypt } from "better-auth/crypto";
 import { jwt } from "better-auth/plugins";
 import { getTestInstance } from "better-auth/test";
 import { SignJWT } from "jose";
 import { Kysely, PostgresDialect } from "kysely";
 import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { createAuthOptions } from "../auth";
 import { localNavigation } from "../auth-navigation";
+import type { AuthPolicy } from "../auth-policy/policy";
 import { defaultAuthPolicy } from "../auth-policy/policy";
 import { clerkCompatiblePasswords } from "../clerk-password";
 import { allauthControl } from "../control";
+import { newWebhookSigningSecret } from "../control/webhook-contract";
+import type { ControlWebhookEnvelope } from "../control/webhooks";
+import { deliverPendingWebhooks } from "../control/webhooks";
 import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
 import type { CompleteOwnedEmailVerification } from "./owned-email-verification";
 import type { OwnedProjectEmailAliases } from "./owned-project-email-aliases";
@@ -143,7 +150,9 @@ describe.skipIf(!existsSync(fixturePath))(
 			for (const migration of [
 				"001-initial-auth.sql",
 				"002-control-plane.sql",
+				"004-webhooks.sql",
 				"005-free-plugins.sql",
+				"006-analytics.sql",
 			])
 				await pool.query(
 					readFileSync(
@@ -177,6 +186,7 @@ describe.skipIf(!existsSync(fixturePath))(
 				emailUnavailable?: boolean;
 				preserveBrowserContinuation?: boolean;
 				hosted?: boolean;
+				policy?: AuthPolicy;
 				completeVerification?: CompleteOwnedEmailVerification;
 			} = {},
 		) {
@@ -188,7 +198,7 @@ describe.skipIf(!existsSync(fixturePath))(
 				database: options.database ?? database,
 				emailAliases: options.emailAliases,
 				project: { slug: project, schemaName: schema },
-				policy: defaultAuthPolicy,
+				policy: options.policy ?? defaultAuthPolicy,
 				signingSecret,
 				baseURL: origin,
 				basePath: options.hosted ? "/api/auth" : basePath,
@@ -798,6 +808,222 @@ describe.skipIf(!existsSync(fixturePath))(
 			expect(ownedEvents.map(({ id, ...event }) => event)).toEqual(
 				legacyEvents.map(({ id, ...event }) => event),
 			);
+		});
+
+		it("preserves the installed password policy rejection and signed reset events", async () => {
+			if (!nativeDatabase)
+				throw new Error("Expected the isolated native database.");
+			const policy = {
+				...defaultAuthPolicy,
+				passwordPolicy: {
+					...defaultAuthPolicy.passwordPolicy,
+					requireSymbol: true,
+				},
+			};
+			const options = createAuthOptions(
+				{ db: nativeDatabase, type: "postgres", transaction: true },
+				{
+					AUTH_RUNTIME: "node",
+					ALLAUTH_AUTH_URL: origin,
+					ALLAUTH_AUTH_SECRET: signingSecret,
+					SCIM_CREDENTIAL_HASH_SECRET: "synthetic-recovery-fixture-scim-secret",
+				},
+				{
+					name: "Recovery event fixture",
+					slug: project,
+					basePath,
+					cookiePrefix: "allauth_project_recovery_event",
+					primaryOrigin: appOrigin,
+					publicOrigin: origin,
+					origins: [appOrigin],
+					broker: {
+						clientId: "fixture-broker-id",
+						clientSecret: "fixture-broker-secret",
+					},
+					authorizeAdmin: async () => null,
+					management: { id: "recovery-event-fixture" },
+				},
+				policy,
+			);
+			const installed = betterAuth({ ...options, logger: { disabled: true } });
+			const owned = fixture({ policy });
+			const account = await seed("password-policy-events@fixture.example");
+			const realm = `"${schema}"`;
+			const address = "192.0.2.188";
+			const agent = "Synthetic recovery policy fixture";
+			const network = vi
+				.spyOn(globalThis, "fetch")
+				.mockImplementation(async (input) => {
+					const url = new URL(input instanceof Request ? input.url : input);
+					if (url.origin !== "https://api.pwnedpasswords.com")
+						throw new Error("Unexpected external request.");
+					return new Response("00000000000000000000000000000000000:0", {
+						headers: { "content-type": "text/plain" },
+					});
+				});
+			const send = (path: string, body: unknown) => {
+				const request = post(path, body);
+				request.headers.set("x-real-ip", address);
+				request.headers.set("user-agent", agent);
+				return request;
+			};
+			const rejected = [
+				[
+					"short",
+					"PASSWORD_TOO_SHORT",
+					"Password must be at least 8 characters.",
+				],
+				[
+					"SyntheticNoSymbol",
+					"PASSWORD_REQUIREMENTS_NOT_MET",
+					"Password must include a symbol.",
+				],
+				[
+					"x".repeat(129),
+					"PASSWORD_TOO_LONG",
+					"Password must be at most 128 characters.",
+				],
+			] as const;
+			try {
+				for (const dispatch of [installed.handler, owned.handler]) {
+					const endpoint = randomUUID();
+					const signing = newWebhookSigningSecret();
+					const recipient = "https://recovery-hook.fixture.example/events";
+					const token = randomUUID().replaceAll("-", "").slice(0, 24);
+					const reset = `reset-password:${token}`;
+					const session = randomUUID();
+					const password = "Synthetic-new-password-2468!";
+					await database.query(
+						`INSERT INTO ${realm}."verification" (id,identifier,value,"expiresAt") VALUES ($1,$2,$3,now()+interval '1 hour')`,
+						[randomUUID(), reset, account.id],
+					);
+					await database.query(
+						`INSERT INTO ${realm}."session" (id,token,"userId","expiresAt","updatedAt") VALUES ($1,$1,$2,now()+interval '1 hour',now())`,
+						[session, account.id],
+					);
+					await database.query(
+						`INSERT INTO ${realm}."allauthWebhookEndpoint" (id,url,"eventTypes","encryptedSecret") VALUES ($1,$2,'["user.*"]',$3)`,
+						[
+							endpoint,
+							recipient,
+							await symmetricEncrypt({ key: signingSecret, data: signing }),
+						],
+					);
+					const state = async () =>
+						(
+							await database.query(
+								`SELECT EXISTS(SELECT 1 FROM ${realm}."verification" WHERE identifier=$1 AND value=$2) AS proof,
+						        EXISTS(SELECT 1 FROM ${realm}."session" WHERE id=$3 AND "userId"=$2) AS session`,
+								[reset, account.id, session],
+							)
+						).rows[0];
+					try {
+						const requested = await dispatch(
+							send("/request-password-reset", {
+								email: "unregistered-recovery@fixture.example",
+							}),
+						);
+						expect(requested?.status).toBe(200);
+						for (const [newPassword, code, message] of rejected) {
+							const response = await dispatch(
+								send("/reset-password", { token, newPassword }),
+							);
+							expect(response?.status).toBe(400);
+							expect(await response?.json()).toEqual({ code, message });
+							expect(await state()).toEqual({ proof: true, session: true });
+						}
+						const success = await dispatch(
+							send("/reset-password", { token, newPassword: password }),
+						);
+						expect(success?.status, await success?.clone().text()).toBe(200);
+						expect(await state()).toEqual({ proof: false, session: false });
+						const replay = await dispatch(
+							send("/reset-password", { token, newPassword: password }),
+						);
+						expect(replay?.status).toBe(400);
+						expect(await replay?.json()).toMatchObject({
+							code: "INVALID_TOKEN",
+						});
+						const events: Omit<
+							ControlWebhookEnvelope["data"]["event"],
+							"id" | "createdAt"
+						>[] = [];
+						const result = await deliverPendingWebhooks({
+							database: nativeDatabase,
+							secret: signingSecret,
+							now: () => new Date(Date.now() + 2_000),
+							resolver: async () => [{ address: "93.184.216.34", family: 4 }],
+							async transport({ destination, body, headers }) {
+								expect(destination.url.href).toBe(recipient);
+								const signature = createHmac(
+									"sha256",
+									Buffer.from(signing.slice(6), "base64"),
+								)
+									.update(
+										`${headers["webhook-id"]}.${headers["webhook-timestamp"]}.${body}`,
+									)
+									.digest("base64");
+								expect(headers["webhook-signature"]).toBe(`v1,${signature}`);
+								for (const value of [
+									token,
+									password,
+									...rejected.map(([value]) => value),
+								])
+									expect(body).not.toContain(value);
+								const envelope = JSON.parse(body) as ControlWebhookEnvelope;
+								const { id, createdAt, ...event } = envelope.data.event;
+								expect(envelope).toEqual({
+									id,
+									type: event.type,
+									timestamp: createdAt,
+									data: { event: { id, createdAt, ...event } },
+								});
+								events.push(event);
+								return 204;
+							},
+						});
+						const context = { ipAddress: address, userAgent: agent };
+						expect(result).toEqual({
+							claimed: 3,
+							delivered: 3,
+							retried: 0,
+							failed: 0,
+						});
+						expect(events).toEqual(
+							expect.arrayContaining([
+								{
+									type: "user.password-reset-requested",
+									outcome: "success",
+									...context,
+									metadata: { path: "/request-password-reset" },
+								},
+								{
+									type: "user.password-reset",
+									outcome: "success",
+									...context,
+									metadata: { path: "/reset-password" },
+								},
+								{
+									type: "user.password-reset",
+									outcome: "failure",
+									...context,
+									metadata: {
+										path: "/reset-password",
+										errorCode: "INVALID_TOKEN",
+									},
+								},
+							]),
+						);
+					} finally {
+						await database.query(
+							`DELETE FROM ${realm}."allauthWebhookEndpoint" WHERE id=$1`,
+							[endpoint],
+						);
+					}
+				}
+			} finally {
+				network.mockRestore();
+			}
 		});
 
 		it("blocks unapproved origins and callback paths before queuing, and applies admission", async () => {

@@ -13,7 +13,14 @@ export type PasswordSafety = "allowed" | "breached" | "unavailable";
 type PasswordResetResult =
 	| { status: "reset" }
 	| { status: "invalid-token" | "breached-password" | "unavailable" }
-	| { status: "password-policy"; message: string };
+	| {
+			status: "password-policy";
+			code:
+				| "PASSWORD_TOO_SHORT"
+				| "PASSWORD_TOO_LONG"
+				| "PASSWORD_REQUIREMENTS_NOT_MET";
+			message: string;
+	  };
 
 interface PasswordResetOptions {
 	database: Pool;
@@ -170,10 +177,20 @@ export function createOwnedPasswordReset(options: PasswordResetOptions) {
 		auditContext?: Pick<ControlEventInput, "ipAddress" | "userAgent">;
 	}): Promise<PasswordResetResult> {
 		if (!policy.emailAndPasswordEnabled) return { status: "unavailable" };
+		const passwordPolicy = policy.passwordPolicy;
+		const error = passwordPolicyError(input.newPassword, passwordPolicy);
+		if (error) {
+			const length = input.newPassword.length;
+			const code =
+				length < passwordPolicy.minLength
+					? "PASSWORD_TOO_SHORT"
+					: length > passwordPolicy.maxLength
+						? "PASSWORD_TOO_LONG"
+						: "PASSWORD_REQUIREMENTS_NOT_MET";
+			return { status: "password-policy", code, message: error };
+		}
 		if (!isLegacyPasswordResetToken(input.token))
 			return { status: "invalid-token" };
-		const error = passwordPolicyError(input.newPassword, policy.passwordPolicy);
-		if (error) return { status: "password-policy", message: error };
 
 		const identifier = `reset-password:${input.token}`;
 		// Only a current token can trigger the breach check and password KDF.

@@ -44,7 +44,7 @@ const hostedResetRequest = resetRequest.extend({
 const verifyRequest = z.object({ email, callbackURL: callback }).strict();
 const resetInput = z
 	.object({
-		newPassword: z.string().max(128),
+		newPassword: z.string(),
 		token: z.string().max(128).optional(),
 	})
 	.strict();
@@ -512,7 +512,8 @@ export function createOwnedRecoveryHttp(options: RecoveryHttpOptions) {
 			case "invalid-token":
 				return rejected(400, "INVALID_TOKEN", "Invalid token");
 			case "password-policy":
-				return rejected(400, "INVALID_PASSWORD", result.message);
+				// The installed password policy rejects before the endpoint audit hook.
+				return failure(400, result.code, result.message);
 			case "breached-password":
 				return rejected(
 					400,
