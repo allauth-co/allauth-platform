@@ -3,6 +3,7 @@ import { readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import { Pool } from "pg";
 import { setting } from "@/lib/configuration";
+import { internalProjectEngineIdSetting } from "@/lib/projects/project-engine-internal-selection";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -45,6 +46,12 @@ export async function GET() {
 		);
 		if (migration.rows[0]?.checksum !== checksum)
 			throw new Error("Schema migration is pending or mismatched");
+		if (setting({}, internalProjectEngineIdSetting).trim()) {
+			const { verifyInternalProjectEngineReadiness } = await import(
+				"@/lib/projects/project-engine-internal-readiness"
+			);
+			await verifyInternalProjectEngineReadiness(pool, {});
+		}
 		return Response.json({ status: "ok" }, { headers });
 	} catch {
 		return Response.json({ status: "unavailable" }, { status: 503, headers });

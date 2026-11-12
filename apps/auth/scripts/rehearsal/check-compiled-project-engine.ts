@@ -241,6 +241,7 @@ async function start(
 	image: string,
 	db: string,
 	values: Record<string, string> = {},
+	readiness = 200,
 ) {
 	if (railway) await railway.start(image, db, values);
 	else
@@ -255,8 +256,8 @@ async function start(
 			image,
 		);
 	await until(
-		async () => (await request("/api/health")).status === 200,
-		"The compiled app did not report ready.",
+		async () => (await request("/api/health")).status === readiness,
+		"The compiled app did not report the expected readiness.",
 	);
 }
 
@@ -524,12 +525,27 @@ try {
 	}
 
 	if (internalSelection) {
-		await start(releaseImage, restored, {
-			ALLAUTH_PROJECT_ENGINE_INTERNAL_ID: owned.id,
+		const mail = {
 			EMAIL_PROVIDER: "cloudflare",
 			EMAIL_FROM: "security@project-engine-rehearsal.invalid",
 			CLOUDFLARE_ACCOUNT_ID: run,
 			CLOUDFLARE_EMAIL_API_TOKEN: run,
+		};
+		await start(
+			releaseImage,
+			restored,
+			{ ...mail, ALLAUTH_PROJECT_ENGINE_INTERNAL_ID: control.id },
+			503,
+		);
+		expectStatus(
+			await request(`${controlPath}/not-installed`, { realm: control }),
+			404,
+			"An ineligible project fails readiness and retains the legacy writer.",
+		);
+		await stop(restored);
+		await start(releaseImage, restored, {
+			...mail,
+			ALLAUTH_PROJECT_ENGINE_INTERNAL_ID: owned.id,
 		});
 		expectStatus(
 			await request("/api/auth/hosted-ui/sdk/config", { host }),
