@@ -165,6 +165,42 @@ describe("project engine aggregate metrics", () => {
 		);
 	});
 
+	it("counts use of legacy provider credential routes without reading their bodies", async () => {
+		const report = vi.fn();
+		const metrics = createProjectEngineMetrics(report);
+		const dispatch = vi.fn<AuthEngine["dispatch"]>(async (request) => {
+			expect(request.bodyUsed).toBe(false);
+			if (request.method === "GET") return new Response(null, { status: 405 });
+			expect(await request.text()).toBe(
+				"synthetic-provider-credential-request",
+			);
+			return Response.json({ accessToken: "synthetic-provider-credential" });
+		});
+		const engine = observeProjectEngine(fixtureEngine(dispatch), {
+			projectId,
+			writer: "legacy",
+			transport: "project",
+			basePath: path,
+			metrics,
+		});
+		await engine.dispatch(request("/get-access-token"));
+		for (const route of ["/get-access-token", "/refresh-token"])
+			await engine.dispatch(
+				request(route, {
+					method: "POST",
+					body: "synthetic-provider-credential-request",
+				}),
+			);
+		metrics.flush();
+		expect(
+			report.mock.calls.map(([event]) => [event.operation, event.outcomes.ok]),
+		).toEqual([
+			["providerAccessToken", 1],
+			["providerTokenRefresh", 1],
+		]);
+		expect(JSON.stringify(report.mock.calls)).not.toContain("synthetic-");
+	});
+
 	it("preserves handler errors and remains available when the reporter fails", async () => {
 		const failure = new Error("synthetic engine failure");
 		const report = vi.fn().mockImplementation(() => {

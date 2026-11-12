@@ -1,6 +1,6 @@
-import { APIError } from "better-auth";
 import { CompiledQuery, Kysely, PostgresDialect, sql } from "kysely";
 import type { Pool } from "pg";
+import { ConsoleRequestError } from "../console/request-error";
 import {
 	consoleUserListQuery,
 	getConsoleUser,
@@ -67,13 +67,11 @@ export function createOwnedProjectUserConsole(options: {
 			url.searchParams.get("project") !== project.slug ||
 			!matchesRoute(url.pathname, request.method, route)
 		)
-			throw new APIError("FORBIDDEN");
+			throw new ConsoleRequestError(403);
 		const writing = route.operation === "metadata";
 		if (writing && request.headers.get("origin") !== options.managementOrigin)
-			throw new APIError("FORBIDDEN", {
-				message: "A same-origin request is required.",
-			});
-		const denied = () => new APIError(writing ? "FORBIDDEN" : "UNAUTHORIZED");
+			throw new ConsoleRequestError(403, "A same-origin request is required.");
+		const denied = () => new ConsoleRequestError(writing ? 403 : 401);
 		if (request.headers.has("authorization")) throw denied();
 		const actor = await options.readWorkspacePrincipal(request.headers);
 		if (!actor) throw denied();
@@ -109,7 +107,7 @@ export function createOwnedProjectUserConsole(options: {
 				);
 			const result = await sql`UPDATE "user" SET ${sql.join(changes)}
 				WHERE id = ${route.userId} RETURNING id`.execute(transaction);
-			if (!result.rows.length) throw new APIError("NOT_FOUND");
+			if (!result.rows.length) throw new ConsoleRequestError(404);
 			await sql`INSERT INTO "allauthAudit" (id, "actorId", action, "targetId", "createdAt")
 				VALUES (${crypto.randomUUID()}, ${actor.user.id}, ${metadataAction}, ${route.userId}, CURRENT_TIMESTAMP)`.execute(
 				transaction,

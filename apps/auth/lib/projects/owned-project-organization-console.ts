@@ -1,4 +1,3 @@
-import { APIError } from "better-auth";
 import { Kysely, PostgresDialect, sql } from "kysely";
 import type { Pool } from "pg";
 import type { ConsoleOrganizationInvitationDelivery } from "../console/organization-invitation-delivery";
@@ -11,6 +10,7 @@ import {
 	consoleOrganizationTransactionClient,
 	executeConsoleOrganization,
 } from "../console/organizations";
+import { ConsoleRequestError } from "../console/request-error";
 import type { ControlDatabase, ControlPrincipal } from "../control/types";
 import { lockOwnedProjectWorkspaceAdministrator } from "./owned-project-admin-authority";
 import { retryProjectOrganizationTransaction } from "./owned-project-organization-lifecycle-store";
@@ -79,16 +79,14 @@ export function createOwnedProjectOrganizationConsole(options: {
 			url.searchParams.get("project") !== project.slug ||
 			!matchesConsoleOrganizationRequest(request, url, organizationId, resource)
 		)
-			throw new APIError("FORBIDDEN");
+			throw new ConsoleRequestError(403);
 		const writing = request.method !== "GET";
 		if (writing && request.headers.get("origin") !== origin)
-			throw new APIError("FORBIDDEN", {
-				message: "A same-origin request is required.",
-			});
+			throw new ConsoleRequestError(403, "A same-origin request is required.");
 		if (request.headers.has("authorization"))
-			throw new APIError("UNAUTHORIZED");
+			throw new ConsoleRequestError(401);
 		const principal = await options.readWorkspacePrincipal(request.headers);
-		if (!principal) throw new APIError("UNAUTHORIZED");
+		if (!principal) throw new ConsoleRequestError(401);
 		let parsedBody: Promise<unknown> | undefined;
 		const execute = () =>
 			database.transaction().execute(async (transaction) => {
@@ -100,7 +98,7 @@ export function createOwnedProjectOrganizationConsole(options: {
 					project,
 					principal,
 				);
-				if (!authorized) throw new APIError("UNAUTHORIZED");
+				if (!authorized) throw new ConsoleRequestError(401);
 				return executeConsoleOrganization(
 					transaction,
 					request,

@@ -24,7 +24,9 @@ type Operation =
 	| "callback"
 	| "session"
 	| "tokenExchange"
-	| "tokenRefresh";
+	| "tokenRefresh"
+	| "providerAccessToken"
+	| "providerTokenRefresh";
 type Series = {
 	projectId: string;
 	writer: "legacy" | "allauth";
@@ -59,6 +61,8 @@ function operationFor(
 	const suffix = path.slice(basePath.length);
 	if (request.method === "POST") {
 		if (suffix === "/oauth2/token") return "tokenExchange";
+		if (suffix === "/get-access-token") return "providerAccessToken";
+		if (suffix === "/refresh-token") return "providerTokenRefresh";
 		if (signIn.has(suffix)) return "signIn";
 	}
 	if (request.method === "GET" && suffix === "/get-session") return "session";
@@ -217,7 +221,7 @@ export function observeProjectEngine(
 			const started = performance.now();
 			const record = (outcome: Outcome) => {
 				const duration = performance.now() - started;
-				if (refresh) {
+				if (refresh !== null) {
 					void refresh
 						.then((isTokenRefresh) =>
 							metrics.record(

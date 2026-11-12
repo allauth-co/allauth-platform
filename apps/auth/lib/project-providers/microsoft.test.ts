@@ -4,7 +4,8 @@ import { getTestInstance } from "better-auth/test";
 import { createAuthOptions } from "../auth";
 import type { AuthRealm } from "../auth";
 import { projectManagement } from "../projects/management-plugin";
-import { microsoftCallbackURL, microsoftConfigurationVersion, microsoftIntegrity, readProjectMicrosoftProvider } from "./microsoft";
+import { microsoftIntegrity } from "./legacy-provider-integrity";
+import { microsoftCallbackURL, microsoftConfigurationVersion, readProjectMicrosoftProvider } from "./microsoft";
 
 const clientId = "11111111-2222-4333-8444-555555555555";
 const tenantId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";

@@ -36,6 +36,9 @@ import { serviceDirectory } from "./service-directory";
 import type { ProjectSupportOptions } from "./support-plugin";
 import { projectSupport } from "./support-plugin";
 import { projectAvatarAsset, projectAvatarInput } from "./project-avatar-upload";
+import { publicProjectUser } from "./project-user-projection";
+
+export { publicProjectUser } from "./project-user-projection";
 
 /** The trusted callback authorizes a fresh platform identity for this workspace; tenant roles grant no console authority. */
 export interface ProjectManagementOptions {
@@ -95,27 +98,6 @@ const listQuery = z
 	})
 	.strict()
 	.prefault({});
-
-/** Explicit user projection excludes private metadata, account passwords and future internal columns. */
-export function publicProjectUser(user: Record<string, unknown>) {
-	const result: Record<string, unknown> = {};
-	for (const field of [
-		"id",
-		"email",
-		"name",
-		"emailVerified",
-		"role",
-		"banned",
-		"banReason",
-		"banExpires",
-		"image",
-		"createdAt",
-		"updatedAt",
-		"publicMetadata",
-	] as const)
-		if (user[field] !== undefined) result[field] = user[field];
-	return result;
-}
 
 /** Native per-project management endpoints operate only through the selected realm's own adapter. */
 export function projectManagement(options: ProjectManagementOptions) {

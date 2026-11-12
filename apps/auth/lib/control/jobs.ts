@@ -1,12 +1,12 @@
 import { Pool } from "pg";
 import { sql } from "kysely";
-import { postgresDatabase } from "../auth";
+import { postgresDatabase } from "../postgres-database";
 import { listProjects } from "../projects/registry";
 import { checkedProjectSchema } from "../projects/validation";
-import { projectSecret } from "../projects/runtime";
+import { projectSecret } from "../projects/project-secret";
 import { setting } from "../configuration";
 import type { AuthEnvironment } from "../configuration";
-import { deliverPendingWebhooks, pruneWebhookDeliveries } from "./webhooks";
+import { deliverPendingWebhooks, pruneWebhookDeliveries } from "./webhook-delivery";
 import { controlRetentionDays } from "./queries";
 import { deliverReleaseNotifications } from "../notifications/delivery";
 import { processBillingJobs } from "../billing/jobs";
@@ -41,7 +41,7 @@ export function startControlJobs(environment: AuthEnvironment) {
 		try {
 			const projects = await listProjects(environment);
 			const project = projects.length ? projects[cursor++ % projects.length] : undefined;
-			await maintain("public", setting(environment, "BETTER_AUTH_SECRET"), ticks++ % 240 === 0);
+			await maintain("public", setting(environment, "ALLAUTH_AUTH_SECRET"), ticks++ % 240 === 0);
 			const notifications = await deliverReleaseNotifications(environment, { maxDeliveries: 3 });
 			if (notifications.claimed) console.info("AllAuth release email processing", JSON.stringify(notifications));
 			if (project) await maintain(checkedProjectSchema(project.schemaName), projectSecret(environment, project.id), true);

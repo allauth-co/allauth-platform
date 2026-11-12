@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { generateKeyPair, SignJWT } from "jose";
 import { getTestInstance } from "better-auth/test";
-import { appleIntegrity } from "./apple";
+import { appleIntegrity } from "./legacy-provider-integrity";
 
 const clientId = "com.fixture.web";
 const origin = "http://localhost:3000";

@@ -86,6 +86,7 @@ import {
 } from "./project-engine-writer-lease";
 import { localizeProjectErrors } from "./project-error-localization";
 import { verifiedProjectRequest } from "./proxy";
+import { projectSecret } from "./project-secret";
 import type { Project } from "./registry";
 import {
 	getProject,
@@ -208,12 +209,7 @@ export async function selectedProjectAdministrator(
 	}
 }
 
-/** Distinct keys isolate signed cookies, encrypted credentials, and security counters. */
-export function projectSecret(env: AuthEnvironment, projectId: string): string {
-	return createHmac("sha256", setting(env, "BETTER_AUTH_SECRET"))
-		.update(`allauth:project:${projectId}`)
-		.digest("hex");
-}
+export { projectSecret } from "./project-secret";
 
 function bindOwnedDirectTransport(engine: AuthEngine, origin: string): AuthEngine {
 	function bind(request: Request) {

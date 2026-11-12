@@ -1,16 +1,16 @@
-import { APIError } from "better-auth";
 import { CompiledQuery, Kysely, PostgresDialect, sql } from "kysely";
 import type { Pool } from "pg";
-import {
-	analyticsEntitiesQuery,
-	analyticsQuery,
-	queryControlAnalytics,
-	queryControlAnalyticsEntities,
-} from "../control/analytics";
 import {
 	createAuthenticatedActivityCollector,
 	isControlActivityMutation,
 } from "../control/analytics-activity";
+import {
+	analyticsEntitiesQuery,
+	analyticsQuery,
+	AnalyticsQueryError,
+	queryControlAnalytics,
+	queryControlAnalyticsEntities,
+} from "../control/analytics-queries";
 import type {
 	AnalyticsEntitiesFilters,
 	AnalyticsFilters,
@@ -159,8 +159,8 @@ export function createOwnedProjectAnalytics(options: {
 				return accountLinkJson(result);
 			});
 		} catch (error) {
-			if (error instanceof APIError)
-				return accountLinkJson(error.body, error.statusCode);
+			if (error instanceof AnalyticsQueryError)
+				return accountLinkJson({ message: error.message }, error.statusCode);
 			throw error;
 		}
 	}

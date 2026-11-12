@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { generateKeyPair, exportPKCS8, jwtVerify, exportSPKI, importSPKI } from "jose";
-import { readProjectAppleProvider, appleConfigurationVersion, appleCallbackURL, generateAppleClientSecret, appleIntegrity } from "./apple";
+import { readProjectAppleProvider, appleConfigurationVersion, appleCallbackURL, generateAppleClientSecret } from "./apple";
+import { appleIntegrity } from "./legacy-provider-integrity";
 import { createAuthOptions } from "../auth";
 import type { AuthRealm } from "../auth";
 import { getTestInstance } from "better-auth/test";

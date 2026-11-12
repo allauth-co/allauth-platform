@@ -4,6 +4,7 @@ import type { createAuth } from "./auth";
 import { withAuth } from "./auth";
 import type { AuthEnvironment } from "./configuration";
 import { authOrigin, isPlatformAdmin, rolesInclude } from "./configuration";
+import { ConsoleRequestError } from "./console/request-error";
 import { selectedProjectAdministrator, projectInstance, withProjectAuth } from "./projects/runtime";
 import { commercialLimitError } from "./billing/entitlements";
 
@@ -55,7 +56,10 @@ export async function apiResponse(callback: (selectWorkspace: (workspace: string
 	catch (error) {
 		const limit = commercialLimitError(error);
 		if (limit) return json({ error: limit.body?.message, code: limit.body?.code, ...(upgradeWorkspace ? { upgradeUrl: `/admin/workspaces?${new URLSearchParams({ workspace: upgradeWorkspace, tab: "billing" })}` } : {}) }, limit.statusCode);
-		if (error instanceof APIError) return json({ error: error.body?.message || "The request is not permitted." }, error.statusCode);
+		if (error instanceof APIError || error instanceof ConsoleRequestError) {
+			const message = error instanceof ConsoleRequestError ? error.message : error.body?.message;
+			return json({ error: message || "The request is not permitted." }, error.statusCode);
+		}
 		if (error instanceof z.ZodError) return json({ error: "The request contains invalid fields." }, 400);
 		if (error && typeof error === "object" && "code" in error && error.code === "23505") return json({ error: "A record with this identifier already exists." }, 409);
 		// Do not log exception bodies: provider errors can include credentials or tokens.

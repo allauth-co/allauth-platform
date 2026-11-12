@@ -73,6 +73,38 @@ function run(lines: unknown[], extraOptions: string[] = []) {
 }
 
 describe("project rollout log comparison", () => {
+	it("reports observed legacy provider credential operations for their exact transport", () => {
+		const legacy = metric("legacy");
+		const result = run([
+			{ ...legacy, operation: "providerAccessToken" },
+			{ ...legacy, transport: "project", operation: "providerTokenRefresh" },
+		]);
+		expect(result.stderr).toBe("");
+		expect(result.status).toBe(0);
+		const { groups } = JSON.parse(result.stdout);
+		expect(groups).toHaveLength(12);
+		expect(groups).toContainEqual(
+			expect.objectContaining({
+				transport: "hosted",
+				operation: "providerAccessToken",
+				legacy: expect.objectContaining({
+					outcomes: expect.objectContaining({ ok: 3 }),
+				}),
+				missingWriters: ["allauth"],
+			}),
+		);
+		expect(groups).toContainEqual(
+			expect.objectContaining({
+				transport: "project",
+				operation: "providerTokenRefresh",
+				legacy: expect.objectContaining({
+					outcomes: expect.objectContaining({ ok: 3 }),
+				}),
+				missingWriters: ["allauth"],
+			}),
+		);
+	});
+
 	it("aggregates response rates and latency buckets while exposing missing transports and operations", () => {
 		const legacy = metric("legacy");
 		const candidate = metric("allauth");

@@ -1,11 +1,11 @@
-import { APIError } from "better-auth";
 import { CompiledQuery, Kysely, PostgresDialect, sql } from "kysely";
 import type { Pool } from "pg";
-import type { ProjectApplicationRecord } from "../applications";
+import type { ProjectApplicationRecord } from "../console/application-contract";
 import {
 	publicProjectApplication,
 	rejectProjectConsoleApplicationWrite,
-} from "../applications";
+} from "../console/application-contract";
+import { ConsoleRequestError } from "../console/request-error";
 import type { ControlDatabase, ControlPrincipal } from "../control/types";
 import { lockOwnedProjectWorkspaceAdministrator } from "./owned-project-admin-authority";
 import type { Project } from "./registry";
@@ -44,15 +44,13 @@ export function createOwnedProjectApplicationConsole(options: {
 			url.searchParams.get("project") !== project.slug ||
 			!matchesRoute(url.pathname, request.method)
 		)
-			throw new APIError("FORBIDDEN");
+			throw new ConsoleRequestError(403);
 		const writing = request.method !== "GET";
 		if (writing && request.headers.get("origin") !== origin)
-			throw new APIError("FORBIDDEN", {
-				message: "A same-origin request is required.",
-			});
-		if (request.headers.has("authorization")) throw new APIError("FORBIDDEN");
+			throw new ConsoleRequestError(403, "A same-origin request is required.");
+		if (request.headers.has("authorization")) throw new ConsoleRequestError(403);
 		const principal = await options.readWorkspacePrincipal(request.headers);
-		if (!principal) throw new APIError("FORBIDDEN");
+		if (!principal) throw new ConsoleRequestError(403);
 		return database.transaction().execute(async (transaction) => {
 			const authorized = await lockOwnedProjectWorkspaceAdministrator(
 				{
@@ -62,7 +60,7 @@ export function createOwnedProjectApplicationConsole(options: {
 				project,
 				principal,
 			);
-			if (!authorized) throw new APIError("FORBIDDEN");
+			if (!authorized) throw new ConsoleRequestError(403);
 			if (writing)
 				rejectProjectConsoleApplicationWrite(url.pathname === collectionPath);
 			const clients = await sql<ProjectApplicationRecord>`

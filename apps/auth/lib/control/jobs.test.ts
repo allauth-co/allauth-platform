@@ -1,10 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 const fixtures = vi.hoisted(() => ({ listProjects: vi.fn().mockResolvedValue([]), billing: vi.fn(), deliverWebhooks: vi.fn().mockResolvedValue(undefined), notifications: vi.fn().mockResolvedValue({ claimed: 0 }), destroy: vi.fn().mockResolvedValue(undefined) }));
-vi.mock("../auth", () => ({ postgresDatabase: () => ({ db: { destroy: fixtures.destroy } }) }));
+vi.mock("../postgres-database", () => ({ postgresDatabase: () => ({ db: { destroy: fixtures.destroy } }) }));
 vi.mock("../projects/registry", () => ({ listProjects: fixtures.listProjects }));
-vi.mock("../projects/runtime", () => ({ projectSecret: () => "fixture" }));
-vi.mock("./webhooks", () => ({ deliverPendingWebhooks: fixtures.deliverWebhooks, pruneWebhookDeliveries: vi.fn() }));
+vi.mock("../projects/project-secret", () => ({ projectSecret: () => "fixture" }));
+vi.mock("./webhook-delivery", () => ({ deliverPendingWebhooks: fixtures.deliverWebhooks, pruneWebhookDeliveries: vi.fn() }));
 vi.mock("../notifications/delivery", () => ({ deliverReleaseNotifications: fixtures.notifications }));
 vi.mock("../billing/jobs", () => ({ processBillingJobs: fixtures.billing }));
 

@@ -16,8 +16,7 @@ import {
 } from "../control/security-policy";
 import { discoveryDocument } from "../discovery";
 import { productionTwoFactor } from "../mfa";
-import { appleIntegrity } from "../project-providers/apple";
-import { microsoftIntegrity } from "../project-providers/microsoft";
+import { appleIntegrity, microsoftIntegrity } from "../project-providers/legacy-provider-integrity";
 import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
 import { projectManagement } from "./management-plugin";
 import { createOwnedProjectEngine } from "./owned-project-engine";

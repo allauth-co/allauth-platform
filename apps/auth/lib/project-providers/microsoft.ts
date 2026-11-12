@@ -1,7 +1,4 @@
 import { createHash } from "node:crypto";
-import { verifyProviderIdToken } from "@better-auth/core/oauth2";
-import { APIError } from "better-auth";
-import type { BetterAuthPlugin } from "better-auth";
 import * as z from "zod";
 import { setting } from "../configuration";
 import type { AuthEnvironment } from "../configuration";
@@ -39,25 +36,4 @@ export function microsoftCallbackURL(realm: { primaryOrigin: string; publicOrigi
 	const local = ["localhost", "127.0.0.1", "[::1]"].includes(parsed.hostname);
 	if (parsed.origin !== origin || parsed.username || parsed.password || (parsed.protocol !== "https:" && !(local && parsed.protocol === "http:" && !realm.publicOrigin))) throw new Error("Microsoft sign-in requires an exact HTTPS application origin or local development origin.");
 	return `${origin}${realm.publicOrigin ? realm.basePath : "/api/allauth"}/callback/microsoft`;
-}
-
-/** Verify the native Microsoft's token contract and state-bound nonce before parsing its profile. */
-export function microsoftIntegrity(): BetterAuthPlugin {
-	return { id: "allauth-microsoft-integrity", init(ctx) {
-		const provider = ctx.socialProviders.find(value => value.id === "microsoft");
-		if (!provider) return;
-		provider.requiresIdTokenNonce = true;
-		const nativeAuthorization = provider.createAuthorizationURL;
-		provider.createAuthorizationURL = async input => {
-			if (!input.idTokenNonce) throw new APIError("BAD_REQUEST", { message: "Microsoft sign-in requires a fresh authorization attempt." });
-			const url = await nativeAuthorization(input);
-			url.searchParams.set("nonce", input.idTokenNonce);
-			return url;
-		};
-		const nativeUserInfo = provider.getUserInfo;
-		provider.getUserInfo = async tokens => {
-			if (!tokens.idToken || !await verifyProviderIdToken(provider, tokens.idToken, tokens.expectedIdTokenNonce)) return null;
-			return nativeUserInfo(tokens);
-		};
-	} };
 }

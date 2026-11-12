@@ -30,6 +30,8 @@ The comparison sums counts and histogram buckets for each operation and transpor
 
 The records cover sign-in and second-factor requests, provider callbacks, session reads and refreshes, and OAuth token exchanges and refreshes. HTTP redirects have a separate outcome, while known error redirects count as rejected. Compare these response outcomes with the realm's authentication event counts when assessing completed sign-ins. Check gateway and readiness evidence for requests that fail before engine dispatch, and exercise each configured accounts hostname separately. The metric records contain the project ID and fixed labels and counts.
 
+Baseline metrics also count the legacy project `/get-access-token` and `/refresh-token` operations on direct and hosted transports. The comparison shows these groups when it observes them. Investigate successful calls and confirm the project's configured clients before selecting its writer. Missing observations describe the sampled interval only.
+
 ## Project cutover
 
 - The AllAuth engine candidate covers password sign-in by email or username, registration, password recovery, email verification, session refresh and scoped session revocation in fixtures. Existing scrypt and Clerk bcrypt credentials still verify. Password recovery consumes legacy links and revokes project sessions, grants and outstanding challenges in the same transaction as the password change.

@@ -6,13 +6,18 @@ const immutableProjectId = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/;
 const metricEvent = "allauth.project_engine_metrics";
 const writers = ["legacy", "allauth"] as const;
 const transports = ["hosted", "project"] as const;
-const operations = [
+const coreOperations = [
 	"signIn",
 	"callback",
 	"session",
 	"tokenExchange",
 	"tokenRefresh",
 ] as const;
+const providerOperations = [
+	"providerAccessToken",
+	"providerTokenRefresh",
+] as const;
+const operations = [...coreOperations, ...providerOperations] as const;
 const outcomeKeys = [
 	"ok",
 	"redirect",
@@ -229,7 +234,12 @@ async function compare(
 		),
 		excluded,
 		groups: transports.flatMap((transport) =>
-			operations.map((operation) => {
+			[
+				...coreOperations,
+				...providerOperations.filter((operation) =>
+					groups.has(`${transport}/${operation}`),
+				),
+			].map((operation) => {
 				const group = groups.get(`${transport}/${operation}`);
 				const bounds = group?.bounds ?? [];
 				const legacy = summarize(group?.samples.legacy, bounds);

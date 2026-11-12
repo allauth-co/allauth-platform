@@ -16,7 +16,6 @@ import { admin, emailOTP, genericOAuth, jwt, lastLoginMethod, magicLink, multiSe
 import { createAccessControl } from "better-auth/plugins/access";
 import type { Statements } from "better-auth/plugins/access";
 import { defaultStatements as organizationStatements, defaultRoles as organizationRoles } from "better-auth/plugins/organization/access";
-import { Kysely, PostgresDialect } from "kysely";
 import { Pool } from "pg";
 import type { AuthEnvironment } from "./configuration";
 import { authConfiguration, authOrigin, isPlatformAdmin, projectEmailEnvironment, setting, trustedOrigins, validateRedirectUris } from "./configuration";
@@ -26,6 +25,7 @@ import { authenticationEmail } from "./email/authentication";
 import { reactInvitationEmail } from "./email/invitation";
 import { emailConfigured, sendAuthEmail as sendEmail } from "./email/send";
 import { productionTwoFactor } from "./mfa";
+import { postgresDatabase } from "./postgres-database";
 import { databasePoolSize, isNodeRuntime } from "./runtime";
 import { allauthControl } from "./control";
 import type { ControlDatabase, ControlPrincipal } from "./control";
@@ -39,10 +39,11 @@ import { authPolicyPlugin } from "./auth-policy/plugin";
 import { readAuthPolicy } from "./auth-policy/storage";
 import { workspaceBrokerPrivilege } from "./workspaces/broker";
 import { googleCallbackURL } from "./project-providers/google";
-import { appleCallbackURL, appleIntegrity, generateAppleClientSecret } from "./project-providers/apple";
+import { appleCallbackURL, generateAppleClientSecret } from "./project-providers/apple";
 import type { ProjectAppleProvider } from "./project-providers/apple";
 import { revokeAppleBeforeUserDeletion } from "./project-providers/apple-deletion";
-import { microsoftCallbackURL, microsoftIntegrity } from "./project-providers/microsoft";
+import { appleIntegrity, microsoftIntegrity } from "./project-providers/legacy-provider-integrity";
+import { microsoftCallbackURL } from "./project-providers/microsoft";
 import type { ProjectMicrosoftProvider } from "./project-providers/microsoft";
 import { assertWorkspaceAccountDeletion } from "./workspaces/authorization";
 import type { ApplicationBranding } from "./branding/types";
@@ -57,10 +58,7 @@ import { legacyAuthEngine } from "./legacy-auth-engine";
 export { authConfiguration, isPlatformAdmin, validateRedirectUris } from "./configuration";
 export type { AuthEnvironment } from "./configuration";
 
-/** PostgreSQL explicitly advertises native transactions to enterprise plugins. */
-export function postgresDatabase(pool: Pool) {
-	return { db: new Kysely<Record<string, Record<string, unknown>>>({ dialect: new PostgresDialect({ pool }) }), type: "postgres", transaction: true } as const;
-}
+export { postgresDatabase } from "./postgres-database";
 
 const auditPaths = new Set(["/admin/create-user", "/admin/update-user", "/admin/set-role", "/admin/ban-user", "/admin/unban-user", "/admin/impersonate-user", "/admin/stop-impersonating", "/admin/remove-user", "/admin/set-user-password", "/admin/revoke-user-session", "/admin/revoke-user-sessions", "/sso/register", "/sso/update-provider", "/sso/delete-provider", "/sso/verify-domain", "/oauth2/create-client", "/oauth2/update-client", "/oauth2/delete-client", "/oauth2/rotate-client-secret", "/admin/oauth2/create-client", "/admin/oauth2/update-client"]);
 
