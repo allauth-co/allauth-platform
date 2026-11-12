@@ -158,9 +158,10 @@ describe.skipIf(!existsSync(fixturePath))(
 			backchannelLogout?: Parameters<
 				typeof createOwnedProjectEngine
 			>[0]["backchannelLogout"],
+			writerDatabase = database,
 		) {
 			return createOwnedProjectEngine({
-				database,
+				database: writerDatabase,
 				project: { slug, schemaName: schema },
 				baseURL: origin,
 				basePath,
@@ -364,6 +365,7 @@ describe.skipIf(!existsSync(fixturePath))(
 			const unaffected = await seedGrants(clientId, user.id, active.id);
 			const deferred: (() => Promise<void>)[] = [];
 			const deliveries: string[] = [];
+			const writerDatabase = new Pool({ connectionString: database.options.connectionString, max: 2 });
 			const candidate = engine({
 				defer(task) {
 					deferred.push(task);
@@ -374,7 +376,7 @@ describe.skipIf(!existsSync(fixturePath))(
 					deliveries.push(body.get("logout_token")!);
 					return 204;
 				},
-			});
+			}, writerDatabase);
 
 			const refused = await engine().dispatch(
 				revoke("/revoke-other-sessions", { cookie: active.cookie, origin }),
@@ -390,7 +392,7 @@ describe.skipIf(!existsSync(fixturePath))(
 
 			const response = await candidate.dispatch(
 				revoke("/revoke-other-sessions", { cookie: active.cookie, origin }),
-			);
+			).finally(() => writerDatabase.end());
 			expect(response.status).toBe(200);
 			expect(await response.json()).toEqual({ status: true });
 			expect(response.headers.getSetCookie()).toEqual([]);

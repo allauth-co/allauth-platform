@@ -53,14 +53,16 @@ export function createOwnedProjectBackchannelLogout(
 	const { signingKey } = createOwnedProjectIssuerKeys(options);
 
 	const post = options.post ?? postToRelyingParty;
-	async function deliver(targets: readonly ProjectBackchannelTarget[]) {
-		let signing: ReturnType<typeof signingKey> | undefined;
+	type Destination = ProjectBackchannelTarget & { endpoint?: URL };
+	type SigningKey = Awaited<ReturnType<typeof signingKey>>;
+
+	async function deliver(targets: readonly Destination[], signing: SigningKey | undefined) {
 		await Promise.allSettled(
 			targets.map(async (target) => {
 				let outcome: "delivered" | "failed" = "failed";
 				try {
-					const url = publicProjectHttpsURL(target.url, true);
-					const { id, alg, key } = await (signing ??= signingKey());
+					if (!target.endpoint || !signing) return;
+					const { id, alg, key } = signing;
 					const iat = Math.floor(Date.now() / 1000);
 					const token = await new SignJWT({
 						sid: target.sessionId,
@@ -75,7 +77,7 @@ export function createOwnedProjectBackchannelLogout(
 						.setExpirationTime(iat + tokenLifetimeSeconds)
 						.sign(key);
 					const status = await post(
-						url,
+						target.endpoint,
 						new URLSearchParams({ logout_token: token }),
 						AbortSignal.timeout(5000),
 					);
@@ -89,12 +91,23 @@ export function createOwnedProjectBackchannelLogout(
 
 	return async (targets: readonly ProjectBackchannelTarget[]) => {
 		if (!targets.length) return;
+		const destinations: Destination[] = targets.map((target) => {
+			try {
+				return { ...target, endpoint: publicProjectHttpsURL(target.url, true) };
+			} catch {
+				return target;
+			}
+		});
+		// Key lookup may create a row and must finish with the request's writer.
+		const signing = destinations.some(({ endpoint }) => endpoint)
+			? await signingKey().catch(() => undefined)
+			: undefined;
 		if (!options.defer) {
-			await deliver(targets);
+			await deliver(destinations, signing);
 			return;
 		}
 		let pending: Promise<void> | undefined;
-		const run = () => (pending ??= deliver(targets));
+		const run = () => (pending ??= deliver(destinations, signing));
 		try {
 			options.defer(run);
 		} catch {
