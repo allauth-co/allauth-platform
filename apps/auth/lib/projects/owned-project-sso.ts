@@ -6,6 +6,7 @@ import * as z from "zod";
 import { validAvatarPath } from "../avatars/protocol";
 import type { LegacyMfaKeys } from "./legacy-mfa-record";
 import { readLegacySessionCookie } from "./legacy-session-cookie";
+import { markOwnedCallbackFailure } from "./owned-project-callback-failure";
 import type { ProjectUser } from "./owned-project-engine-store";
 import type { SsoFetch } from "./owned-project-sso-network";
 import {
@@ -227,7 +228,12 @@ export function createOwnedProjectSso(options: OwnedProjectSsoOptions) {
 		return new Response(response.body, { status: response.status, headers });
 	}
 
-	function failure(code: string, flow?: SsoState, clear = false) {
+	function failure(
+		code: string,
+		flow?: SsoState,
+		clear = false,
+		auditCode = code,
+	) {
 		const target =
 			(flow?.errorURL && allowedReturn(flow.errorURL, origin, origins)) ||
 			(flow && allowedReturn(flow.callbackURL, origin, origins)) ||
@@ -241,7 +247,10 @@ export function createOwnedProjectSso(options: OwnedProjectSsoOptions) {
 				"referrer-policy": "no-referrer",
 			},
 		});
-		return clear ? finish(response) : response;
+		return markOwnedCallbackFailure(
+			clear ? finish(response) : response,
+			auditCode,
+		);
 	}
 
 	async function start(request: Request, input: OwnedProjectSsoInput) {
@@ -409,7 +418,7 @@ export function createOwnedProjectSso(options: OwnedProjectSsoOptions) {
 		state: string,
 		flow: SsoState,
 		provider: SsoProvider,
-	): Promise<SsoIdentity | string> {
+	): Promise<SsoIdentity | { error: string; providerResponse?: true }> {
 		const resolved = await resolveProjectOidc(provider, network, origins);
 		const { config, metadata } = resolved;
 		const client: oauth.Client = { client_id: config.clientId };
@@ -422,10 +431,10 @@ export function createOwnedProjectSso(options: OwnedProjectSsoOptions) {
 				authorizationErrorCodes.has(error.error) &&
 				!authorizationResultFields.some((field) => error.cause.has(field))
 			)
-				return error.error;
+				return { error: error.error, providerResponse: true };
 			throw error;
 		}
-		if (!query.get("code")) return "invalid_request";
+		if (!query.get("code")) return { error: "invalid_request" };
 		const auth = await projectOidcClientAuth(
 			resolved,
 			provider.providerId,
@@ -542,7 +551,12 @@ export function createOwnedProjectSso(options: OwnedProjectSsoOptions) {
 				options.signingSecret,
 			) !== state
 		)
-			return failure("state_mismatch");
+			return failure(
+				"state_mismatch",
+				undefined,
+				false,
+				states.length <= 1 && !state ? "state_not_found" : "state_mismatch",
+			);
 		let flow: SsoState | null = null;
 		try {
 			flow = await store.consume(state, providerId);
@@ -558,13 +572,19 @@ export function createOwnedProjectSso(options: OwnedProjectSsoOptions) {
 			const provider = await store.getProvider(providerId);
 			if (!provider?.oidcConfig || !sameSsoProvider(provider, reference))
 				return failure("invalid_state", flow, true);
-			let identity: SsoIdentity | string;
+			let identity: Awaited<ReturnType<typeof exchange>>;
 			try {
 				identity = await exchange(url, state, flow, provider);
 			} catch {
 				return failure("invalid_provider", flow, true);
 			}
-			if (typeof identity === "string") return failure(identity, flow, true);
+			if ("error" in identity)
+				return failure(
+					identity.error,
+					flow,
+					true,
+					identity.providerResponse ? "AUTHENTICATION_FAILED" : identity.error,
+				);
 			let rejection = "internal_server_error";
 			const abort = Symbol("project SSO admission rejected");
 			try {

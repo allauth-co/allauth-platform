@@ -28,6 +28,9 @@ const userAgent = "Synthetic provider callback fixture";
 const rawUserAgent = "Synthetic provider\t callback fixture";
 const submitted = "private-callback-value@fixture.example";
 const assertion = "synthetic-unusable-assertion";
+const relay = "synthetic_relay_state_not_for_audit_fixture";
+const upstreamError = "synthetic_upstream_reason_not_for_audit";
+const oidcUpstreamError = "invalid_request";
 const issuer = "https://callback-idp.fixture.example";
 const oidc = "fixture-enterprise-oidc";
 const saml = "fixture-enterprise-saml";
@@ -177,7 +180,7 @@ describe.skipIf(!existsSync(fixturePath))(
 			const callbackIP = "192.0.2.177";
 			const ruleId = randomUUID();
 			await database.query(
-				`INSERT INTO ${scope}."allauthWebhookEndpoint" (id,url,"eventTypes","encryptedSecret") VALUES ($1,'https://callback-policy-hook.fixture.example/events','["security.*"]',$2)`,
+				`INSERT INTO ${scope}."allauthWebhookEndpoint" (id,url,"eventTypes","encryptedSecret") VALUES ($1,'https://callback-policy-hook.fixture.example/events','["security.*","auth.sign-in"]',$2)`,
 				[
 					endpoint,
 					await symmetricEncrypt({ key: secret, data: signingSecret }),
@@ -438,9 +441,24 @@ describe.skipIf(!existsSync(fixturePath))(
 						ruleType: "email-domain",
 					},
 				};
+				const authFailure = (errorCode: string) => ({
+					type: "auth.sign-in",
+					outcome: "failure",
+					ipAddress: callbackIP,
+					userAgent,
+					metadata: { path: "/callback/:id", errorCode },
+				});
 				for (const [mode, subject, expected] of [
-					["linked", linkedSubject, [blocked, failure]],
-					["signup", signupSubject, [failure]],
+					[
+						"linked",
+						linkedSubject,
+						[blocked, failure, authFailure("validation_failed")],
+					],
+					[
+						"signup",
+						signupSubject,
+						[failure, authFailure("validation_failed")],
+					],
 				] as const) {
 					const baseline = await exercise(stock.handler, subject, mode);
 					expect(baseline).toEqual(expect.arrayContaining([...expected]));
@@ -454,8 +472,14 @@ describe.skipIf(!existsSync(fixturePath))(
 					[owner, blockedStoredEmail],
 				);
 				const stored = await exercise(stock.handler, linkedSubject, "stored");
-				expect(stored).toEqual(expect.arrayContaining([blocked, failure]));
-				expect(stored).toHaveLength(2);
+				expect(stored).toEqual(
+					expect.arrayContaining([
+						blocked,
+						failure,
+						authFailure("ALLAUTH_SECURITY_BLOCKED"),
+					]),
+				);
+				expect(stored).toHaveLength(3);
 				await database.query(
 					`UPDATE ${scope}."account" SET "accessToken"='synthetic-existing-access',"refreshToken"='synthetic-existing-refresh',"idToken"='synthetic-existing-id' WHERE "providerId"='google' AND "accountId"=$1`,
 					[linkedSubject],
@@ -509,13 +533,13 @@ describe.skipIf(!existsSync(fixturePath))(
 			}
 		});
 
-		it("keeps signed callback failure payloads and counters on the receiving realm", async () => {
+		it("keeps signed auth and security callback failure payloads on the receiving realm", async () => {
 			const subscription = newWebhookSigningSecret();
 			const recipient =
 				"https://callback-security-webhook.fixture.example/events";
 			for (const realm of [schema, sibling])
 				await database.query(
-					`INSERT INTO "${realm}"."allauthWebhookEndpoint" (id,url,"eventTypes","encryptedSecret") VALUES ($1,$2,'["security.*"]',$3)`,
+					`INSERT INTO "${realm}"."allauthWebhookEndpoint" (id,url,"eventTypes","encryptedSecret") VALUES ($1,$2,'["security.*","auth.sign-in"]',$3)`,
 					[
 						randomUUID(),
 						recipient,
@@ -540,6 +564,7 @@ describe.skipIf(!existsSync(fixturePath))(
 						authorizationEndpoint: `${issuer}/authorize`,
 						tokenEndpoint: `${issuer}/token`,
 						jwksEndpoint: `${issuer}/jwks`,
+						discoveryEndpoint: `${issuer}/.well-known/openid-configuration`,
 						pkce: true,
 					}),
 					JSON.stringify({
@@ -551,6 +576,7 @@ describe.skipIf(!existsSync(fixturePath))(
 				],
 			);
 			const discovery = `${origin}/.well-known/openid-configuration`;
+			const brokerDiscovery = `${issuer}/.well-known/openid-configuration`;
 			const observedRequests: string[] = [];
 			const network = vi
 				.spyOn(globalThis, "fetch")
@@ -563,6 +589,16 @@ describe.skipIf(!existsSync(fixturePath))(
 							authorization_endpoint: `${origin}${basePath}/oauth2/authorize`,
 							token_endpoint: `${origin}${basePath}/oauth2/token`,
 							jwks_uri: `${origin}${basePath}/jwks`,
+						});
+					if (url === brokerDiscovery)
+						return Response.json({
+							issuer,
+							authorization_endpoint: `${issuer}/authorize`,
+							token_endpoint: `${issuer}/token`,
+							jwks_uri: `${issuer}/jwks`,
+							response_types_supported: ["code"],
+							subject_types_supported: ["public"],
+							id_token_signing_alg_values_supported: ["RS256"],
 						});
 					throw new Error(
 						"Unexpected external traffic in callback security fixture.",
@@ -583,7 +619,7 @@ describe.skipIf(!existsSync(fixturePath))(
 						template: "/sso/saml2/sp/acs/:providerId",
 						body: new URLSearchParams({
 							SAMLResponse: assertion,
-							RelayState: submitted,
+							RelayState: relay,
 						}),
 					},
 				];
@@ -609,8 +645,31 @@ describe.skipIf(!existsSync(fixturePath))(
 					).rows[0]?.count;
 				const failureKey = await securitySubject(secret, "fail-ip", ip);
 				const ruleId = randomUUID();
-				const failures = callbacks.length + 1;
-				async function exercise(dispatch: Dispatch) {
+				const cancellations = [
+					{
+						start: "/sign-in/social",
+						body: { provider: "google" },
+						callback: callbacks[0]!,
+						error: upstreamError,
+					},
+					{
+						start: "/sign-in/social",
+						body: { provider: "allauth" },
+						callback: callbacks[1]!,
+						error: upstreamError,
+					},
+					{
+						start: "/sign-in/sso",
+						body: { providerId: oidc, providerType: "oidc" },
+						callback: callbacks[2]!,
+						error: oidcUpstreamError,
+					},
+				];
+				const failures = callbacks.length + cancellations.length;
+				async function exercise(
+					dispatch: Dispatch,
+					writer: "native" | "owned",
+				) {
 					for (const callback of callbacks) {
 						const response = await dispatch(incoming(callback));
 						expect([302, 400]).toContain(response.status);
@@ -620,47 +679,51 @@ describe.skipIf(!existsSync(fixturePath))(
 								.some((value) => value.includes("session_token=")),
 						).toBe(false);
 					}
-					const started = await dispatch(
-						new Request(`${origin}${basePath}/sign-in/social`, {
-							method: "POST",
-							headers: {
-								origin,
-								"content-type": "application/json",
-								"x-real-ip": ip,
-							},
-							body: JSON.stringify({
-								provider: "google",
-								callbackURL: `${origin}/account`,
+					const states: string[] = [];
+					for (const fixture of cancellations) {
+						const started = await dispatch(
+							new Request(`${origin}${basePath}${fixture.start}`, {
+								method: "POST",
+								headers: {
+									origin,
+									"content-type": "application/json",
+									"x-real-ip": ip,
+								},
+								body: JSON.stringify({
+									...fixture.body,
+									callbackURL: `${origin}/account`,
+								}),
 							}),
-						}),
-					);
-					expect(started.status, await started.clone().text()).toBe(200);
-					const { url: authorization } = (await started.json()) as {
-						url: string;
-					};
-					const state = new URL(authorization).searchParams.get("state");
-					if (!state)
-						throw new Error("The configured provider did not issue a state.");
-					const canceled = incoming(callbacks[0]!);
-					const callback = new URL(canceled.url);
-					callback.searchParams.set("state", state);
-					callback.searchParams.set("error", "access_denied");
-					canceled.headers.set(
-						"cookie",
-						started.headers
-							.getSetCookie()
-							.map((header) => header.split(";", 1)[0])
-							.join("; "),
-					);
-					const declined = await dispatch(
-						new Request(callback, { headers: canceled.headers }),
-					);
-					expect(declined.status).toBe(302);
-					expect(
-						new URL(declined.headers.get("location")!).searchParams.has(
-							"error",
-						),
-					).toBe(true);
+						);
+						expect(started.status, await started.clone().text()).toBe(200);
+						const { url: authorization } = (await started.json()) as {
+							url: string;
+						};
+						const state = new URL(authorization).searchParams.get("state");
+						if (!state)
+							throw new Error("The configured provider did not issue a state.");
+						states.push(state);
+						const canceled = incoming(fixture.callback);
+						const callback = new URL(canceled.url);
+						callback.searchParams.set("state", state);
+						callback.searchParams.set("error", fixture.error);
+						canceled.headers.set(
+							"cookie",
+							started.headers
+								.getSetCookie()
+								.map((header) => header.split(";", 1)[0])
+								.join("; "),
+						);
+						const declined = await dispatch(
+							new Request(callback, { headers: canceled.headers }),
+						);
+						expect(declined.status).toBe(302);
+						expect(
+							new URL(declined.headers.get("location")!).searchParams.has(
+								"error",
+							),
+						).toBe(true);
+					}
 					const { rows } = await database.query(
 						`SELECT key,count,scope FROM ${scope}."allauthSecurityCounter"`,
 					);
@@ -693,7 +756,7 @@ describe.skipIf(!existsSync(fixturePath))(
 						database: nativeDatabase,
 						secret,
 						now: () => new Date(Date.now() + 2_000),
-						maxDeliveries: 10,
+						maxDeliveries: 20,
 						resolver: async () => [{ address: "93.184.216.34", family: 4 }],
 						async transport({ destination, body, headers }) {
 							expect(destination.url.href).toBe(recipient);
@@ -709,8 +772,13 @@ describe.skipIf(!existsSync(fixturePath))(
 							);
 							expect(body).not.toContain(submitted);
 							expect(body).not.toContain(assertion);
-							expect(body).not.toContain(state);
+							expect(body).not.toContain(relay);
+							for (const state of states) expect(body).not.toContain(state);
 							expect(body).not.toContain("192.0.2.88");
+							if (writer === "owned") {
+								expect(body).not.toContain(upstreamError);
+								expect(body).not.toContain(oidcUpstreamError);
+							}
 							const envelope = JSON.parse(body) as ControlWebhookEnvelope;
 							const { id, createdAt, ...event } = envelope.data.event;
 							expect(envelope).toEqual({
@@ -724,8 +792,8 @@ describe.skipIf(!existsSync(fixturePath))(
 						},
 					});
 					expect(delivered).toEqual({
-						claimed: failures + 1,
-						delivered: failures + 1,
+						claimed: failures * 2 + 1,
+						delivered: failures * 2 + 1,
 						retried: 0,
 						failed: 0,
 					});
@@ -734,7 +802,7 @@ describe.skipIf(!existsSync(fixturePath))(
 						JSON.stringify(left).localeCompare(JSON.stringify(right)),
 					);
 				}
-				const expected = await exercise(stock.handler);
+				const expected = await exercise(stock.handler, "native");
 				expect(expected).toEqual(
 					expect.arrayContaining(
 						callbacks.map(({ template }) => ({
@@ -746,8 +814,58 @@ describe.skipIf(!existsSync(fixturePath))(
 						})),
 					),
 				);
-				expect(await exercise(candidate.dispatch)).toEqual(expected);
-				expect(observedRequests).toEqual([discovery]);
+				const raw = expected.filter(
+					(event) =>
+						event.type === "auth.sign-in" &&
+						event.metadata.errorCode === upstreamError,
+				);
+				expect(raw).toEqual(
+					Array.from({ length: 2 }, () => ({
+						type: "auth.sign-in",
+						outcome: "failure",
+						ipAddress: ip,
+						userAgent,
+						metadata: { path: "/callback/:id", errorCode: upstreamError },
+					})),
+				);
+				expect(expected).toContainEqual({
+					type: "auth.sign-in",
+					outcome: "failure",
+					ipAddress: ip,
+					userAgent,
+					metadata: {
+						path: "/sso/callback/:providerId",
+						errorCode: oidcUpstreamError,
+					},
+				});
+				const standardized = expected
+					.map((event) =>
+						event.type === "auth.sign-in" &&
+						event.metadata.errorCode === upstreamError
+							? {
+									...event,
+									metadata: { ...event.metadata, errorCode: "invalid_code" },
+								}
+							: event.type === "auth.sign-in" &&
+									event.metadata.errorCode === oidcUpstreamError
+								? {
+										...event,
+										metadata: {
+											...event.metadata,
+											errorCode: "AUTHENTICATION_FAILED",
+										},
+									}
+								: event,
+					)
+					.sort((left, right) =>
+						JSON.stringify(left).localeCompare(JSON.stringify(right)),
+					);
+				expect(await exercise(candidate.dispatch, "owned")).toEqual(
+					standardized,
+				);
+				expect(new Set(observedRequests)).toEqual(
+					new Set([discovery, brokerDiscovery]),
+				);
 				for (const table of [
 					"allauthEvent",
 					"allauthWebhookDelivery",

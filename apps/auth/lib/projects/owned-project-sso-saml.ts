@@ -1,6 +1,7 @@
 import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
 import type { PoolClient } from "pg";
 import * as z from "zod";
+import { markOwnedCallbackFailure } from "./owned-project-callback-failure";
 import type { OwnedProjectSsoOptions } from "./owned-project-sso";
 import type { ProjectCustomSamlTransport } from "./owned-project-sso-saml-eligibility";
 import { configureProjectSamlTransport } from "./owned-project-sso-saml-eligibility";
@@ -174,12 +175,13 @@ export function createOwnedProjectSaml(options: {
 			returnURL(flow?.callbackURL, receiver) ||
 			new URL(options.defaultError.href);
 		destination.searchParams.set("error", code);
-		return finish(
+		const response = finish(
 			new Response(null, {
 				status: 302,
 				headers: { location: destination.href },
 			}),
 		);
+		return markOwnedCallbackFailure(response, code);
 	}
 
 	async function start(provider: SsoProvider, flow: StartFlow) {
@@ -367,9 +369,12 @@ export function createOwnedProjectSaml(options: {
 				throw new Error("This transport is not the registered SAML receiver.");
 			proof = await verifyOwnedSaml(form.response, selected.configured);
 		} catch {
-			return json(
-				{ code: "INVALID_SAML_RESPONSE", message: "Invalid SAML response." },
-				400,
+			return markOwnedCallbackFailure(
+				json(
+					{ code: "INVALID_SAML_RESPONSE", message: "Invalid SAML response." },
+					400,
+				),
+				"saml_error",
 			);
 		}
 		let flow: SsoState | undefined;

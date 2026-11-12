@@ -21,6 +21,7 @@ import { Pool } from "pg";
 import samlifyDefault, * as samlifyNamespace from "samlify";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { defaultAuthPolicy } from "../auth-policy/policy";
+import { allauthControl } from "../control";
 import { resolveEnterpriseUser } from "../enterprise";
 import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
 import { createOwnedProjectEngine } from "./owned-project-engine";
@@ -109,7 +110,7 @@ const scopedKey = (parts: string[]) =>
 	createHash("sha256").update(JSON.stringify(parts)).digest("base64url");
 type LegacyDatabase = Kysely<Record<string, Record<string, unknown>>>;
 
-async function nativeSso(db: LegacyDatabase) {
+async function nativeSso(db: LegacyDatabase, withAudit = false) {
 	return (
 		await getTestInstance(
 			{
@@ -124,6 +125,16 @@ async function nativeSso(db: LegacyDatabase) {
 					accountLinking: { enabled: true, trustedProviders: [] },
 				},
 				plugins: [
+					...(withAudit
+						? [
+								allauthControl({
+									database: db,
+									secret,
+									baseURL: origin,
+									ipHeader: "x-real-ip",
+								}),
+							]
+						: []),
 					{
 						id: "fixture-saml-directory",
 						schema: {
@@ -604,6 +615,95 @@ describe.skipIf(!existsSync(fixturePath))(
 				[JSON.stringify(value), providerId],
 			);
 		}
+
+		it("records the same redacted callback failure for a signed inactive-directory assertion", async () => {
+			if (!nativeDatabase)
+				throw new Error("Expected the scoped native database.");
+			const stock = await nativeSso(nativeDatabase, true);
+			const candidate = managementEngine();
+			const userAgent = "Synthetic inactive SAML directory fixture";
+			const ipAddress = "192.0.2.31";
+			const path = "/sso/saml2/sp/acs/:providerId";
+			await database.query(
+				`UPDATE "${schema}"."scimUser" SET active=FALSE WHERE id=$1`,
+				[source],
+			);
+			try {
+				async function exercise(
+					dispatch: (request: Request) => Promise<Response>,
+				) {
+					const countSessions = async () =>
+						(await database.query(`SELECT id FROM "${schema}"."session"`))
+							.rowCount;
+					const before = await countSessions();
+					const initial = await pending(await dispatch(startRequest()));
+					const proof = signedResponse(initial.requestId);
+					const incoming = callback(proof.encoded, initial.relay);
+					incoming.headers.set("x-real-ip", ipAddress);
+					incoming.headers.set("user-agent", userAgent);
+					const result = await dispatch(incoming);
+					expect(result.status).toBe(302);
+					expect(
+						new URL(result.headers.get("location")!).searchParams.has("error"),
+					).toBe(true);
+					expect(
+						result.headers
+							.getSetCookie()
+							.some((value) => value.includes("session_token=")),
+					).toBe(false);
+					expect(await countSessions()).toBe(before);
+					const rows = (
+						await database.query(
+							`SELECT type,outcome,"actorId","userId","targetId","ipAddress","userAgent",metadata
+						 FROM "${schema}"."allauthEvent" WHERE "userAgent"=$1 ORDER BY type`,
+							[userAgent],
+						)
+					).rows;
+					await database.query(
+						`DELETE FROM "${schema}"."allauthEvent" WHERE "userAgent"=$1`,
+						[userAgent],
+					);
+					for (const privateValue of [
+						subject,
+						decoyEmail,
+						initial.relay,
+						proof.encoded,
+						proof.assertionId,
+					])
+						expect(JSON.stringify(rows)).not.toContain(privateValue);
+					return rows;
+				}
+				const expected = await exercise(stock.handler);
+				expect(expected).toEqual([
+					{
+						type: "auth.sign-in",
+						outcome: "failure",
+						actorId: null,
+						userId: null,
+						targetId: null,
+						ipAddress,
+						userAgent,
+						metadata: { path, errorCode: "directory_identity_inactive" },
+					},
+					{
+						type: "security.sign-in-failed",
+						outcome: "failure",
+						actorId: null,
+						userId: null,
+						targetId: null,
+						ipAddress,
+						userAgent,
+						metadata: { path, method: ":providerId" },
+					},
+				]);
+				expect(await exercise(candidate.dispatch)).toEqual(expected);
+			} finally {
+				await database.query(
+					`UPDATE "${schema}"."scimUser" SET active=TRUE WHERE id=$1`,
+					[source],
+				);
+			}
+		});
 
 		it.each([
 			{

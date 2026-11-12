@@ -17,6 +17,10 @@ import {
 	linkedProviderProfile,
 	readLinkedOAuthToken,
 } from "./owned-project-account-info";
+import {
+	markOwnedCallbackFailure,
+	ownedCallbackFailureCode,
+} from "./owned-project-callback-failure";
 import type {
 	AuthorizeLinkedAccounts,
 	LinkedAccountGrant,
@@ -259,7 +263,12 @@ function navigation(response: Response, stateCookie: string) {
 	headers.append("set-cookie", stateCookie);
 	headers.set("cache-control", "no-store");
 	headers.set("referrer-policy", "no-referrer");
-	return new Response(response.body, { status: response.status, headers });
+	const result = new Response(response.body, {
+		status: response.status,
+		headers,
+	});
+	const failureCode = ownedCallbackFailureCode(response);
+	return failureCode ? markOwnedCallbackFailure(result, failureCode) : result;
 }
 
 function publicRedirect(url: string) {
@@ -466,10 +475,11 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 		target.searchParams.set("error", code);
 		if (description) target.searchParams.set("error_description", description);
 		const result = publicRedirect(target.href);
-		if (clearState) return navigation(result, expireState);
+		if (clearState)
+			return markOwnedCallbackFailure(navigation(result, expireState), code);
 		result.headers.set("cache-control", "no-store");
 		result.headers.set("referrer-policy", "no-referrer");
-		return result;
+		return markOwnedCallbackFailure(result, code);
 	}
 
 	async function redirectStart(

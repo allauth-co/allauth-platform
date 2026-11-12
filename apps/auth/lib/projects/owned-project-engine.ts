@@ -28,6 +28,7 @@ import {
 import { createOwnedProjectMfa } from "./owned-mfa";
 import { createOwnedMfaEnrollment } from "./owned-mfa-enrollment";
 import { createOwnedProjectPasskeyHttp } from "./owned-passkey-http";
+import { ownedCallbackFailureCode } from "./owned-project-callback-failure";
 import type { OwnedProjectAccountDeletionOptions } from "./owned-project-account-deletion";
 import { createOwnedProjectAccountDeletion } from "./owned-project-account-deletion";
 import type { ProjectAccountLinkOptions } from "./owned-project-account-links";
@@ -1181,9 +1182,11 @@ export function createOwnedProjectEngine(
 	) {
 		const response = await handle();
 		if (controlResponseFailure(response, response.headers).failed)
-			await store.transaction((client) =>
-				security.failed(client, request, endpoint),
-			);
+			await store.transaction(async (client) => {
+				await security.failed(client, request, endpoint);
+				const code = ownedCallbackFailureCode(response);
+				if (code) await recordPrimaryFailure(client, request, endpoint, code);
+			});
 		return response;
 	}
 
