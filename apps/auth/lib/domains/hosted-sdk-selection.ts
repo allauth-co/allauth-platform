@@ -4,7 +4,7 @@ import {
 	internalProjectEngineIdSetting,
 	internalProjectEngineSelected,
 } from "../projects/project-engine-internal-selection";
-import { internalProjectWriterLease } from "../projects/project-engine-internal-writer";
+import { protectedProjectWriterLease } from "../projects/project-engine-internal-writer";
 import type { Project } from "../projects/registry";
 import {
 	hostedSdkProjectEnabled,
@@ -30,6 +30,7 @@ export function hostedSdkTransportEnabled(env: AuthEnvironment, project: Project
 /** New pages follow the authoritative writer unless explicitly previewing the first-party UI. */
 export async function hostedSdkSelected(env: AuthEnvironment, project: Project) {
 	if (independentlyPreviewed(env, project)) return true;
-	const lease = internalProjectWriterLease(project, env);
+	if (!internalProjectEngineSelected(env, project)) return false;
+	const lease = protectedProjectWriterLease(project, env);
 	return (await lease?.read())?.writer === "allauth";
 }

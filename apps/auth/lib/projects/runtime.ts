@@ -72,7 +72,7 @@ import {
 	internalProjectPreparationRevision,
 	selectInternalProjectEngine,
 } from "./project-engine-internal-selection";
-import { internalProjectWriterLease } from "./project-engine-internal-writer";
+import { protectedProjectWriterLease } from "./project-engine-internal-writer";
 import { selectRehearsalProjectEngine } from "./project-engine-rehearsal-selection";
 import {
 	projectEngineWriterConnectionOptions,
@@ -537,7 +537,7 @@ async function withProjectEntry<T>(
 		(await selectRehearsalProjectEngine(project, env));
 	if (rehearsal)
 		return withConfiguredProjectEntry(project, env, publicOrigin, callback, rehearsal);
-	const lease = internalProjectWriterLease(project, env);
+	const lease = protectedProjectWriterLease(project, env);
 	if (!lease) return withConfiguredProjectEntry(project, env, publicOrigin, callback);
 	return lease.withCurrent(({ writer, revision }) => {
 		const candidate = writer === "allauth" ? selectInternalProjectEngine(project, env) : undefined;
@@ -726,14 +726,14 @@ export function withHostedProjectAuth<T>(
 	);
 }
 
-/** Check the active internal writer and prepare the initial candidate without dispatching a request. */
+/** Check the active internal writer and prepare a selected candidate without dispatching a request. */
 export function confirmInternalProjectEngine(
 	project: Project,
 	env: AuthEnvironment,
 	hostname?: string,
 ) {
 	const candidate = selectInternalProjectEngine(project, env);
-	const lease = internalProjectWriterLease(project, env);
+	const lease = protectedProjectWriterLease(project, env);
 	if (!candidate || !lease)
 		throw new Error("The internal project selection changed.");
 	const origin = hostname ? `https://${hostname}` : undefined;

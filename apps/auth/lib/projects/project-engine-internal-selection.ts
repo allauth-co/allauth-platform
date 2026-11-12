@@ -17,19 +17,19 @@ export function internalProjectPreparationRevision(env: AuthEnvironment) {
 	return Number(revision);
 }
 
-/** The first release cohort is a single immutable development realm in the protected platform workspace. */
-export function internalProjectEngineSelected(
-	env: AuthEnvironment,
-	project: Pick<Project, "id" | "environment" | "workspaceId" | "schemaName">,
-) {
-	const id = setting(env, internalProjectEngineIdSetting).trim();
-	return (
-		projectIdPattern.test(id) &&
-		project.id === id &&
+type ProjectBinding = Pick<Project, "id" | "environment" | "workspaceId" | "schemaName">;
+
+export function protectedInternalProject(project: ProjectBinding) {
+	return projectIdPattern.test(project.id) &&
 		project.environment === "development" &&
 		project.workspaceId === platformWorkspaceId &&
-		project.schemaName === `allauth_project_${id.replaceAll("-", "")}`
-	);
+		project.schemaName === `allauth_project_${project.id.replaceAll("-", "")}`;
+}
+
+/** The first release cohort is a single immutable development realm in the protected platform workspace. */
+export function internalProjectEngineSelected(env: AuthEnvironment, project: ProjectBinding) {
+	return setting(env, internalProjectEngineIdSetting).trim() === project.id &&
+		protectedInternalProject(project);
 }
 
 export function selectInternalProjectEngine(

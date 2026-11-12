@@ -46,7 +46,15 @@ export async function GET() {
 		);
 		if (migration.rows[0]?.checksum !== checksum)
 			throw new Error("Schema migration is pending or mismatched");
-		if (setting({}, internalProjectEngineIdSetting).trim()) {
+		const selected = setting({}, internalProjectEngineIdSetting).trim();
+		const unmatchedWriter = await pool.query(
+			`SELECT 1 FROM public."allauthProjectEngineWriter"
+			 WHERE writer='allauth' AND "projectId" IS DISTINCT FROM $1 LIMIT 1`,
+			[selected || null],
+		);
+		if (unmatchedWriter.rowCount)
+			throw new Error("An active internal project writer is missing from this deployment.");
+		if (selected) {
 			const { verifyInternalProjectEngineReadiness } = await import(
 				"@/lib/projects/project-engine-internal-readiness"
 			);

@@ -883,6 +883,14 @@ try {
 	await stop(restored);
 
 	if (internalSelection) {
+		if (!railway) {
+			await start(releaseImage, restored, {}, 503);
+			expectStatus(await request(`${direct}/get-session`, { realm: owned, cookie: ownedCookie }),
+				503, "A replica missing the active realm selection fails closed.");
+			expectStatus(await request(`${controlPath}/not-installed`, { realm: control }),
+				404, "A replica missing the active realm selection cannot cross into its sibling.");
+			await stop(restored);
+		}
 		await start(releaseImage, restored, internalEnvironment);
 		assert.deepEqual(await internalWriter("status"), { writer: "allauth", revision: 1 });
 		expectStatus(

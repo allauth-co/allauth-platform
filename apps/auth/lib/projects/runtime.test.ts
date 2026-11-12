@@ -177,6 +177,7 @@ describe("protected internal project writer selection", () => {
 			selected,
 		);
 		expect(hosted.status).toBe(202);
+		await expect(dispatch(internal, environment)).rejects.toThrow("The internal project writer is unavailable.");
 		for (const rejected of [
 			{ ...internal, workspaceId: project().workspaceId },
 			{ ...internal, environment: "production" as const },
@@ -184,7 +185,8 @@ describe("protected internal project writer selection", () => {
 			{ ...internal, id: "0953c4f5-a783-4e91-9055-a05ead278cd0" },
 		])
 			expect((await dispatch(rejected, selected)).status).toBe(204);
-		expect((await dispatch(internal, { ...selected, ALLAUTH_PROJECT_ENGINE_INTERNAL_ID: `${id},*` })).status).toBe(204);
+		await expect(dispatch(internal, { ...selected, ALLAUTH_PROJECT_ENGINE_INTERNAL_ID: `${id},*` }))
+			.rejects.toThrow("The internal project writer is unavailable.");
 		fixture.admitted = { writer: "legacy", revision: 2 };
 		expect((await dispatch(internal, selected)).status).toBe(204);
 		expect((await dispatch(internal, environment)).status).toBe(204);
