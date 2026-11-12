@@ -28,13 +28,18 @@ const deleted = { success: true, message: "User deleted" };
 const leasePrefix = "allauth-account-deletion:";
 
 type DeletePath = "/delete-user" | "/delete-user/callback";
+export interface AccountDeletionFence {
+	/** Check the rows used by external cleanup after locking the user for erasure. */
+	verify(client: PoolClient): Promise<boolean>;
+}
+
 export interface OwnedProjectAccountDeletionOptions
 	extends ProjectAccountLinkOptions {
 	/** Resolve the realm's existing avatar erasure and provider grant hooks before SQL deletion. */
 	beforeDelete(input: {
 		request: Request;
 		user: ProjectUser;
-	}): Promise<void | Response>;
+	}): Promise<void | Response | AccountDeletionFence>;
 	/** Revoke this realm's live sessions/grants and return the browser cookie-clearing headers. */
 	revokeSessions(
 		client: PoolClient,
@@ -159,9 +164,9 @@ export function createOwnedProjectAccountDeletion(
 		try {
 			// Avatar cleanup takes its own realm-scoped user lock. External grant
 			// revocation and asset erasure must complete before the account disappears.
-			let blocked: Response | void;
+			let cleanup: Response | AccountDeletionFence | void;
 			try {
-				blocked = await options.beforeDelete({ request, user: claim.user });
+				cleanup = await options.beforeDelete({ request, user: claim.user });
 			} catch {
 				return accountLinkError(
 					503,
@@ -169,11 +174,12 @@ export function createOwnedProjectAccountDeletion(
 					"Account deletion is temporarily unavailable.",
 				);
 			}
-			if (blocked)
-				return new Response(blocked.body, {
-					status: blocked.status,
-					headers: accountLinkHeaders(new Headers(blocked.headers)),
+			if (cleanup instanceof Response)
+				return new Response(cleanup.body, {
+					status: cleanup.status,
+					headers: accountLinkHeaders(new Headers(cleanup.headers)),
 				});
+			const fence = cleanup;
 			const result = await store.transaction(async (client) => {
 				const current = await lockAuthority(client, request);
 				if (
@@ -187,6 +193,12 @@ export function createOwnedProjectAccountDeletion(
 					[claim.key, lease],
 				);
 				if (reserved.rowCount !== 1) return invalid();
+				if (fence && !(await fence.verify(client)))
+					return accountLinkError(
+						503,
+						"ACCOUNT_DELETION_UNAVAILABLE",
+						"The linked account changed during deletion. Retry account deletion.",
+					);
 				const userId = current.user.id;
 				const headers = await options.revokeSessions(
 					client,

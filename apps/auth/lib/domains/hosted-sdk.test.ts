@@ -202,6 +202,73 @@ describe("hosted SDK transport", () => {
 		expect(await dispatched.text()).toBe("{}");
 	});
 
+	it("uses the native sign-out POST and returns only the verified realm's cookie expiry", async () => {
+		const { auth } = await getTestInstance(
+			{
+				baseURL: origin,
+				emailAndPassword: { enabled: true },
+				advanced: { cookiePrefix: `allauth_project_${slug}` },
+			},
+			{ disableTestUser: true },
+		);
+		const signUp = await auth.api.signUpEmail({
+			body: {
+				email: "sign-out-fixture@example.com",
+				name: "Sign-out fixture",
+				password: "fixture-password-99",
+			},
+			asResponse: true,
+		});
+		expect(signUp.status).toBe(200);
+		const cookie = signUp.headers
+			.getSetCookie()
+			.map((value) => value.split(";", 1)[0])
+			.join("; ");
+		expect(
+			await auth.api.getSession({ headers: new Headers({ cookie }) }),
+		).not.toBeNull();
+		verifiedFixture();
+		gateway.dispatch.mockImplementation((incoming: Request) =>
+			auth.handler(incoming),
+		);
+		expect((await GET(request("sign-out"))).status).toBe(404);
+		expect(
+			(
+				await POST(
+					request("sign-out", "POST", { origin: "https://other.example" }),
+				)
+			).status,
+		).toBe(403);
+		expect(gateway.dispatch).not.toHaveBeenCalled();
+
+		const template = request("sign-out", "POST", { origin, body: {} });
+		const headers = new Headers(template.headers);
+		headers.set("cookie", cookie);
+		const response = await POST(new Request(template, { headers }));
+		expect(response.status).toBe(200);
+		expect(await response.json()).toEqual({ success: true });
+		const expired = response.headers.getSetCookie();
+		expect(expired).toEqual(
+			expect.arrayContaining([
+				expect.stringContaining(`allauth_project_${slug}.session_token=;`),
+			]),
+		);
+		expect(
+			expired.every(
+				(value) =>
+					value
+						.replace(/^__Secure-/, "")
+						.startsWith(`allauth_project_${slug}.`) &&
+					value.includes("Max-Age=0"),
+			),
+		).toBe(true);
+		expect(
+			await auth.api.getSession({ headers: new Headers({ cookie }) }),
+		).toBeNull();
+		const dispatched: Request = gateway.dispatch.mock.calls[0]?.[0];
+		expect(dispatched.url).toBe(`${origin}/api/auth/sign-out`);
+	});
+
 	it("normalizes a native hosted MFA redirect with a scoped pending cookie", async () => {
 		const headers = new Headers({
 			location: `${origin}/two-factor?callbackUrl=%2Faccount`,

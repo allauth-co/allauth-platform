@@ -8,6 +8,7 @@ import type { AuthPolicy } from "../auth-policy/policy";
 import { authPolicySchema } from "../auth-policy/policy";
 import type { ApplicationBranding } from "../branding/types";
 import { clerkCompatiblePasswords } from "../clerk-password";
+import { isPlatformAdmin } from "../configuration";
 import { discoveryHeaders } from "../discovery";
 import { isServerTokenRequest } from "../features/helpers";
 import { applicationMfaCallback } from "../mfa-continuation";
@@ -57,6 +58,7 @@ import type { OwnedProjectOrganizationOptions } from "./owned-project-organizati
 import { createOwnedProjectOrganizationHttp } from "./owned-project-organization";
 import type { OwnedProjectPasswordChangeOptions } from "./owned-project-password-change";
 import { createOwnedProjectPasswordChange } from "./owned-project-password-change";
+import { createOwnedProjectPersonalKeys } from "./owned-project-personal-keys";
 import { createOwnedProjectProfile } from "./owned-project-profile";
 import {
 	createOwnedProjectSCIMDiscovery,
@@ -1244,7 +1246,7 @@ export function createOwnedProjectEngine(
 		return json({ status: true }, 200, headers);
 	}
 
-	function bulkSessionBearer(headers: Headers) {
+	function serverSessionBearer(headers: Headers) {
 		if (
 			!isServerTokenRequest(headers) ||
 			headers.has("allauth-proxy-signature")
@@ -1264,7 +1266,7 @@ export function createOwnedProjectEngine(
 		}
 	}
 
-	function bulkSessionOrigin(request: Request) {
+	function sessionMutationOrigin(request: Request) {
 		const { headers } = request;
 		const from = headers.get("origin");
 		const site = headers.get("sec-fetch-site");
@@ -1286,6 +1288,43 @@ export function createOwnedProjectEngine(
 			: failure(403, "INVALID_ORIGIN", "Invalid origin");
 	}
 
+	async function renewAuthorizedSession(
+		request: Request,
+		current: NonNullable<Awaited<ReturnType<typeof eligibleSession>>>,
+		client: PoolClient,
+		headers: Headers,
+	) {
+		const token = current.token;
+		if (
+			current.refreshDue &&
+			!new URL(request.url).searchParams.get("disableRefresh") &&
+			!tokenFrom(request.headers, rememberCookie) &&
+			(await store.refresh(
+				token,
+				policy.sessionExpiresInSeconds,
+				updateAge,
+				client,
+			))
+		) {
+			writeCookie(
+				headers,
+				sessionCookie,
+				token,
+				policy.sessionExpiresInSeconds,
+			);
+			if (isServerTokenRequest(request.headers)) {
+				const value = headers
+					.getSetCookie()[0]
+					?.split(";", 1)[0]
+					?.slice(sessionCookie.length + 1);
+				if (value) {
+					headers.set("set-auth-token", value);
+					headers.set("access-control-expose-headers", "set-auth-token");
+				}
+			}
+		}
+	}
+
 	async function revokeBrowserSessions(
 		request: Request,
 		path: "/revoke-other-sessions" | "/revoke-sessions",
@@ -1297,11 +1336,11 @@ export function createOwnedProjectEngine(
 			}),
 		);
 		if (limited) return limited;
-		const originFailure = bulkSessionOrigin(request);
+		const originFailure = sessionMutationOrigin(request);
 		if (originFailure) return originFailure;
 
 		const token =
-			bulkSessionBearer(request.headers) ?? tokenFrom(request.headers);
+			serverSessionBearer(request.headers) ?? tokenFrom(request.headers);
 		const headers = new Headers();
 		const unauthorized = () =>
 			failure(401, "UNAUTHORIZED", "Unauthorized", headers);
@@ -1321,34 +1360,7 @@ export function createOwnedProjectEngine(
 			const current = await eligibleSession(token, client);
 			if (!current || current.user.id !== user.id) return unauthorized();
 
-			if (
-				current.refreshDue &&
-				!new URL(request.url).searchParams.get("disableRefresh") &&
-				!tokenFrom(request.headers, rememberCookie) &&
-				(await store.refresh(
-					token,
-					policy.sessionExpiresInSeconds,
-					updateAge,
-					client,
-				))
-			) {
-				writeCookie(
-					headers,
-					sessionCookie,
-					token,
-					policy.sessionExpiresInSeconds,
-				);
-				if (isServerTokenRequest(request.headers)) {
-					const value = headers
-						.getSetCookie()[0]
-						?.split(";", 1)[0]
-						?.slice(sessionCookie.length + 1);
-					if (value) {
-						headers.set("set-auth-token", value);
-						headers.set("access-control-expose-headers", "set-auth-token");
-					}
-				}
-			}
+			await renewAuthorizedSession(request, current, client, headers);
 			const removed = await store.revoke(
 				{
 					userId: user.id,
@@ -1894,6 +1906,41 @@ export function createOwnedProjectEngine(
 				return removed.ids.length > 0;
 			},
 		});
+	const personalKeys = createOwnedProjectPersonalKeys({
+		database: options.database,
+		schemaName: options.project.schemaName,
+		readBody: requestBody,
+		trustedIP: options.trustedIP,
+		async authorize(request, client) {
+			if (request.method === "POST") {
+				const originFailure = sessionMutationOrigin(request);
+				if (originFailure) return originFailure;
+			} else if (request.headers.get("sec-fetch-site") === "cross-site") {
+				return forbidden();
+			}
+			const token =
+				serverSessionBearer(request.headers) ?? tokenFrom(request.headers);
+			const observed = await eligibleSession(token, client);
+			if (!observed) return null;
+			const userId = observed.user.id;
+			if (
+				request.method === "POST" &&
+				(!(await store.lockUser(client, userId)) ||
+					!(await store.lockSession(client, observed.token, userId, false)))
+			)
+				return null;
+			const current = await eligibleSession(observed.token, client);
+			if (!current || current.user.id !== userId) return null;
+			const headers = new Headers();
+			await renewAuthorizedSession(request, current, client, headers);
+			return {
+				userId,
+				headers,
+				platformAdmin: isPlatformAdmin(current.user, current.session),
+			};
+		},
+	});
+
 	const organization = createOwnedProjectOrganizationHttp({
 		database: options.database,
 		project: options.project,
@@ -1981,6 +2028,11 @@ export function createOwnedProjectEngine(
 					),
 				readBody: (verified) => requestBody(verified, 2048),
 			});
+		if (path.startsWith("/api-key/"))
+			return (
+				(await personalKeys(path, request)) ??
+				new Response(null, { status: 404 })
+			);
 		const directoryResponse = await directory?.dispatch(path, request);
 		if (directoryResponse) return directoryResponse;
 		if (path === "/sdk/config" && request.method === "GET") {

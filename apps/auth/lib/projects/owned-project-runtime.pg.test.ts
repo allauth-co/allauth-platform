@@ -12,10 +12,16 @@ import { clerkCompatiblePasswords } from "../clerk-password";
 import { defaultSecurityPolicy } from "../control/security-policy";
 import type { ControlPrincipal } from "../control/types";
 import { signEdgeRequest } from "../domains/edge";
+import { googleProviderRepository } from "../project-providers/repository";
 import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
 import { createWorkspace } from "../workspaces/repository";
 import { signProjectIssuerQuery } from "./owned-project-issuer-authorization-query";
 import type { ProjectRuntimeFixtureBoot } from "./owned-project-runtime-fixture";
+import {
+	runtimeFixtureGoogle,
+	runtimeFixtureMicrosoft,
+	runtimeProviderFixtureCode,
+} from "./owned-project-runtime-provider-fixture";
 import type { Project } from "./registry";
 import { projectRegistryPool, provisionProject } from "./registry";
 import { projectSecret } from "./runtime";
@@ -44,7 +50,8 @@ const credentials = {
 	updated: "Fixture-rotated-password-73!",
 };
 
-function childEnvironment(): NodeJS.ProcessEnv {
+function childEnvironment(microsoftProject?: string): NodeJS.ProcessEnv {
+	const { clientId, clientSecret, tenantId } = runtimeFixtureMicrosoft;
 	return {
 		PATH: process.env.PATH,
 		NODE_ENV: "test",
@@ -60,6 +67,13 @@ function childEnvironment(): NodeJS.ProcessEnv {
 		ALLAUTH_EDGE_SECRET: edgeSecret,
 		CLOUDFLARE_SAAS_READY: "true",
 		ALLAUTH_HOSTING_BASE_DOMAIN: "allauth.co",
+		...(microsoftProject
+			? {
+					ALLAUTH_PROJECT_MICROSOFT_PROVIDERS: JSON.stringify({
+						[microsoftProject]: { clientId, clientSecret, tenantId },
+					}),
+				}
+			: {}),
 	};
 }
 
@@ -75,10 +89,11 @@ async function openProcess(
 	databaseURL: string,
 	project: Project,
 	owned: boolean,
+	microsoftProject = project.slug,
 ) {
 	const child = fork(worker, [], {
 		cwd: appRoot,
-		env: childEnvironment(),
+		env: childEnvironment(microsoftProject),
 		execArgv: ["--import", "tsx"],
 		stdio: ["ignore", "ignore", "pipe", "ipc"],
 	});
@@ -225,6 +240,60 @@ async function fixtureVerificationMail(
 	});
 }
 
+async function startFixtureProvider(
+	service: Awaited<ReturnType<typeof openProcess>>,
+	provider: "google" | "microsoft",
+	transport: {
+		prefix: string;
+		callback: string;
+		destination: string;
+		host?: string;
+		clientIP?: string;
+	},
+) {
+	const started = await service.request(`${transport.prefix}/sign-in/social`, {
+		host: transport.host,
+		clientIP: transport.clientIP,
+		body: {
+			provider,
+			callbackURL: transport.destination,
+			disableRedirect: true,
+		},
+	});
+	expect(
+		started.status,
+		started.ok ? undefined : await started.clone().text(),
+	).toBe(200);
+	const authorization = await fixtureRedirect(started);
+	const config =
+		provider === "google" ? runtimeFixtureGoogle : runtimeFixtureMicrosoft;
+	expect(authorization.origin).toBe(
+		provider === "google"
+			? "https://accounts.google.com"
+			: "https://login.microsoftonline.com",
+	);
+	expect(authorization.searchParams.get("client_id")).toBe(config.clientId);
+	expect(authorization.searchParams.get("redirect_uri")).toBe(
+		transport.callback,
+	);
+	if (provider === "microsoft") {
+		expect(authorization.pathname).toBe(
+			`/${runtimeFixtureMicrosoft.tenantId}/oauth2/v2.0/authorize`,
+		);
+		expect(authorization.searchParams.get("nonce")).toBeTruthy();
+	}
+	const state = authorization.searchParams.get("state");
+	expect(state).toBeTruthy();
+	const query = new URLSearchParams({
+		state: state!,
+		code: runtimeProviderFixtureCode(authorization),
+	});
+	return {
+		path: `${transport.prefix}/callback/${provider}?${query}`,
+		cookie: cookie(started),
+	};
+}
+
 async function issueFixtureTokens(
 	service: Awaited<ReturnType<typeof openProcess>>,
 	transport: { prefix: string; issuer: string; host?: string; cookie: string },
@@ -349,10 +418,21 @@ async function seed(databaseURL: string) {
 			);
 			return project;
 		}
-		return {
-			alpha: await provision("runtime-owned-fixture"),
-			beta: await provision("runtime-control-fixture"),
-		};
+		const alpha = await provision("runtime-owned-fixture");
+		const beta = await provision("runtime-control-fixture");
+		await googleProviderRepository(database, env).update(
+			alpha,
+			{
+				version: 0,
+				google: {
+					enabled: true,
+					clientId: runtimeFixtureGoogle.clientId,
+					clientSecret: runtimeFixtureGoogle.clientSecret,
+				},
+			},
+			owner.user.id,
+		);
+		return { alpha, beta };
 	} finally {
 		cwd.mockRestore();
 		await database.end();
@@ -390,6 +470,16 @@ describe.skipIf(!existsSync(fixture))(
 				const alphaHost = `${alpha.slug}-accounts.allauth.co`;
 				const directIssuer = `${platformOrigin}${alphaPath}`;
 				const hostedIssuer = `https://${alphaHost}/api/auth`;
+				const hostedProvider = {
+					prefix: "/api/auth",
+					host: alphaHost,
+					destination: `https://${alphaHost}/account`,
+					clientIP: "192.0.2.57",
+				};
+				const directProvider = {
+					prefix: alphaPath,
+					destination: `${alpha.primaryOrigin}/account`,
+				};
 				const betaHost = `${beta.slug}-accounts.allauth.co`;
 				const login = {
 					email: credentials.project.email,
@@ -419,6 +509,10 @@ describe.skipIf(!existsSync(fixture))(
 				});
 				expect(hostedLogin.status).toBe(200);
 				const legacyHostedCookie = cookie(hostedLogin);
+				const nativeGoogle = await startFixtureProvider(service, "google", {
+					...hostedProvider,
+					callback: `${hostedIssuer}/callback/google`,
+				});
 				const legacyContinuation = await fixtureRedirect(
 					await service.request(
 						`/api/auth/oauth2/authorize?${fixtureAuthorizationQuery()}`,
@@ -442,6 +536,44 @@ describe.skipIf(!existsSync(fixture))(
 
 				service = await openProcess(url(restored), alpha, true);
 				expect((await service.request("/api/health")).status).toBe(200);
+				const switchedGoogle = await service.request(nativeGoogle.path, {
+					host: alphaHost,
+					cookie: nativeGoogle.cookie,
+					clientIP: "192.0.2.57",
+				});
+				expect(switchedGoogle.headers.get("location")).toBe(
+					hostedProvider.destination,
+				);
+				const googleSession = await service.request("/api/auth/get-session", {
+					host: alphaHost,
+					cookie: cookie(switchedGoogle),
+				});
+				expect(await googleSession.json()).toMatchObject({
+					user: { email: runtimeFixtureGoogle.email, emailVerified: true },
+				});
+				await startFixtureProvider(service, "google", {
+					...directProvider,
+					callback: `${alpha.primaryOrigin}/api/allauth/callback/google`,
+				});
+				await startFixtureProvider(service, "microsoft", {
+					...hostedProvider,
+					clientIP: "192.0.2.58",
+					callback: `${hostedIssuer}/callback/microsoft`,
+				});
+				const ownedMicrosoft = await startFixtureProvider(
+					service,
+					"microsoft",
+					{
+						...directProvider,
+						callback: `${alpha.primaryOrigin}/api/allauth/callback/microsoft`,
+					},
+				);
+				expect(
+					await (await service.request(`${alphaPath}/sdk/config`)).json(),
+				).toMatchObject({
+					googleProvider: "google",
+					microsoftProvider: "microsoft",
+				});
 				const directDiscovery = await service.request(
 					`${alphaPath}/.well-known/openid-configuration`,
 				);
@@ -546,6 +678,8 @@ describe.skipIf(!existsSync(fixture))(
 					enterpriseSSO: false,
 					scim: false,
 					signUpEnabled: true,
+					googleProvider: "google",
+					microsoftProvider: "microsoft",
 				});
 				const legacyConfig = await service.request("/api/config", {
 					host: betaHost,
@@ -555,6 +689,8 @@ describe.skipIf(!existsSync(fixture))(
 					apiKeys: true,
 					enterpriseSSO: true,
 					scim: true,
+					google: false,
+					microsoft: false,
 				});
 				expect(
 					(await service.request("/oauth/login", { host: alphaHost })).status,
@@ -781,6 +917,27 @@ describe.skipIf(!existsSync(fixture))(
 
 				service = await openProcess(url(restored), alpha, false);
 				expect((await service.request("/api/health")).status).toBe(200);
+				const rolledBackMicrosoft = await service.request(ownedMicrosoft.path, {
+					cookie: ownedMicrosoft.cookie,
+				});
+				expect(rolledBackMicrosoft.headers.get("location")).toBe(
+					directProvider.destination,
+				);
+				const microsoftSession = await service.request(
+					`${alphaPath}/get-session`,
+					{ cookie: cookie(rolledBackMicrosoft) },
+				);
+				expect(await microsoftSession.json()).toMatchObject({
+					user: { email: runtimeFixtureMicrosoft.email, emailVerified: false },
+				});
+				expect(
+					await (
+						await service.request("/api/auth/get-session", {
+							host: alphaHost,
+							cookie: cookie(switchedGoogle),
+						})
+					).json(),
+				).toMatchObject({ user: { email: runtimeFixtureGoogle.email } });
 				expect(
 					await (
 						await service.request(`${alphaPath}/get-session`, {
@@ -831,8 +988,28 @@ describe.skipIf(!existsSync(fixture))(
 				});
 				await service.stop();
 				service = undefined;
+				await expect(
+					openProcess(url(restored), alpha, true, beta.slug),
+				).rejects.toThrow("stored features outside the candidate scope");
 				const changed = new Pool({ connectionString: url(restored), max: 1 });
 				try {
+					const stored = await changed.query(
+						`SELECT "providerId", "accountId" FROM "${alpha.schemaName}"."account" WHERE "providerId" IN ('google','microsoft') ORDER BY "providerId"`,
+					);
+					expect(stored.rows).toEqual([
+						{ providerId: "google", accountId: runtimeFixtureGoogle.subject },
+						{
+							providerId: "microsoft",
+							accountId: runtimeFixtureMicrosoft.subject,
+						},
+					]);
+					expect(
+						(
+							await changed.query(
+								`SELECT 1 FROM "${beta.schemaName}"."account" WHERE "providerId" IN ('google','microsoft')`,
+							)
+						).rowCount,
+					).toBe(0);
 					await changed.query(
 						`UPDATE "${alpha.schemaName}"."oauthClient" SET "grantTypes" = '["client_credentials"]' WHERE "clientId" = $1`,
 						[oauthClientId],

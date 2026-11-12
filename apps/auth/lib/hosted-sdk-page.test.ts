@@ -2,17 +2,25 @@ import { beforeEach, expect, it, vi } from "vitest";
 import { AllAuthAuth } from "@/components/better-auth-ui/allauth-auth";
 import { HostedProjectAuth } from "@/components/hosted-project-auth";
 import { HostedProjectAuthPage } from "@/components/hosted-project-auth-page";
+import type { HostedProjectAuthPageProps } from "@/components/hosted-project-auth-page";
 import { portalHeader } from "./domains/edge";
 
 const runtime = vi.hoisted(() => ({
 	headers: vi.fn(),
 	getAuthEnvironment: vi.fn(),
 	withPortalHeadersEngine: vi.fn(),
+	portalSession: vi.fn(),
 }));
 vi.mock("next/headers", () => ({ headers: runtime.headers }));
+vi.mock("next/navigation", () => ({
+	redirect: (path: string) => {
+		throw new Error(`redirect:${path}`);
+	},
+}));
 vi.mock("./auth", () => ({ getAuthEnvironment: runtime.getAuthEnvironment }));
 vi.mock("./domains/hosting", () => ({
 	withPortalHeadersEngine: runtime.withPortalHeadersEngine,
+	portalSession: runtime.portalSession,
 }));
 vi.mock("@/components/hosted-project-auth", () => ({
 	HostedProjectAuth: () => null,
@@ -46,6 +54,98 @@ beforeEach(() => {
 		.mockReset()
 		.mockResolvedValue({ ALLAUTH_PROJECT_HOSTED_UI_PROJECT_IDS: project.id });
 	runtime.withPortalHeadersEngine.mockReset();
+	runtime.portalSession.mockReset();
+});
+
+it("preserves exact sign-out destinations, verifies a direct OAuth query, and defaults to native UI", async () => {
+	const read = (searchParams: HostedProjectAuthPageProps["searchParams"]) =>
+		HostedProjectAuthPage({ view: "signOut", searchParams });
+	const platform = await read(Promise.resolve({}));
+	expect(platform.type).toBe(AllAuthAuth);
+	expect(platform.props).toEqual({ path: "sign-out" });
+	expect(runtime.withPortalHeadersEngine).not.toHaveBeenCalled();
+
+	runtime.headers.mockResolvedValue(
+		new Headers({ [portalHeader]: "fixture-proof" }),
+	);
+	const engine = engineConfiguration({ emailPassword: true });
+	runtime.withPortalHeadersEngine.mockImplementation(async (_headers, select) =>
+		select(engine, new Headers(), {
+			kind: "accounts",
+			project,
+			hostname: accountsHostname,
+		}),
+	);
+	const direct = await read(Promise.resolve({}));
+	expect(direct.type).toBe(HostedProjectAuth);
+	expect(direct.props).toMatchObject({
+		view: "signOut",
+		destination: "/sign-in",
+	});
+	const callback = "/account/security?state=one%2Btwo#sessions";
+	const local = await read(Promise.resolve({ callbackUrl: callback }));
+	expect(local.props).toMatchObject({
+		destination: `/sign-in?${new URLSearchParams({ callbackUrl: callback })}`,
+	});
+	expect(
+		(await read(Promise.resolve({ callbackUrl: "//other.example/account" })))
+			.type,
+	).toBe(AllAuthAuth);
+	const signed = {
+		client_id: "fixture",
+		resource: ["one", "two"],
+		sig: "fixture",
+	};
+	const query = "client_id=fixture&resource=one&resource=two&sig=fixture";
+	engine.readOAuthContext.mockResolvedValueOnce(
+		Response.json({ continueURL: `/oauth2/continue?${query}` }),
+	);
+	const oauth = await read(Promise.resolve(signed));
+	expect(oauth.type).toBe(HostedProjectAuth);
+	expect(oauth.props).toMatchObject({ destination: `/sign-in?${query}` });
+	expect(engine.readOAuthContext.mock.calls[0]?.[0].url).toBe(
+		`https://${accountsHostname}/api/oauth/context?${query}`,
+	);
+	expect((await read(Promise.resolve(signed))).type).toBe(AllAuthAuth);
+});
+
+it("ports query-free result and redirect views while retaining the parameterized native pages", async () => {
+	runtime.headers.mockResolvedValue(
+		new Headers({ [portalHeader]: "fixture-proof" }),
+	);
+	runtime.withPortalHeadersEngine.mockImplementation(async (_headers, select) =>
+		select(engineConfiguration({ emailPassword: true }), new Headers(), {
+			kind: "accounts",
+			project,
+			hostname: accountsHostname,
+		}),
+	);
+	const bare = await HostedProjectAuthPage({
+		view: "authCallback",
+		searchParams: Promise.resolve({}),
+	});
+	expect(bare.type).toBe(HostedProjectAuth);
+	expect(bare.props).toMatchObject({ view: "authCallback" });
+	for (const [view, query] of [
+		["authCallback", { result: "email_verified" }],
+		["authRedirect", { redirectTo: "/account/security" }],
+	] as const) {
+		const fallback = await HostedProjectAuthPage({
+			view,
+			searchParams: Promise.resolve(query),
+		});
+		expect(fallback.type).toBe(AllAuthAuth);
+	}
+	expect(runtime.portalSession).not.toHaveBeenCalled();
+	const redirect = () =>
+		HostedProjectAuthPage({
+			view: "authRedirect",
+			searchParams: Promise.resolve({}),
+		});
+	runtime.portalSession.mockResolvedValueOnce(null);
+	await expect(redirect()).rejects.toThrow("redirect:/sign-in");
+	runtime.portalSession.mockResolvedValueOnce({ user: { id: "fixture" } });
+	await expect(redirect()).rejects.toThrow("redirect:/");
 });
 
 it("uses the standard page for an unverified account hostname without looking up project configuration", async () => {

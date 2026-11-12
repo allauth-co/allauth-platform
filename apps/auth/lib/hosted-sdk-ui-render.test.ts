@@ -1,7 +1,7 @@
 // @vitest-environment happy-dom
 // @vitest-environment-options {"url":"https://accounts.customer.example"}
 
-import { act, createElement } from "react";
+import { act, createElement, StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { afterEach, expect, it, vi } from "vitest";
 import { HostedProjectAuth } from "@/components/hosted-project-auth";
@@ -9,6 +9,7 @@ import type { HostedSdkForm } from "./domains/hosted-sdk-policy";
 
 const native = vi.hoisted(() => ({
 	social: vi.fn(),
+	signOut: vi.fn(),
 	sendVerificationEmail: vi.fn(),
 	onChallenge: undefined as ((methods?: string[]) => void) | undefined,
 }));
@@ -20,6 +21,7 @@ vi.mock("@/sdk/client", () => ({
 		native.onChallenge = onChallenge;
 		return {
 			signIn: { social: native.social },
+			signOut: native.signOut,
 			sendVerificationEmail: native.sendVerificationEmail,
 		};
 	},
@@ -39,8 +41,46 @@ afterEach(async () => {
 	vi.useRealTimers();
 	window.sessionStorage.clear();
 	native.social.mockReset();
+	native.signOut.mockReset();
 	native.sendVerificationEmail.mockReset();
 	native.onChallenge = undefined;
+});
+
+it.each([
+	"success",
+	"error",
+] as const)("replaces the sign-out view with sign-in after one %s in Strict Mode", async (outcome) => {
+	vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+	vi.stubGlobal(
+		"fetch",
+		vi.fn(async () =>
+			Response.json({
+				emailPassword: true,
+				google: false,
+				organizations: true,
+				twoFactor: true,
+			}),
+		),
+	);
+	const replace = vi
+		.spyOn(window.location, "replace")
+		.mockImplementation(() => {});
+	const completion = Promise.withResolvers<unknown>();
+	native.signOut.mockReturnValue(completion.promise);
+	const next = "/sign-in?callbackUrl=%2Faccount%2Fsecurity";
+	const container = await renderHostedAuth("signOut", next, true);
+	expect(container.querySelector('[role="status"]')?.textContent).toBe(
+		"Signing out…",
+	);
+	expect(container.querySelector("button")).toBeNull();
+	expect(native.signOut).toHaveBeenCalledTimes(1);
+	expect(replace).not.toHaveBeenCalled();
+	await act(async () => {
+		if (outcome === "success")
+			completion.resolve({ data: { success: true }, error: null });
+		else completion.reject(new Error("Fixture network error"));
+	});
+	expect(replace).toHaveBeenCalledExactlyOnceWith(next);
 });
 
 it("resends verification to the remembered email after the cooldown and honors server admission", async () => {
@@ -160,7 +200,11 @@ it("offers configuration retry without exposing a resend action for missing capa
 	expect(native.sendVerificationEmail).not.toHaveBeenCalled();
 });
 
-async function renderHostedAuth(view: HostedSdkForm) {
+async function renderHostedAuth(
+	view: HostedSdkForm,
+	next = destination,
+	strict = false,
+) {
 	const container = document.createElement("div");
 	document.body.appendChild(container);
 	const root = createRoot(container);
@@ -168,23 +212,22 @@ async function renderHostedAuth(view: HostedSdkForm) {
 		await act(async () => root.unmount());
 		container.remove();
 	};
+	const auth = createElement(HostedProjectAuth, {
+		view,
+		basePath,
+		destination: next,
+		legacyPath:
+			view === "signUp"
+				? legacyPath.replace("/sign-in", "/sign-up")
+				: legacyPath,
+		showRecovery: true,
+		showBroker: true,
+		showPassword: true,
+		showEmail: true,
+		showSso: true,
+	});
 	await act(async () =>
-		root.render(
-			createElement(HostedProjectAuth, {
-				view,
-				basePath,
-				destination,
-				legacyPath:
-					view === "signUp"
-						? legacyPath.replace("/sign-in", "/sign-up")
-						: legacyPath,
-				showRecovery: true,
-				showBroker: true,
-				showPassword: true,
-				showEmail: true,
-				showSso: true,
-			}),
-		),
+		root.render(strict ? createElement(StrictMode, null, auth) : auth),
 	);
 	return container;
 }

@@ -1,6 +1,14 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
+import { symmetricEncrypt } from "better-auth/crypto";
 import { getTestInstance } from "better-auth/test";
+import {
+	exportJWK,
+	exportPKCS8,
+	generateKeyPair,
+	jwtVerify,
+	SignJWT,
+} from "jose";
 import { Kysely, PostgresDialect } from "kysely";
 import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -9,6 +17,7 @@ import { clerkCompatiblePasswords } from "../clerk-password";
 import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
 import type { OwnedProjectAccountDeletionOptions } from "./owned-project-account-deletion";
 import type { ProjectAccountLinkOptions } from "./owned-project-account-links";
+import { createOwnedProjectAppleDeletion } from "./owned-project-apple-deletion";
 import { createOwnedProjectEngine } from "./owned-project-engine";
 
 const fixturePath = new URL(
@@ -532,6 +541,128 @@ describe.skipIf(!existsSync(fixturePath))(
 					)
 				).rowCount,
 			).toBe(0);
+			expect(await session(decoy.cookie)).toMatchObject({
+				user: { id: decoy.id },
+			});
+		});
+
+		it("revokes a legacy Apple grant and keeps the account when a callback rotates it during deletion", async () => {
+			const account = await user("native-apple-delete");
+			const decoy = await user("separate-apple-account");
+			const ownerKey = await generateKeyPair("ES256", { extractable: true });
+			const providerKey = await generateKeyPair("RS256", { extractable: true });
+			const configured = {
+				clientId: "com.fixture.web",
+				appBundleIdentifier: "com.fixture.native",
+				teamId: "TEAM123456",
+				keyId: "KEY1234567",
+				privateKey: await exportPKCS8(ownerKey.privateKey),
+			};
+			const nativeContext = await native.$context;
+			const encryptGrant = (data: string) =>
+				symmetricEncrypt({ key: nativeContext.secretConfig, data });
+			const issuer = "https://appleid.apple.com";
+			const issued = Math.floor(Date.now() / 1000) - 86_400;
+			const oldRefresh = "fixture-original-apple-grant";
+			const newRefresh = "fixture-replacement-apple-grant";
+			async function save(userId: string, subject: string) {
+				const idToken = await new SignJWT({})
+					.setProtectedHeader({
+						alg: "RS256",
+						kid: "fixture-apple-signing-key",
+					})
+					.setIssuer(issuer)
+					.setAudience(configured.appBundleIdentifier)
+					.setSubject(subject)
+					.setIssuedAt(issued)
+					.setExpirationTime(issued + 3600)
+					.sign(providerKey.privateKey);
+				return nativeContext.internalAdapter.createAccount({
+					userId,
+					accountId: subject,
+					providerId: "apple",
+					idToken,
+					refreshToken: await encryptGrant(oldRefresh),
+				});
+			}
+			const linked = await save(account.id, "fixture-apple-owner");
+			await save(decoy.id, "fixture-decoy-apple-owner");
+			const jwk = await exportJWK(providerKey.publicKey);
+			const revoked: string[] = [];
+			const request: typeof fetch = Object.assign(
+				async (input: URL | RequestInfo, init?: RequestInit) => {
+					if (String(input) === `${issuer}/auth/keys`)
+						return Response.json({
+							keys: [
+								{ ...jwk, alg: "RS256", kid: "fixture-apple-signing-key" },
+							],
+						});
+					expect(String(input)).toBe(`${issuer}/auth/revoke`);
+					expect(init?.redirect).toBe("error");
+					const body = new URLSearchParams(String(init?.body));
+					expect(body.get("client_id")).toBe(configured.appBundleIdentifier);
+					expect(body.get("token_type_hint")).toBe("refresh_token");
+					await jwtVerify(body.get("client_secret")!, ownerKey.publicKey, {
+						issuer: configured.teamId,
+						subject: configured.appBundleIdentifier,
+						audience: issuer,
+						algorithms: ["ES256"],
+					});
+					revoked.push(body.get("token")!);
+					if (revoked.length === 1) {
+						await nativeContext.internalAdapter.updateAccount(linked.id, {
+							refreshToken: await encryptGrant(newRefresh),
+						});
+					}
+					return new Response(null, {
+						status: revoked.length === 2 ? 503 : 200,
+					});
+				},
+				{ preconnect() {} },
+			);
+			const revoke = createOwnedProjectAppleDeletion({
+				database,
+				schemaName: schema,
+				keys: { secret },
+				configured,
+				request,
+			});
+			beforeDelete = ({ user }) => revoke(user.id);
+			const engine = owned("203.0.113.122");
+			async function confirm() {
+				const started = await native.handler(
+					post("/delete-user", { callbackURL: destination }, account.cookie),
+				);
+				expect(started.status).toBe(200);
+				const proof = await mailbox("delete-account", account.email, "native");
+				return engine.dispatch(follow(proof, account.cookie));
+			}
+			try {
+				const changed = await confirm();
+				expect(changed.status).toBe(503);
+				expect(await changed.json()).toMatchObject({
+					code: "ACCOUNT_DELETION_UNAVAILABLE",
+				});
+				const unavailable = await confirm();
+				expect(unavailable.status).toBe(503);
+				expect(await unavailable.json()).toMatchObject({
+					code: "APPLE_REVOCATION_UNAVAILABLE",
+				});
+				expect(await identity(account.id)).toMatchObject({
+					email: account.email,
+				});
+				expect(await session(account.cookie)).toMatchObject({
+					user: { id: account.id },
+				});
+				const removed = await confirm();
+				expect(removed.status).toBe(302);
+				expect(removed.headers.get("location")).toBe(destination);
+			} finally {
+				beforeDelete = undefined;
+			}
+			expect(revoked).toEqual([oldRefresh, newRefresh, newRefresh]);
+			expect(await identity(account.id)).toBeUndefined();
+			expect(await identity(decoy.id)).toMatchObject({ email: decoy.email });
 			expect(await session(decoy.cookie)).toMatchObject({
 				user: { id: decoy.id },
 			});

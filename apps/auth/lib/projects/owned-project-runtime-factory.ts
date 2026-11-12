@@ -23,11 +23,23 @@ import {
 	selectedNativePasskeys,
 } from "../project-native-passkeys";
 import { readProjectAppleProvider } from "../project-providers/apple";
-import { readProjectMicrosoftProvider } from "../project-providers/microsoft";
-import { readGoogleProvider } from "../project-providers/repository";
+import {
+	googleCallbackURL,
+	googleClientId,
+	googleClientSecret,
+} from "../project-providers/google";
+import {
+	microsoftCallbackURL,
+	readProjectMicrosoftProvider,
+} from "../project-providers/microsoft";
+import {
+	googleProviderCredentials,
+	googleProviderRepository,
+} from "../project-providers/repository";
 import { backendCredentialRepository } from "./backend-credentials";
 import { projectBrokerTwoFactor } from "./broker-two-factor";
 import { createOwnedEmailVerification } from "./owned-email-verification";
+import { createOwnedProjectAppleDeletion } from "./owned-project-apple-deletion";
 import { createOwnedProjectEmailCallbackPolicy } from "./owned-project-email-callback";
 import { createOwnedProjectEngine } from "./owned-project-engine";
 import { createProjectEngineStore } from "./owned-project-engine-store";
@@ -72,7 +84,7 @@ const authAdmission = {
 	"send-verification-email": [3, 60_000],
 } as const;
 
-async function assertSupportedRealm(options: Options) {
+async function readSupportedProviders(options: Options) {
 	const { database, project, policy, env } = options;
 	if (
 		project.environment !== "development" ||
@@ -82,9 +94,7 @@ async function assertSupportedRealm(options: Options) {
 		policy.supportAccess?.enabled ||
 		ownedAvatarSelected(env, project.id) ||
 		brandingStorage(env).available ||
-		readProjectAppleProvider(env, project.slug) ||
-		readProjectMicrosoftProvider(env, project.slug) ||
-		(await readGoogleProvider(project.id, env)).enabled
+		readProjectAppleProvider(env, project.slug)
 	)
 		throw new Error(
 			"This development project's configuration requires adapters outside the candidate scope.",
@@ -99,10 +109,41 @@ async function assertSupportedRealm(options: Options) {
 		throw new Error(
 			"The selected development project does not match its registry binding.",
 		);
+	const microsoft = readProjectMicrosoftProvider(env, registered.slug);
+	const storedGoogle = await googleProviderRepository(database, env).read(
+		registered.id,
+	);
+	const google = await googleProviderCredentials(
+		storedGoogle,
+		registered.id,
+		env,
+	);
+	if (google) {
+		const id = googleClientId.safeParse(google.clientId);
+		const secret = googleClientSecret.safeParse(google.clientSecret);
+		if (
+			!id.success ||
+			!id.data ||
+			id.data !== google.clientId ||
+			!secret.success ||
+			!secret.data ||
+			secret.data !== google.clientSecret
+		)
+			throw new Error(
+				"This development project's Google provider configuration is invalid.",
+			);
+	}
+	const providers = [
+		"credential",
+		"allauth",
+		...(google ? ["google"] : []),
+		...(microsoft ? ["microsoft"] : []),
+	];
 	const schema = checkedProjectSchema(project.schemaName);
 	const {
 		rows: [snapshot],
-	} = await database.query<{ incompatible: boolean }>(`
+	} = await database.query<{ incompatible: boolean }>(
+		`
 		SELECT (
 		 EXISTS (SELECT 1 FROM "${schema}"."ssoProvider") OR
 		 EXISTS (SELECT 1 FROM "${schema}"."scimManagedConnection") OR
@@ -115,15 +156,18 @@ async function assertSupportedRealm(options: Options) {
 		 EXISTS (SELECT 1 FROM "${schema}"."session" WHERE "impersonatedBy" IS NOT NULL AND "expiresAt" > now()) OR
 		 EXISTS (SELECT 1 FROM "${schema}"."allauthWebhookEndpoint") OR
 		 EXISTS (SELECT 1 FROM "${schema}"."allauthAvatarAsset" WHERE state <> 'deleted') OR
-		 EXISTS (SELECT 1 FROM "${schema}"."account" WHERE "providerId" NOT IN ('credential', 'allauth')) OR
+		 EXISTS (SELECT 1 FROM "${schema}"."account" WHERE "providerId" <> ALL($1::text[])) OR
 		 EXISTS (SELECT 1 FROM "${schema}"."oauthClient" WHERE "grantTypes" IS NOT NULL AND (
 		  jsonb_typeof("grantTypes") <> 'array' OR NOT "grantTypes" <@ '["authorization_code","refresh_token","urn:ietf:params:oauth:grant-type:device_code"]'::jsonb
 		 ))
-		) AS incompatible`);
+		) AS incompatible`,
+		[providers],
+	);
 	if (!snapshot || snapshot.incompatible)
 		throw new Error(
 			"This development project has stored features outside the candidate scope.",
 		);
+	return { google, microsoft };
 }
 
 /** Assemble an explicitly selected internal development realm. This function does not select a runtime. */
@@ -149,7 +193,12 @@ export async function createOwnedProjectRuntimeCandidate(options: Options) {
 		throw new Error(
 			"The development candidate requires an approved project mail transport.",
 		);
-	await assertSupportedRealm(options);
+	const { google, microsoft } = await readSupportedProviders(options);
+	const callbacks = {
+		primaryOrigin: app,
+		publicOrigin: hosted ? origin : undefined,
+		basePath,
+	};
 	const readBranding = () => readApplicationBranding(project.id, env);
 	const [branding, clientSecret] = await Promise.all([
 		readBranding(),
@@ -217,6 +266,12 @@ export async function createOwnedProjectRuntimeCandidate(options: Options) {
 	);
 	const relyingParty = realmPasskeyOptions(browserOrigin, project.name, native);
 	const credentials = backendCredentialRepository(projectRegistryPool(env));
+	const revokeAppleGrants = createOwnedProjectAppleDeletion({
+		database,
+		schemaName: project.schemaName,
+		keys: { secret: signingSecret },
+		configured: readProjectAppleProvider(env, project.slug),
+	});
 	const engine = createOwnedProjectEngine({
 		database,
 		project,
@@ -241,6 +296,17 @@ export async function createOwnedProjectRuntimeCandidate(options: Options) {
 		backchannelLogout: { defer, post: options.postBackchannelLogout },
 		oauth: {
 			defaultErrorURL: `${platform}/auth-error`,
+			...(google
+				? { google: { ...google, redirectURI: googleCallbackURL(callbacks) } }
+				: {}),
+			...(microsoft
+				? {
+						microsoft: {
+							...microsoft,
+							redirectURI: microsoftCallbackURL(callbacks),
+						},
+					}
+				: {}),
 			broker: {
 				clientId: project.brokerClientId,
 				clientSecret,
@@ -349,8 +415,8 @@ export async function createOwnedProjectRuntimeCandidate(options: Options) {
 					actionLabel: title,
 				});
 			},
-			beforeDelete: ({ user }) =>
-				eraseOwnedAvatarsBeforeDelete(
+			async beforeDelete({ user }) {
+				await eraseOwnedAvatarsBeforeDelete(
 					user.id,
 					{
 						projectId: project.id,
@@ -360,7 +426,9 @@ export async function createOwnedProjectRuntimeCandidate(options: Options) {
 					},
 					database,
 					env,
-				),
+				);
+				return revokeAppleGrants(user.id);
+			},
 		},
 		organization: {
 			membershipLimit: async (client) =>

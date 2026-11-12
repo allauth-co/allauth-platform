@@ -79,6 +79,8 @@ jobs:
           lib/projects/owned-project-runtime.pg.test.ts
           lib/projects/owned-project-password-safety.test.ts
           lib/projects/owned-project-bulk-session.pg.test.ts lib/projects/owned-project-email-callback.test.ts
+          lib/projects/owned-project-personal-keys.pg.test.ts
+          lib/project-providers/apple.test.ts lib/project-providers/apple-deletion.test.ts
           lib/projects/owned-project-issuer-authorization.pg.test.ts lib/projects/owned-project-issuer-introspection.pg.test.ts
           lib/projects/owned-project-issuer-device.pg.test.ts
           lib/projects/owned-project-account-links.pg.test.ts lib/projects/owned-project-broker-mfa.test.ts

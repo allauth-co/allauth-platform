@@ -1,4 +1,5 @@
 import { headers } from "next/headers";
+import { redirect } from "next/navigation";
 import { getAuthEnvironment } from "@/lib/auth";
 import {
 	authConfiguration,
@@ -16,7 +17,7 @@ import {
 	hostedSdkProjectIdsSetting,
 	hostedSdkViewRequest,
 } from "@/lib/domains/hosted-sdk-policy";
-import { withPortalHeadersEngine } from "@/lib/domains/hosting";
+import { portalSession, withPortalHeadersEngine } from "@/lib/domains/hosting";
 import { emailConfigured } from "@/lib/email/send";
 import { AllAuthAuth } from "./better-auth-ui/allauth-auth";
 import { HostedProjectAuth } from "./hosted-project-auth";
@@ -41,6 +42,12 @@ export async function HostedProjectAuthPage({
 			<AllAuthAuth path="magic-link" />
 		) : view === "emailOtp" ? (
 			<AllAuthAuth path="email-otp" />
+		) : view === "signOut" ? (
+			<AllAuthAuth path="sign-out" />
+		) : view === "authCallback" ? (
+			<AllAuthAuth path="auth-callback" />
+		) : view === "authRedirect" ? (
+			<AllAuthAuth path="auth-redirect" />
 		) : (
 			<AllAuthAuth view={view} />
 		);
@@ -63,21 +70,21 @@ export async function HostedProjectAuthPage({
 			)
 				return null;
 			if (request.oauthQuery) {
-				const context = await engine.readOAuthContext(
-					new Request(
-						`https://${binding.hostname}/api/oauth/context?${request.oauthQuery}`,
-						{
-							headers: { accept: "application/json" },
-						},
-					),
-				);
-				if (!context.ok) return null;
+				const context = await engine
+					.readOAuthContext(
+						new Request(
+							`https://${binding.hostname}/api/oauth/context?${request.oauthQuery}`,
+							{ headers: { accept: "application/json" } },
+						),
+					)
+					.catch(() => null);
+				if (!context?.ok) return null;
 				const result: unknown = await context.json().catch(() => null);
 				if (
 					!result ||
 					typeof result !== "object" ||
 					!("continueURL" in result) ||
-					result.continueURL !== request.destination
+					result.continueURL !== `/oauth2/continue?${request.oauthQuery}`
 				)
 					return null;
 			}
@@ -124,6 +131,10 @@ export async function HostedProjectAuthPage({
 	);
 
 	if (!project) return standardForm;
+	if (view === "authRedirect") {
+		const session = await portalSession(requestHeaders);
+		redirect(session ? "/" : "/sign-in");
+	}
 	return (
 		<HostedProjectAuth
 			view={request.username ? "username" : view}

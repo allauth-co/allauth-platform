@@ -11,6 +11,10 @@ import {
 	withAuthReturnTo,
 } from "@/sdk/react";
 import type { HostedSdkForm } from "@/lib/domains/hosted-sdk-policy";
+import {
+	HostedProjectAuthCallback,
+	HostedProjectSignOut,
+} from "./hosted-project-auth-status";
 import { HostedProjectEmailStatus } from "./hosted-project-email-status";
 import {
 	HostedProjectCard,
@@ -264,6 +268,10 @@ export function HostedProjectAuth({
 					<HostedProjectSso showPassword={showPassword} {...continuation} />
 				)}
 				{view === "twoFactor" && <HostedProjectMfa {...continuation} />}
+				{view === "signOut" && (
+					<HostedProjectSignOut destination={destination} />
+				)}
+				{view === "authCallback" && <HostedProjectAuthCallback />}
 				{(view === "verifyEmail" ||
 					view === "resetLinkSent" ||
 					view === "magicLinkSent") && (

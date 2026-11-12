@@ -2,24 +2,18 @@ import { notFound } from "next/navigation";
 import { HostedProjectAuthPage } from "@/components/hosted-project-auth-page";
 import type { HostedProjectAuthPageProps } from "@/components/hosted-project-auth-page";
 import { AllAuthAuth } from "@/components/better-auth-ui/allauth-auth";
-const paths = new Set([
-	"enterprise-sign-in",
-	"reset-link-sent",
-	"magic-link",
-	"magic-link-sent",
-	"email-otp",
-	"sign-out",
-	"auth-callback",
-	"auth-error",
-	"auth-redirect",
+import type { HostedSdkView } from "@/lib/domains/hosted-sdk-policy";
+
+const previewViews = new Map<string, HostedSdkView>([
+	["enterprise-sign-in", "enterpriseSignIn"],
+	["magic-link", "magicLink"],
+	["magic-link-sent", "magicLinkSent"],
+	["email-otp", "emailOtp"],
+	["reset-link-sent", "resetLinkSent"],
+	["sign-out", "signOut"],
+	["auth-callback", "authCallback"],
+	["auth-redirect", "authRedirect"],
 ]);
-const previewViews = {
-	"enterprise-sign-in": "enterpriseSignIn",
-	"magic-link": "magicLink",
-	"magic-link-sent": "magicLinkSent",
-	"email-otp": "emailOtp",
-	"reset-link-sent": "resetLinkSent",
-} as const;
 
 export default async function Page({
 	params,
@@ -28,19 +22,9 @@ export default async function Page({
 	params: Promise<{ authView: string }>;
 } & HostedProjectAuthPageProps) {
 	const { authView } = await params;
-	if (!paths.has(authView)) notFound();
-	if (
-		authView === "enterprise-sign-in" ||
-		authView === "magic-link" ||
-		authView === "magic-link-sent" ||
-		authView === "email-otp" ||
-		authView === "reset-link-sent"
-	)
-		return (
-			<HostedProjectAuthPage
-				view={previewViews[authView]}
-				searchParams={searchParams}
-			/>
-		);
+	const view = previewViews.get(authView);
+	if (view)
+		return <HostedProjectAuthPage view={view} searchParams={searchParams} />;
+	if (authView !== "auth-error") notFound();
 	return <AllAuthAuth path={authView} />;
 }

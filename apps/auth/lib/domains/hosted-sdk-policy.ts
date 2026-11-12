@@ -10,6 +10,9 @@ const localOrigin = "https://allauth.invalid";
 const views = {
 	signIn: "/sign-in",
 	signUp: "/sign-up",
+	signOut: "/sign-out",
+	authCallback: "/auth-callback",
+	authRedirect: "/auth-redirect",
 	forgotPassword: "/forgot-password",
 	resetPassword: "/reset-password",
 	resetLinkSent: "/reset-link-sent",
@@ -21,7 +24,7 @@ const views = {
 	twoFactor: "/two-factor",
 } as const;
 export type HostedSdkView = keyof typeof views;
-export type HostedSdkForm = HostedSdkView | "username";
+export type HostedSdkForm = Exclude<HostedSdkView, "authRedirect"> | "username";
 export type HostedSdkSearchParams = Record<
 	string,
 	string | string[] | undefined
@@ -72,7 +75,7 @@ function hostedOAuthRequest(
 	)
 		return null;
 	const raw = params.returnTo ?? params.callbackUrl;
-	const nested = oauthBrowserReturnPath(raw);
+	const nested = view === "signOut" ? null : oauthBrowserReturnPath(raw);
 	const direct = new URLSearchParams();
 	for (const [name, value] of Object.entries(params)) {
 		if (typeof value === "string") direct.append(name, value);
@@ -92,7 +95,10 @@ function hostedOAuthRequest(
 	if (view === "resetPassword" && typeof params.token === "string")
 		fallback.searchParams.set("token", params.token);
 	return {
-		destination: `/oauth2/continue?${oauthQuery}`,
+		destination:
+			view === "signOut"
+				? `/sign-in?${oauthQuery}`
+				: `/oauth2/continue?${oauthQuery}`,
 		legacyPath: fallback.pathname + fallback.search,
 		oauthQuery,
 		username: params.method === "username",
@@ -104,15 +110,26 @@ export function hostedSdkViewRequest(
 	view: HostedSdkView,
 	params: HostedSdkSearchParams,
 ) {
+	if (view === "authCallback" || view === "authRedirect") {
+		if (Object.values(params).some((value) => value !== undefined)) return null;
+		return {
+			destination: "/sign-in",
+			legacyPath: `${views[view]}?interface=legacy`,
+			oauthQuery: undefined,
+			username: false,
+		};
+	}
 	if (
 		(view === "verifyEmail" ||
 			view === "resetLinkSent" ||
-			view === "magicLinkSent") &&
+			view === "magicLinkSent" ||
+			view === "signOut") &&
 		(params.token !== undefined ||
 			params.code !== undefined ||
 			params.error !== undefined)
 	)
 		return null;
+	if (view === "signOut" && params.returnTo !== undefined) return null;
 	const oauth = hostedOAuthRequest(view, params);
 	if (oauth) return oauth;
 	const allowed = new Set([
@@ -136,6 +153,20 @@ export function hostedSdkViewRequest(
 	);
 	const fallback = new URL(views[view], localOrigin);
 	fallback.searchParams.set("interface", "legacy");
+	if (view === "signOut") {
+		const next = new URL("/sign-in", localOrigin);
+		if (typeof raw === "string") {
+			if (raw && raw !== destination) return null;
+			next.searchParams.set("callbackUrl", raw);
+			fallback.searchParams.set("callbackUrl", raw);
+		}
+		return {
+			destination: next.pathname + next.search,
+			legacyPath: fallback.pathname + fallback.search,
+			oauthQuery: undefined,
+			username: false,
+		};
+	}
 	fallback.searchParams.set("callbackUrl", destination);
 	if (view === "resetPassword" && typeof params.token === "string")
 		fallback.searchParams.set("token", params.token);
@@ -154,6 +185,7 @@ const getEndpoints = new Set([
 ]);
 const postEndpoints = new Set([
 	"get-session",
+	"sign-out",
 	"sign-in/email",
 	"sign-in/username",
 	"sign-in/magic-link",

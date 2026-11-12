@@ -11,6 +11,7 @@ import { GET as brokerLogin } from "../../app/oauth/login/route";
 import { authOrigin } from "../configuration";
 import { resolveHostedBinding } from "../domains/hosting";
 import { createOwnedProjectRuntimeCandidate } from "./owned-project-runtime-factory";
+import { runtimeProviderFixtureFetch } from "./owned-project-runtime-provider-fixture";
 import { getProject, projectRegistryPool } from "./registry";
 import {
 	closeProjectInstances,
@@ -109,7 +110,7 @@ async function boot(selection: ProjectRuntimeFixtureBoot) {
 			"This project HTTP fixture does not perform outbound HTTP.",
 		);
 	};
-	globalThis.fetch = Object.assign(async () => outboundDisabled(), {
+	globalThis.fetch = Object.assign(runtimeProviderFixtureFetch(), {
 		preconnect: outboundDisabled,
 	});
 	const pending = new Set<Promise<void>>();
