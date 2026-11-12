@@ -352,6 +352,69 @@ describe.skipIf(!existsSync(fixturePath))(
 			expect(await capture(owned(ip).dispatch)).toEqual(legacyEvents);
 		});
 
+		it("matches native email verification events when the account email actually changes", async () => {
+			const ip = "192.0.2.56";
+			const execute = async (writer: "native" | "owned") => {
+				const account = await user(`email-verify-event-${writer}`);
+				const newEmail = `email-verify-new-${writer}@fixture.example`;
+				const engine = owned(ip);
+				const dispatch = (request: ReturnType<typeof post>) => {
+					request.headers.set("x-real-ip", ip);
+					request.headers.set(
+						"user-agent",
+						"synthetic-email-verification-client",
+					);
+					return writer === "native"
+						? native.handler(request)
+						: engine.dispatch(request);
+				};
+				expect(
+					(
+						await dispatch(
+							post(
+								"/change-email",
+								{ newEmail, callbackURL: destination },
+								account.cookie,
+							),
+						)
+					).status,
+				).toBe(200);
+				const confirmation = await mailbox(
+					"change-email-confirmation",
+					account.email,
+					writer,
+				);
+				expect(
+					(await dispatch(follow(confirmation, account.cookie))).headers.get(
+						"location",
+					),
+				).toBe(destination);
+				const verified = await mailbox(
+					"change-email-verification",
+					newEmail,
+					writer,
+				);
+				expect(
+					(await dispatch(follow(verified, account.cookie))).headers.get(
+						"location",
+					),
+				).toBe(destination);
+				const { rows } = await database.query(
+					`SELECT type,outcome,"actorId"=$1 AS "selfActor","userId"=$1 AS "selfUser",
+					        "targetId"=$1 AS "selfTarget","ipAddress","userAgent",metadata
+					 FROM "${schema}"."allauthEvent"
+					 WHERE type IN ('user.updated','user.email-verified')
+					   AND "userId"=$1 AND metadata->>'path'='/verify-email'
+					 ORDER BY type,id`,
+					[account.id],
+				);
+				return rows;
+			};
+			const nativeEvents = await execute("native");
+			expect(nativeEvents).toHaveLength(2);
+			expect(await execute("owned")).toEqual(nativeEvents);
+		});
+
 		it("finishes native two-step email links, retaining the original session and retiring old mailbox proofs", async () => {
 			const account = await user("old-native-change");
 			const decoy = await user("wrong-browser");

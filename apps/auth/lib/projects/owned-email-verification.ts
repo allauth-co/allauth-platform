@@ -2,6 +2,7 @@ import { jwtVerify, SignJWT } from "jose";
 import { JWTExpired } from "jose/errors";
 import type { Pool, PoolClient } from "pg";
 import * as z from "zod";
+import type { ControlEventInput } from "../control/types";
 import { createProjectEngineStore } from "./owned-project-engine-store";
 
 const lifetimeSeconds = 3600;
@@ -44,6 +45,9 @@ export function createOwnedEmailVerification(options: {
 	schemaName: string;
 	signingSecret: string;
 	completeVerification?: CompleteOwnedEmailVerification;
+	auditContext?(
+		request: Request,
+	): Pick<ControlEventInput, "ipAddress" | "userAgent">;
 }) {
 	if (options.signingSecret.length < 32)
 		throw new Error("Invalid email-verification configuration.");
@@ -116,14 +120,15 @@ export function createOwnedEmailVerification(options: {
 				user.id,
 				user.id,
 			);
-			await store.record(
-				client,
-				"user.email-verified",
-				"success",
-				"/verify-email",
-				user.id,
-				user.id,
-			);
+			await store.recordEvent(client, {
+				type: "user.email-verified",
+				outcome: "success",
+				actorId: user.id,
+				userId: user.id,
+				targetId: user.id,
+				...options.auditContext?.(input.request),
+				metadata: { path: "/verify-email" },
+			});
 			const response = await options.completeVerification?.({
 				client,
 				user: {

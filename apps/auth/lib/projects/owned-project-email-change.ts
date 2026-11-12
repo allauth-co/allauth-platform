@@ -355,14 +355,15 @@ export function createOwnedProjectEmailChange(
 					user.id,
 					user.id,
 				);
-				await store.record(
-					client,
-					"user.email-verified",
-					"success",
-					"/verify-email",
-					user.id,
-					user.id,
-				);
+				await store.recordEvent(client, {
+					type: "user.email-verified",
+					outcome: "success",
+					actorId: user.id,
+					userId: user.id,
+					targetId: user.id,
+					...options.auditContext?.(request),
+					metadata: { path: "/verify-email" },
+				});
 				const completed = await options.complete(client, {
 					request,
 					user: updated,
