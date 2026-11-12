@@ -3,9 +3,9 @@ title: Native AllAuth React header components
 description: Add portable user and organization menus with native account-management dialogs.
 ---
 
-AllAuth React SDK 1.3.4 adds opt-in header menus and native account dialogs while
-retaining existing full-page defaults. Use the existing cookie-based same-origin
-proxy and import `@allauth/react/styles.css`.
+The AllAuth React SDK provides opt-in header menus and native account dialogs.
+Use the existing cookie-based same-origin proxy and import
+`@allauth/react/styles.css`.
 
 ```tsx
 <UserButton variant="avatar" managementMode="modal" />
@@ -43,15 +43,15 @@ Header menus support keyboard navigation and stay within the viewport.
 Use host `--allauth-*` CSS tokens and `--allauth-modal-accent` to match the app.
 The components use React and React DOM and do not import Next.js APIs.
 
-SDK 1.3.4 clamps the menu’s actual positioned box to the document viewport,
+The SDK keeps the positioned menu within the document viewport,
 including after resizing or delayed session/organization data changes the trigger.
 Size observers track the anchor, menu and viewport; measurements are coalesced
 per animation frame and cleaned up when the menu closes.
 
 ## Organization teams and custom roles
 
-The working 1.4.0 SDK adds `view="teams"` and `view="roles"` to
-`OrganizationProfile`, and the same sections to `OrganizationProfileModal`.
+`OrganizationProfile` supports `view="teams"` and `view="roles"`.
+`OrganizationProfileModal` supports the same sections.
 Teams provide native create, rename, delete, and membership management. Deletion
 and member removal require confirmation. Team rosters follow the native
 requirement that the current user belongs to the team; opening the view does
@@ -70,5 +70,5 @@ The SDK checks proposed grants before saving; the native server rechecks them.
 
 Switching organization or account clears drafts and invalidates pending
 callbacks, including callbacks that finish after switching away and back.
-Install the corresponding SDK proxy update so its allowlist includes native
-permission and role endpoints.
+Use a matching SDK proxy so its allowlist includes native permission and role
+endpoints.

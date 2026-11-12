@@ -1,0 +1,28 @@
+name: AllAuth Platform bug report
+description: Report a reproducible problem with the AllAuth platform or self-hosting.
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Follow the [AllAuth security policy](https://github.com/allauth-co/allauth-platform/security/policy) to report a suspected vulnerability privately. Redact credentials, tokens and personal data.
+  - type: input
+    id: version
+    attributes:
+      label: AllAuth version or source revision
+      description: For managed hosting, enter "Hosted AllAuth" if you do not know the version.
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: What happened?
+      description: Describe what you observed and what you expected to happen.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Include relevant configuration with secrets removed.
+    validations:
+      required: true

@@ -1,20 +1,8 @@
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="public/branding/svg/better-auth-wordmark-light.svg" />
+# Documentation source
 
-  <source media="(prefers-color-scheme: light)" srcset="public/branding/svg/better-auth-wordmark-dark.svg" />
+For AllAuth, start with the React SDK quickstart or the self-hosting guide. AllAuth integration guides in this tree cover features such as MFA, organizations, enterprise providers and application configuration. [React SDK quickstart](https://allauth.co/sdk/quickstart) · [Self-hosting](SELF_HOSTING.md) · [Integration guides](content/docs/integrations)
 
-  <img alt="Better Auth" src="public/branding/svg/better-auth-wordmark-dark.svg" width="280" />
-</picture>
-
-### Website & Docs
-
-The main website and documentation for [better-auth.com](https://better-auth.com)
-
-[![Website](https://img.shields.io/badge/better--auth.com-000?style=flat\&logo=data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iNjAiIGhlaWdodD0iNDUiIHZpZXdCb3g9IjAgMCA2MCA0NSIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj48cGF0aCBmaWxsLXJ1bGU9ImV2ZW5vZGQiIGNsaXAtcnVsZT0iZXZlbm9kZCIgZD0iTTAgMEgxNVYxNUgzMFYzMEgxNVY0NUgwVjMwVjE1VjBaTTQ1IDMwVjE1SDMwVjBINDVINjBWMTVWMzBWNDVINDVIMzBWMzBINDVaIiBmaWxsPSJ3aGl0ZSIvPjwvc3ZnPg==\&logoColor=white)](https://better-auth.com)
-[![GitHub Stars](https://img.shields.io/github/stars/better-auth/better-auth?style=flat\&logo=github\&label=stars\&color=24292e)](https://github.com/better-auth/better-auth)
-[![License](https://img.shields.io/badge/license-MIT-blue?style=flat)](LICENSE)
-
-***
+This Next.js site and its framework reference originate from the upstream Better Auth documentation. The source below is useful when working on the vendored packages. [Upstream documentation](https://better-auth.com/docs) · [Third-party notices](../THIRD_PARTY_NOTICES.md)
 
 ## Quick Start
 
