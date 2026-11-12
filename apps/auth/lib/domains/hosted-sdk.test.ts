@@ -1,5 +1,5 @@
 import { sso } from "@better-auth/sso";
-import { emailOTP, magicLink, username } from "better-auth/plugins";
+import { admin, emailOTP, magicLink, username } from "better-auth/plugins";
 import { symmetricDecrypt } from "better-auth/crypto";
 import { getTestInstance } from "better-auth/test";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -281,6 +281,89 @@ describe("hosted SDK transport", () => {
 			`${origin}/api/auth/sign-in/email?project=wrong-project`,
 		);
 		expect(await dispatched.text()).toBe("{}");
+	});
+
+	it("ends a valid native hosted impersonation with the actor's restored cookie and a public identity", async () => {
+		const { auth } = await getTestInstance(
+			{
+				baseURL: origin,
+				emailAndPassword: { enabled: true },
+				advanced: { cookiePrefix: `allauth_project_${slug}` },
+				plugins: [admin()],
+			},
+			{ disableTestUser: true },
+		);
+		const join = async (name: string, email: string) => {
+			const result = await auth.api.signUpEmail({
+				body: { name, email, password: "fixture-password-99" },
+				asResponse: true,
+			});
+			expect(result.status).toBe(200);
+			return {
+				result,
+				body: (await result.json()) as { user: { id: string } },
+			};
+		};
+		const cookieHeader = (response: Response) => {
+			const pairs = new Map<string, string>();
+			for (const raw of response.headers.getSetCookie()) {
+				const pair = raw.split(";", 1)[0]!;
+				const name = pair.slice(0, pair.indexOf("="));
+				if (/;\s*Max-Age=0(?:;|$)/i.test(raw)) pairs.delete(name);
+				else pairs.set(name, pair);
+			}
+			return [...pairs.values()].join("; ");
+		};
+		const actor = await join("Support actor", "support-actor@fixture.example");
+		const target = await join("Project user", "project-user@fixture.example");
+		await (await auth.$context).internalAdapter.updateUser(actor.body.user.id, {
+			role: "admin",
+		});
+		const impersonation = await auth.api.impersonateUser({
+			headers: new Headers({ origin, cookie: cookieHeader(actor.result) }),
+			body: { userId: target.body.user.id },
+			asResponse: true,
+		});
+		expect(impersonation.status).toBe(200);
+		const supportCookie = cookieHeader(impersonation);
+		const acting = await auth.api.getSession({
+			headers: new Headers({ cookie: supportCookie }),
+		});
+		expect(acting).toMatchObject({
+			user: { id: target.body.user.id },
+			session: { impersonatedBy: actor.body.user.id },
+		});
+		verifiedFixture();
+		gateway.dispatch.mockImplementation((incoming: Request) =>
+			auth.handler(incoming),
+		);
+		const path = "admin/stop-impersonating";
+		expect((await GET(request(path))).status).toBe(404);
+		expect(
+			(await POST(request(path, "POST", { origin: "https://other.example" })))
+				.status,
+		).toBe(403);
+		expect(gateway.dispatch).not.toHaveBeenCalled();
+		const template = request(path, "POST", { origin, body: {} });
+		const headers = new Headers(template.headers);
+		headers.set("cookie", supportCookie);
+		const stopped = await POST(new Request(template, { headers }));
+		expect(stopped.status).toBe(200);
+		const result = await stopped.json();
+		expect(result).toMatchObject({ user: { id: actor.body.user.id } });
+		expect(result).not.toHaveProperty("session.token");
+		expect(
+			(
+				await auth.api.getSession({
+					headers: new Headers({ cookie: cookieHeader(stopped) }),
+				})
+			)?.user.id,
+		).toBe(actor.body.user.id);
+		expect(
+			await auth.api.getSession({
+				headers: new Headers({ cookie: supportCookie }),
+			}),
+		).toBeNull();
 	});
 
 	it("uses the native sign-out POST and returns only the verified realm's cookie expiry", async () => {

@@ -218,6 +218,7 @@ const postEndpoints = new Set([
 	"organization/update-role",
 	"organization/delete-role",
 	"sign-out",
+	"admin/stop-impersonating",
 	"sign-in/email",
 	"sign-in/username",
 	"sign-in/magic-link",
