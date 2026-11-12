@@ -4,7 +4,7 @@ The platform installs `@better-auth/agent-auth` 0.6.2. The endpoint inventory be
 
 | Installed surface | Methods and paths | Owned fixture coverage |
 | --- | --- | --- |
-| Discovery | `GET /agent-configuration` | Pending |
+| Discovery | `GET /agent-configuration` | Public native-format document with the selected auth base, delegated mode, Ed25519, CIBA and device approval, and a one-hour cache. |
 | Host listing and detail | `GET /host/list`, `GET /host/get` | Signed browser session |
 | Host revocation | `POST /host/revoke` | Fresh verified owner cookie or signed self-revocation by an active owned inline Ed25519 host. |
 | Host provisioning and enrollment | `POST /host/create`, `POST /host/enroll` | Fresh verified browser provisioning, inline Ed25519, and one-time enrollment across writers. |
@@ -26,9 +26,9 @@ The platform installs `@better-auth/agent-auth` 0.6.2. The endpoint inventory be
 | Agent device code | `POST /agent/device/code`, `GET /agent/status?agent_id=…` | Active signed host can issue or reissue a device code for its pending delegated agent. The host polls the same agent before and after browser approval. |
 | Agent CIBA | `POST /agent/ciba/authorize` | Active signed inline host can request poll-only approval for its pending delegated agent and current verified owner, with an empty capability list. |
 | Capability grant revocation | `POST /agent/revoke-capability` | Fresh verified browser owner, active signed host, or active signed agent can revoke named existing grants within their scope. |
-| Agent capability requests and grants | `POST /agent/request-capability`, `POST /agent/grant-capability` | Pending |
+| Agent capability requests and grants | `POST /agent/request-capability`, `POST /agent/grant-capability` | An active signed agent can submit a request, and a fresh verified browser owner can submit a grant for their agent or their host’s agent. The configured empty catalog rejects both without creating approvals or grants. |
 | Capability catalog | `GET /capability/list`, `GET /capability/describe` | A live signed host or agent can read the configured empty catalog. |
-| Capability actions | `POST /capability/execute`, `POST /capability/batch-execute` | Pending. AllAuth denies execution. |
+| Capability actions | `POST /capability/execute`, `POST /capability/batch-execute` | An active signed agent receives the native unknown-capability error for each action. |
 
 AllAuth permits delegated registration with inline Ed25519 public keys. It disables dynamic hosts and remote key discovery, limits each account to five agents, and configures a 15-minute session, a one-hour agent maximum lifetime, and a 24-hour absolute lifetime. Browser host writes require a verified non-impersonated session created within five minutes and exact user ownership. The installed package distinguishes `host+jwt` from `agent+jwt` and checks replay in a process-local cache. The verified hosted gateway currently forwards Authorization only for its separate OAuth and SCIM allowlists. The package’s description mentions a well-known discovery alias. The application installs the auth-relative `/agent-configuration` route.
 
@@ -82,6 +82,8 @@ Signed host rotation uses the replacement JWK thumbprint as the host ID. The ins
 The installed delegated-agent rotation endpoint requires a host JWT. The fixture replaces the inline key and key ID under the same agent, host and owner, with the native five-per-minute limit. A previously accepted host proof can retry the current replacement key for that agent. Another key change for the same agent requires a fresh proof. The client from the matching upstream release tag sends an agent JWT for this endpoint. The tested compatibility lane is the native host-signed HTTP request. [Tagged Agent Auth client](https://github.com/better-auth/agent-auth/blob/a6736a4414e6cd3febffc86d00d9924694883364/packages/sdk/src/client.ts#L1005)
 
 Capability catalog reads preserve the native empty list and unknown-capability response. Both require a live signed host or delegated agent in the selected realm. Agent credentials share the same single-use proof records and bounded heartbeat as signed status. Host credentials remain reusable for catalog reads within their existing lifetime.
+
+The discovery document uses the validated auth base of the selected realm for each advertised endpoint. Capability request and execution validate the signed agent credential and any method, URL and body binding. Grant requests require a fresh verified browser session and ownership of the target agent or its host. PostgreSQL fixtures compare native response bodies and authentication challenges and verify that the candidate leaves approvals, grants and host budgets intact. Signed denials still consume the proof and renew the bounded heartbeat. Stored grants and host budgets cannot supply a capability definition or cause execution. The production factory continues to exclude projects with agent hosts.
 
 Introspection validates the body token against the active agent’s stored inline key and returns the native identity, stored expiry and currently active grants. It preserves legacy body tokens with optional audience and JTI claims. A supplied audience must match a native audience for the selected realm, and a supplied JTI shares the persisted replay check with status and catalog reads. The fixture accepts a single credential in the request body.
 

@@ -34,13 +34,13 @@ const constraints = z.record(
 		z.record(z.string(), z.union([primitive, z.array(primitive)])),
 	]),
 );
-const capability = z.union([
+export const ownedAgentCapabilityItem = z.union([
 	z.string(),
 	z.object({ name: z.string(), constraints: constraints.optional() }),
 ]);
 const input = z.object({
 	name: z.string().min(1),
-	capabilities: z.array(capability).optional(),
+	capabilities: z.array(ownedAgentCapabilityItem).optional(),
 	reason: z.string().optional(),
 	mode: z.enum(["delegated", "autonomous"]).optional(),
 	preferred_method: z.string().optional(),

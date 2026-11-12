@@ -3678,6 +3678,258 @@ describe.skipIf(!existsSync(fixture))(
 			expect(await resumed.json()).toEqual(expected);
 		});
 
+		it("publishes the native Agent discovery for the selected realm only", async () => {
+			const path = "/agent-configuration";
+			const previous = await legacy.handler(request(alpha, path));
+			const current = await owned.dispatch(request(alpha, path));
+			expect(previous.status).toBe(200);
+			expect(current.status).toBe(200);
+			expect(current.headers.get("cache-control")).toBe("public, max-age=3600");
+			expect(current.headers.get("cache-control")).toBe(
+				previous.headers.get("cache-control"),
+			);
+			const expected = await previous.json();
+			expect(await current.json()).toEqual(expected);
+			expect(expected).toMatchObject({
+				issuer: agentAudience,
+				modes: ["delegated"],
+				approval_methods: ["ciba", "device_authorization"],
+			});
+			const sibling = await outside.dispatch(request(beta, path));
+			const siblingIssuer = `${origin}${beta.basePath}`;
+			expect(sibling.status).toBe(200);
+			expect(await sibling.json()).toMatchObject({
+				issuer: siblingIssuer,
+				default_location: `${siblingIssuer}/capability/execute`,
+				endpoints: { register: `${siblingIssuer}/agent/register` },
+			});
+			expect((await disabled.dispatch(request(alpha, path))).status).toBe(501);
+		});
+
+		it("denies empty-catalog capability actions with native signed and browser authority without granting or executing", async () => {
+			const requestPath = "/agent/request-capability";
+			const grantPath = "/agent/grant-capability";
+			const executePath = "/capability/execute";
+			const batchPath = "/capability/batch-execute";
+			const machine = await nativeMachine(
+				"Empty capability actions",
+				sessionCookie,
+			);
+			const schema = `"${alpha.schemaName}"`;
+			const siblingSchema = `"${beta.schemaName}"`;
+			const capability = "fixture.read";
+			const missing = {
+				code: "capability_not_found",
+				message: 'Capability "fixture.read" does not exist.',
+			};
+			const invalid = {
+				error: "invalid_capabilities",
+				message:
+					"One or more requested capability names don't exist or are blocked",
+			};
+			const requestBody = {
+				capabilities: [
+					{ name: capability, constraints: { region: "fixture" } },
+				],
+				preferred_method: "ciba",
+			};
+			const grantBody = {
+				agent_id: machine.agentId,
+				capabilities: [capability],
+				ttl: 90,
+			};
+			const executeBody = { capability, arguments: { region: "fixture" } };
+			const batchBody = {
+				requests: [{ id: "first", ...executeBody }, { capability }],
+			};
+			const authorization = async (path: string, body: object) =>
+				`Bearer ${await new SignJWT({
+					htm: "POST",
+					htu: `${agentAudience}${path}`,
+					ath: createHash("sha256")
+						.update(JSON.stringify(body))
+						.digest("base64url"),
+				})
+					.setProtectedHeader({ alg: "EdDSA", typ: "agent+jwt" })
+					.setIssuer(machine.hostId)
+					.setSubject(machine.agentId)
+					.setAudience(agentAudience)
+					.setIssuedAt()
+					.setExpirationTime("45s")
+					.setJti(randomUUID())
+					.sign(machine.agentKey.privateKey)}`;
+			const snapshot = async () =>
+				(
+					await database.query(
+						`SELECT
+				 (SELECT jsonb_agg(to_jsonb(a) ORDER BY id) FROM ${schema}."approvalRequest" a
+				  WHERE "agentId"=$1 OR "hostId"=$2) AS approvals,
+				 (SELECT jsonb_agg(to_jsonb(g) ORDER BY id) FROM ${schema}."agentCapabilityGrant" g
+				  WHERE "agentId"=$1) AS grants,
+				 (SELECT count(*) FROM ${siblingSchema}."approvalRequest") AS "siblingApprovals",
+				 (SELECT count(*) FROM ${siblingSchema}."agentCapabilityGrant") AS "siblingGrants",
+				 (SELECT "defaultCapabilities" FROM ${schema}."agentHost" WHERE id=$2) AS "hostBudget"`,
+						[machine.agentId, machine.hostId],
+					)
+				).rows;
+			const before = await snapshot();
+			const hostBearer = `Bearer ${await nativeClientHostProof(machine)}`;
+			await expectSame(requestPath, sessionCookie, 401, requestBody);
+			await expectSame(requestPath, "", 401, requestBody, hostBearer);
+			await expectSame(executePath, sessionCookie, 401, executeBody);
+			await expectSame(executePath, "", 401, executeBody, hostBearer);
+			await expectSame(batchPath, "", 401, batchBody);
+			await expectSame(requestPath, "", 400, { capabilities: [] });
+			await expectSame(batchPath, "", 400, { requests: [] });
+			await expectSame(requestPath, "", 400, {
+				...requestBody,
+				host_jwks_url: "https://keys.fixture.example/jwks",
+			});
+			for (const [path, body] of [
+				[requestPath, requestBody],
+				[executePath, executeBody],
+				[batchPath, batchBody],
+			] as const) {
+				const previous = await legacy.handler(request(alpha, path, "", body));
+				const current = await owned.dispatch(request(alpha, path, "", body));
+				expect(current.headers.get("www-authenticate")).toBe(
+					previous.headers.get("www-authenticate"),
+				);
+			}
+			await expectSame(grantPath, "", 403, grantBody);
+			await expectSame(grantPath, peerCookie, 403, grantBody);
+			await expectSame(grantPath, sessionCookie, 403, grantBody, hostBearer);
+			const stale = await signIn(sessionOwner.email);
+			const { session } = (await (
+				await legacy.handler(request(alpha, "/get-session", stale))
+			).json()) as { session: { id: string } };
+			await database.query(
+				`UPDATE ${schema}."session" SET "createdAt"=now()-interval '6 minutes' WHERE id=$1`,
+				[session.id],
+			);
+			await expectSame(grantPath, stale, 403, grantBody);
+			await expectSame(grantPath, sessionCookie, 404, {
+				...grantBody,
+				agent_id: randomUUID(),
+			});
+			await expectSame(grantPath, sessionCookie, 400, {
+				...grantBody,
+				capabilities: [],
+			});
+			await expectSame(grantPath, sessionCookie, 400, {
+				...grantBody,
+				agent_jwks_url: "https://keys.fixture.example/jwks",
+			});
+			expect(
+				await expectSame(grantPath, sessionCookie, 400, grantBody),
+			).toEqual(invalid);
+			const proof = await authorization(requestPath, requestBody);
+			expect(
+				await expectSame(requestPath, "", 400, requestBody, proof),
+			).toEqual(invalid);
+			const repeated = await candidate(alpha, true).dispatch(
+				request(alpha, requestPath, "", requestBody, proof),
+			);
+			const previousReplay = await legacy.handler(
+				request(alpha, requestPath, "", requestBody, proof),
+			);
+			expect(previousReplay.status).toBe(401);
+			expect(repeated.status).toBe(401);
+			const replay = await repeated.json();
+			expect(replay).toEqual(await previousReplay.json());
+			expect(replay).toMatchObject({ error: "jti_replay" });
+			await expectSame(
+				executePath,
+				"",
+				401,
+				executeBody,
+				await authorization(executePath, {
+					...executeBody,
+					capability: "different",
+				}),
+			);
+			expect(
+				await expectSame(
+					executePath,
+					"",
+					404,
+					executeBody,
+					await authorization(executePath, executeBody),
+				),
+			).toEqual({ error: missing.code, message: missing.message });
+			expect(
+				await expectSame(
+					batchPath,
+					"",
+					200,
+					batchBody,
+					await authorization(batchPath, batchBody),
+				),
+			).toEqual({
+				responses: ["first", "1"].map((id) => ({
+					id,
+					status: "failed",
+					error: missing,
+				})),
+			});
+			const outsideProof = await authorization(executePath, executeBody);
+			expect(
+				(
+					await outside.dispatch(
+						request(beta, executePath, "", executeBody, outsideProof),
+					)
+				).status,
+			).toBe(401);
+			expect(
+				(
+					await outside.dispatch(
+						request(beta, grantPath, sessionCookie, grantBody),
+					)
+				).status,
+			).toBe(403);
+			expect(await snapshot()).toEqual(before);
+
+			// Historical host budgets and grants cannot give a name a definition in this realm.
+			await database.query(
+				`UPDATE ${schema}."agentHost" SET "defaultCapabilities"=$2 WHERE id=$1`,
+				[machine.hostId, JSON.stringify([capability, "fixture.write"])],
+			);
+			await database.query(
+				`INSERT INTO ${schema}."agentCapabilityGrant" (id,"agentId",capability,status,"createdAt","updatedAt") VALUES ($1,$2,$3,'active',now(),now())`,
+				[randomUUID(), machine.agentId, capability],
+			);
+			const withHistoricalGrants = await snapshot();
+			const historicalBatch = {
+				requests: [{ capability }, { capability: "fixture.write" }],
+			};
+			const historical = await owned.dispatch(
+				request(
+					alpha,
+					batchPath,
+					"",
+					historicalBatch,
+					await authorization(batchPath, historicalBatch),
+				),
+			);
+			expect(historical.status).toBe(200);
+			expect(await historical.json()).toMatchObject({
+				responses: [
+					{ status: "failed", error: missing },
+					{ status: "failed", error: { code: missing.code } },
+				],
+			});
+			expect(await snapshot()).toEqual(withHistoricalGrants);
+			const revoked = await legacy.handler(
+				request(alpha, "/agent/revoke", sessionCookie, {
+					agent_id: machine.agentId,
+				}),
+			);
+			expect(revoked.status).toBe(200);
+			expect(
+				await expectSame(grantPath, sessionCookie, 403, grantBody),
+			).toMatchObject({ error: "agent_revoked" });
+		});
+
 		it("introspects an inline body proof with native public grants, replay and expiry rules", async () => {
 			const path = "/agent/introspect";
 			const machine = await nativeMachine("Agent introspection");

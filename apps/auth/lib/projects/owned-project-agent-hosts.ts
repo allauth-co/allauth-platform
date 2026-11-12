@@ -18,6 +18,14 @@ import {
 	revokeOwnedHostAgent,
 	updateOwnedBrowserAgent,
 } from "./owned-project-agent-browser";
+import {
+	agentDiscoveryPath,
+	agentGrantCapabilityPath,
+	denyOwnedAgentBrowserGrant,
+	denyOwnedAgentMachineCapability,
+	ownedAgentDiscovery,
+	ownedAgentMachineCapabilityPath,
+} from "./owned-project-agent-capability-policy";
 import { readOwnedAgentCatalog } from "./owned-project-agent-catalog";
 import {
 	agentCibaAuthorizePath,
@@ -299,6 +307,14 @@ export function createOwnedProjectAgentHosts(options: BrowserHosts) {
 		path: string,
 		request: Request,
 	): Promise<Response | undefined> => {
+		if (request.method === "GET" && path === agentDiscoveryPath)
+			return ownedAgentDiscovery(request);
+		const machineCapability =
+			request.method === "POST"
+				? ownedAgentMachineCapabilityPath(path)
+				: undefined;
+		const capabilityGrant =
+			request.method === "POST" && path === agentGrantCapabilityPath;
 		const decision =
 			request.method === "POST" && path === "/agent/approve-capability";
 		const pending = request.method === "GET" && path === "/agent/ciba/pending";
@@ -335,6 +351,7 @@ export function createOwnedProjectAgentHosts(options: BrowserHosts) {
 		const write =
 			decision ||
 			browserAgentWrite ||
+			capabilityGrant ||
 			grantRevoke ||
 			hostRevoke ||
 			hostUpdate ||
@@ -359,6 +376,7 @@ export function createOwnedProjectAgentHosts(options: BrowserHosts) {
 			!hostRotation &&
 			!agentRotation &&
 			!reactivate &&
+			!machineCapability &&
 			!agentRead
 		)
 			return;
@@ -371,6 +389,8 @@ export function createOwnedProjectAgentHosts(options: BrowserHosts) {
 						: pending || status
 							? 300
 							: agentRead ||
+									capabilityGrant ||
+									machineCapability ||
 									deviceCode ||
 									agentRevoke ||
 									reactivate ||
@@ -385,6 +405,17 @@ export function createOwnedProjectAgentHosts(options: BrowserHosts) {
 			}),
 		);
 		if (limited) return limited;
+		if (machineCapability) {
+			const body = await options.readBody(request);
+			return options.store.transaction((client) =>
+				denyOwnedAgentMachineCapability(
+					client,
+					request,
+					machineCapability,
+					body,
+				),
+			);
+		}
 		if (agentRotation) {
 			const body = await options.readBody(request);
 			return options.store.transaction((client) =>
@@ -531,6 +562,8 @@ export function createOwnedProjectAgentHosts(options: BrowserHosts) {
 				return revokeOwnedBrowserAgent(client, userId, browserRevoke);
 			if (browserUpdate)
 				return updateOwnedBrowserAgent(client, userId, browserUpdate);
+			if (capabilityGrant)
+				return denyOwnedAgentBrowserGrant(client, userId, body);
 			if (browserGrantRevoke) {
 				const agent = await lockBrowserOwnedAgent(
 					client,
