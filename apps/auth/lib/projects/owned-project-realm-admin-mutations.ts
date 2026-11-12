@@ -11,22 +11,61 @@ import {
 	realmAdministratorRequestGuard,
 	recordOwnedRealmAdminEvent,
 } from "./owned-project-realm-admin-audit";
+import { readRealmAdminUser } from "./owned-project-realm-admin-directory";
 
 const singlePath = "/admin/revoke-user-session";
 const bulkPath = "/admin/revoke-user-sessions";
+const rolePath = "/admin/set-role";
+const banPath = "/admin/ban-user";
+const unbanPath = "/admin/unban-user";
+const userId = z.coerce.string();
 const inputs = {
-	[singlePath]: z.object({ sessionToken: z.string() }),
-	[bulkPath]: z.object({ userId: z.coerce.string() }),
+	[singlePath]: z
+		.object({ sessionToken: z.string() })
+		.transform((data) => ({ ...data, path: singlePath }) as const),
+	[bulkPath]: z
+		.object({ userId })
+		.transform((data) => ({ ...data, path: bulkPath }) as const),
+	[rolePath]: z
+		.object({ userId, role: z.union([z.string(), z.array(z.string())]) })
+		.transform((data) => ({ ...data, path: rolePath }) as const),
+	[banPath]: z
+		.object({
+			userId,
+			banReason: z.string().optional(),
+			banExpiresIn: z.number().optional(),
+		})
+		.transform((data) => ({ ...data, path: banPath }) as const),
+	[unbanPath]: z
+		.object({ userId })
+		.transform((data) => ({ ...data, path: unbanPath }) as const),
 };
-const deniedCode = "YOU_ARE_NOT_ALLOWED_TO_REVOKE_USERS_SESSIONS";
+const revokeDenied = [
+	"YOU_ARE_NOT_ALLOWED_TO_REVOKE_USERS_SESSIONS",
+	"You are not allowed to revoke users sessions",
+] as const;
+const banDenied = [
+	"YOU_ARE_NOT_ALLOWED_TO_BAN_USERS",
+	"You are not allowed to ban users",
+] as const;
+const permissionDenied = {
+	[singlePath]: revokeDenied,
+	[bulkPath]: revokeDenied,
+	[rolePath]: [
+		"YOU_ARE_NOT_ALLOWED_TO_CHANGE_USERS_ROLE",
+		"You are not allowed to change users role",
+	],
+	[banPath]: banDenied,
+	[unbanPath]: banDenied,
+};
 
-type RevocationPath = keyof typeof inputs;
+type MutationPath = keyof typeof inputs;
 type RevocationSelector = { tokens: string[] } | { userId: string };
 type Store = ReturnType<typeof createProjectEngineStore>;
 type RealmSession = NonNullable<Awaited<ReturnType<Store["session"]>>>;
 
 /** Accept only a verified browser administrator from the selected project realm. */
-export function createOwnedProjectRealmAdminSessions(options: {
+export function createOwnedProjectRealmAdminMutations(options: {
 	store: Store;
 	readBody(request: Request): Promise<unknown>;
 	checkOrigin(request: Request): Response | null;
@@ -45,14 +84,15 @@ export function createOwnedProjectRealmAdminSessions(options: {
 		client: PoolClient,
 		request: Request,
 		selector: RevocationSelector,
-		path: RevocationPath,
+		path: MutationPath,
 		actorId: string,
 	): Promise<void>;
 }) {
 	const { store } = options;
-	return async (path: string, request: Request) => {
-		if (request.method !== "POST" || (path !== singlePath && path !== bulkPath))
+	return async (route: string, request: Request) => {
+		if (request.method !== "POST" || !Object.hasOwn(inputs, route))
 			return undefined;
+		const path = route as MutationPath;
 		const originFailure = options.checkOrigin(request);
 		if (originFailure) return originFailure;
 		const body = await options.readBody(request);
@@ -68,13 +108,10 @@ export function createOwnedProjectRealmAdminSessions(options: {
 					)
 					.join("; "),
 			);
-		const selector =
-			"userId" in input.data
-				? { userId: input.data.userId }
-				: { tokens: [input.data.sessionToken] };
-		// The native route coerces the selector, but its after-hook audits the raw ID.
+		const mutation = input.data;
+		// The native endpoint coerces the selector, but its after-hook audits the raw ID.
 		const targetId =
-			path === bulkPath &&
+			path !== singlePath &&
 			typeof body === "object" &&
 			body !== null &&
 			"userId" in body &&
@@ -131,33 +168,29 @@ export function createOwnedProjectRealmAdminSessions(options: {
 				return new Response(null, { status: 401, headers });
 			}
 			const denied = async () => {
+				const [deniedCode, message] = permissionDenied[path];
 				await record(deniedCode);
-				return accountLinkJson(
-					{
-						code: deniedCode,
-						message: "You are not allowed to revoke users sessions",
-					},
-					403,
-					headers,
-				);
+				return accountLinkJson({ code: deniedCode, message }, 403, headers);
 			};
 			if (!current.user.role?.split(",").includes("admin")) return denied();
 			const targetUserId =
-				"userId" in selector
-					? selector.userId
+				"userId" in mutation
+					? mutation.userId
 					: (
 							await client.query<{ userId: string }>(
 								'SELECT "userId" FROM "session" WHERE token=$1',
-								[selector.tokens[0]],
+								[mutation.sessionToken],
 							)
 						).rows[0]?.userId;
 			// Acquire actor and target in a stable order before locking sessions/grants.
 			const users = new Set([current.user.id]);
 			if (targetUserId) users.add(targetUserId);
 			let administrator = null;
+			let target = null;
 			for (const userId of [...users].sort()) {
 				const user = await store.lockUser(client, userId);
 				if (userId === current.user.id) administrator = user;
+				if (userId === targetUserId) target = user;
 			}
 			if (
 				!administrator ||
@@ -175,9 +208,79 @@ export function createOwnedProjectRealmAdminSessions(options: {
 				return requireEnrollment();
 			if (!administrator.role?.split(",").includes("admin")) return denied();
 			await options.renew(request, { ...current, token }, client, headers);
-			await options.revoke(client, request, selector, path, administrator.id);
+			if (mutation.path === singlePath || mutation.path === bulkPath) {
+				const selector =
+					mutation.path === singlePath
+						? { tokens: [mutation.sessionToken] }
+						: { userId: mutation.userId };
+				await options.revoke(client, request, selector, path, administrator.id);
+				await record();
+				return accountLinkJson({ success: true }, 200, headers);
+			}
+			const reject = async (status: number, code: string, message: string) => {
+				await record(code);
+				return accountLinkJson({ code, message }, status, headers);
+			};
+			if (!target) return reject(404, "USER_NOT_FOUND", "User not found");
+			if (mutation.path === rolePath) {
+				const role =
+					typeof mutation.role === "string"
+						? mutation.role
+						: mutation.role.join(",");
+				await client.query(
+					'UPDATE "user" SET role=$2,"updatedAt"=statement_timestamp() WHERE id=$1',
+					[target.id, role],
+				);
+			} else {
+				const banned = mutation.path === banPath;
+				if (banned && target.id === administrator.id)
+					return reject(
+						400,
+						"YOU_CANNOT_BAN_YOURSELF",
+						"You cannot ban yourself",
+					);
+				const banExpires =
+					banned && mutation.banExpiresIn
+						? new Date(Date.now() + mutation.banExpiresIn * 1000)
+						: null;
+				if (banExpires && !Number.isFinite(banExpires.getTime()))
+					return reject(
+						400,
+						"VALIDATION_ERROR",
+						"The ban expiration is outside the supported date range.",
+					);
+				await client.query(
+					`UPDATE "user" SET banned=$2,"banReason"=$3,"banExpires"=$4,"updatedAt"=statement_timestamp() WHERE id=$1`,
+					[
+						target.id,
+						banned,
+						banned ? mutation.banReason || "No reason" : null,
+						banExpires,
+					],
+				);
+			}
+			await store.record(
+				client,
+				"user.updated",
+				"success",
+				path,
+				target.id,
+				target.id,
+				administrator.id,
+			);
+			if (mutation.path === banPath)
+				await options.revoke(
+					client,
+					request,
+					{ userId: target.id },
+					path,
+					administrator.id,
+				);
+			const user = await readRealmAdminUser(client, target.id);
+			if (!user)
+				throw new Error("The updated realm account could not be read.");
 			await record();
-			return accountLinkJson({ success: true }, 200, headers);
+			return accountLinkJson({ user }, 200, headers);
 		});
 	};
 }

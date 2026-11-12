@@ -83,7 +83,7 @@ import { createOwnedProjectOneTimeToken } from "./owned-project-one-time-token";
 import type { OwnedProjectPasswordChangeOptions } from "./owned-project-password-change";
 import { createOwnedProjectPasswordChange } from "./owned-project-password-change";
 import { createOwnedProjectPersonalKeys } from "./owned-project-personal-keys";
-import { createOwnedProjectRealmAdminSessions } from "./owned-project-realm-admin-sessions";
+import { createOwnedProjectRealmAdminMutations } from "./owned-project-realm-admin-mutations";
 import { createOwnedProjectRealmAdminRead } from "./owned-project-realm-admin-read";
 import { createOwnedProjectRealmImpersonation } from "./owned-project-realm-impersonation";
 import { createOwnedProjectProfile } from "./owned-project-profile";
@@ -2535,7 +2535,7 @@ export function createOwnedProjectEngine(
 		session: sessionCookie,
 		remember: rememberCookie,
 	};
-	const realmAdminSessions = createOwnedProjectRealmAdminSessions({
+	const realmAdminMutations = createOwnedProjectRealmAdminMutations({
 		store,
 		readBody: requestBody,
 		checkOrigin: sessionMutationOrigin,
@@ -2731,8 +2731,8 @@ export function createOwnedProjectEngine(
 		}
 		const impersonation = await realmImpersonation.dispatch(path, request);
 		if (impersonation) return impersonation;
-		const realmSessionRevocation = await realmAdminSessions(path, request);
-		if (realmSessionRevocation) return realmSessionRevocation;
+		const realmMutation = await realmAdminMutations(path, request);
+		if (realmMutation) return realmMutation;
 		if (
 			wallet &&
 			request.method === "POST" &&

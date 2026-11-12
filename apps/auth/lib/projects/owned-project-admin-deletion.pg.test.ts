@@ -43,6 +43,9 @@ const startPath = "/admin/impersonate-user";
 const stopPath = "/admin/stop-impersonating";
 const singleRevocationPath = "/admin/revoke-user-session";
 const bulkRevocationPath = "/admin/revoke-user-sessions";
+const rolePath = "/admin/set-role";
+const banPath = "/admin/ban-user";
+const unbanPath = "/admin/unban-user";
 const clientIP = "192.0.2.9";
 const userAgent = "AllAuth project administrator fixture";
 const platformSecret = "isolated-root-administrator-deletion-fixture-secret";
@@ -142,6 +145,7 @@ describe.skipIf(!existsSync(fixturePath))(
 		let root: Awaited<ReturnType<typeof legacy>>;
 		let native: Awaited<ReturnType<typeof legacy>>;
 		let nativeProjectDatabase: NativeDatabase;
+		let configuredNative: ReturnType<typeof createConfiguredNative>;
 		let hash: string;
 		const rootId = "fixture-workspace-owner";
 		const realmAdmin = "fixture-project-admin";
@@ -238,6 +242,51 @@ describe.skipIf(!existsSync(fixturePath))(
 					)
 				).rowCount === 1
 			);
+		}
+
+		function createConfiguredNative() {
+			const options = createAuthOptions(
+				{ db: nativeProjectDatabase, type: "postgres", transaction: true },
+				{
+					ALLAUTH_AUTH_URL: origin,
+					ALLAUTH_AUTH_SECRET: alpha.secret,
+					AUTH_RUNTIME: "node",
+					SCIM_CREDENTIAL_HASH_SECRET:
+						"synthetic-administrator-test-scim-secret",
+				},
+				{
+					name: "Synthetic realm administrator fixture",
+					basePath: alpha.path,
+					cookiePrefix: `allauth_project_${alpha.slug}`,
+					primaryOrigin: origin,
+					origins: [],
+					broker: {
+						clientId: "fixture-broker",
+						clientSecret: "synthetic-broker-secret",
+					},
+					authorizeAdmin: async () => null,
+					management: { id: "realm-admin-fixture" },
+				},
+			);
+			return betterAuth({
+				...options,
+				advanced: { ...options.advanced, disableOriginCheck: false },
+				logger: { disabled: true },
+			});
+		}
+
+		async function stockRealm() {
+			if (configuredNative) return configuredNative;
+			await sql
+				.raw(
+					readFileSync(
+						new URL("../../migrations/006-analytics.sql", import.meta.url),
+						"utf8",
+					),
+				)
+				.execute(nativeProjectDatabase);
+			configuredNative = createConfiguredNative();
+			return configuredNative;
 		}
 
 		beforeAll(async () => {
@@ -628,42 +677,7 @@ describe.skipIf(!existsSync(fixturePath))(
 		});
 
 		it("interchanges realm administrator session revocation with the production native handler", async () => {
-			await sql
-				.raw(
-					readFileSync(
-						new URL("../../migrations/006-analytics.sql", import.meta.url),
-						"utf8",
-					),
-				)
-				.execute(nativeProjectDatabase);
-			const stockOptions = createAuthOptions(
-				{ db: nativeProjectDatabase, type: "postgres", transaction: true },
-				{
-					ALLAUTH_AUTH_URL: origin,
-					ALLAUTH_AUTH_SECRET: alpha.secret,
-					AUTH_RUNTIME: "node",
-					SCIM_CREDENTIAL_HASH_SECRET:
-						"synthetic-administrator-test-scim-secret",
-				},
-				{
-					name: "Synthetic realm administrator fixture",
-					basePath: alpha.path,
-					cookiePrefix: `allauth_project_${alpha.slug}`,
-					primaryOrigin: origin,
-					origins: [],
-					broker: {
-						clientId: "fixture-broker",
-						clientSecret: "synthetic-broker-secret",
-					},
-					authorizeAdmin: async () => null,
-					management: { id: "realm-admin-fixture" },
-				},
-			);
-			const stock = betterAuth({
-				...stockOptions,
-				advanced: { ...stockOptions.advanced, disableOriginCheck: false },
-				logger: { disabled: true },
-			});
+			const stock = await stockRealm();
 			const scope = `"${alpha.schemaName}"`;
 			const targetId = "fixture-project-revocation-target";
 			const relyingParty = "realm-admin-revocation-client";
@@ -956,7 +970,7 @@ describe.skipIf(!existsSync(fixturePath))(
 			).toBe(1);
 		});
 
-		it("commits realm admin single and bulk revocation before sending signed backchannel logout", async () => {
+		it("commits realm admin session revocations and bans before sending signed backchannel logout", async () => {
 			const scope = `"${alpha.schemaName}"`;
 			const targetId = "realm-admin-logout-fixture-target";
 			const clientId = "realm-admin-logout-fixture-client";
@@ -991,7 +1005,7 @@ describe.skipIf(!existsSync(fixturePath))(
 					return 204;
 				},
 			});
-			for (const path of [singleRevocationPath, bulkRevocationPath]) {
+			for (const path of [singleRevocationPath, bulkRevocationPath, banPath]) {
 				const signed = await login(native, alpha.path, targetId);
 				const current = await native.api.getSession({
 					headers: new Headers({ cookie: signed }),
@@ -1007,6 +1021,13 @@ describe.skipIf(!existsSync(fixturePath))(
 						? { sessionToken: current.session.token }
 						: { userId: targetId };
 				const call = () => request(alpha.path + path, realmCookie, body);
+				const userBan = async () =>
+					(
+						await database.query(
+							`SELECT banned FROM ${scope}."user" WHERE id=$1`,
+							[targetId],
+						)
+					).rows;
 				const before = (
 					await database.query(
 						`SELECT id FROM ${scope}."allauthAudit" WHERE action=$1`,
@@ -1014,6 +1035,7 @@ describe.skipIf(!existsSync(fixturePath))(
 					)
 				).rowCount;
 				expect((await engine().dispatch(call())).status).toBe(501);
+				expect(await userBan()).toEqual([{ banned: null }]);
 				expect(
 					(
 						await native.api.getSession({
@@ -1039,6 +1061,9 @@ describe.skipIf(!existsSync(fixturePath))(
 				).toBe(before);
 				const response = await candidate.dispatch(call());
 				expect(response.status, await response.clone().text()).toBe(200);
+				expect(await userBan()).toEqual([
+					{ banned: path === banPath ? true : null },
+				]);
 				revokedSessions.push(current.session.id);
 				expect(
 					await native.api.getSession({
@@ -1053,7 +1078,7 @@ describe.skipIf(!existsSync(fixturePath))(
 			);
 			expect(publicKeys.status).toBe(200);
 			const verifyKey = createLocalJWKSet(await publicKeys.json());
-			expect(delivered).toHaveLength(2);
+			expect(delivered).toHaveLength(3);
 			for (const [index, jwt] of delivered.entries()) {
 				const { payload } = await jwtVerify(jwt, verifyKey, {
 					issuer: origin + alpha.path,
@@ -1065,6 +1090,287 @@ describe.skipIf(!existsSync(fixturePath))(
 					sid: revokedSessions[index],
 					events: { "http://schemas.openid.net/event/backchannel-logout": {} },
 				});
+			}
+		});
+
+		it("preserves native realm role and ban mutations, rollback state and signed events", async () => {
+			const stock = await stockRealm();
+			const candidate = localizeProjectErrors(engine());
+			const scope = `"${alpha.schemaName}"`;
+			const id = "realm-role-ban-fixture-user";
+			const relyingParty = "realm-role-ban-fixture-client";
+			await seedUser(alpha.schemaName, id);
+			await seedUser(beta.schemaName, id);
+			const endpoint = randomUUID();
+			const url = "https://realm-role-ban-events.fixture.example/hook";
+			const signingSecret = newWebhookSigningSecret();
+			await database.query(
+				`INSERT INTO ${scope}."allauthWebhookEndpoint" (id,url,"eventTypes","encryptedSecret")
+				 VALUES ($1,$2,'["admin.*","user.updated","session.deleted"]',$3)`,
+				[
+					endpoint,
+					url,
+					await symmetricEncrypt({ key: alpha.secret, data: signingSecret }),
+				],
+			);
+			await database.query(
+				`INSERT INTO ${scope}."oauthClient" (id,"clientId","redirectUris") VALUES ($1,$1,'[]')`,
+				[relyingParty],
+			);
+			const readSession = async (cookie: string) =>
+				native.api.getSession({ headers: new Headers({ cookie }) });
+			type Dispatch = (incoming: Request) => Promise<Response>;
+			async function exercise(dispatch: Dispatch, rollback: Dispatch) {
+				const userCookie = await login(native, alpha.path, id);
+				const identity = await readSession(userCookie);
+				if (!identity) throw new Error("Expected a live fixture session.");
+				const sessionId = identity.session.id;
+				const call = (path: string, body: unknown, authority = realmCookie) =>
+					dispatch(request(alpha.path + path, authority, body));
+				for (const [table, scopes] of [
+					["oauthAccessToken", '["openid"]'],
+					["oauthRefreshToken", '["openid","offline_access"]'],
+				] as const)
+					await database.query(
+						`INSERT INTO ${scope}."${table}" (id,token,"clientId","sessionId","userId","expiresAt","createdAt",scopes)
+						 VALUES ($1,$2,$3,$4,$5,now()+interval '1 hour',now(),$6)`,
+						[randomUUID(), randomUUID(), relyingParty, sessionId, id, scopes],
+					);
+				const challenges = [
+					"trust-device-synthetic",
+					"2fa-synthetic",
+					"untouched-synthetic",
+				];
+				for (const identifier of challenges)
+					await database.query(
+						`INSERT INTO ${scope}."verification" (id,identifier,value,"expiresAt") VALUES ($1,$2,$3,now()+interval '1 hour')`,
+						[randomUUID(), identifier, id],
+					);
+				const grants = async () =>
+					(
+						await database.query(
+							`SELECT id FROM ${scope}."oauthAccessToken" WHERE "userId"=$1
+					 UNION ALL SELECT id FROM ${scope}."oauthRefreshToken" WHERE "userId"=$1`,
+							[id],
+						)
+					).rowCount;
+				const rejections: unknown[] = [];
+				async function reject(
+					response: Response,
+					status: number,
+					code?: string,
+				) {
+					expect(response.status, await response.clone().text()).toBe(status);
+					expect(response.headers.getSetCookie()).toEqual([]);
+					const body = await response.text();
+					const parsed = body ? JSON.parse(body) : null;
+					if (code) expect(parsed).toMatchObject({ code });
+					rejections.push(parsed);
+				}
+				for (const [path, body, code] of [
+					[
+						rolePath,
+						{ userId: id, role: "admin" },
+						"YOU_ARE_NOT_ALLOWED_TO_CHANGE_USERS_ROLE",
+					],
+					[banPath, { userId: id }, "YOU_ARE_NOT_ALLOWED_TO_BAN_USERS"],
+					[unbanPath, { userId: id }, "YOU_ARE_NOT_ALLOWED_TO_BAN_USERS"],
+				] as const) {
+					await reject(await call(path, body, rootCookie), 401);
+					await reject(await call(path, body, userCookie), 403, code);
+					await reject(
+						await call(path, { ...body, userId: "missing-fixture-user" }),
+						404,
+						"USER_NOT_FOUND",
+					);
+					const crossOrigin = request(
+						alpha.path + path,
+						realmCookie,
+						body,
+						"https://untrusted.fixture.example",
+					);
+					await reject(await dispatch(crossOrigin), 403, "INVALID_ORIGIN");
+					const bearer = request(alpha.path + path, undefined, body);
+					bearer.headers.delete("origin");
+					bearer.headers.set(
+						"authorization",
+						`Bearer ${realmCookie.split("=", 2)[1]}`,
+					);
+					await reject(await dispatch(bearer), 403);
+				}
+				await reject(
+					await call(banPath, { userId: realmAdmin }),
+					400,
+					"YOU_CANNOT_BAN_YOURSELF",
+				);
+				const userResponses: unknown[] = [];
+				async function update(path: string, body: unknown, expected: object) {
+					const response = await call(path, body);
+					expect(response.status, await response.clone().text()).toBe(200);
+					expect(response.headers.getSetCookie()).toEqual([]);
+					const { user } = (await response.json()) as {
+						user: Record<string, unknown>;
+					};
+					expect(user).toMatchObject({ id, ...expected });
+					expect(Date.parse(String(user.updatedAt))).toBeGreaterThan(0);
+					expect(user).not.toHaveProperty("privateMetadata");
+					const { banExpires, updatedAt: _updatedAt, ...stable } = user;
+					userResponses.push({
+						...stable,
+						banExpires: banExpires === null ? null : "expiry",
+					});
+					return user;
+				}
+				const inspect = (authority: string) =>
+					rollback(request(`${alpha.path}/admin/get-user?id=${id}`, authority));
+				await update(
+					rolePath,
+					{ userId: id, role: ["user", "custom-realm-role", "admin"] },
+					{ role: "user,custom-realm-role,admin" },
+				);
+				expect((await inspect(userCookie)).status).toBe(200);
+				await update(
+					rolePath,
+					{ userId: id, role: "user,custom-realm-role" },
+					{ role: "user,custom-realm-role" },
+				);
+				expect((await inspect(userCookie)).status).toBe(403);
+				expect((await readSession(userCookie))?.session.id).toBe(sessionId);
+				expect(await grants()).toBe(2);
+
+				const cutoff = Date.now() + 600_250;
+				const banned = await update(
+					banPath,
+					{
+						userId: id,
+						banReason: "  Synthetic restriction  ",
+						banExpiresIn: 600.25,
+					},
+					{ banned: true, banReason: "  Synthetic restriction  " },
+				);
+				expect(
+					Math.abs(Date.parse(String(banned.banExpires)) - cutoff),
+				).toBeLessThan(5_000);
+				expect(await readSession(userCookie)).toBeNull();
+				expect(await grants()).toBe(0);
+				expect(
+					(
+						await database.query(
+							`SELECT identifier FROM ${scope}."verification" WHERE value=$1`,
+							[id],
+						)
+					).rows,
+				).toEqual([{ identifier: "untouched-synthetic" }]);
+				await update(
+					banPath,
+					{ userId: id, banReason: "", banExpiresIn: 0 },
+					{ banned: true, banReason: "No reason", banExpires: null },
+				);
+				await update(
+					unbanPath,
+					{ userId: id },
+					{ banned: false, banReason: null, banExpires: null },
+				);
+				expect(await readSession(userCookie)).toBeNull();
+				expect(await (await inspect(realmCookie)).json()).toMatchObject({
+					id,
+					banned: false,
+					role: "user,custom-realm-role",
+				});
+				await database.query(
+					`DELETE FROM ${scope}."verification" WHERE value=$1`,
+					[id],
+				);
+				await database.query(
+					`UPDATE ${scope}."user" SET role='user',banned=NULL WHERE id=$1`,
+					[id],
+				);
+
+				const events: unknown[] = [];
+				const drain = () =>
+					deliverPendingWebhooks({
+						database: nativeProjectDatabase,
+						secret: alpha.secret,
+						now: () => new Date(Date.now() + 2_000),
+						maxDeliveries: 20,
+						resolver: async () => [{ address: "93.184.216.34", family: 4 }],
+						async transport({ destination, headers, body }) {
+							expect(destination.url.href).toBe(url);
+							expect(headers["webhook-signature"]).toBe(
+								`v1,${createHmac(
+									"sha256",
+									Buffer.from(signingSecret.slice(6), "base64"),
+								)
+									.update(
+										`${headers["webhook-id"]}.${headers["webhook-timestamp"]}.${body}`,
+									)
+									.digest("base64")}`,
+							);
+							const { id, type, timestamp, data } = JSON.parse(
+								body,
+							) as ControlWebhookEnvelope;
+							const { id: eventId, createdAt, ...event } = data.event;
+							expect([id, type, timestamp]).toEqual([
+								eventId,
+								event.type,
+								createdAt,
+							]);
+							expect(body).not.toContain(identity.session.token);
+							expect(body).not.toContain("Synthetic restriction");
+							if (event.targetId === sessionId)
+								event.targetId = "revoked-session";
+							events.push(event);
+							return 204;
+						},
+					});
+				for (const count of [20, 1])
+					expect(await drain()).toEqual({
+						claimed: count,
+						delivered: count,
+						retried: 0,
+						failed: 0,
+					});
+				expect(events).toHaveLength(21);
+				const audit = (
+					await database.query(
+						`SELECT action,"actorId","targetId" FROM ${scope}."allauthAudit"
+					 WHERE action=ANY($1::text[]) AND "targetId"=$2 ORDER BY action,"targetId"`,
+						[[rolePath, banPath, unbanPath], id],
+					)
+				).rows;
+				expect(audit).toHaveLength(5);
+				await database.query(
+					`DELETE FROM ${scope}."allauthAudit" WHERE action=ANY($1::text[]) AND "targetId"=$2`,
+					[[rolePath, banPath, unbanPath], id],
+				);
+				return {
+					userResponses,
+					rejections,
+					audit,
+					events: events.sort((left, right) =>
+						JSON.stringify(left).localeCompare(JSON.stringify(right)),
+					),
+				};
+			}
+
+			try {
+				const expected = await exercise(stock.handler, candidate.dispatch);
+				expect(await exercise(candidate.dispatch, stock.handler)).toEqual(
+					expected,
+				);
+				expect(
+					(
+						await database.query(
+							`SELECT role,banned FROM "${beta.schemaName}"."user" WHERE id=$1`,
+							[id],
+						)
+					).rows,
+				).toEqual([{ role: "user", banned: null }]);
+			} finally {
+				await database.query(
+					`DELETE FROM ${scope}."allauthWebhookEndpoint" WHERE id=$1`,
+					[endpoint],
+				);
 			}
 		});
 
