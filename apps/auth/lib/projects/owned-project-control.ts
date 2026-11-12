@@ -1,6 +1,8 @@
 import { CompiledQuery, Kysely, PostgresDialect, sql } from "kysely";
 import type { Pool } from "pg";
+import * as z from "zod";
 import { rolesInclude } from "../configuration";
+import { controlEventAttributes } from "../control/event-metadata";
 import {
 	controlLogDetailQuery,
 	controlLogsQuery,
@@ -13,6 +15,7 @@ import {
 } from "../control/queries";
 import {
 	controlEventsQuery,
+	controlIdentifier,
 	controlSessionsQuery,
 } from "../control/read-input";
 import {
@@ -42,19 +45,22 @@ const queries = {
 	"/control/logs/detail": controlLogDetailQuery,
 };
 type ControlPath = keyof typeof queries;
+const revokePath = "/control/revoke-session";
+const revokeInput = z.object({ id: controlIdentifier }).strict();
 
 type ProjectControlSession = {
 	id: string;
 	userId: string;
 };
 
-export function createOwnedProjectControlRead(options: {
+export function createOwnedProjectControl(options: {
 	database: Pool;
 	project: Pick<Project, "id" | "schemaName" | "slug" | "workspaceId">;
 	origin: string;
 	basePath: string;
 	platformOrigin: string;
 	trustedIP(request: Request): string | null;
+	readBody(request: Request): Promise<unknown>;
 	readWorkspacePrincipal(headers: Headers): Promise<ControlPrincipal | null>;
 	readProjectSession(headers: Headers): Promise<ProjectControlSession | null>;
 }) {
@@ -134,8 +140,62 @@ export function createOwnedProjectControlRead(options: {
 		filters.userId = current.userId;
 	}
 
-	return async function read(request: Request, path: string) {
-		if (!Object.hasOwn(queries, path) || request.method !== "GET") return null;
+	async function revokeSession(
+		transaction: ControlDatabase,
+		request: Request,
+		principal: ControlPrincipal,
+		id: string,
+	) {
+		const absent = () =>
+			accountLinkError(404, "NOT_FOUND", "This session no longer exists.");
+		const {
+			rows: [target],
+		} = await sql<{ userId: string }>`
+			SELECT "userId" FROM session WHERE id=${id}
+		`.execute(transaction);
+		if (!target) return absent();
+		const { userId } = target;
+		const user =
+			await sql`SELECT id FROM "user" WHERE id=${userId} FOR UPDATE`.execute(
+				transaction,
+			);
+		if (!user.rows.length) return absent();
+		const removed =
+			await sql`DELETE FROM session WHERE id=${id} AND "userId"=${userId}
+			RETURNING id`.execute(transaction);
+		if (!removed.rows.length) return absent();
+		await sql`DELETE FROM "oauthAccessToken" WHERE "userId"=${userId}`.execute(
+			transaction,
+		);
+		await sql`DELETE FROM "oauthRefreshToken" WHERE "userId"=${userId}`.execute(
+			transaction,
+		);
+		await sql`DELETE FROM verification WHERE value=${userId}
+			AND (starts_with(identifier,'trust-device-') OR starts_with(identifier,'2fa-'))`.execute(
+			transaction,
+		);
+		const { ipAddress, userAgent } = controlEventAttributes({
+			ipAddress: options.trustedIP(request) ?? undefined,
+			userAgent: request.headers.get("user-agent") ?? undefined,
+		});
+		await sql`INSERT INTO "allauthEvent" (id,type,outcome,"actorId","userId","targetId",
+			"ipAddress","userAgent","createdAt",metadata)
+			VALUES (${crypto.randomUUID()},'session.deleted','success',NULL,${userId},${id},NULL,NULL,
+			        statement_timestamp(),${JSON.stringify({ path: revokePath })}::jsonb),
+			       (${crypto.randomUUID()},'session.revoked','success',${principal.user.id},${userId},${id},
+			        ${ipAddress ?? null},${userAgent ?? null},statement_timestamp(),'{}'::jsonb)`.execute(
+			transaction,
+		);
+		return accountLinkJson({ success: true });
+	}
+
+	return async function control(request: Request, path: string) {
+		const revoking = path === revokePath;
+		if (
+			(!revoking && !Object.hasOwn(queries, path)) ||
+			request.method !== (revoking ? "POST" : "GET")
+		)
+			return null;
 		const url = new URL(request.url);
 		if (
 			url.origin !== options.origin ||
@@ -153,7 +213,10 @@ export function createOwnedProjectControlRead(options: {
 		const parsed = queries[path as ControlPath]?.safeParse(
 			Object.fromEntries(url.searchParams),
 		);
-		if (parsed && !parsed.success)
+		const target = revoking
+			? revokeInput.safeParse(await options.readBody(request))
+			: undefined;
+		if ((parsed && !parsed.success) || (target && !target.success))
 			return accountLinkError(
 				400,
 				"BAD_REQUEST",
@@ -179,6 +242,16 @@ export function createOwnedProjectControlRead(options: {
 				request.headers,
 			);
 			if (!workspacePrincipal) return forbidden();
+			if (
+				revoking &&
+				(request.headers.get("origin") !== options.platformOrigin ||
+					request.headers.get("sec-fetch-site") === "cross-site")
+			)
+				return accountLinkError(
+					403,
+					"FORBIDDEN",
+					"Control changes require a same-origin request.",
+				);
 		} else {
 			projectSession = await options.readProjectSession(request.headers);
 			if (!projectSession)
@@ -201,6 +274,13 @@ export function createOwnedProjectControlRead(options: {
 					))
 				)
 					return forbidden();
+				if (target?.success)
+					return revokeSession(
+						transaction,
+						request,
+						workspacePrincipal,
+						target.data.id,
+					);
 			} else if (projectSession) {
 				const denied = await checkProjectScope(
 					transaction,

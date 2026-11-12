@@ -29,7 +29,7 @@ import type { ProjectAccountLinkOptions } from "./owned-project-account-links";
 import type { OwnedProjectAdminDeletionOptions } from "./owned-project-admin-deletion";
 import { createOwnedProjectAdminDeletion } from "./owned-project-admin-deletion";
 import { createOwnedProjectAdminUsers } from "./owned-project-admin-users";
-import { createOwnedProjectControlRead } from "./owned-project-control-read";
+import { createOwnedProjectControl } from "./owned-project-control";
 import { createOwnedProjectAgentHosts } from "./owned-project-agent-hosts";
 import type { ProjectBackchannelTarget } from "./owned-project-backchannel-logout";
 import { createOwnedProjectBackchannelLogout } from "./owned-project-backchannel-logout";
@@ -2014,14 +2014,15 @@ export function createOwnedProjectEngine(
 			basePath: options.basePath,
 			readBody: (request) => requestBody(request, 1024 * 1024),
 		});
-	const controlRead = options.adminDeletion && adminProject &&
-		createOwnedProjectControlRead({
+	const projectControl = options.adminDeletion && adminProject &&
+		createOwnedProjectControl({
 			...options.adminDeletion,
 			database: options.database,
 			project: adminProject,
 			origin,
 			basePath: options.basePath,
 			trustedIP: options.trustedIP,
+			readBody: requestBody,
 			async readProjectSession(headers) {
 				if (!trustedRequest(headers, false)) return null;
 				const current = await currentSession(headers);
@@ -2630,7 +2631,7 @@ export function createOwnedProjectEngine(
 		if (imported) return imported;
 		const importedInvitations = await invitationImport?.(request, path);
 		if (importedInvitations) return importedInvitations;
-		const control = await controlRead?.(request, path);
+		const control = await projectControl?.(request, path);
 		if (control) return control;
 		const webhook = await webhookManagement?.(request, path);
 		if (webhook) return webhook;

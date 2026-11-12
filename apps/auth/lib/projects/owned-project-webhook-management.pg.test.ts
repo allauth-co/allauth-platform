@@ -1,9 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { runWithAdapter } from "@better-auth/core/context";
+import { oauthProvider } from "@better-auth/oauth-provider";
 import { APIError } from "better-auth";
 import { symmetricDecrypt } from "better-auth/crypto";
-import { admin, organization } from "better-auth/plugins";
+import { admin, jwt, organization } from "better-auth/plugins";
 import { getTestInstance } from "better-auth/test";
 import { Kysely, PostgresDialect } from "kysely";
 import { Pool } from "pg";
@@ -27,6 +28,10 @@ import {
 	deliverPendingWebhooks,
 } from "../control/webhooks";
 import type { ControlWebhookEnvelope } from "../control/webhooks";
+import {
+	revokeAuthenticationChallenges,
+	revokeUserGrants,
+} from "../enterprise";
 import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
 import { createOwnedProjectEngine } from "./owned-project-engine";
 import { projectSecret } from "./runtime";
@@ -105,7 +110,16 @@ async function native(
 ) {
 	const control = allauthControl({
 		ipHeader: "x-real-ip",
-		...(realm && readRoot ? { database, authorizeAdmin: readRoot } : {}),
+		...(realm && readRoot
+			? {
+					database,
+					authorizeAdmin: readRoot,
+					async onRevokeUser(adapter, id) {
+						await revokeUserGrants(adapter, id);
+						await revokeAuthenticationChallenges(adapter, id);
+					},
+				}
+			: {}),
 	});
 	const webhooks =
 		realm &&
@@ -134,7 +148,16 @@ async function native(
 			emailAndPassword: { enabled: true, password: clerkCompatiblePasswords },
 			plugins: [
 				admin(),
-				...(realm ? [organization()] : []),
+				...(realm
+					? [
+							organization(),
+							jwt({ disableSettingJwtHeader: true }),
+							oauthProvider({
+								loginPage: "/sign-in",
+								consentPage: "/oauth/consent",
+							}),
+						]
+					: []),
 				{
 					...control,
 					endpoints: { ...control.endpoints, ...webhooks?.endpoints },
@@ -427,6 +450,119 @@ describe.skipIf(!existsSync(fixture))(
 				expect(
 					(await send(writer, catalog[4][0], undefined, projectCookie)).status,
 				).toBe(403);
+		});
+
+		it("revokes one console session, associated user grants and challenges with native event parity", async () => {
+			const path = "/control/revoke-session";
+			const id = "fixture-control-revoked-session";
+			const sibling = "fixture-control-surviving-session";
+			const clientId = "fixture-control-revoke-client";
+			const grantId = "fixture-control-revoke-grant";
+			const realm = `"${alpha.schemaName}"`;
+			await database.query(
+				`INSERT INTO ${realm}."oauthClient"(id,"clientId","redirectUris") VALUES ($1,$1,'[]')`,
+				[clientId],
+			);
+			const seed = async () => {
+				await database.query(
+					`INSERT INTO ${realm}.session(id,token,"userId","expiresAt","updatedAt")
+					 VALUES ($1,$2,$3,now()+interval '1 hour',now()),
+					        ($4,$5,$3,now()+interval '1 hour',now())`,
+					[id, randomUUID(), userId, sibling, randomUUID()],
+				);
+				await database.query(
+					`INSERT INTO ${realm}."oauthRefreshToken"(id,token,"clientId","sessionId","userId","expiresAt","createdAt",scopes)
+					 VALUES ($1,$2,$3,$4,$5,now()+interval '1 hour',now(),'["offline_access"]')`,
+					[grantId, randomUUID(), clientId, sibling, userId],
+				);
+				await database.query(
+					`INSERT INTO ${realm}.verification(id,identifier,value,"expiresAt")
+					 VALUES ($1,'trust-device-fixture',$2,now()+interval '1 hour')`,
+					[grantId, userId],
+				);
+			};
+			const events = async () =>
+				(
+					await database.query(
+						`SELECT id,type,outcome,"actorId","userId","targetId","ipAddress","userAgent",metadata
+				 FROM ${realm}."allauthEvent" WHERE "targetId"=$1 ORDER BY type,id`,
+						[id],
+					)
+				).rows;
+			const state = async () =>
+				(
+					await database.query(
+						`SELECT EXISTS(SELECT 1 FROM ${realm}.session WHERE id=$1) AS target,
+				        EXISTS(SELECT 1 FROM ${realm}.session WHERE id=$2) AS sibling,
+				        EXISTS(SELECT 1 FROM ${realm}."oauthRefreshToken" WHERE id=$3) AS grant,
+				        EXISTS(SELECT 1 FROM ${realm}.verification WHERE id=$3) AS challenge`,
+						[id, sibling, grantId],
+					)
+				).rows[0];
+
+			const run = async (writer: "legacy" | "owned") => {
+				await seed();
+				const prior = new Set((await events()).map((event) => event.id));
+				expect(
+					(
+						await send(
+							writer,
+							path,
+							{ id },
+							rootCookie,
+							"https://other.fixture.example",
+						)
+					).status,
+				).toBe(403);
+				const response = await send(writer, path, { id });
+				expect(response.status, await response.clone().text()).toBe(200);
+				expect(await response.json()).toEqual({ success: true });
+				expect(await state()).toEqual({
+					target: false,
+					sibling: true,
+					grant: false,
+					challenge: false,
+				});
+				expect((await send(writer, path, { id })).status).toBe(404);
+				await database.query(`DELETE FROM ${realm}.session WHERE id=$1`, [
+					sibling,
+				]);
+				return (await events())
+					.filter((event) => !prior.has(event.id))
+					.map(({ id, ...event }) => event);
+			};
+			const nativeEvents = await run("legacy");
+			expect(nativeEvents).toHaveLength(2);
+			expect(await run("owned")).toEqual(nativeEvents);
+			await seed();
+			await database.query(
+				`ALTER TABLE ${realm}."allauthEvent" ADD CONSTRAINT reject_console_revoke_fixture CHECK (type <> 'session.revoked') NOT VALID`,
+			);
+			try {
+				await expect(send("owned", path, { id })).rejects.toMatchObject({
+					code: "23514",
+				});
+				expect(await state()).toEqual({
+					target: true,
+					sibling: true,
+					grant: true,
+					challenge: true,
+				});
+			} finally {
+				await database.query(
+					`ALTER TABLE ${realm}."allauthEvent" DROP CONSTRAINT reject_console_revoke_fixture`,
+				);
+				await database.query(`DELETE FROM ${realm}."oauthClient" WHERE id=$1`, [
+					clientId,
+				]);
+				await database.query(
+					`DELETE FROM ${realm}.session WHERE id=ANY($1::text[])`,
+					[[id, sibling]],
+				);
+				await database.query(`DELETE FROM ${realm}.verification WHERE id=$1`, [
+					grantId,
+				]);
+			}
 		});
 
 		async function endpoint(
