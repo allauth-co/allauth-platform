@@ -511,7 +511,7 @@ describe.skipIf(!existsSync(fixturePath))(
 					schemas: [patchOp],
 					Operations: [
 						{ op: "replace", path: "active", value: false },
-						{ op: "add", path: "manager.value", value: "unsupported" },
+						{ op: "add", path: "unknownAttribute.value", value: "unsupported" },
 					],
 				}),
 			);
@@ -682,6 +682,152 @@ describe.skipIf(!existsSync(fixturePath))(
 					)
 				).rowCount,
 			).toBe(0);
+		});
+
+		it("matches native structured Entra PATCH semantics and validates email tuple deltas", async () => {
+			const [ownedUser, nativeUser] = await Promise.all(
+				["patch-owned", "patch-native"].map(async (name) =>
+					resource(
+						await native.handler(
+							request("Users", token, "POST", {
+								schemas: [scimUserSchema],
+								userName: `${name}@scim.example`,
+								phoneNumbers: [
+									{ type: "home", value: "+61000000001", primary: true },
+								],
+							}),
+						),
+						201,
+					),
+				),
+			);
+			const advanced = {
+				schemas: [patchOp],
+				Operations: [
+					{
+						op: "replace",
+						path: 'phoneNumbers[ type eq "work" ].value',
+						value: "+61000000002",
+					},
+					{
+						op: "replace",
+						path: 'phoneNumbers [ type eq "work" ] . primary',
+						value: "True",
+					},
+					{
+						op: "add",
+						path: 'addresses[type eq "work"].streetAddress',
+						value: "Fixture Street",
+					},
+					{
+						op: "add",
+						path: 'roles[type eq "employee"]',
+						value: { value: "Engineer" },
+					},
+					{
+						op: "replace",
+						path: 'entitlements[primary eq "true"]',
+						value: { value: "Fixture grant" },
+					},
+					{ op: "replace", path: "manager.value", value: "fixture-manager" },
+					{
+						op: "replace",
+						path: `${scimEnterpriseUserSchema}:manager.$ref`,
+						value: "https://scim.example/Users/fixture-manager",
+					},
+					{
+						op: "add",
+						path: scimEnterpriseUserSchema,
+						value: { department: "Fixture", employeeNumber: ["E-16"] },
+					},
+				],
+			};
+			const query = `?attributes=${encodeURIComponent(`phoneNumbers,addresses,roles,entitlements,${scimEnterpriseUserSchema}`)}`;
+			const actual = await resource(
+				await writer(
+					request(`Users/${ownedUser!.id}${query}`, token, "PATCH", advanced),
+				),
+				200,
+			);
+			const expected = await resource(
+				await native.handler(
+					request(`Users/${nativeUser!.id}${query}`, token, "PATCH", advanced),
+				),
+				200,
+			);
+			expect(actual.body).toEqual({ ...expected.body, id: ownedUser!.id });
+			const addEmail = {
+				schemas: [patchOp],
+				Operations: [
+					{
+						op: "add",
+						path: "emails",
+						value: [
+							{
+								type: "work",
+								value: "preferred@scim.example",
+								primary: "true",
+							},
+						],
+					},
+				],
+			};
+			const added = await resource(
+				await writer(
+					request(`Users/${ownedUser!.id}`, token, "PATCH", addEmail),
+				),
+				200,
+			);
+			expect(added.body).toMatchObject({
+				emails: [
+					{ value: "patch-owned@scim.example", primary: false },
+					{ value: "preferred@scim.example", type: "work", primary: true },
+				],
+			});
+			const replay = await resource(
+				await writer(
+					request(`Users/${ownedUser!.id}`, token, "PATCH", addEmail),
+				),
+				200,
+			);
+			expect(replay.body).toEqual(added.body);
+			const duplicate = await writer(
+				request(`Users/${ownedUser!.id}`, token, "PATCH", {
+					schemas: [patchOp],
+					Operations: [
+						{
+							op: "add",
+							path: "emails",
+							value: [{ type: "work", value: "duplicate@scim.example" }],
+						},
+					],
+				}),
+			);
+			expect(duplicate?.status).toBe(400);
+			expect(await duplicate?.json()).toMatchObject({
+				detail: "emails cannot contain duplicate defined types",
+			});
+			const removed = await resource(
+				await writer(
+					request(`Users/${ownedUser!.id}`, token, "PATCH", {
+						schemas: [patchOp],
+						Operations: [
+							{ op: "remove", path: scimEnterpriseUserSchema },
+							{ op: "remove", path: 'phoneNumbers[type eq "home"]' },
+						],
+					}),
+				),
+				200,
+			);
+			expect(removed.body).toMatchObject({
+				schemas: [scimUserSchema],
+				phoneNumbers: [{ type: "work", value: "+61000000002", primary: true }],
+			});
+			expect(
+				await (
+					await native.handler(request(`Users/${ownedUser!.id}`, token))
+				).json(),
+			).toEqual(removed.body);
 		});
 	},
 );

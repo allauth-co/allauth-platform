@@ -26,7 +26,7 @@ export const ssoProviderId = z
 	.string()
 	.regex(/^[A-Za-z0-9._-]{1,128}$/)
 	.refine((value) => !reservedProviders.has(value.toLowerCase()));
-const referenceSchema = z.object({
+export const ssoReferenceSchema = z.object({
 	providerId: ssoProviderId,
 	source: z.object({
 		type: z.literal("persisted"),
@@ -36,7 +36,7 @@ const referenceSchema = z.object({
 		.string()
 		.regex(/^[A-Za-z0-9_-]{43}$/),
 });
-const stateSchema = z.object({
+export const ssoStateSchema = z.object({
 	callbackURL: z.string().max(2048),
 	newUserURL: z.string().max(2048).optional(),
 	errorURL: z.string().max(2048).optional(),
@@ -45,10 +45,13 @@ const stateSchema = z.object({
 	expiresAt: z.number().int(),
 	idTokenNonce: z.string().min(1).max(128).optional(),
 	requestSignUp: z.boolean().optional(),
-	serverContext: z.object({ ssoProviderReference: referenceSchema }),
+	serverContext: z.object({
+		ssoProviderReference: ssoReferenceSchema,
+		allauthSamlRequestId: z.string().optional(),
+	}),
 });
-export type SsoState = z.infer<typeof stateSchema>;
-type SsoProviderReference = z.infer<typeof referenceSchema>;
+export type SsoState = z.infer<typeof ssoStateSchema>;
+type SsoProviderReference = z.infer<typeof ssoReferenceSchema>;
 
 type ProviderRow = {
 	id: string;
@@ -61,7 +64,7 @@ type ProviderRow = {
 	samlConfig: string | null;
 };
 export type SsoProvider = Omit<ProviderRow, "oidcConfig" | "samlConfig"> & {
-	oidcConfig: Record<string, unknown>;
+	oidcConfig?: Record<string, unknown>;
 	samlConfig?: Record<string, unknown>;
 };
 export type SsoIdentity = {
@@ -69,9 +72,9 @@ export type SsoIdentity = {
 	email: string;
 	name: string;
 	image?: string;
-	accessToken: string;
+	accessToken?: string;
 	refreshToken?: string;
-	idToken: string;
+	idToken?: string;
 	accessTokenExpiresAt?: Date;
 	refreshTokenExpiresAt?: Date;
 	scope?: string;
@@ -86,17 +89,21 @@ function object(value: unknown): Record<string, unknown> | undefined {
 
 function provider(row: ProviderRow | undefined): SsoProvider | null {
 	if (
-		!row?.oidcConfig ||
+		!row ||
+		(!row.oidcConfig && !row.samlConfig) ||
 		row.domainVerified !== true ||
 		!ssoProviderId.safeParse(row.providerId).success
 	)
 		return null;
 	try {
-		const oidcConfig = object(JSON.parse(row.oidcConfig));
-		if (!oidcConfig) return null;
+		const oidcConfig = row.oidcConfig
+			? object(JSON.parse(row.oidcConfig))
+			: undefined;
 		const samlConfig = row.samlConfig
 			? object(JSON.parse(row.samlConfig))
 			: undefined;
+		if ((row.oidcConfig && !oidcConfig) || (row.samlConfig && !samlConfig))
+			return null;
 		return { ...row, oidcConfig, samlConfig };
 	} catch {
 		return null;
@@ -138,7 +145,9 @@ export function ssoProviderReference(
 				domainVerified: provider.domainVerified,
 				issuer: provider.issuer,
 				organizationId: provider.organizationId,
-				oidcConfig: { ...provider.oidcConfig, clientSecret: undefined },
+				oidcConfig: provider.oidcConfig
+					? { ...provider.oidcConfig, clientSecret: undefined }
+					: undefined,
 				samlConfig: saml
 					? {
 							...saml,
@@ -272,10 +281,11 @@ export function createProjectSsoStore(
 			} catch {
 				return null;
 			}
-			const flow = stateSchema.safeParse(raw);
+			const flow = ssoStateSchema.safeParse(raw);
 			if (
 				!flow.success ||
 				flow.data.expiresAt <= Date.now() ||
+				flow.data.serverContext.allauthSamlRequestId !== undefined ||
 				(flow.data.oauthState !== undefined &&
 					flow.data.oauthState !== state) ||
 				flow.data.serverContext.ssoProviderReference.providerId !== providerId
@@ -352,6 +362,7 @@ export function createProjectSsoStore(
 		current: SsoProvider,
 		identity: SsoIdentity,
 		signUpEnabled: boolean,
+		protocol: "oidc" | "saml" = "oidc",
 	) {
 		const providerId = current.providerId;
 		// OAuth and OIDC provider accounts share the existing subject namespace.
@@ -421,20 +432,25 @@ export function createProjectSsoStore(
 			(!directory && user.directoryManaged)
 		)
 			return "account_not_linked" as const;
-		const path = `/sso/callback/${providerId}`;
-		const access = sealLegacyMfaRecord(identity.accessToken, keys);
+		const path =
+			protocol === "saml"
+				? `/sso/saml2/sp/acs/${providerId}`
+				: `/sso/callback/${providerId}`;
+		const access = identity.accessToken
+			? sealLegacyMfaRecord(identity.accessToken, keys)
+			: (identity.accessToken ?? null);
 		const refresh = identity.refreshToken
 			? sealLegacyMfaRecord(identity.refreshToken, keys)
-			: null;
+			: (identity.refreshToken ?? null);
 		if (account) {
 			const updated = await client.query(
-				`UPDATE "${schema}"."account" SET "accessToken" = $1, "refreshToken" = COALESCE($2,"refreshToken"), "idToken" = $3,
+				`UPDATE "${schema}"."account" SET "accessToken" = COALESCE($1,"accessToken"), "refreshToken" = COALESCE($2,"refreshToken"), "idToken" = COALESCE($3,"idToken"),
 				"accessTokenExpiresAt" = COALESCE($4,"accessTokenExpiresAt"), "refreshTokenExpiresAt" = COALESCE($5,"refreshTokenExpiresAt"), "updatedAt" = statement_timestamp()
 				WHERE id = $6 AND "providerId" = $7 AND "accountId" = $8 AND "userId" = $9`,
 				[
 					access,
 					refresh,
-					identity.idToken,
+					identity.idToken ?? null,
 					identity.accessTokenExpiresAt ?? null,
 					identity.refreshTokenExpiresAt ?? null,
 					account.id,
@@ -456,7 +472,7 @@ export function createProjectSsoStore(
 					user.id,
 					access,
 					refresh,
-					identity.idToken,
+					identity.idToken ?? null,
 					identity.accessTokenExpiresAt ?? null,
 					identity.refreshTokenExpiresAt ?? null,
 					identity.scope ?? null,

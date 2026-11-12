@@ -4,13 +4,18 @@ import {
 	scimEnterpriseUserSchema,
 	scimUserSchema,
 } from "./owned-project-scim-discovery";
+import type { parseOwnedSCIMPatch } from "./owned-project-scim-mutation";
+import { ownedSCIMBodyValidation } from "./owned-project-scim-mutation";
 import type { OwnedSCIMUserRow } from "./owned-project-scim-resources";
 import {
 	ownedSCIMStoredUserAttributes,
 	readOwnedSCIMUserAttributes,
 } from "./owned-project-scim-resources-user";
+import {
+	applyOwnedSCIMUserPatchField,
+	normalizeOwnedSCIMBoolean,
+} from "./owned-project-scim-user-patch-fields";
 
-const patchSchema = "urn:ietf:params:scim:api:messages:2.0:PatchOp";
 const short = z.string().trim().min(1).max(256);
 const long = z.string().trim().min(1).max(1024);
 const nameFields = [
@@ -58,22 +63,6 @@ const basic = z.object({
 		.optional(),
 	emails: z.array(inputEmail).max(20).optional(),
 });
-const patch = z.object({
-	schemas: z
-		.array(z.literal(patchSchema))
-		.length(1, "schemas must contain only the PatchOp schema"),
-	Operations: z.array(
-		z.object({
-			op: z
-				.string()
-				.toLowerCase()
-				.default("replace")
-				.pipe(z.enum(["replace", "add", "remove"])),
-			path: z.string().optional(),
-			value: z.unknown().optional(),
-		}),
-	),
-});
 
 function record(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -83,18 +72,11 @@ function scalar(value: unknown) {
 	return Array.isArray(value) && value.length === 1 ? value[0] : value;
 }
 
-function boolean(value: unknown) {
-	if (typeof value !== "string") return value;
-	if (value.toLowerCase() === "true") return true;
-	if (value.toLowerCase() === "false") return false;
-	return value;
-}
-
 function primaryValues(value: unknown) {
 	return Array.isArray(value)
 		? value.map((entry: unknown) =>
 				record(entry) && Object.hasOwn(entry, "primary")
-					? { ...entry, primary: boolean(entry.primary) }
+					? { ...entry, primary: normalizeOwnedSCIMBoolean(entry.primary) }
 					: entry,
 			)
 		: value;
@@ -104,47 +86,73 @@ function invalid(detail: string): never {
 	throw ownedSCIMError(400, detail, "invalidValue");
 }
 
-function bodyValidation(issues: readonly z.core.$ZodIssue[]) {
-	return issues
-		.map(
-			(issue) =>
-				`[body${issue.path.length ? `.${issue.path.join(".")}` : ""}] ${issue.message}`,
-		)
-		.join("; ");
+type EmailValue = z.output<typeof inputEmail>;
+
+function normalizeEmail(value: EmailValue) {
+	return {
+		value: value.value.trim().toLowerCase(),
+		...(value.type ? { type: value.type.trim().toLowerCase() } : {}),
+		primary: value.primary === true,
+	};
+}
+
+function emailTuple(value: EmailValue) {
+	return JSON.stringify([value.type ?? null, value.value]);
+}
+
+function normalizeEmailSet(input: readonly EmailValue[], prefix = "") {
+	const values = input.map(normalizeEmail);
+	if (values.filter((value) => value.primary).length > 1)
+		invalid(`${prefix}emails cannot contain multiple primary values`);
+	if (new Set(values.map(emailTuple)).size !== values.length)
+		invalid(`${prefix}emails cannot contain duplicate type and value pairs`);
+	const types = values.flatMap((value) => (value.type ? [value.type] : []));
+	if (new Set(types).size !== types.length)
+		invalid(`${prefix}emails cannot contain duplicate defined types`);
+	const explicit = values.findIndex((value) => value.primary);
+	const work = values.findIndex((value) => value.type === "work");
+	const primary = explicit >= 0 ? explicit : work >= 0 ? work : 0;
+	return values.map((value, index) => ({
+		...value,
+		primary: index === primary,
+	}));
+}
+
+const patchEmails = z.array(inputEmail).min(1).max(20);
+
+function readPatchEmails(value: unknown) {
+	const parsed = patchEmails.safeParse(primaryValues(value));
+	if (!parsed.success)
+		invalid("emails must contain between 1 and 20 valid emails");
+	return parsed.data;
 }
 
 /** Converts SCIM User input into the canonical fields used by the existing rows and read path. */
-export function parseOwnedSCIMUser(input: unknown) {
+export function parseOwnedSCIMUser(input: unknown, patch = false) {
 	if (!record(input)) invalid("[body] Invalid input: expected object");
+	function schemaError(issues: readonly z.core.$ZodIssue[]) {
+		const issue = issues[0];
+		return patch && issue
+			? `${issue.path.join(".") || "User"}: ${issue.message}`
+			: ownedSCIMBodyValidation(issues);
+	}
 	const normalized = {
 		...input,
-		active: boolean(input.active),
+		active: normalizeOwnedSCIMBoolean(input.active),
 		emails: primaryValues(input.emails),
 	};
 	const data = basic.safeParse(normalized);
-	if (!data.success) invalid(bodyValidation(data.error.issues));
+	if (!data.success) invalid(schemaError(data.error.issues));
 	const { userName, externalId, name, displayName, active } = data.data;
-	const values = (data.data.emails ?? []).map((value) => ({
-		...value,
-		value: value.value.toLowerCase(),
-		...(value.type ? { type: value.type.toLowerCase() } : {}),
-	}));
-	if (values.filter((value) => value.primary === true).length > 1)
-		invalid("[body.emails] emails cannot contain multiple primary values");
+	const values = data.data.emails ?? [];
 	if (!values.length && !email.safeParse(userName).success)
 		invalid(
 			"[body.emails] emails must contain an email when userName is not an email address",
 		);
 	if (!values.length)
 		values.push({ value: userName.toLowerCase(), primary: true });
-	const explicit = values.findIndex((value) => value.primary);
-	const work = values.findIndex((value) => value.type === "work");
-	const primary = explicit >= 0 ? explicit : work >= 0 ? work : 0;
-	const emails = values.map((value, index) => ({
-		...value,
-		primary: index === primary,
-	}));
-	const primaryEmail = emails[primary]!.value;
+	const emails = normalizeEmailSet(values, patch ? "" : "[body.emails] ");
+	const primaryEmail = emails.find((value) => value.primary)!.value;
 	const formatted =
 		name?.formatted ??
 		displayName ??
@@ -177,7 +185,7 @@ export function parseOwnedSCIMUser(input: unknown) {
 		),
 		enterprise,
 	});
-	if (!attrs.success) invalid(bodyValidation(attrs.error.issues));
+	if (!attrs.success) invalid(schemaError(attrs.error.issues));
 	const serializedAttributes = JSON.stringify(attrs.data);
 	if (serializedAttributes.length > 65_535)
 		invalid("SCIM User attributes exceed the supported serialized size");
@@ -194,16 +202,10 @@ export function parseOwnedSCIMUser(input: unknown) {
 
 export type OwnedSCIMUserInput = ReturnType<typeof parseOwnedSCIMUser>;
 
-export function parseOwnedSCIMUserPatch(input: unknown) {
-	const result = patch.safeParse(input);
-	if (!result.success) invalid(bodyValidation(result.error.issues));
-	return result.data.Operations;
-}
-
-/** Applies ordered basic profile, email, identifier and lifecycle PATCH operations. */
+/** Applies ordered SCIM User operations to a canonical working profile. */
 export function patchOwnedSCIMUser(
 	row: OwnedSCIMUserRow,
-	operations: ReturnType<typeof parseOwnedSCIMUserPatch>,
+	operations: ReturnType<typeof parseOwnedSCIMPatch>,
 ) {
 	const current = readOwnedSCIMUserAttributes(row);
 	const document: Record<string, unknown> = {
@@ -215,6 +217,30 @@ export function patchOwnedSCIMUser(
 	};
 	let name = { ...current.name };
 	let emails = [...current.emails];
+	function setEmails(values: readonly EmailValue[]) {
+		emails = normalizeEmailSet(readPatchEmails(values));
+	}
+	function addEmails(value: unknown) {
+		const additions = new Map<string, ReturnType<typeof normalizeEmail>>();
+		for (const candidate of readPatchEmails(value).map(normalizeEmail)) {
+			const key = emailTuple(candidate);
+			const existing = additions.get(key);
+			if (!existing || candidate.primary) additions.set(key, candidate);
+		}
+		if ([...additions.values()].filter((item) => item.primary).length > 1)
+			invalid("emails cannot contain multiple primary values");
+		const existing = new Set(emails.map(emailTuple));
+		const next = [...additions].flatMap(([key, candidate]) =>
+			existing.has(key) ? [] : [candidate],
+		);
+		if (next.length)
+			setEmails([
+				...(next.some((item) => item.primary)
+					? emails.map((item) => ({ ...item, primary: false }))
+					: emails),
+				...next,
+			]);
+	}
 	const core = `${scimUserSchema.toLowerCase()}:`;
 	const setFormatted = (value: string) => {
 		if (document.displayName === name.formatted) document.displayName = value;
@@ -269,7 +295,8 @@ export function patchOwnedSCIMUser(
 			return;
 		}
 		if (relative === "active") {
-			const normalized = op === "remove" ? true : scalar(boolean(value));
+			const normalized =
+				op === "remove" ? true : scalar(normalizeOwnedSCIMBoolean(value));
 			if (typeof normalized !== "boolean") invalid("active must be a boolean");
 			document.active = normalized;
 			return;
@@ -280,13 +307,19 @@ export function patchOwnedSCIMUser(
 				name = { formatted: name.formatted };
 				return;
 			}
-			const item = scalar(value);
+			const item = value;
 			if (!record(item)) invalid("name must be an object");
 			for (const [key, value] of Object.entries(item)) {
 				const field = nameFields.find(
 					(field) => field.toLowerCase() === key.toLowerCase(),
 				);
-				if (field) changeName(field, false, value);
+				if (!field)
+					throw ownedSCIMError(
+						400,
+						`User attribute name.${key} is not supported`,
+						"invalidPath",
+					);
+				changeName(field, false, value);
 			}
 			return;
 		}
@@ -314,49 +347,36 @@ export function patchOwnedSCIMUser(
 						: true;
 			if (op === "remove") {
 				if (!selectedEmail) invalid("emails.value cannot be removed");
-				emails = emails.filter((item) => !matches(item));
+				const remaining = emails.filter((item) => !matches(item));
+				if (remaining.length !== emails.length) setEmails(remaining);
 				return;
 			}
-			const parsed = email.safeParse(scalar(value));
-			if (!parsed.success) invalid("Email value must be a valid email address");
+			const parsed = email.safeParse(value);
+			if (!parsed.success) invalid("emails.value must be an email");
 			if (selectedEmail && !emails.some(matches))
-				emails.push({
-					value: parsed.data,
-					type: selectedEmail,
-					primary: false,
-				});
+				setEmails([
+					...emails,
+					{
+						value: parsed.data,
+						type: selectedEmail,
+						primary: false,
+					},
+				]);
 			else
-				emails = emails.map((item) =>
-					matches(item) ? { ...item, value: parsed.data } : item,
+				setEmails(
+					emails.map((item) =>
+						matches(item) ? { ...item, value: parsed.data } : item,
+					),
 				);
 			return;
 		}
-		if (relative === "emails" && op !== "add") {
-			if (op === "remove") emails = [];
-			else {
-				const parsed = z.array(inputEmail).safeParse(primaryValues(value));
-				if (!parsed.success)
-					invalid("emails must be an array of valid email values");
-				emails = parsed.data.map((item) => ({
-					...item,
-					primary: item.primary ?? false,
-				}));
-			}
+		if (relative === "emails") {
+			if (op === "remove") invalid("emails cannot be removed");
+			if (op === "add") addEmails(value);
+			else setEmails(readPatchEmails(value));
 			return;
 		}
-		const field = [
-			...optionalScalars,
-			...structuredFields.filter((item) => item !== "emails"),
-		].find((item) => item.toLowerCase() === relative);
-		if (field && (op !== "add" || !Array.isArray(document[field]))) {
-			document[field] = op === "remove" ? undefined : value;
-			return;
-		}
-		throw ownedSCIMError(
-			400,
-			"This SCIM User PATCH path is not supported by the candidate",
-			"invalidPath",
-		);
+		applyOwnedSCIMUserPatchField(document, op, rawPath, value);
 	}
 	for (const operation of operations) {
 		if (operation.path?.trim())
@@ -374,5 +394,5 @@ export function patchOwnedSCIMUser(
 				apply(operation.op, key, value);
 		}
 	}
-	return parseOwnedSCIMUser({ ...document, name, emails });
+	return parseOwnedSCIMUser({ ...document, name, emails }, true);
 }

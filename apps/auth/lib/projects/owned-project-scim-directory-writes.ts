@@ -295,11 +295,13 @@ async function reconcileDirectory(
 		WHERE "userId" = $1 AND "profileSourceId" IS NOT NULL AND NOT ("profileSourceId" = ANY($2::text[]))`,
 		[userId, rows.map((row) => row.id)],
 	);
-	await client.query(
-		`DELETE FROM "scimProjectionGrant" WHERE "userId" = $1 AND "provisioningDomainId" = $2`,
-		[userId, provisioningDomainId],
+	await reconcileOwnedSCIMOrganizationProjection(
+		client,
+		userId,
+		organizationId,
+		provisioningDomainId,
+		activeInDomain,
 	);
-	await reconcileMembership(client, userId, organizationId, activeInDomain);
 	await client.query(
 		`UPDATE "user" SET "directoryManaged" = true, "directoryDisabled" = $2 WHERE id = $1`,
 		[userId, !active],
@@ -323,6 +325,21 @@ async function reconcileDirectory(
 		await audit(client, "session.deleted", userId, session.id, path);
 }
 
+/** AllAuth projects derive organization membership from active User sources in this domain. */
+export async function reconcileOwnedSCIMOrganizationProjection(
+	client: Client,
+	userId: string,
+	organizationId: string,
+	provisioningDomainId: string,
+	active: boolean,
+) {
+	await client.query(
+		`DELETE FROM "scimProjectionGrant" WHERE "userId" = $1 AND "provisioningDomainId" = $2`,
+		[userId, provisioningDomainId],
+	);
+	await reconcileMembership(client, userId, organizationId, active);
+}
+
 function changed(row: Source, profile: OwnedSCIMUserInput) {
 	const { [scimEnterpriseUserSchema]: enterprise, ...current } =
 		readOwnedSCIMUserAttributes(row);
@@ -339,15 +356,10 @@ function changed(row: Source, profile: OwnedSCIMUserInput) {
 	);
 }
 
-/** Applies organization projection and User writes with the existing transaction lock ordering. */
-export async function ownedSCIMDirectoryWriter(
+export async function lockOwnedSCIMOrganization(
 	client: Client,
-	connection: OwnedProjectSCIMConnection,
-	request: Request,
-	admitProfile: SCIMProfileAdmission,
+	domain: string,
 ) {
-	const domain = connection.provisioningDomainId;
-	const connectionId = connection.connectionId;
 	const organizationId = domain.startsWith("organization:")
 		? domain.slice("organization:".length)
 		: "";
@@ -360,6 +372,19 @@ export async function ownedSCIMDirectoryWriter(
 			409,
 			"SCIM connection requires an existing organization provisioning domain",
 		);
+	return organizationId;
+}
+
+/** Applies organization projection and User writes with the existing transaction lock ordering. */
+export async function ownedSCIMDirectoryWriter(
+	client: Client,
+	connection: OwnedProjectSCIMConnection,
+	request: Request,
+	admitProfile: SCIMProfileAdmission,
+) {
+	const domain = connection.provisioningDomainId;
+	const connectionId = connection.connectionId;
+	const organizationId = await lockOwnedSCIMOrganization(client, domain);
 	const collectionPath = "/scim/v2/Users";
 	const detailPath = `${collectionPath}/:userId`;
 

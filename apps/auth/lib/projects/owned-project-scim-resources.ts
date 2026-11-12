@@ -11,6 +11,7 @@ import {
 	ownedSCIMURLs,
 	scimGroupSchema,
 } from "./owned-project-scim-discovery";
+import { ownedSCIMGroupMemberLimit } from "./owned-project-scim-group-input";
 import type {
 	AttributeProjection,
 	SCIMFilter,
@@ -26,7 +27,7 @@ import { readOwnedSCIMUserAttributes } from "./owned-project-scim-resources-user
 
 type Reader = Pick<PoolClient, "query">;
 type Location = (path: string) => string;
-interface ResourceRow {
+export interface OwnedSCIMGroupRow {
 	id: string;
 	provisioningDomainId: string;
 	externalId: string | null;
@@ -35,7 +36,7 @@ interface ResourceRow {
 	updatedAt: Date;
 }
 
-export interface OwnedSCIMUserRow extends ResourceRow {
+export interface OwnedSCIMUserRow extends OwnedSCIMGroupRow {
 	userName: string;
 	active: boolean;
 	serializedAttributes: string | null;
@@ -47,7 +48,7 @@ export interface OwnedSCIMUserRow extends ResourceRow {
 
 type ResourceRows =
 	| { kind: "User"; rows: OwnedSCIMUserRow[] }
-	| { kind: "Group"; rows: ResourceRow[] };
+	| { kind: "Group"; rows: OwnedSCIMGroupRow[] };
 
 interface GroupMembership {
 	groupId: string;
@@ -58,7 +59,6 @@ interface GroupMembership {
 
 const columns = `id, "provisioningDomainId", "externalId", "displayName", "createdAt", "updatedAt"`;
 const userColumns = `${columns}, "userName", active, "serializedAttributes", "formattedName", "givenName", "familyName", "serializedEmails"`;
-const groupMemberLimit = 1000;
 
 function domainConflict() {
 	return ownedSCIMError(
@@ -72,7 +72,7 @@ function resourceLocation(location: Location, kind: SCIMResource, id: string) {
 }
 
 function resourceMeta(
-	row: ResourceRow,
+	row: OwnedSCIMGroupRow,
 	kind: SCIMResource,
 	location: Location,
 ) {
@@ -112,16 +112,16 @@ function requestsMembers(projection: AttributeProjection) {
 	);
 }
 
-async function groupResources(
+export async function ownedSCIMGroupResources(
 	client: Reader,
 	connection: OwnedProjectSCIMConnection,
-	groups: ResourceRow[],
+	groups: OwnedSCIMGroupRow[],
 	location: Location,
 	projection: AttributeProjection,
 ) {
 	const membersByGroup = new Map<string, GroupMembership[]>();
 	if (groups.length && requestsMembers(projection)) {
-		const maximum = groups.length * groupMemberLimit;
+		const maximum = groups.length * ownedSCIMGroupMemberLimit;
 		const { rows } = await client.query<GroupMembership>(
 			`SELECT m."groupId", u.id, u."displayName", u."provisioningDomainId"
 			 FROM (
@@ -145,7 +145,7 @@ async function groupResources(
 				throw domainConflict();
 			const group = membersByGroup.get(membership.groupId) ?? [];
 			group.push(membership);
-			if (group.length > groupMemberLimit)
+			if (group.length > ownedSCIMGroupMemberLimit)
 				throw ownedSCIMError(
 					500,
 					"Persisted SCIM Group membership exceeds the server limit",
@@ -269,7 +269,7 @@ export function createOwnedProjectSCIMResources(
 							: {
 									kind,
 									rows: (
-										await client.query<ResourceRow>(
+										await client.query<OwnedSCIMGroupRow>(
 											`SELECT ${columns} FROM ${table} ${clause}`,
 											parameters,
 										)
@@ -283,7 +283,7 @@ export function createOwnedProjectSCIMResources(
 							? result.rows.map((row) =>
 									ownedSCIMUserResource(row, location, projection),
 								)
-							: groupResources(
+							: ownedSCIMGroupResources(
 									client,
 									connection,
 									result.rows,

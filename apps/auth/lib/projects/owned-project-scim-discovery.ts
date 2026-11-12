@@ -6,6 +6,14 @@ const schemaPrefix = "urn:ietf:params:scim:schemas:core:2.0:";
 const messagePrefix = "urn:ietf:params:scim:api:messages:2.0:";
 const discoveryPath = "/scim/v2/";
 
+export interface OwnedSCIMAttributeDescriptor {
+	name: string;
+	type: string;
+	multiValued: boolean;
+	mutability: string;
+	subAttributes?: readonly OwnedSCIMAttributeDescriptor[];
+}
+
 function attribute(name: string, description: string) {
 	return {
 		name,
@@ -57,7 +65,7 @@ function booleanAttribute(name: string, description: string) {
 function complexAttribute(
 	name: string,
 	description: string,
-	subAttributes: object[],
+	subAttributes: OwnedSCIMAttributeDescriptor[],
 	multiValued = false,
 ) {
 	return {
@@ -81,7 +89,7 @@ function schema(
 	id: string,
 	name: string,
 	description: string,
-	attributes: object[],
+	attributes: OwnedSCIMAttributeDescriptor[],
 ) {
 	return {
 		id,
@@ -251,6 +259,16 @@ const resourceTypes = (["User", "Group"] as const).map((name) => ({
 		location: `${discoveryPath}ResourceTypes/${name}`,
 	},
 }));
+
+/** Shares the discovery descriptor with User mutation validation. */
+export function ownedSCIMUserAttributeDescriptors(
+	enterprise: boolean,
+): readonly OwnedSCIMAttributeDescriptor[] {
+	return schemas.find(
+		(schema) =>
+			schema.id === (enterprise ? scimEnterpriseUserSchema : scimUserSchema),
+	)!.attributes;
+}
 
 export function ownedSCIMResponse(body: object, status = 200): Response {
 	return new Response(JSON.stringify(body), {

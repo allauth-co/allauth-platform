@@ -5,7 +5,10 @@ import * as z from "zod";
 import { supportCallbackSchema } from "../auth-policy/policy";
 import type { ControlPrincipal } from "../control/types";
 import { readLegacySessionCookie } from "./legacy-session-cookie";
-import { createProjectEngineStore } from "./owned-project-engine-store";
+import {
+	createProjectEngineStore,
+	projectUserResponse,
+} from "./owned-project-engine-store";
 import type { SupportSession } from "./owned-project-support-store";
 import {
 	projectSupportStore,
@@ -409,6 +412,109 @@ export function createOwnedProjectSupportHttp(
 			target.expiresAt.getTime() <= expiry
 			? target
 			: null;
+	}
+
+	async function currentBoundTarget(
+		realm: RealmSupport,
+		binding: Binding,
+		token: string,
+		config: OwnedSupportRegistration | null,
+		proxyVersion?: string,
+	) {
+		if (
+			!config ||
+			config.callbackUrl !== binding.callbackUrl ||
+			config.proxyVersion !== binding.proxyVersion ||
+			(proxyVersion !== undefined && proxyVersion !== binding.proxyVersion)
+		)
+			return null;
+		const target = await boundTarget(realm, binding, config);
+		return target?.token === token ? target : null;
+	}
+
+	async function readBrowserSession(request: Request) {
+		if (
+			new URL(request.url).origin !== platform ||
+			request.headers.has("authorization") ||
+			request.headers.get("sec-fetch-site") === "cross-site"
+		)
+			return json(null);
+		const token = readLegacySessionCookie(
+			request.headers,
+			`${cookiePrefix}session_token`,
+			options.signingSecret,
+		);
+		if (!token) return;
+		return store.transaction(async (client) => {
+			const revoke = options.revokeSession;
+			const realm = projectSupportStore(
+				client,
+				revoke && ((current) => revoke(client, current, request)),
+			);
+			const observed = await realm.session(token, "token");
+			if (!observed) return json(null, 200, clearSession(request));
+			if (!observed.impersonatedBy) return;
+			const stored = await realm.verification(supportSessionKey(observed.id));
+			const binding = decodeBinding(stored);
+			if (
+				stored &&
+				(!binding || !matchingSupport(binding, observed, project.id))
+			)
+				return json(null);
+
+			let proxyVersion: string | undefined;
+			if (request.headers.has("allauth-proxy-signature")) {
+				if (!binding) return json(null);
+				const verified = await options.verifyProxy(request);
+				if (
+					!verified ||
+					!exactOrigin(binding.callbackUrl, verified.origin) ||
+					!browserOrigin(request, verified.origin)
+				)
+					return json(null);
+				proxyVersion = verified.proxyVersion;
+			} else {
+				const origin = request.headers.get("origin");
+				if (binding?.application || (origin && origin !== platform))
+					return json(null);
+				const actor = await platformActor(request, false);
+				if (actor?.user.id !== observed.impersonatedBy) return json(null);
+			}
+
+			const target = binding
+				? await currentBoundTarget(
+						realm,
+						binding,
+						token,
+						await options.configuration(),
+						proxyVersion,
+					)
+				: observed;
+			if (!target || !eligibleTarget(target)) {
+				await realm.revokeSession(observed);
+				return json(null, 200, clearSession(request));
+			}
+			const current = await store.session(token, 0, client);
+			if (
+				!current ||
+				current.session.id !== target.id ||
+				current.session.impersonatedBy !== target.impersonatedBy ||
+				current.user.id !== target.userId ||
+				!eligibleTarget(current.user) ||
+				Date.parse(current.session.expiresAt) !== target.expiresAt.getTime()
+			)
+				return json(null, 200, clearSession(request));
+			const { session, user } = current;
+			return json({
+				session: {
+					...session,
+					createdAt: new Date(session.createdAt).toISOString(),
+					updatedAt: new Date(session.updatedAt).toISOString(),
+					expiresAt: target.expiresAt.toISOString(),
+				},
+				user: projectUserResponse(user),
+			});
+		});
 	}
 
 	function supportIdentity(binding: Binding, target: SupportSession) {
@@ -867,20 +973,21 @@ export function createOwnedProjectSupportHttp(
 		const binding = decodeBinding(
 			await realm.verification(supportSessionKey(observed.id)),
 		);
-		const config = await options.configuration();
 		if (
-			binding &&
-			config &&
-			matchingSupport(binding, observed, project.id) &&
-			config.callbackUrl === binding.callbackUrl &&
-			config.proxyVersion === binding.proxyVersion &&
-			verified.proxyVersion === binding.proxyVersion &&
-			exactOrigin(binding.callbackUrl, verified.origin)
-		) {
-			const target = await boundTarget(realm, binding, config);
-			if (target?.token === token)
-				return json(supportIdentity(binding, target));
-		}
+			!binding ||
+			!matchingSupport(binding, observed, project.id) ||
+			!exactOrigin(binding.callbackUrl, verified.origin) ||
+			!browserOrigin(request, verified.origin)
+		)
+			return json(null);
+		const target = await currentBoundTarget(
+			realm,
+			binding,
+			observed.token,
+			await options.configuration(),
+			verified.proxyVersion,
+		);
+		if (target) return json(supportIdentity(binding, target));
 		await realm.revokeSession(observed);
 		return json(null, 200, clearSession(request));
 	}
@@ -1045,10 +1152,10 @@ export function createOwnedProjectSupportHttp(
 		return json({ success: true, ...input });
 	}
 
-	return async (
+	async function dispatch(
 		path: string,
 		request: Request,
-	): Promise<Response | undefined> => {
+	): Promise<Response | undefined> {
 		const get = request.method === "GET";
 		const post = request.method === "POST";
 		const read = get && path === "/sdk/support/session";
@@ -1187,5 +1294,6 @@ export function createOwnedProjectSupportHttp(
 				);
 			throw error;
 		}
-	};
+	}
+	return Object.assign(dispatch, { readBrowserSession });
 }

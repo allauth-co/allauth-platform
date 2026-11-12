@@ -1,0 +1,734 @@
+import { execFile } from "node:child_process";
+import { createHash, createHmac, createVerify, randomUUID } from "node:crypto";
+import { existsSync, readFileSync } from "node:fs";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { promisify } from "node:util";
+import { inflateRawSync } from "node:zlib";
+import { scim } from "@better-auth/scim";
+import { sso } from "@better-auth/sso";
+import { DOMParser } from "@xmldom/xmldom";
+import { getTestInstance } from "better-auth/test";
+import { Kysely, PostgresDialect } from "kysely";
+import { Pool } from "pg";
+import samlifyDefault, * as samlifyNamespace from "samlify";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { defaultAuthPolicy } from "../auth-policy/policy";
+import { resolveEnterpriseUser } from "../enterprise";
+import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
+import { createOwnedProjectEngine } from "./owned-project-engine";
+import { createProjectEngineStore } from "./owned-project-engine-store";
+import { createOwnedProjectSso } from "./owned-project-sso";
+import {
+	configureOwnedSaml,
+	verifyOwnedSaml,
+} from "./owned-project-sso-saml-protocol";
+
+async function generateSamlKeys() {
+	const directory = await mkdtemp(join(tmpdir(), "allauth-saml-fixture-"));
+	try {
+		const key = join(directory, "key.pem");
+		const cert = join(directory, "cert.pem");
+		await promisify(execFile)(
+			"openssl",
+			[
+				"req",
+				"-x509",
+				"-newkey",
+				"rsa:2048",
+				"-sha256",
+				"-nodes",
+				"-days",
+				"1",
+				"-subj",
+				"/CN=allauth-saml-fixture",
+				"-keyout",
+				key,
+				"-out",
+				cert,
+			],
+			{ timeout: 5000 },
+		);
+		const [privateKey, certificate] = await Promise.all([
+			readFile(key, "utf8"),
+			readFile(cert, "utf8"),
+		]);
+		return { privateKey, certificate };
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+}
+
+let fixtureKeys: Awaited<ReturnType<typeof generateSamlKeys>>;
+
+const fixturePath = new URL(
+	"../../../../.secrets/local-postgres.json",
+	import.meta.url,
+);
+const origin = "https://owned-saml.fixture.example";
+const issuer = "https://saml-idp.fixture.example/metadata";
+const idpOrigin = new URL(issuer).origin;
+const sp = `${origin}/saml/entity`;
+const slug = "owned-saml-fixture";
+const providerId = "fixture-saml";
+const secret = "synthetic-project-saml-fixture-signing-secret";
+const prefix = `allauth_project_${slug}`;
+const destination = `${origin}/account?enterprise=saml`;
+const acs = `${origin}/api/auth/sso/saml2/sp/acs/${providerId}`;
+const subject = "opaque-native-saml-directory-subject";
+const managedEmail = "directory-profile@corp.example";
+const decoyEmail = "decoy-profile@corp.example";
+const signatureAlgorithm = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256";
+const saml =
+	typeof samlifyNamespace.SamlLib === "object"
+		? samlifyNamespace
+		: samlifyDefault;
+const configuration = () => ({
+	issuer: sp,
+	entryPoint: `${idpOrigin}/redirect`,
+	cert: fixtureKeys.certificate,
+	idpMetadata: { entityID: issuer },
+	wantAssertionsSigned: true,
+	mapping: { email: "corpEmail" },
+});
+const body = {
+	providerId,
+	callbackURL: destination,
+	providerType: "saml" as const,
+};
+const scopedKey = (parts: string[]) =>
+	createHash("sha256").update(JSON.stringify(parts)).digest("base64url");
+type LegacyDatabase = Kysely<Record<string, Record<string, unknown>>>;
+
+async function nativeSso(db: LegacyDatabase) {
+	return (
+		await getTestInstance(
+			{
+				baseURL: origin,
+				secret,
+				trustedOrigins: [idpOrigin],
+				logger: { disabled: true },
+				database: { db, type: "postgres", transaction: true },
+				advanced: { cookiePrefix: prefix },
+				account: {
+					encryptOAuthTokens: true,
+					accountLinking: { enabled: true, trustedProviders: [] },
+				},
+				plugins: [
+					{
+						id: "fixture-saml-directory",
+						schema: {
+							allauthDirectory: {
+								fields: {
+									providerId: { type: "string", required: true },
+									organizationId: { type: "string", required: true },
+									connectionId: { type: "string", required: true },
+									createdAt: { type: "date", required: true },
+								},
+							},
+						},
+					},
+					scim({
+						connections: [],
+						managedConnections: {
+							credentialHashSecret: "synthetic-saml-scim-credential-secret",
+						},
+					}),
+					sso({
+						domainVerification: { enabled: true },
+						resolveUser: resolveEnterpriseUser,
+						saml: {
+							enableInResponseToValidation: true,
+							allowIdpInitiated: false,
+							requireTimestamps: true,
+							clockSkew: 60_000,
+							algorithms: { onDeprecated: "reject" },
+						},
+					}),
+				],
+			},
+			{ disableTestUser: true },
+		)
+	).auth;
+}
+
+function startRequest() {
+	return new Request(`${origin}/api/auth/sign-in/sso`, {
+		method: "POST",
+		headers: { origin, "content-type": "application/json" },
+		body: JSON.stringify(body),
+	});
+}
+
+function callback(samlResponse: string, relay?: string) {
+	const data = new URLSearchParams({ SAMLResponse: samlResponse });
+	if (relay) data.set("RelayState", relay);
+	return new Request(acs, {
+		method: "POST",
+		headers: {
+			origin: idpOrigin,
+			"content-type": "application/x-www-form-urlencoded",
+			"sec-fetch-site": "cross-site",
+			"sec-fetch-mode": "navigate",
+		},
+		body: data,
+	});
+}
+
+function cookies(response: Response) {
+	return response.headers
+		.getSetCookie()
+		.filter((cookie) => !/;\s*Max-Age=0(?:;|$)/i.test(cookie))
+		.map((cookie) => cookie.split(";", 1)[0])
+		.join("; ");
+}
+
+async function pending(response: Response) {
+	expect(response.status, await response.clone().text()).toBe(200);
+	const result = (await response.json()) as { url: string; redirect: boolean };
+	expect(result.redirect).toBe(true);
+	const redirect = new URL(result.url);
+	expect(redirect.origin).toBe(idpOrigin);
+	const raw = redirect.searchParams.get("SAMLRequest");
+	expect(raw).toBeTruthy();
+	const xml = inflateRawSync(Buffer.from(raw!, "base64")).toString("utf8");
+	const root = new DOMParser().parseFromString(xml, "text/xml").documentElement;
+	expect(root?.getAttribute("AssertionConsumerServiceURL")).toBe(acs);
+	const requestId = root?.getAttribute("ID");
+	const relay = redirect.searchParams.get("RelayState");
+	expect(requestId).toBeTruthy();
+	expect(relay).toBeTruthy();
+	return { requestId: requestId!, relay: relay! };
+}
+
+function signedResponse(
+	requestId: string,
+	options: {
+		assertionId?: string;
+		issuer?: string;
+		audience?: string;
+		recipient?: string;
+		expired?: boolean;
+		signature?: "assertion" | "response" | "both" | "none";
+	} = {},
+) {
+	const now = new Date().toISOString();
+	const expires = new Date(
+		Date.now() + (options.expired ? -120_000 : 180_000),
+	).toISOString();
+	const assertionId = options.assertionId ?? `_${randomUUID()}`;
+	const actualIssuer = options.issuer ?? issuer;
+	const signature = options.signature ?? "assertion";
+	let xml = `<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="_${randomUUID()}" Version="2.0" IssueInstant="${now}" Destination="${acs}" InResponseTo="${requestId}">
+		<saml:Issuer>${actualIssuer}</saml:Issuer>
+		<samlp:Status><samlp:StatusCode Value="urn:oasis:names:tc:SAML:2.0:status:Success"/></samlp:Status>
+		<saml:Assertion ID="${assertionId}" Version="2.0" IssueInstant="${now}">
+			<saml:Issuer>${actualIssuer}</saml:Issuer>
+			<saml:Subject><saml:NameID>${subject}</saml:NameID><saml:SubjectConfirmation Method="urn:oasis:names:tc:SAML:2.0:cm:bearer"><saml:SubjectConfirmationData InResponseTo="${requestId}" Recipient="${options.recipient ?? acs}" NotOnOrAfter="${expires}"/></saml:SubjectConfirmation></saml:Subject>
+			<saml:Conditions NotOnOrAfter="${expires}"><saml:AudienceRestriction><saml:Audience>${options.audience ?? sp}</saml:Audience></saml:AudienceRestriction></saml:Conditions>
+			<saml:AuthnStatement AuthnInstant="${now}" SessionIndex="_${randomUUID()}"><saml:AuthnContext><saml:AuthnContextClassRef>urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport</saml:AuthnContextClassRef></saml:AuthnContext></saml:AuthnStatement>
+			<saml:AttributeStatement><saml:Attribute Name="corpEmail"><saml:AttributeValue>${decoyEmail}</saml:AttributeValue></saml:Attribute></saml:AttributeStatement>
+		</saml:Assertion>
+	</samlp:Response>`;
+	function sign(assertion: boolean) {
+		const node = assertion
+			? "/*[local-name(.)='Response']/*[local-name(.)='Assertion']"
+			: "/*[local-name(.)='Response']";
+		return saml.SamlLib.constructSAMLSignature({
+			rawSamlMessage: xml,
+			referenceTagXPath: assertion ? node : undefined,
+			privateKey: fixtureKeys.privateKey,
+			signatureAlgorithm,
+			signingCert: saml.Utility.normalizeCerString(fixtureKeys.certificate),
+			isBase64Output: false,
+			isMessageSigned: !assertion,
+			signatureConfig: {
+				prefix: "ds",
+				location: {
+					reference: `${node}/*[local-name(.)='Issuer']`,
+					action: "after",
+				},
+			},
+		});
+	}
+	if (signature === "assertion" || signature === "both") xml = sign(true);
+	if (signature === "response" || signature === "both") xml = sign(false);
+	return { assertionId, encoded: Buffer.from(xml).toString("base64") };
+}
+
+describe.skipIf(!existsSync(fixturePath))(
+	"isolated PostgreSQL project SAML interoperability",
+	() => {
+		const databaseName = `allauth_hosted_${randomUUID().replaceAll("-", "")}`;
+		const schema = `allauth_project_${randomUUID().replaceAll("-", "")}`;
+		const managed = randomUUID();
+		const decoy = randomUUID();
+		const organization = randomUUID();
+		const connection = randomUUID();
+		const source = randomUUID();
+		const domain = `organization:${organization}`;
+		let database: Pool;
+		let administrator: Pool | undefined;
+		let nativeDatabase: LegacyDatabase | undefined;
+		let native: Awaited<ReturnType<typeof nativeSso>>;
+		let created = false;
+
+		beforeAll(async () => {
+			fixtureKeys = await generateSamlKeys();
+			const fixture: { container: string; DATABASE_URL: string } = JSON.parse(
+				readFileSync(fixturePath, "utf8"),
+			);
+			const url = new URL(fixture.DATABASE_URL);
+			if (
+				fixture.container !== "allauth-production-test-20261007" ||
+				url.hostname !== "127.0.0.1" ||
+				url.port !== "55445"
+			)
+				throw new Error("SAML tests require the isolated PostgreSQL fixture.");
+			administrator = new Pool({
+				connectionString: fixture.DATABASE_URL,
+				max: 1,
+			});
+			await administrator.query(`CREATE DATABASE "${databaseName}"`);
+			created = true;
+			url.pathname = `/${databaseName}`;
+			database = new Pool({ connectionString: url.toString(), max: 6 });
+			await database.query(`CREATE SCHEMA "${schema}"`);
+			const nativePool = new Pool({
+				connectionString: url.toString(),
+				options: `-c search_path=${schema}`,
+				max: 2,
+			});
+			nativeDatabase = new Kysely({
+				dialect: new PostgresDialect({ pool: nativePool }),
+			});
+			for (const migration of [
+				"001-initial-auth.sql",
+				"002-control-plane.sql",
+				"005-free-plugins.sql",
+			])
+				await nativePool.query(
+					readFileSync(
+						new URL(`../../migrations/${migration}`, import.meta.url),
+						"utf8",
+					),
+				);
+			await nativePool.query(
+				`INSERT INTO "user"(id,email,name,"emailVerified","directoryManaged","directoryDisabled") VALUES ($1,$2,'Directory user',TRUE,TRUE,FALSE),($3,$4,'Decoy',TRUE,FALSE,FALSE)`,
+				[managed, managedEmail, decoy, decoyEmail],
+			);
+			await nativePool.query(
+				`INSERT INTO "organization"(id,name,slug,"createdAt") VALUES ($1,'Fixture Organization','fixture-company',statement_timestamp())`,
+				[organization],
+			);
+			await nativePool.query(
+				`INSERT INTO "ssoProvider"(id,"providerId",issuer,"samlConfig","userId","organizationId",domain,"domainVerified") VALUES ($1,$2,$3,$4,$5,$6,'corp.example',TRUE)`,
+				[
+					randomUUID(),
+					providerId,
+					sp,
+					JSON.stringify(configuration()),
+					decoy,
+					organization,
+				],
+			);
+			await nativePool.query(
+				`INSERT INTO "allauthDirectory"(id,"providerId","organizationId","connectionId","createdAt") VALUES ($1,$2,$3,$4,statement_timestamp())`,
+				[randomUUID(), providerId, organization, connection],
+			);
+			await nativePool.query(
+				`INSERT INTO "scimManagedConnection"(id,"creationRequestId","connectionId","provisioningDomainId",status,revision,"createdAt","createdBy") VALUES ($1,$2,$3,$4,'active',0,statement_timestamp(),$5)`,
+				[randomUUID(), randomUUID(), connection, domain, decoy],
+			);
+			await nativePool.query(
+				`INSERT INTO "scimConnectionBinding"(id,"connectionId","connectionKey","provisioningDomainId","createdAt","decommissionStatus","decommissionReconciledUserCount","decommissionBatchCount","decommissionRevision") VALUES ($1,$2,$3,$4,statement_timestamp(),'active',0,0,0)`,
+				[
+					randomUUID(),
+					connection,
+					scopedKey(["scim-connection", connection]),
+					domain,
+				],
+			);
+			await nativePool.query(
+				`INSERT INTO "scimSubject"(id,"userId","profileSourceId",revision,"createdAt","updatedAt") VALUES ($1,$2,$3,0,statement_timestamp(),statement_timestamp())`,
+				[randomUUID(), managed, source],
+			);
+			await nativePool.query(
+				`INSERT INTO "scimUser"(id,"connectionId","provisioningDomainId","userId","connectionUserKey","userName","userNameKey","primaryEmail","workEmailValueIndex","emailValueIndex","displayName","formattedName","serializedEmails","serializedAttributes","externalId","externalIdKey",active,"orderKey","createdAt","updatedAt") VALUES ($1,$2,$3,$4,$1,$5,$1,$5,'','','Directory user','Directory user','[]','{}',$6,$7,TRUE,$1,statement_timestamp(),statement_timestamp())`,
+				[
+					source,
+					connection,
+					domain,
+					managed,
+					managedEmail,
+					subject,
+					scopedKey(["scim-user-external-id", connection, subject]),
+				],
+			);
+			native = await nativeSso(nativeDatabase);
+		});
+
+		afterAll(async () => {
+			await Promise.all([database?.end(), nativeDatabase?.destroy()]);
+			if (!administrator) return;
+			try {
+				if (created)
+					await dropClosedFixtureDatabase(administrator, databaseName);
+			} finally {
+				await administrator.end();
+			}
+		});
+
+		function owned() {
+			const store = createProjectEngineStore(database, schema);
+			return createOwnedProjectSso({
+				database,
+				project: { schemaName: schema, slug },
+				baseURL: origin,
+				basePath: "/api/auth",
+				trustedOrigins: [],
+				signingSecret: secret,
+				defaultErrorURL: `${origin}/auth-error`,
+				signUpEnabled: true,
+				saml: true,
+				async complete(client, input) {
+					expect(input).toMatchObject({
+						user: { id: managed },
+						providerId,
+						managed: true,
+						protocol: "saml",
+					});
+					const token = randomUUID();
+					await store.createSession(client, {
+						id: randomUUID(),
+						token,
+						userId: input.user.id,
+						expiresIn: 604800,
+						ip: "192.0.2.12",
+						userAgent: "SAML fixture",
+					});
+					const signature = createHmac("sha256", secret)
+						.update(token)
+						.digest("base64");
+					return new Response(null, {
+						status: 302,
+						headers: {
+							location: input.destination,
+							"set-cookie": `__Secure-${prefix}.session_token=${encodeURIComponent(`${token}.${signature}`)}; Path=/; HttpOnly; Secure; SameSite=Lax`,
+						},
+					});
+				},
+			});
+		}
+
+		async function assertSession(response: Response) {
+			expect(
+				response.headers.get("location"),
+				await response.clone().text(),
+			).toBe(destination);
+			expect(
+				await native.api.getSession({
+					headers: new Headers({ cookie: cookies(response) }),
+					query: { disableRefresh: true },
+				}),
+			).toMatchObject({
+				user: { id: managed, email: managedEmail, name: "Directory user" },
+			});
+			expect(
+				(
+					await database.query(
+						`SELECT "userId", "accountId", "accessToken", "refreshToken" FROM "${schema}"."account" WHERE "providerId" = $1`,
+						[providerId],
+					)
+				).rows,
+			).toEqual([
+				{
+					userId: managed,
+					accountId: subject,
+					accessToken: "",
+					refreshToken: "",
+				},
+			]);
+		}
+
+		async function startOwned() {
+			return pending(await owned().start(startRequest(), body));
+		}
+
+		it("finishes a native request using a verified assertion and the exact managed subject", async () => {
+			const state = await pending(await native.handler(startRequest()));
+			const signed = signedResponse(state.requestId);
+			const protocol = configureOwnedSaml(configuration(), acs);
+			expect(verifyOwnedSaml(signed.encoded, protocol).requestId).toBe(
+				state.requestId,
+			);
+			await assertSession(
+				await owned().samlCallback(
+					callback(signed.encoded, state.relay),
+					providerId,
+				),
+			);
+			const identifier = `saml-used-assertion:${signed.assertionId}`;
+			expect(
+				(
+					await database.query(
+						`SELECT id FROM "${schema}"."verification" WHERE identifier = $1`,
+						[identifier],
+					)
+				).rows,
+			).toEqual([
+				{
+					id: createHash("sha256")
+						.update(`reserve:${identifier}`)
+						.digest("base64url"),
+				},
+			]);
+		});
+
+		it("starts a legacy-readable request that the native ACS can complete after rollback", async () => {
+			const state = await startOwned();
+			const signed = signedResponse(state.requestId);
+			await assertSession(
+				await native.handler(callback(signed.encoded, state.relay)),
+			);
+		});
+
+		it("uses the configured private key for signed Redirect AuthnRequests", async () => {
+			await database.query(
+				`UPDATE "${schema}"."ssoProvider" SET "samlConfig" = $1 WHERE "providerId" = $2`,
+				[
+					JSON.stringify({
+						...configuration(),
+						authnRequestsSigned: true,
+						privateKey: fixtureKeys.privateKey,
+					}),
+					providerId,
+				],
+			);
+			try {
+				const started = await owned().start(startRequest(), body);
+				const state = await pending(started.clone());
+				const { url } = (await started.json()) as { url: string };
+				const wire = new URL(url);
+				const signature = wire.searchParams.get("Signature");
+				expect(signature).toBeTruthy();
+				const parameters = wire.search
+					.slice(1)
+					.split("&")
+					.filter((value) => !value.startsWith("Signature="));
+				expect(parameters.map((value) => value.split("=")[0])).toEqual([
+					"SAMLRequest",
+					"RelayState",
+					"SigAlg",
+				]);
+				expect(
+					createVerify("RSA-SHA256")
+						.update(parameters.join("&"))
+						.verify(fixtureKeys.certificate, signature!, "base64"),
+				).toBe(true);
+				await assertSession(
+					await native.handler(
+						callback(signedResponse(state.requestId).encoded, state.relay),
+					),
+				);
+			} finally {
+				await database.query(
+					`UPDATE "${schema}"."ssoProvider" SET "samlConfig" = $1 WHERE "providerId" = $2`,
+					[JSON.stringify(configuration()), providerId],
+				);
+			}
+		});
+
+		it("checks a pinned signed envelope and preserves the configured assertion-signature policy", async () => {
+			const strict = await startOwned();
+			const responseOnly = signedResponse(strict.requestId, {
+				signature: "response",
+			});
+			expect(
+				(
+					await owned().samlCallback(
+						callback(responseOnly.encoded, strict.relay),
+						providerId,
+					)
+				).status,
+			).toBe(400);
+			await database.query(
+				`UPDATE "${schema}"."ssoProvider" SET "samlConfig" = $1 WHERE "providerId" = $2`,
+				[
+					JSON.stringify({ ...configuration(), wantAssertionsSigned: false }),
+					providerId,
+				],
+			);
+			try {
+				const state = await startOwned();
+				await assertSession(
+					await owned().samlCallback(
+						callback(
+							signedResponse(state.requestId, { signature: "response" })
+								.encoded,
+							state.relay,
+						),
+						providerId,
+					),
+				);
+				const both = await startOwned();
+				await assertSession(
+					await owned().samlCallback(
+						callback(
+							signedResponse(both.requestId, { signature: "both" }).encoded,
+							both.relay,
+						),
+						providerId,
+					),
+				);
+			} finally {
+				await database.query(
+					`UPDATE "${schema}"."ssoProvider" SET "samlConfig" = $1 WHERE "providerId" = $2`,
+					[JSON.stringify(configuration()), providerId],
+				);
+			}
+		});
+
+		it("consumes the matching RelayState and AuthnRequest once across concurrent callbacks", async () => {
+			const state = await startOwned();
+			const other = await startOwned();
+			const signed = signedResponse(state.requestId);
+			const mismatched = await owned().samlCallback(
+				callback(signed.encoded, other.relay),
+				providerId,
+			);
+			expect(
+				new URL(mismatched.headers.get("location")!).searchParams.get("error"),
+			).toBe("invalid_state");
+			const results = await Promise.all(
+				[1, 2].map(() =>
+					owned().samlCallback(
+						callback(signed.encoded, state.relay),
+						providerId,
+					),
+				),
+			);
+			expect(
+				results.filter(
+					(result) => result.headers.get("location") === destination,
+				),
+			).toHaveLength(1);
+			const replay = signedResponse(other.requestId, {
+				assertionId: signed.assertionId,
+			});
+			const rejected = await owned().samlCallback(
+				callback(replay.encoded, other.relay),
+				providerId,
+			);
+			expect(
+				new URL(rejected.headers.get("location")!).searchParams.get("error"),
+			).toBe("replay_detected");
+			expect(cookies(rejected)).toBe("");
+		});
+
+		it("rejects absent signatures, stale conditions and mismatched recipient, issuer, or audience", async () => {
+			const state = await startOwned();
+			const invalid = [
+				{ signature: "none" },
+				{ expired: true },
+				{ recipient: `${origin}/wrong-acs` },
+				{ issuer: "https://different.fixture.example/metadata" },
+				{ audience: "https://different.fixture.example/entity" },
+			] as const;
+			for (const value of invalid) {
+				const result = await owned().samlCallback(
+					callback(signedResponse(state.requestId, value).encoded, state.relay),
+					providerId,
+				);
+				expect(result.status).toBe(400);
+				expect(cookies(result)).toBe("");
+			}
+			await assertSession(
+				await owned().samlCallback(
+					callback(signedResponse(state.requestId).encoded, state.relay),
+					providerId,
+				),
+			);
+		});
+
+		it("dispatches SAML sign-in and ACS through the realm security and native-readable session hooks", async () => {
+			const ip = "203.0.113.83";
+			const engine = createOwnedProjectEngine({
+				database,
+				project: { schemaName: schema, slug },
+				baseURL: origin,
+				basePath: "/api/auth",
+				trustedOrigins: [],
+				signingSecret: secret,
+				policy: defaultAuthPolicy,
+				trustedIP: () => ip,
+				sso: { defaultErrorURL: `${origin}/auth-error`, saml: true },
+			});
+			const state = await pending(await engine.dispatch(startRequest()));
+			const signed = signedResponse(state.requestId);
+			const rule = randomUUID();
+			await database.query(
+				`INSERT INTO "${schema}"."allauthSecurityRule"(id,type,value,reason) VALUES ($1,'ip',$2,'fixture')`,
+				[rule, ip],
+			);
+			try {
+				const blocked = await engine.dispatch(
+					callback(signed.encoded, state.relay),
+				);
+				expect(blocked.status).toBe(429);
+				expect(await blocked.json()).toMatchObject({
+					code: "ALLAUTH_SECURITY_BLOCKED",
+				});
+				expect(cookies(blocked)).toBe("");
+			} finally {
+				await database.query(
+					`DELETE FROM "${schema}"."allauthSecurityRule" WHERE id=$1`,
+					[rule],
+				);
+			}
+			await assertSession(
+				await engine.dispatch(callback(signed.encoded, state.relay)),
+			);
+			const audit = await database.query(
+				`SELECT type,outcome FROM "${schema}"."allauthEvent" WHERE "userId"=$1 AND metadata->>'path'=$2 ORDER BY type`,
+				[managed, `/sso/saml2/sp/acs/${providerId}`],
+			);
+			expect(audit.rows).toContainEqual({
+				type: "session.created",
+				outcome: "success",
+			});
+		});
+
+		it("requires an active directory identity and consumes a valid denied assertion without email fallback", async () => {
+			const state = await startOwned();
+			const signed = signedResponse(state.requestId);
+			await database.query(
+				`UPDATE "${schema}"."scimUser" SET active = FALSE WHERE id = $1`,
+				[source],
+			);
+			try {
+				const response = await owned().samlCallback(
+					callback(signed.encoded, state.relay),
+					providerId,
+				);
+				expect(
+					new URL(response.headers.get("location")!).searchParams.get("error"),
+				).toBe("directory_identity_inactive");
+				expect(cookies(response)).toBe("");
+			} finally {
+				await database.query(
+					`UPDATE "${schema}"."scimUser" SET active = TRUE WHERE id = $1`,
+					[source],
+				);
+			}
+			const retry = await owned().samlCallback(
+				callback(signed.encoded, state.relay),
+				providerId,
+			);
+			expect(
+				new URL(retry.headers.get("location")!).searchParams.get("error"),
+			).toBe("invalid_saml_response");
+		});
+	},
+);

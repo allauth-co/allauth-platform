@@ -18,6 +18,7 @@ import {
 	resolveProjectOidc,
 	ssoScope,
 } from "./owned-project-sso-oidc";
+import { createOwnedProjectSaml } from "./owned-project-sso-saml";
 import type {
 	SsoIdentity,
 	SsoProvider,
@@ -73,6 +74,8 @@ export interface OwnedProjectSsoOptions {
 	tokenKeys?: LegacyMfaKeys;
 	defaultErrorURL: string;
 	signUpEnabled: boolean;
+	/** Enable the isolated candidate for SP-initiated plaintext SAML. */
+	saml?: boolean;
 	/** Session/MFA admission runs on the same client as the exact account and directory binding. */
 	complete(
 		client: PoolClient,
@@ -83,6 +86,7 @@ export interface OwnedProjectSsoOptions {
 			destination: string;
 			managed: boolean;
 			registered: boolean;
+			protocol?: "saml";
 		},
 	): Promise<Response>;
 	/** Deployment-owned transport for approved IdPs, or an isolated fixture network. */
@@ -126,7 +130,7 @@ function json(body: unknown, status: number, headers = new Headers()) {
 	return Response.json(body, { status, headers });
 }
 
-/** Configured project OIDC. The shared issuer and existing SAML transport remain separate. */
+/** Configured project enterprise sign-in against the realm’s existing provider and account records. */
 export function createOwnedProjectSso(options: OwnedProjectSsoOptions) {
 	const origin = projectOrigin.parse(options.baseURL);
 	const slug = projectSlug.parse(options.project.slug);
@@ -149,6 +153,20 @@ export function createOwnedProjectSso(options: OwnedProjectSsoOptions) {
 		options.project.schemaName,
 		options.tokenKeys ?? { secret: options.signingSecret },
 	);
+	const saml =
+		options.saml &&
+		createOwnedProjectSaml({
+			origin,
+			basePath: options.basePath,
+			cookieName: `${secure ? "__Secure-" : ""}allauth_project_${slug}.relay_state`,
+			cookieAttributes: attributes,
+			signingSecret: options.signingSecret,
+			signUpEnabled: options.signUpEnabled,
+			defaultError,
+			store,
+			allowedReturn: (value) => allowedReturn(value, origin, origins),
+			complete: options.complete,
+		});
 	const network: SsoFetch = (input, init) =>
 		(options.fetch ?? fetchPublicSsoEndpoint)(input, {
 			...init,
@@ -215,7 +233,7 @@ export function createOwnedProjectSso(options: OwnedProjectSsoOptions) {
 				400,
 			);
 		const body = parsed.data;
-		if (body.providerType === "saml")
+		if (body.providerType === "saml" && !saml)
 			return json(
 				{
 					code: "SSO_PROTOCOL_UNSUPPORTED",
@@ -256,6 +274,38 @@ export function createOwnedProjectSso(options: OwnedProjectSsoOptions) {
 					message: "No verified OIDC provider found.",
 				},
 				404,
+			);
+		if (
+			body.providerType === "saml" ||
+			(body.providerType !== "oidc" && !provider.oidcConfig)
+		) {
+			if (!provider.samlConfig || !saml)
+				return json(
+					{
+						code: "SSO_PROTOCOL_UNSUPPORTED",
+						message: "This SSO protocol uses the existing service.",
+					},
+					501,
+				);
+			if (body.callbackURL === undefined)
+				return json(
+					{ code: "BAD_REQUEST", message: "callbackURL is required" },
+					400,
+				);
+			return saml.start(provider, {
+				callbackURL: destination.href,
+				newUserURL: newUser?.href,
+				errorURL: error?.href,
+				requestSignUp: body.requestSignUp,
+			});
+		}
+		if (!provider.oidcConfig)
+			return json(
+				{
+					code: "INVALID_OIDC_CONFIGURATION",
+					message: "OIDC provider is not configured.",
+				},
+				400,
 			);
 		try {
 			const { config, metadata } = await resolveProjectOidc(
@@ -456,7 +506,7 @@ export function createOwnedProjectSso(options: OwnedProjectSsoOptions) {
 				return failure("invalid_state", flow, true);
 			const reference = flow.serverContext.ssoProviderReference;
 			const provider = await store.getProvider(providerId);
-			if (!provider || !sameSsoProvider(provider, reference))
+			if (!provider?.oidcConfig || !sameSsoProvider(provider, reference))
 				return failure("invalid_state", flow, true);
 			let identity: SsoIdentity;
 			try {
@@ -470,7 +520,7 @@ export function createOwnedProjectSso(options: OwnedProjectSsoOptions) {
 				return finish(
 					await store.transaction(async (client) => {
 						const current = await store.getProvider(providerId, client);
-						if (!current || !sameSsoProvider(current, reference)) {
+						if (!current?.oidcConfig || !sameSsoProvider(current, reference)) {
 							rejection = "invalid_state";
 							throw abort;
 						}
@@ -506,5 +556,26 @@ export function createOwnedProjectSso(options: OwnedProjectSsoOptions) {
 		}
 	}
 
-	return { start, callback };
+	async function samlCallback(request: Request, providerId: string) {
+		if (!saml)
+			return json(
+				{
+					code: "SSO_PROTOCOL_UNSUPPORTED",
+					message: "This SSO protocol uses the existing service.",
+				},
+				501,
+			);
+		if (
+			request.method !== "POST" ||
+			!ssoProviderId.safeParse(providerId).success ||
+			!route(request, `/sso/saml2/sp/acs/${providerId}`)
+		)
+			return json(
+				{ code: "INVALID_REQUEST", message: "Invalid SAML callback." },
+				400,
+			);
+		return saml.callback(request, providerId);
+	}
+
+	return { start, callback, samlCallback };
 }

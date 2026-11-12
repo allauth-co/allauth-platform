@@ -12,6 +12,26 @@ const hex = (data: ArrayBuffer) =>
 		byte.toString(16).padStart(2, "0"),
 	).join("");
 export const validAvatarPath = (value: string) => pathPattern.test(value);
+/** Resolve browser URL aliases before the SQL owner guard checks the original asset URL. */
+export function validAvatarProfileImage(
+	image: unknown,
+	operation: "create" | "update",
+	baseURL: string,
+) {
+	if (typeof image !== "string") return true;
+	let url: URL;
+	try {
+		url = new URL(image, baseURL);
+	} catch {
+		return true;
+	}
+	return (
+		!validAvatarPath(url.pathname) ||
+		(operation === "update" &&
+			url.protocol === "https:" &&
+			image === url.origin + url.pathname)
+	);
+}
 async function body(request: Request): Promise<Uint8Array<ArrayBuffer>> {
 	const reader = request.clone().body?.getReader();
 	if (!reader) return new Uint8Array();

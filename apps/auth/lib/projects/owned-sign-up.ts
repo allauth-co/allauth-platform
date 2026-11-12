@@ -99,7 +99,7 @@ function rateLimited(retryAfter: number) {
 	);
 }
 
-function usernameError(username: string) {
+export function ownedProjectUsernameError(username: string) {
 	if (!username)
 		return { code: "INVALID_USERNAME", message: "Username is invalid" };
 	if (username.length < 3)
@@ -239,11 +239,12 @@ export function createOwnedSignUpHttp(options: OwnedSignUpOptions) {
 		}
 		const unnormalized =
 			input.username ??
-			(input.displayUsername && !usernameError(input.displayUsername)
+			(input.displayUsername &&
+			!ownedProjectUsernameError(input.displayUsername)
 				? input.displayUsername
 				: undefined);
 		if (unnormalized !== undefined) {
-			const invalid = usernameError(unnormalized);
+			const invalid = ownedProjectUsernameError(unnormalized);
 			if (invalid) return json(invalid, 400);
 		}
 		if (input.image) {
@@ -392,7 +393,7 @@ export function createOwnedSignUpHttp(options: OwnedSignUpOptions) {
 		const input = availabilityInput.safeParse(await readBody(request, false));
 		if (!input.success)
 			return failure(400, "INVALID_BODY", "Supply a username.");
-		const invalid = usernameError(input.data.username);
+		const invalid = ownedProjectUsernameError(input.data.username);
 		if (invalid) return json(invalid, 422);
 		const normalized = input.data.username.toLowerCase();
 		const decision = await options.admit(

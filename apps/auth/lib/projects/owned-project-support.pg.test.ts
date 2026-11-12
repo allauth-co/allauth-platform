@@ -6,7 +6,16 @@ import { getTestInstance } from "better-auth/test";
 import { decodeJwt } from "jose";
 import { Kysely, PostgresDialect } from "kysely";
 import { Pool } from "pg";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import {
+	afterAll,
+	beforeAll,
+	beforeEach,
+	describe,
+	expect,
+	it,
+	vi,
+} from "vitest";
+import { createAllAuthProxy } from "../../sdk/next";
 import { defaultAuthPolicy } from "../auth-policy/policy";
 import { allauthControl } from "../control";
 import type { ControlPrincipal } from "../control/types";
@@ -18,6 +27,7 @@ import type { OwnedSupportRegistration } from "./owned-project-support";
 import { createOwnedProjectSupportHttp } from "./owned-project-support";
 import { projectProxySecret, verifiedProjectRequest } from "./proxy";
 import type { Project } from "./registry";
+import { handleProjectAuthentication } from "./session-introspection";
 import type { ProjectSupportOptions } from "./support-plugin";
 import { projectSupport } from "./support-plugin";
 
@@ -49,6 +59,15 @@ const cookieOf = (response: Response) =>
 
 type Account = { id: string; name: string; email: string };
 type Session = { id: string; token: string; cookie: string };
+type BrowserSupport = {
+	session: {
+		id: string;
+		userId: string;
+		impersonatedBy: string;
+		expiresAt: string;
+	};
+	user: Record<string, unknown>;
+};
 
 function signedCookie(name: string, token: string) {
 	const signature = createHmac("sha256", signingSecret)
@@ -361,16 +380,16 @@ describe.skipIf(!existsSync(fixturePath))(
 			};
 		}
 
-		function ownedEngine(
+		function candidateEngine(
 			backchannelLogout?: Parameters<
 				typeof createOwnedProjectEngine
 			>[0]["backchannelLogout"],
+			transport = { baseURL: origin, basePath },
 		) {
 			return createOwnedProjectEngine({
 				database,
 				project,
-				baseURL: origin,
-				basePath,
+				...transport,
 				signingSecret,
 				trustedOrigins: project.origins,
 				policy: defaultAuthPolicy,
@@ -385,8 +404,11 @@ describe.skipIf(!existsSync(fixturePath))(
 					authorizeStoredActor,
 					verifyProxy,
 				},
-			}).dispatch;
+			});
 		}
+
+		const ownedEngine = (...args: Parameters<typeof candidateEngine>) =>
+			candidateEngine(...args).dispatch;
 
 		async function account(
 			role = "user",
@@ -578,6 +600,299 @@ describe.skipIf(!existsSync(fixturePath))(
 				)),
 			};
 		}
+
+		it("reads a native console browser session only for the live platform owner and never refreshes it", async () => {
+			const engine = candidateEngine();
+			const actor = await account("admin", "public");
+			const root = await session(actor, "public");
+			const target = await account();
+			const issued = await native(
+				request("/project-admin/impersonate-user", {
+					caller: origin,
+					cookie: root.cookie,
+					signed: false,
+					body: { userId: target.id },
+				}),
+			);
+			expect(issued.status).toBe(200);
+			const { session: expected } = (await issued.json()) as BrowserSupport;
+			const supportCookie = cookieOf(issued);
+			const browser = request("/get-session", {
+				caller: origin,
+				cookie: `${root.cookie}; ${supportCookie}`,
+				signed: false,
+			});
+			browser.headers.delete("origin");
+			browser.headers.set("sec-fetch-site", "same-origin");
+			const checked = await engine.dispatch(browser);
+			expect(checked.status).toBe(200);
+			expect(checked.headers.getSetCookie()).toEqual([]);
+			expect(checked.headers.get("cache-control")).toBe("no-store");
+			expect(checked.headers.get("referrer-policy")).toBe("no-referrer");
+			const data = (await checked.json()) as BrowserSupport;
+			expect(data).toMatchObject({
+				session: expected,
+				user: { id: target.id, email: target.email },
+			});
+			expect(data.session).not.toHaveProperty("token");
+			expect(data.user).not.toHaveProperty("privateMetadata");
+			expect(await engine.readPrincipal(browser.headers)).toBeNull();
+			const unrelated = await session(
+				await account("admin", "public"),
+				"public",
+			);
+			for (const cookie of [
+				supportCookie,
+				`${unrelated.cookie}; ${supportCookie}`,
+			]) {
+				const ignored = await engine.dispatch(
+					request("/get-session", { caller: origin, cookie, signed: false }),
+				);
+				expect(await ignored.json()).toBeNull();
+				expect(ignored.headers.getSetCookie()).toEqual([]);
+			}
+			const deniedProxy = await engine.readSession(
+				request("/get-session", { cookie: supportCookie }),
+			);
+			expect(await deniedProxy.json()).toBeNull();
+			expect(deniedProxy.headers.getSetCookie()).toEqual([]);
+			const hosted = candidateEngine(undefined, {
+				baseURL: otherOrigin,
+				basePath: "/api/auth",
+			});
+			expect(
+				await (
+					await hosted.dispatch(
+						new Request(`${otherOrigin}/api/auth/get-session`, {
+							headers: browser.headers,
+						}),
+					)
+				).json(),
+			).toBeNull();
+			expect(await (await engine.dispatch(browser)).json()).toEqual(data);
+			const originalExpiry = await database.query<{ expiresAt: Date }>(
+				`SELECT "expiresAt" FROM "${schema}"."session" WHERE id = $1`,
+				[expected.id],
+			);
+			expect(originalExpiry.rows).toEqual([
+				{ expiresAt: new Date(expected.expiresAt) },
+			]);
+			await database.query(`DELETE FROM public."session" WHERE id = $1`, [
+				root.id,
+			]);
+			expect(await (await engine.dispatch(browser)).json()).toBeNull();
+		});
+
+		it("hands a console session to the real SDK through either engine and restores its ordinary browser session", async () => {
+			const engine = candidateEngine();
+			const actor = await account("admin", "public");
+			const root = await session(actor, "public");
+			const target = await account();
+			const ordinary = await session(await account());
+			const started = await engine.dispatch(
+				request("/project-admin/impersonate-user", {
+					caller: origin,
+					cookie: root.cookie,
+					signed: false,
+					body: { userId: target.id },
+				}),
+			);
+			expect(started.status).toBe(200);
+			const { session: expected } = (await started.json()) as BrowserSupport;
+			const consoleCookie = `${root.cookie}; ${cookieOf(started)}`;
+			const launch = await engine.dispatch(
+				request("/project-admin/support/launch", {
+					caller: origin,
+					cookie: consoleCookie,
+					signed: false,
+					body: {},
+				}),
+			);
+			expect(launch.status).toBe(200);
+			const { url } = (await launch.json()) as { url: string };
+			const launchUrl = new URL(url);
+			expect(launchUrl.origin).toBe(supportOrigin);
+			const proxy = createAllAuthProxy({
+				project: slug,
+				appOrigin: supportOrigin,
+				allauthURL: origin,
+				proxySecret: projectProxySecret(project, environment),
+				supportAccess: { enabled: true },
+			});
+			const jar = new Map<string, string>();
+			const [cookieName, ...cookieValue] = ordinary.cookie.split("=");
+			jar.set(cookieName!, cookieValue.join("="));
+			async function appRequest(endpoint: string, body?: object) {
+				const response = await proxy(
+					new Request(`${supportOrigin}/api/allauth/${endpoint}`, {
+						method: body ? "POST" : "GET",
+						headers: {
+							cookie: [...jar]
+								.map(([name, value]) => `${name}=${value}`)
+								.join("; "),
+							...(body
+								? { origin: supportOrigin, "content-type": "application/json" }
+								: {}),
+						},
+						...(body ? { body: JSON.stringify(body) } : {}),
+					}),
+					{
+						params: Promise.resolve({
+							all: endpoint.split("?", 1)[0]!.split("/"),
+						}),
+					},
+				);
+				for (const value of response.headers.getSetCookie()) {
+					const [pair] = value.split(";", 1);
+					const equals = pair!.indexOf("=");
+					const name = pair!.slice(0, equals);
+					if (/Max-Age=0(?:;|$)/i.test(value)) jar.delete(name);
+					else jar.set(name, pair!.slice(equals + 1));
+				}
+				return response;
+			}
+			const upstream = (...[input, init]: Parameters<typeof fetch>) =>
+				handleProjectAuthentication(
+					new Request(input, init),
+					project,
+					environment,
+					signingSecret,
+					{
+						scope: engine,
+						diagnostic: () => undefined,
+						consume: async () => ({ allowed: true, retryAfter: 0 }),
+						session: (_headers, verified) => engine.readSession(verified),
+						fallback: engine.dispatch,
+					},
+				);
+			const transport = vi
+				.spyOn(globalThis, "fetch")
+				.mockImplementation(upstream);
+			try {
+				const start = await appRequest(`support/start${launchUrl.search}`);
+				expect(start.status).toBe(302);
+				const authorized = await native(
+					new Request(start.headers.get("location")!, {
+						headers: { cookie: consoleCookie },
+					}),
+				);
+				expect(authorized.status).toBe(302);
+				const callback = new URL(authorized.headers.get("location")!);
+				expect(`${callback.origin}${callback.pathname}`).toBe(callbackUrl);
+				expect(
+					(await appRequest(`support/callback${callback.search}`)).status,
+				).toBe(303);
+				const candidate = await appRequest("get-session");
+				expect(await candidate.json()).toMatchObject({
+					session: expected,
+					user: { id: target.id },
+				});
+				expect(candidate.headers.getSetCookie()).toEqual([]);
+				expect(
+					await (await appRequest("support/session")).json(),
+				).toMatchObject({
+					support: { session: { id: expected.id } },
+					canRestore: true,
+				});
+				expect(
+					await (
+						await engine.dispatch(
+							request("/get-session", {
+								caller: origin,
+								cookie: consoleCookie,
+								signed: false,
+							}),
+						)
+					).json(),
+				).toMatchObject({ session: expected });
+				transport.mockImplementation((input, init) =>
+					native(new Request(input, init)),
+				);
+				expect(
+					await (await appRequest("get-session?disableRefresh=true")).json(),
+				).toMatchObject({ session: expected });
+				transport.mockImplementation(upstream);
+				expect(
+					await (await appRequest("support/stop", {})).json(),
+				).toMatchObject({ success: true, restored: true });
+				expect(await (await appRequest("get-session")).json()).toMatchObject({
+					session: { id: ordinary.id, impersonatedBy: null },
+				});
+				expect(
+					await (
+						await native(
+							request("/get-session", {
+								caller: origin,
+								cookie: consoleCookie,
+								signed: false,
+							}),
+						)
+					).json(),
+				).toBeNull();
+			} finally {
+				transport.mockRestore();
+			}
+		});
+
+		it("limits native application support to its exact signed browser origin and ends it when the ordinary actor is lost", async () => {
+			const fixture = await nativeApplicationSupport();
+			const engine = candidateEngine();
+			const load = () => request("/get-session", { cookie: fixture.cookie });
+			const prior = await native(load());
+			const result = await engine.readSession(load());
+			const expected = {
+				session: {
+					id: fixture.sessionId,
+					userId: fixture.target.id,
+					impersonatedBy: fixture.actor.id,
+				},
+				user: { id: fixture.target.id },
+			};
+			expect(await prior.json()).toMatchObject(expected);
+			expect(await result.json()).toMatchObject(expected);
+			expect(result.headers.getSetCookie()).toEqual([]);
+			const signedWrongOrigin = request("/get-session", {
+				caller: otherOrigin,
+				cookie: fixture.cookie,
+			});
+			const forgedSignature = load();
+			forgedSignature.headers.set("allauth-proxy-signature", "0".repeat(64));
+			for (const denied of [
+				signedWrongOrigin,
+				forgedSignature,
+				request("/get-session", { cookie: fixture.cookie, signed: false }),
+			]) {
+				const response = await engine.readSession(denied);
+				expect(await response.json()).toBeNull();
+				expect(response.headers.getSetCookie()).toEqual([]);
+			}
+			const wrongStatusOrigin = await engine.dispatch(
+				request("/sdk/support/session", {
+					caller: otherOrigin,
+					cookie: fixture.cookie,
+				}),
+			);
+			expect(await wrongStatusOrigin.json()).toBeNull();
+			expect(wrongStatusOrigin.headers.getSetCookie()).toEqual([]);
+			expect(await (await engine.readSession(load())).json()).toMatchObject(
+				expected,
+			);
+			await database.query(`DELETE FROM "${schema}"."session" WHERE id = $1`, [
+				fixture.original.id,
+			]);
+			const ended = await engine.readSession(load());
+			expect(await ended.json()).toBeNull();
+			expect(
+				ended.headers
+					.getSetCookie()
+					.some(
+						(value) =>
+							value.startsWith(`${cookieName}=;`) &&
+							value.includes("Max-Age=0"),
+					),
+			).toBe(true);
+			expect(await (await native(load())).json()).toBeNull();
+		});
 
 		it("reads a native console handoff without refresh and revokes it when the platform actor loses authority", async () => {
 			const fixture = await nativeConsoleSupport();
@@ -843,9 +1158,12 @@ describe.skipIf(!existsSync(fixturePath))(
 			]);
 		});
 
-		it("ends support through owned dispatch and notifies connected apps after commit", async () => {
+		it.each([
+			"explicit stop",
+			"stale session read",
+		])("notifies connected apps after commit when support ends through %s", async (operation) => {
 			const fixture = await nativeApplicationSupport();
-			const clientId = "fixture-support-connected-app";
+			const clientId = randomUUID();
 			const target = "https://rp.fixture.example/logout";
 			await database.query(
 				`INSERT INTO "${schema}"."oauthClient"(id,"clientId","redirectUris","backchannelLogoutUri") VALUES ($1,$2,'[]',$3)`,
@@ -863,7 +1181,7 @@ describe.skipIf(!existsSync(fixturePath))(
 				],
 			);
 			const delivered: unknown[] = [];
-			const candidate = ownedEngine({
+			const candidate = candidateEngine({
 				async post(url, params) {
 					const state = await database.query(
 						`SELECT id FROM "${schema}"."session" WHERE id = $1`,
@@ -875,9 +1193,22 @@ describe.skipIf(!existsSync(fixturePath))(
 					return 200;
 				},
 			});
-			const ended = await candidate(
-				request("/sdk/support/stop", { cookie: fixture.cookie, body: {} }),
-			);
+			if (operation === "stale session read")
+				await database.query(
+					`DELETE FROM "${schema}"."session" WHERE id = $1`,
+					[fixture.original.id],
+				);
+			const ended =
+				operation === "explicit stop"
+					? await candidate.dispatch(
+							request("/sdk/support/stop", {
+								cookie: fixture.cookie,
+								body: {},
+							}),
+						)
+					: await candidate.readSession(
+							request("/get-session", { cookie: fixture.cookie }),
+						);
 			expect(ended.status).toBe(200);
 			expect(delivered).toEqual([
 				expect.objectContaining({

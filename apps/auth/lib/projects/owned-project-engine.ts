@@ -10,62 +10,54 @@ import type { ApplicationBranding } from "../branding/types";
 import { clerkCompatiblePasswords } from "../clerk-password";
 import { applicationMfaCallback } from "../mfa-continuation";
 import type { NativePasskeyCapability } from "../project-native-passkeys";
-import { readLegacySessionCookie } from "./legacy-session-cookie";
 import type { LegacyMfaKeys } from "./legacy-mfa-record";
+import { readLegacySessionCookie } from "./legacy-session-cookie";
 import { createOwnedProjectMfa } from "./owned-mfa";
 import { createOwnedMfaEnrollment } from "./owned-mfa-enrollment";
 import { createOwnedProjectPasskeyHttp } from "./owned-passkey-http";
-import { createOwnedRecoveryHttp } from "./owned-recovery-http";
-import { createOwnedSignUpHttp } from "./owned-sign-up";
-import {
-	createOwnedProjectBackchannelLogout,
-	type ProjectBackchannelTarget,
-} from "./owned-project-backchannel-logout";
+import type { ProjectBackchannelTarget } from "./owned-project-backchannel-logout";
+import { createOwnedProjectBackchannelLogout } from "./owned-project-backchannel-logout";
+import type { OwnedProjectEmailSignInOptions } from "./owned-project-email-sign-in";
+import { createOwnedProjectEmailSignIn } from "./owned-project-email-sign-in";
 import type { ProjectSession, ProjectUser } from "./owned-project-engine-store";
 import {
 	afterOwnedProjectCommit,
 	createProjectEngineStore,
 	projectUserResponse,
 } from "./owned-project-engine-store";
-import {
-	createOwnedProjectEmailSignIn,
-	type OwnedProjectEmailSignInOptions,
-} from "./owned-project-email-sign-in";
+import type { OwnedProjectOAuthOptions } from "./owned-project-oauth";
 import {
 	createOwnedProjectOAuth,
 	ownedProjectOAuthStartInput,
 	ownedProjectOAuthUnlinkInput,
 	projectOAuthProvider,
-	type OwnedProjectOAuthOptions,
 } from "./owned-project-oauth";
-import {
-	createOwnedProjectOrganizationHttp,
-	type OwnedProjectOrganizationOptions,
-} from "./owned-project-organization";
-import {
-	createOwnedProjectPasswordChange,
-	type OwnedProjectPasswordChangeOptions,
-} from "./owned-project-password-change";
+import type { OwnedProjectOrganizationOptions } from "./owned-project-organization";
+import { createOwnedProjectOrganizationHttp } from "./owned-project-organization";
+import type { OwnedProjectPasswordChangeOptions } from "./owned-project-password-change";
+import { createOwnedProjectPasswordChange } from "./owned-project-password-change";
+import { createOwnedProjectProfile } from "./owned-project-profile";
 import {
 	createOwnedProjectSCIMDiscovery,
 	ownedSCIMError,
 } from "./owned-project-scim-discovery";
-import { createOwnedProjectSCIMUserWrites } from "./owned-project-scim-user-writes";
+import { createOwnedProjectSCIMGroupWrites } from "./owned-project-scim-group-writes";
 import { createOwnedProjectSCIMResources } from "./owned-project-scim-resources";
-import {
-	createOwnedProjectSso,
-	ownedProjectSsoInput,
-	type OwnedProjectSsoOptions,
-} from "./owned-project-sso";
-import { createOwnedProjectServiceDirectory } from "./owned-project-service-directory";
-import {
-	createOwnedProjectSupportHttp,
-	type OwnedProjectSupportOptions,
-} from "./owned-project-support";
+import { createOwnedProjectSCIMUserWrites } from "./owned-project-scim-user-writes";
 import {
 	createOwnedProjectSecurity,
 	projectSecurityBlockedCode,
 } from "./owned-project-security";
+import { createOwnedProjectServiceDirectory } from "./owned-project-service-directory";
+import type { OwnedProjectSsoOptions } from "./owned-project-sso";
+import {
+	createOwnedProjectSso,
+	ownedProjectSsoInput,
+} from "./owned-project-sso";
+import type { OwnedProjectSupportOptions } from "./owned-project-support";
+import { createOwnedProjectSupportHttp } from "./owned-project-support";
+import { createOwnedRecoveryHttp } from "./owned-recovery-http";
+import { createOwnedSignUpHttp } from "./owned-sign-up";
 import type { Project } from "./registry";
 import { consumeProxySessionCheck } from "./session-introspection-admission";
 import { projectOrigin, projectSlug } from "./validation";
@@ -330,6 +322,7 @@ export function createOwnedProjectEngine(
 		secureCookies: secure,
 		keys: options.mfaKeys,
 	});
+	const updateProfile = createOwnedProjectProfile(store, origin);
 	const security = createOwnedProjectSecurity({
 		secret: options.signingSecret,
 		trustedIP: options.trustedIP,
@@ -415,6 +408,13 @@ export function createOwnedProjectEngine(
 		const current = token
 			? await store.session(token, refreshWindow, client)
 			: null;
+		return ordinarySession(token, current);
+	}
+
+	function ordinarySession(
+		token: string | null,
+		current: Awaited<ReturnType<typeof store.session>> | null,
+	) {
 		if (
 			!token ||
 			!current ||
@@ -986,9 +986,21 @@ export function createOwnedProjectEngine(
 	async function readSession(request: Request) {
 		if (!trustedRequest(request.headers, false)) return forbidden();
 		const headers = new Headers();
-		let current = await currentSession(request.headers);
+		const token = tokenFrom(request.headers);
+		const observed = token ? await store.session(token, refreshWindow) : null;
+		if (support && observed?.session.impersonatedBy) {
+			const url = new URL(request.url);
+			if (
+				request.method !== "GET" ||
+				url.origin !== origin ||
+				url.pathname !== `${options.basePath}/get-session`
+			)
+				return forbidden();
+			return (await support.readBrowserSession(request)) ?? json(null);
+		}
+		let current = ordinarySession(token, observed);
 		if (!current) {
-			if (tokenFrom(request.headers)) clearSessionCookies(headers);
+			if (token) clearSessionCookies(headers);
 			return json(null, 200, headers);
 		}
 		const query = new URL(request.url).searchParams;
@@ -1491,14 +1503,16 @@ export function createOwnedProjectEngine(
 			signUpEnabled: policy.signUpEnabled,
 			async complete(
 				client,
-				{ user, request, providerId, destination, managed },
+				{ user, request, providerId, destination, managed, protocol },
 			) {
 				const result = await primaryResult(
 					client,
 					await store.lockUser(client, user.id),
 					request,
 					true,
-					`/sso/callback/${providerId}`,
+					protocol === "saml"
+						? `/sso/saml2/sp/acs/${providerId}`
+						: `/sso/callback/${providerId}`,
 					destination,
 					{ managed, allowUnverifiedEmail: true },
 				);
@@ -1513,6 +1527,14 @@ export function createOwnedProjectEngine(
 	const scimResources =
 		options.scim &&
 		createOwnedProjectSCIMResources({
+			database: options.database,
+			schemaName: options.project.schemaName,
+			baseURL: `${origin}${options.basePath}`,
+			credentialHashSecret: options.scim.credentialHashSecret,
+		});
+	const scimGroupWrites =
+		options.scim &&
+		createOwnedProjectSCIMGroupWrites({
 			database: options.database,
 			schemaName: options.project.schemaName,
 			baseURL: `${origin}${options.basePath}`,
@@ -1641,7 +1663,8 @@ export function createOwnedProjectEngine(
 			const response =
 				scimDiscovery?.(request) ??
 				(await scimResources?.(request)) ??
-				(await scimUserWrites?.(request));
+				(await scimUserWrites?.(request)) ??
+				(await scimGroupWrites?.(request));
 			if (response) return response;
 		}
 		const supportResponse = await support?.(path, request);
@@ -1671,6 +1694,23 @@ export function createOwnedProjectEngine(
 			);
 			if (denied) return securityBlocked();
 			return sso.callback(request, provider);
+		}
+		const samlCallbackPath = "/sso/saml2/sp/acs/";
+		if (
+			sso &&
+			options.sso?.saml &&
+			request.method === "POST" &&
+			path.startsWith(samlCallbackPath)
+		) {
+			const provider = path.slice(samlCallbackPath.length);
+			if (!provider || provider.includes("/")) return forbidden();
+			const denied = await store.transaction((client) =>
+				security.admit(client, request),
+			);
+			if (denied) return securityBlocked();
+			// The IdP posts cross-site. The SAML service validates the signed response
+			// against the stored, single-use request for this realm and provider.
+			return sso.samlCallback(request, provider);
 		}
 		const recovery = await recoveryHttp?.(request);
 		if (recovery) return recovery;
@@ -1771,6 +1811,27 @@ export function createOwnedProjectEngine(
 			if (denied) return denied;
 			return passwordChange.change(request, await requestBody(request));
 		}
+		if (request.method === "POST" && path === "/update-user") {
+			if (!trustedRequest(request.headers, true)) return forbidden();
+			const current = await currentSession(request.headers);
+			if (!current) return failure(401, "UNAUTHORIZED", "Unauthorized");
+			const result = await updateProfile(await requestBody(request), {
+				userId: current.user.id,
+				token: current.token,
+			});
+			if (result.status !== 200)
+				return failure(result.status, result.code, result.message);
+			const headers = new Headers();
+			writeCookie(
+				headers,
+				sessionCookie,
+				current.token,
+				tokenFrom(request.headers, rememberCookie)
+					? undefined
+					: policy.sessionExpiresInSeconds,
+			);
+			return json({ status: true }, 200, headers);
+		}
 		if (request.method === "POST" && path === "/sign-in/email")
 			return signIn(request);
 		if (request.method === "POST" && path === "/sign-in/username")
@@ -1805,6 +1866,12 @@ export function createOwnedProjectEngine(
 		return unsupported();
 	}
 
+	async function deliverCommittedLogout(request: Request) {
+		const targets = committedLogoutTargets.get(request);
+		committedLogoutTargets.delete(request);
+		if (targets) await backchannel?.(targets);
+	}
+
 	return {
 		async dispatch(request) {
 			try {
@@ -1818,12 +1885,19 @@ export function createOwnedProjectEngine(
 				throw error;
 			} finally {
 				notifications.delete(request);
-				const targets = committedLogoutTargets.get(request);
-				committedLogoutTargets.delete(request);
-				if (targets) await backchannel?.(targets);
+				await deliverCommittedLogout(request);
 			}
 		},
-		readSession,
+		async readSession(request) {
+			try {
+				return await readSession(request);
+			} catch (error) {
+				if (error === unavailableLogout) return unsupported();
+				throw error;
+			} finally {
+				await deliverCommittedLogout(request);
+			}
+		},
 		listAccountSessions,
 		revokeAccountSession,
 		readDirectory: async (operation, headers, query) =>
