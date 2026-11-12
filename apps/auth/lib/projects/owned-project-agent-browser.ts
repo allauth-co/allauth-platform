@@ -257,7 +257,8 @@ function missingRevocationTarget() {
 	);
 }
 
-async function revokeLockedAgent(client: PoolClient, id: string) {
+/** Retire the key and grants of an agent already locked by the current transaction. */
+export async function revokeLockedOwnedAgent(client: PoolClient, id: string) {
 	await client.query(
 		`UPDATE "agent" SET status='revoked',"publicKey"='',kid=NULL,"updatedAt"=transaction_timestamp() WHERE id=$1`,
 		[id],
@@ -330,7 +331,7 @@ export async function revokeOwnedBrowserAgent(
 	const agent = await lockBrowserOwnedAgent(client, userId, input.agent_id);
 	return agent instanceof Response
 		? agent
-		: revokeLockedAgent(client, agent.id);
+		: revokeLockedOwnedAgent(client, agent.id);
 }
 
 /** A live signed host may disconnect an explicitly selected agent on that host. */
@@ -343,5 +344,5 @@ export async function revokeOwnedHostAgent(
 	const agent = await lockHostOwnedAgent(client, hostId, input.agent_id);
 	return agent instanceof Response
 		? agent
-		: revokeLockedAgent(client, agent.id);
+		: revokeLockedOwnedAgent(client, agent.id);
 }

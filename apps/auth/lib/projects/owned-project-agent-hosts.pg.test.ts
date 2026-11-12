@@ -2305,6 +2305,249 @@ describe.skipIf(!existsSync(fixture))(
 			});
 		});
 
+		it("reactivates an owned delegated agent with empty host defaults across writers", async () => {
+			const path = "/agent/reactivate";
+			const schema = `"${alpha.schemaName}"`;
+			const ownerId = cleanupOwners[1].id;
+			const seed = async (label: string) => {
+				const machine = await nativeMachine(label, cleanupCookies[1]);
+				await database.query(
+					`UPDATE ${schema}."agent" SET "createdAt"=now()-interval '4 hours',"activatedAt"=now()-interval '2 hours',"expiresAt"=now()-interval '1 minute' WHERE id=$1`,
+					[machine.agentId],
+				);
+				await database.query(
+					`INSERT INTO ${schema}."agentCapabilityGrant" (id,"agentId",capability,status,"createdAt","updatedAt") VALUES
+					($1,$3,'fixture.previous','active',now(),now()),($2,$3,'fixture.pending','pending',now(),now())`,
+					[randomUUID(), randomUUID(), machine.agentId],
+				);
+				return machine;
+			};
+			const previous = await seed("Legacy reactivation");
+			const current = await seed("Owned reactivation");
+			const cleanup = await legacy.handler(
+				new Request(request(alpha, "/agent/cleanup", cleanupCookies[1]), {
+					method: "POST",
+				}),
+			);
+			expect(cleanup.status).toBe(200);
+			expect(await cleanup.json()).toEqual({
+				expired: 2,
+				approvals_expired: 0,
+			});
+			const persistedAgent = async (agentId: string) =>
+				(
+					await database.query<{
+						status: string;
+						publicKey: string;
+						kid: string | null;
+						hostId: string;
+						userId: string;
+						createdAt: Date;
+						grants: string[];
+					}>(
+						`SELECT a.status,a."publicKey",a.kid,a."hostId",a."userId",a."createdAt",ARRAY(SELECT g.status FROM ${schema}."agentCapabilityGrant" g WHERE g."agentId"=a.id ORDER BY g.capability) AS grants FROM ${schema}."agent" a WHERE id=$1`,
+						[agentId],
+					)
+				).rows[0];
+			const original = await persistedAgent(current.agentId);
+			expect(original).toMatchObject({
+				status: "expired",
+				grants: ["pending", "active"],
+			});
+			const currentBody = { agent_id: current.agentId };
+			const currentProof = `Bearer ${await nativeClientHostProof(current)}`;
+			await expectSame(path, cleanupCookies[1], 401, currentBody);
+			await expectSame(
+				path,
+				"",
+				401,
+				currentBody,
+				`Bearer ${await hostProof(current, current.hostId, "https://elsewhere.fixture.example")}`,
+			);
+			await expectSame(
+				path,
+				"",
+				403,
+				{ agent_id: previous.agentId },
+				currentProof,
+			);
+			await expectSame(path, "", 404, { agent_id: randomUUID() }, currentProof);
+			const pending = await pendingApproval(
+				current.hostId,
+				"ciba",
+				cleanupOwners[1],
+			);
+			await expectSame(
+				path,
+				"",
+				403,
+				{ agent_id: pending.agentId },
+				currentProof,
+			);
+			expect(
+				(
+					await outside.dispatch(
+						request(beta, path, "", currentBody, currentProof),
+					)
+				).status,
+			).toBe(401);
+			expect(
+				(
+					await disabled.dispatch(
+						request(alpha, path, "", currentBody, currentProof),
+					)
+				).status,
+			).toBe(501);
+			const reactivate = () =>
+				owned.dispatch(request(alpha, path, "", currentBody, currentProof));
+			await database.query(
+				`UPDATE ${schema}."agentHost" SET "defaultCapabilities"='["fixture.previous"]' WHERE id=$1`,
+				[current.hostId],
+			);
+			expect((await reactivate()).status).toBe(501);
+			await database.query(
+				`UPDATE ${schema}."agentHost" SET "defaultCapabilities"='[]' WHERE id=$1`,
+				[current.hostId],
+			);
+			await database.query(
+				`UPDATE ${schema}."user" SET "directoryDisabled"=true WHERE id=$1`,
+				[ownerId],
+			);
+			expect((await reactivate()).status).toBe(401);
+			await database.query(
+				`UPDATE ${schema}."user" SET "directoryDisabled"=false WHERE id=$1`,
+				[ownerId],
+			);
+			await database.query(`CREATE FUNCTION ${schema}."rejectFixtureReactivation"() RETURNS trigger LANGUAGE plpgsql AS $$
+				BEGIN RAISE EXCEPTION 'fixture reactivation failed'; END;
+			$$`);
+			try {
+				await database.query(`CREATE TRIGGER "rejectFixtureReactivation" BEFORE UPDATE ON ${schema}."agent"
+					FOR EACH ROW WHEN (OLD.status='expired' AND NEW.status='active') EXECUTE FUNCTION ${schema}."rejectFixtureReactivation"()`);
+				await expect(reactivate()).rejects.toThrow(
+					"fixture reactivation failed",
+				);
+				expect(await persistedAgent(current.agentId)).toEqual(original);
+			} finally {
+				await database.query(
+					`DROP TRIGGER IF EXISTS "rejectFixtureReactivation" ON ${schema}."agent"`,
+				);
+				await database.query(
+					`DROP FUNCTION ${schema}."rejectFixtureReactivation"()`,
+				);
+			}
+			const baseline = await legacy.handler(
+				request(
+					alpha,
+					path,
+					"",
+					{ agent_id: previous.agentId },
+					`Bearer ${await nativeClientHostProof(previous)}`,
+				),
+			);
+			const [resumed, concurrent] = await Promise.all([
+				reactivate(),
+				reactivate(),
+			]);
+			expect([baseline.status, resumed.status, concurrent.status]).toEqual([
+				200, 200, 200,
+			]);
+			const response = (value: Response) =>
+				value.json() as Promise<{
+					activated_at: string;
+					expires_at: string;
+					last_used_at: string;
+				}>;
+			const [priorSession, ownedSession] = await Promise.all([
+				response(baseline),
+				response(resumed),
+			]);
+			expect(await concurrent.json()).toEqual(ownedSession);
+			for (const [machine, status] of [
+				[previous, priorSession],
+				[current, ownedSession],
+			] as const) {
+				expect(status).toMatchObject({
+					agent_id: machine.agentId,
+					host_id: machine.hostId,
+					status: "active",
+					mode: "delegated",
+					user_id: ownerId,
+					agent_capability_grants: [],
+				});
+				expect(status.last_used_at).toBe(status.activated_at);
+				expect(
+					Date.parse(status.expires_at) - Date.parse(status.activated_at),
+				).toBe(900_000);
+			}
+			expect(await persistedAgent(current.agentId)).toEqual({
+				...original,
+				status: "active",
+				grants: [],
+			});
+			const repeated = await reactivate();
+			expect(repeated.status).toBe(200);
+			expect(await repeated.json()).toEqual(ownedSession);
+			legacy = await native(nativePool);
+			const rolledBack = await legacy.handler(
+				request(
+					alpha,
+					`${statusPath}?agent_id=${current.agentId}`,
+					"",
+					undefined,
+					currentProof,
+				),
+			);
+			expect(rolledBack.status).toBe(200);
+			expect(await rolledBack.json()).toEqual(ownedSession);
+			const usableKey = await legacy.handler(
+				request(
+					alpha,
+					statusPath,
+					"",
+					undefined,
+					`Bearer ${await agentProof(current)}`,
+				),
+			);
+			expect(usableKey.status).toBe(200);
+			expect(await usableKey.json()).toMatchObject({
+				agent_id: current.agentId,
+				status: "active",
+			});
+			for (const machine of [previous, current]) {
+				await database.query(
+					`UPDATE ${schema}."agent" SET status='expired',"createdAt"=now()-interval '25 hours' WHERE id=$1`,
+					[machine.agentId],
+				);
+				await database.query(
+					`INSERT INTO ${schema}."agentCapabilityGrant" (id,"agentId",capability,status,"createdAt","updatedAt") VALUES ($1,$2,'fixture.absolute','active',now(),now())`,
+					[randomUUID(), machine.agentId],
+				);
+			}
+			const priorDenial = await legacy.handler(
+				request(
+					alpha,
+					path,
+					"",
+					{ agent_id: previous.agentId },
+					`Bearer ${await nativeClientHostProof(previous)}`,
+				),
+			);
+			const denial = await reactivate();
+			expect([priorDenial.status, denial.status]).toEqual([403, 403]);
+			const expectedDenial = await priorDenial.json();
+			expect(expectedDenial).toMatchObject({
+				error: "absolute_lifetime_exceeded",
+			});
+			expect(await denial.json()).toEqual(expectedDenial);
+			expect(await persistedAgent(current.agentId)).toMatchObject({
+				status: "revoked",
+				publicKey: "",
+				kid: null,
+				grants: ["revoked"],
+			});
+		});
+
 		it("updates the fresh browser owner's host and replaces its inline key under the stable ID across writers", async () => {
 			const path = "/host/update";
 			const host = await nativeMachineHost("Browser key update", ownerCookie);

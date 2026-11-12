@@ -51,6 +51,10 @@ import {
 	validAgentIdentifier,
 	verifyAgentMachineJWT,
 } from "./owned-project-agent-machine";
+import {
+	agentReactivationPath,
+	reactivateOwnedProjectAgent,
+} from "./owned-project-agent-reactivation";
 import { registerOwnedProjectAgent } from "./owned-project-agent-registration";
 import {
 	agentSessionPath,
@@ -294,6 +298,8 @@ export function createOwnedProjectAgentHosts(options: BrowserHosts) {
 			request.method === "GET" &&
 			(path === "/agent/get" || path === "/agent/list");
 		const agentRevoke = request.method === "POST" && path === agentRevokePath;
+		const reactivate =
+			request.method === "POST" && path === agentReactivationPath;
 		const grantRevoke =
 			request.method === "POST" && path === agentGrantRevokePath;
 		const agentUpdate = request.method === "POST" && path === "/agent/update";
@@ -325,6 +331,7 @@ export function createOwnedProjectAgentHosts(options: BrowserHosts) {
 			!catalog &&
 			!introspect &&
 			!hostRotation &&
+			!reactivate &&
 			!agentRead
 		)
 			return;
@@ -338,6 +345,7 @@ export function createOwnedProjectAgentHosts(options: BrowserHosts) {
 							? 300
 							: agentRead ||
 									agentRevoke ||
+									reactivate ||
 									grantRevoke ||
 									agentUpdate ||
 									catalog ||
@@ -349,6 +357,12 @@ export function createOwnedProjectAgentHosts(options: BrowserHosts) {
 			}),
 		);
 		if (limited) return limited;
+		if (reactivate) {
+			const body = await options.readBody(request);
+			return options.store.transaction((client) =>
+				reactivateOwnedProjectAgent(client, request, body),
+			);
+		}
 		if (hostRotation) {
 			const body = await options.readBody(request);
 			return options.store.transaction((client) =>

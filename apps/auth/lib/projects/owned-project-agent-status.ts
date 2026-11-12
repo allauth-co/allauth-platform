@@ -15,31 +15,38 @@ import {
 } from "./owned-project-agent-machine";
 
 const statusPath = "/agent/status";
-const heartbeatLifetime = 900;
+export const agentSessionLifetime = 900;
 const activationLifetime = 3600;
-const absoluteLifetime = 86400;
+export const agentAbsoluteLifetime = 86400;
 
-type Agent = {
+export type OwnedAgentStatusRecord = {
 	id: string;
 	name: string;
 	hostId: string;
 	userId: string | null;
-	publicKey: string;
-	jwksUrl: string | null;
 	status: string;
 	mode: string;
-	metadata: string | null;
 	createdAt: Date;
 	activatedAt: Date | null;
 	expiresAt: Date | null;
 	lastUsedAt: Date | null;
 };
-const agentFields = `id,name,"hostId","userId","publicKey","jwksUrl",status,mode,metadata,"createdAt","activatedAt","expiresAt","lastUsedAt"`;
+type Agent = OwnedAgentStatusRecord & {
+	publicKey: string;
+	jwksUrl: string | null;
+	metadata: string | null;
+};
+export const ownedAgentStatusColumns = `id,name,"hostId","userId",status,mode,"createdAt","activatedAt","expiresAt","lastUsedAt"`;
+const agentFields = `${ownedAgentStatusColumns},"publicKey","jwksUrl",metadata`;
 function agentNotFound(status: 401 | 404, origin?: string) {
 	return problem(status, "agent_not_found", "Agent not found", origin);
 }
 
-async function publicAgent(client: PoolClient, agent: Agent) {
+/** Project the native public agent status and grants from the current realm. */
+export async function ownedAgentStatusResponse(
+	client: PoolClient,
+	agent: OwnedAgentStatusRecord,
+) {
 	const grants = await readOwnedAgentGrants(client, [agent.id]);
 	return json({
 		agent_id: agent.id,
@@ -56,8 +63,9 @@ async function publicAgent(client: PoolClient, agent: Agent) {
 	});
 }
 
-function inactiveAgent(agent: Agent, now: number, origin: string) {
-	switch (agent.status) {
+/** Match the native errors for terminal or approval-pending states. */
+export function ownedAgentStateError(status: string) {
+	switch (status) {
 		case "pending":
 			return problem(403, "agent_pending", "Agent is still pending approval");
 		case "rejected":
@@ -71,7 +79,12 @@ function inactiveAgent(agent: Agent, now: number, origin: string) {
 				"Agent has been claimed and is no longer active",
 			);
 	}
-	if (now >= agent.createdAt.getTime() + absoluteLifetime * 1000)
+}
+
+function inactiveAgent(agent: Agent, now: number, origin: string) {
+	const state = ownedAgentStateError(agent.status);
+	if (state) return state;
+	if (now >= agent.createdAt.getTime() + agentAbsoluteLifetime * 1000)
 		return problem(
 			403,
 			"absolute_lifetime_exceeded",
@@ -212,7 +225,7 @@ export async function refreshOwnedAgentHeartbeat(
 		 WHERE id=$1 AND ("expiresAt" IS NULL OR "expiresAt">statement_timestamp())
 		 AND COALESCE("activatedAt","createdAt")+$3::int*interval '1 second'>statement_timestamp()
 		 AND "createdAt"+$4::int*interval '1 second'>statement_timestamp() RETURNING "lastUsedAt","expiresAt"`,
-		[agent.id, heartbeatLifetime, activationLifetime, absoluteLifetime],
+		[agent.id, agentSessionLifetime, activationLifetime, agentAbsoluteLifetime],
 	);
 	if (!heartbeat)
 		return problem(401, "agent_expired", "Agent session has expired", origin);
@@ -267,7 +280,7 @@ export async function readOwnedAgentStatus(
 				"unauthorized",
 				"Caller is not authorized for this operation",
 			);
-		return publicAgent(client, agent);
+		return ownedAgentStatusResponse(client, agent);
 	}
 	const principal = await authorizeOwnedActiveAgent(
 		client,
@@ -285,5 +298,5 @@ export async function readOwnedAgentStatus(
 	);
 	return refreshed instanceof Response
 		? refreshed
-		: publicAgent(client, refreshed);
+		: ownedAgentStatusResponse(client, refreshed);
 }

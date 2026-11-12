@@ -20,7 +20,8 @@ The platform installs `@better-auth/agent-auth` 0.6.2. The endpoint inventory be
 | Agent profile | `POST /agent/update` | Current agent owner’s signed browser session, with native name and metadata updates. |
 | Agent revocation | `POST /agent/revoke` | Signed browser session of the agent or host owner, or an active signed host selecting an agent on that host. Direct agent JWT revocation is pending. |
 | Agent expiry cleanup | `POST /agent/cleanup` | Live browser owner can expire their overdue active agents and pending approval records. |
-| Other agent lifecycle | `POST /agent/rotate-key`, `POST /agent/reactivate` | Pending. |
+| Agent reactivation | `POST /agent/reactivate` | Active signed host and eligible owner, existing delegated inline agent, and empty host defaults for expired-agent renewal. |
+| Agent key rotation | `POST /agent/rotate-key` | Pending. |
 | Browser approvals | `GET /agent/ciba/pending`, `POST /agent/approve-capability` | Current owner’s pending device and CIBA summaries. Fresh verified owner can approve or deny an existing, owner-bound delegated registration without capability grants. The decision accepts native `approval_id` or `agent_id`. |
 | Capability grant revocation | `POST /agent/revoke-capability` | Fresh verified browser owner, active signed host, or active signed agent can revoke named existing grants within their scope. |
 | Agent approval requests and grants | `POST /agent/request-capability`, `POST /agent/grant-capability`, `POST /agent/ciba/authorize`, `POST /agent/device/code` | Pending |
@@ -53,6 +54,8 @@ Browser agent list and detail accept the current owner’s signed session and ex
 Browser profile updates require the agent owner’s live session. The native metadata map accepts string, number, boolean and null values. A supplied map replaces the stored map, and a request containing only the name retains the previous metadata. The write changes the profile and update time under the same agent ID.
 
 Browser cleanup changes due active agents and due pending approvals for the signed owner to `expired`, using one transaction and the existing five-per-minute limit. The native response counts each transition. Expired agent rows retain their signing keys and grants for the separate reactivation flow.
+
+Explicit reactivation verifies the same host’s existing signed key and locks its eligible owner and delegated agent. With empty host defaults, it clears old grant rows and starts a new 15-minute agent session under the existing ID and key. A repeat on an active agent reads the existing session. The absolute lifetime retires an expired agent’s key and grants. Reactivation with configured capabilities or approval requirements still needs separate coverage.
 
 Capability revocation accepts the fresh verified browser owner of the agent or its persisted host, a live signed host selecting one of its agents, or a live agent selecting itself. It changes every matching existing grant and returns the changed capability names and grant IDs. Agent credentials require the native audience and single-use JTI and validate any supplied method, URL and JSON body binding. An authorized retry with a fresh agent credential returns empty change lists.
 
