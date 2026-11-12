@@ -25,7 +25,7 @@ import type { createProjectEngineStore } from "./owned-project-engine-store";
 import { admitOwnedProjectNativeRoute } from "./owned-project-native-admission";
 import {
 	ownedWebhookAccountsSupported,
-	ownedWebhookPolicySupported,
+	ownedWebhookSelectors,
 	ownedWebhookUsesPolicyGuard,
 } from "./owned-project-webhook-admission";
 import type { Project } from "./registry";
@@ -219,8 +219,9 @@ export function createOwnedProjectWebhookManagement(options: {
 					const { policy } = await authPolicyRepository(client).read(
 						project.id,
 					);
+					const available = ownedWebhookSelectors(policy);
 					if (
-						!ownedWebhookPolicySupported(policy) ||
+						eventTypes.some((selector) => !available.includes(selector)) ||
 						!(await ownedWebhookAccountsSupported(client, project.schemaName))
 					)
 						return unavailableSubscriptions();

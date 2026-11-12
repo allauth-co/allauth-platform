@@ -1,4 +1,5 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
+import { isServerTokenRequest } from "../features/helpers";
 
 /** Verify the decoded value of a legacy signed cookie and return its token. */
 export function verifyLegacySessionCookie(value: string, secret: string): string | null {
@@ -35,4 +36,18 @@ export function readLegacySessionCookie(
 		return verifyLegacySessionCookie(value, secret);
 	}
 	return null;
+}
+
+/** Validate the same signed session value when it arrives through a server-only bearer request. */
+export function readLegacyServerSessionBearer(headers: Headers, secret: string): string | null {
+	if (!isServerTokenRequest(headers) || headers.has("allauth-proxy-signature")) return null;
+	const authorization = headers.get("authorization");
+	if (authorization?.slice(0, 7).toLowerCase() !== "bearer ") return null;
+	const signed = authorization.slice(7).trim();
+	if (!signed || signed.length > 1024 || /[\s,]/.test(signed)) return null;
+	try {
+		return verifyLegacySessionCookie(decodeURIComponent(signed), secret);
+	} catch {
+		return null;
+	}
 }

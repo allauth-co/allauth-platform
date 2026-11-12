@@ -1551,6 +1551,74 @@ describe.skipIf(!existsSync(fixture))(
 					"mfa.verified",
 					"mfa.verified",
 				]);
+
+				const keyEndpoint = randomUUID();
+				await database.query(
+					`INSERT INTO ${schema}."allauthWebhookEndpoint" (id,url,"eventTypes","encryptedSecret") VALUES ($1,$2,'["api-key.*"]',$3)`,
+					[
+						keyEndpoint,
+						"https://webhook.runtime.fixture.example/keys-only",
+						await symmetricEncrypt({ key: projectKey, data: newSigningKey }),
+					],
+				);
+				expect(
+					(
+						await service.request(`${webhooks}/delete`, {
+							cookie: adminCookie,
+							body: { id: endpointId },
+						})
+					).status,
+				).toBe(200);
+				const liveBeforePolicy = await service.request(
+					`${hosted}/sign-in/email`,
+					{
+						host,
+						clientIP: "192.0.2.89",
+						body: {
+							email: credentials.project.email,
+							password: credentials.password,
+						},
+					},
+				);
+				expect(
+					liveBeforePolicy.status,
+					await liveBeforePolicy.clone().text(),
+				).toBe(200);
+				const priorCookie = cookie(liveBeforePolicy);
+				expect(priorCookie).toBeTruthy();
+				await service.stop();
+				service = undefined;
+				const optional = await repository.read(alpha.id);
+				await repository.update(
+					alpha.id,
+					optional.version,
+					{
+						...eligiblePolicy,
+						mfaMode: "required",
+						requireEmailVerification: true,
+						signUpEnabled: false,
+					},
+					credentials.platform.id,
+				);
+				service = await openProcess(databaseURL, alpha, true);
+				const restricted = await service.request(webhooks, {
+					cookie: adminCookie,
+				});
+				expect(restricted.status).toBe(200);
+				expect(await restricted.json()).toMatchObject({
+					endpoints: [{ id: keyEndpoint, eventTypes: ["api-key.*"] }],
+					supportedEventTypes: ["api-key.*"],
+				});
+				const staleKey = await service.request(`${hosted}/api-key/create`, {
+					host,
+					cookie: priorCookie,
+					body: { name: "Blocked by new MFA policy" },
+				});
+				expect(staleKey.status, await staleKey.clone().text()).toBe(403);
+				expect(await staleKey.json()).toMatchObject({
+					message:
+						"This application requires an already verified account enrolled in MFA.",
+				});
 			} finally {
 				try {
 					await service?.stop();

@@ -6,12 +6,13 @@ import {
 	createAuthMiddleware,
 	getSessionFromCtx,
 } from "better-auth/api";
-import { organization } from "better-auth/plugins";
+import { admin, bearer, organization, twoFactor } from "better-auth/plugins";
 import { getTestInstance } from "better-auth/test";
 import { Kysely, PostgresDialect } from "kysely";
 import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { defaultAuthPolicy } from "../auth-policy/policy";
+import { authPolicyPlugin } from "../auth-policy/plugin";
+import { type AuthPolicy, defaultAuthPolicy } from "../auth-policy/policy";
 import { isPlatformAdmin } from "../configuration";
 import { allauthControl } from "../control";
 import {
@@ -41,7 +42,7 @@ const day = 86_400;
 const permissions = { identity: ["read"] };
 type LegacyDatabase = Kysely<Record<string, Record<string, unknown>>>;
 
-async function legacyFixture(database: LegacyDatabase) {
+async function legacyFixture(database: LegacyDatabase, policy?: AuthPolicy) {
 	return (
 		await getTestInstance(
 			{
@@ -75,6 +76,14 @@ async function legacyFixture(database: LegacyDatabase) {
 				},
 				plugins: [
 					organization({ dynamicAccessControl: { enabled: true } }),
+					...(policy
+						? [
+								admin(),
+								bearer({ requireSignature: true }),
+								authPolicyPlugin(policy, { project: true }),
+								twoFactor(),
+							]
+						: []),
 					allauthControl({ ipHeader: "x-real-ip" }),
 					apiKey({
 						defaultPrefix: "allauth_",
@@ -99,7 +108,7 @@ function request(
 	const headers = new Headers(options.headers);
 	if (options.cookie) headers.set("cookie", options.cookie);
 	if (options.body) {
-		headers.set("origin", origin);
+		if (!headers.has("authorization")) headers.set("origin", origin);
 		headers.set("content-type", "application/json");
 	}
 	return new Request(`${origin}${basePath}${path}`, {
@@ -125,6 +134,20 @@ describe.skipIf(!existsSync(fixturePath))(
 		let native: Awaited<ReturnType<typeof legacyFixture>>;
 		let owned: ReturnType<typeof createOwnedProjectEngine>;
 		let created = false;
+
+		function candidate(policy: AuthPolicy = defaultAuthPolicy) {
+			return createOwnedProjectEngine({
+				database,
+				project: { slug, schemaName: schema },
+				baseURL: origin,
+				basePath,
+				trustedOrigins: [],
+				signingSecret,
+				policy,
+				trustedIP: () => "203.0.113.81",
+				sdk: { personalApiKeys: true },
+			});
+		}
 
 		beforeAll(async () => {
 			const fixture: { container: string; DATABASE_URL: string } = JSON.parse(
@@ -169,17 +192,7 @@ describe.skipIf(!existsSync(fixturePath))(
 					),
 				);
 			native = await legacyFixture(legacyDatabase);
-			owned = createOwnedProjectEngine({
-				database,
-				project: { slug, schemaName: schema },
-				baseURL: origin,
-				basePath,
-				trustedOrigins: [],
-				signingSecret,
-				policy: defaultAuthPolicy,
-				trustedIP: () => "203.0.113.81",
-				sdk: { personalApiKeys: true },
-			});
+			owned = candidate();
 		});
 
 		afterAll(async () => {
@@ -213,6 +226,121 @@ describe.skipIf(!existsSync(fixturePath))(
 		async function verify(key: string) {
 			return native.api.verifyApiKey({ body: { key, permissions } });
 		}
+
+		it("preserves key authority and webhook delivery after requiring verified MFA", async () => {
+			const stale = await user("key-before-required-mfa");
+			const enrolled = await user("key-with-existing-mfa");
+			const policy = {
+				...defaultAuthPolicy,
+				mfaMode: "required" as const,
+				requireEmailVerification: true,
+				signUpEnabled: false,
+			};
+			await database.query(
+				`UPDATE "${schema}"."user" SET "emailVerified"=TRUE, "twoFactorEnabled"=TRUE WHERE id=$1`,
+				[enrolled.id],
+			);
+			await database.query(
+				`INSERT INTO "${schema}"."twoFactor" (id,"userId",secret,"backupCodes",verified) VALUES ($1,$2,$3,$4,TRUE)`,
+				[
+					randomUUID(),
+					enrolled.id,
+					await sealLegacyMfaRecord("JBSWY3DPEHPK3PXP", {
+						secret: signingSecret,
+					}),
+					await sealLegacyMfaRecord("[]", { secret: signingSecret }),
+				],
+			);
+			const endpoint = randomUUID();
+			await database.query(
+				`INSERT INTO "${schema}"."allauthWebhookEndpoint" (id,url,"eventTypes","encryptedSecret") VALUES ($1,'https://key-policy.fixture.example',$2::jsonb,'fixture')`,
+				[endpoint, JSON.stringify(["api-key.*"])],
+			);
+			try {
+				const oldWriter = (await legacyFixture(legacyDatabase!, policy))
+					.handler;
+				const newWriter = candidate(policy).dispatch;
+				const signedBearer = (cookie: string) => ({
+					authorization: `Bearer  ${decodeURIComponent(cookie.slice(cookie.indexOf("=") + 1))}`,
+				});
+				for (const dispatch of [oldWriter, newWriter]) {
+					const staleMutation = await dispatch(
+						request("/api-key/create", {
+							cookie: stale.cookie,
+							body: { name: "Rejected stale session" },
+						}),
+					);
+					expect(await json(staleMutation, 403)).toMatchObject({
+						message:
+							"This application requires an already verified account enrolled in MFA.",
+					});
+					expect(
+						(await dispatch(request("/api-key/list", { cookie: stale.cookie })))
+							.status,
+					).toBe(403);
+				}
+				await database.query(
+					`UPDATE "${schema}"."session" SET "impersonatedBy"=$1 WHERE "userId"=$2`,
+					[enrolled.id, stale.id],
+				);
+				for (const dispatch of [oldWriter, newWriter]) {
+					const denied = await dispatch(
+						request("/api-key/create", {
+							headers: signedBearer(stale.cookie),
+							body: { name: "Rejected support credential" },
+						}),
+					);
+					expect(denied.status).toBe(403);
+					expect(await denied.json()).toMatchObject({
+						message:
+							"Authentication changes and account deletion are unavailable during impersonation.",
+					});
+				}
+				const created = await json(
+					await oldWriter(
+						request("/api-key/create", {
+							cookie: enrolled.cookie,
+							body: { name: "Enrolled native key" },
+						}),
+					),
+				);
+				const update = await json(
+					await newWriter(
+						request("/api-key/update", {
+							headers: signedBearer(enrolled.cookie),
+							body: { keyId: created.id, name: "Enrolled AllAuth key" },
+						}),
+					),
+				);
+				expect(update).toMatchObject({
+					id: created.id,
+					name: "Enrolled AllAuth key",
+					referenceId: enrolled.id,
+				});
+				expect(
+					await json(
+						await oldWriter(
+							request(`/api-key/get?id=${created.id}`, {
+								cookie: enrolled.cookie,
+							}),
+						),
+					),
+				).toMatchObject({ name: "Enrolled AllAuth key" });
+				const deliveries = await database.query(
+					`SELECT "eventType",payload#>>'{data,event,userId}' AS subject FROM "${schema}"."allauthWebhookDelivery" WHERE "endpointId"=$1 ORDER BY "eventType"`,
+					[endpoint],
+				);
+				expect(deliveries.rows).toEqual([
+					{ eventType: "api-key.create", subject: enrolled.id },
+					{ eventType: "api-key.update", subject: enrolled.id },
+				]);
+			} finally {
+				await database.query(
+					`DELETE FROM "${schema}"."allauthWebhookEndpoint" WHERE id=$1`,
+					[endpoint],
+				);
+			}
+		});
 
 		it("preserves signed API-key webhook outcomes across project writers", async () => {
 			const account = await user("api-key-webhook");

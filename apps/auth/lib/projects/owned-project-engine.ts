@@ -24,8 +24,8 @@ import { reservedProjectEmailError } from "../project-email-alias-config";
 import type { NativePasskeyCapability } from "../project-native-passkeys";
 import type { LegacyMfaKeys } from "./legacy-mfa-record";
 import {
+	readLegacyServerSessionBearer,
 	readLegacySessionCookie,
-	verifyLegacySessionCookie,
 } from "./legacy-session-cookie";
 import { createOwnedProjectMfa } from "./owned-mfa";
 import { createOwnedMfaEnrollment } from "./owned-mfa-enrollment";
@@ -1560,23 +1560,7 @@ export function createOwnedProjectEngine(
 	}
 
 	function serverSessionBearer(headers: Headers) {
-		if (
-			!isServerTokenRequest(headers) ||
-			headers.has("allauth-proxy-signature")
-		)
-			return null;
-		const signed = /^Bearer ([^\s,]+)$/i.exec(
-			headers.get("authorization") ?? "",
-		)?.[1];
-		if (!signed || signed.length > 1024) return null;
-		try {
-			return verifyLegacySessionCookie(
-				decodeURIComponent(signed),
-				options.signingSecret,
-			);
-		} catch {
-			return null;
-		}
+		return readLegacyServerSessionBearer(headers, options.signingSecret);
 	}
 
 	function sessionMutationOrigin(request: Request) {
@@ -2794,6 +2778,17 @@ export function createOwnedProjectEngine(
 					403,
 					"FORBIDDEN",
 					"Authentication changes and account deletion are unavailable during impersonation.",
+				);
+			if (
+				raw &&
+				!raw.session.impersonatedBy &&
+				policy.mfaMode === "required" &&
+				(!raw.user.emailVerified || !raw.user.twoFactorEnabled)
+			)
+				return failure(
+					403,
+					"FORBIDDEN",
+					"This application requires an already verified account enrolled in MFA.",
 				);
 			const observed = ordinarySession(token, raw);
 			if (!observed) return null;

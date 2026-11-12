@@ -1,7 +1,9 @@
 import type { AuthPolicy } from "../auth-policy/policy";
+import type { webhookEventTypes } from "../control/webhook-contract";
 import { checkedProjectSchema } from "./validation";
 
 const supportedSelectors = ["mfa.*", "api-key.*"] as const;
+const apiKeySelectors = ["api-key.*"] as const;
 
 type Queryable = {
 	query<Row extends Record<string, unknown>>(
@@ -10,13 +12,12 @@ type Queryable = {
 	): Promise<{ rows: Row[] }>;
 };
 
-/** Configured webhook compatibility covers optional MFA and disabled email verification. */
-export function ownedWebhookPolicySupported(policy: AuthPolicy) {
-	return policy.mfaMode === "optional" && !policy.requireEmailVerification;
-}
-
-export function ownedWebhookSelectors(policy: AuthPolicy) {
-	return ownedWebhookPolicySupported(policy) ? supportedSelectors : [];
+export function ownedWebhookSelectors(
+	policy: AuthPolicy,
+): readonly (typeof webhookEventTypes)[number][] {
+	return policy.mfaMode === "optional" && !policy.requireEmailVerification
+		? supportedSelectors
+		: apiKeySelectors;
 }
 
 export function ownedWebhookUsesPolicyGuard(selectors: readonly string[]) {
@@ -44,8 +45,7 @@ export async function ownedWebhookAccountsSupported(
 	return rows[0]?.supported === true;
 }
 
-/** Persisted rows must use supported selectors for the current policy. */
-export async function assertOwnedProjectWebhookAdmission(
+export async function storedProjectWebhookSelectors(
 	database: Queryable,
 	schemaName: string,
 	policy: AuthPolicy,
@@ -63,11 +63,25 @@ export async function assertOwnedProjectWebhookAdmission(
 				OR "eventTypes" = '[]'::jsonb OR NOT ("eventTypes" <@ $1::jsonb)) AS unsupported`,
 		[JSON.stringify(ownedWebhookSelectors(policy))],
 	);
+	return configuration;
+}
+
+/** Persisted rows must use supported selectors for the current policy. */
+export async function assertOwnedProjectWebhookAdmission(
+	database: Queryable,
+	schemaName: string,
+	policy: AuthPolicy,
+) {
+	const configuration = await storedProjectWebhookSelectors(
+		database,
+		schemaName,
+		policy,
+	);
 	if (
 		!configuration ||
 		(configuration.configured &&
 			(configuration.unsupported ||
-				!(await ownedWebhookAccountsSupported(database, schema))))
+				!(await ownedWebhookAccountsSupported(database, schemaName))))
 	)
 		throw new Error(
 			"This development project's configured webhooks are outside the candidate scope.",

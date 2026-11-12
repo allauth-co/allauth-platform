@@ -2,7 +2,7 @@ import { APIError } from "better-auth";
 import { randomUUID } from "node:crypto";
 import type { Pool } from "pg";
 import type { AuthEnvironment } from "../configuration";
-import { ownedWebhookPolicySupported } from "../projects/owned-project-webhook-admission";
+import { storedProjectWebhookSelectors } from "../projects/owned-project-webhook-admission";
 import type { ProjectEngineWriter } from "../projects/project-engine-writer-lease";
 import { projectRegistryPool } from "../projects/registry";
 import { checkedProjectSchema } from "../projects/validation";
@@ -20,12 +20,9 @@ export function authPolicyRepository(pool: Pick<Pool, "query">) {
 		},
 		async update(scopeId: string, expectedVersion: number, policy: AuthPolicy, actorId: string, auditSchema?: string, writer?: ProjectEngineWriter): Promise<StoredAuthPolicy> {
 			const validated = authPolicySchema.parse(policy);
-			if (writer === "allauth" && !ownedWebhookPolicySupported(validated)) {
-				const schema = checkedProjectSchema(auditSchema ?? "");
-				const { rows: [configuration] } = await pool.query<{ configured: boolean }>(
-					`SELECT EXISTS (SELECT 1 FROM "${schema}"."allauthWebhookEndpoint") AS configured`,
-				);
-				if (configuration?.configured !== false)
+			if (writer === "allauth") {
+				const configuration = await storedProjectWebhookSelectors(pool, auditSchema ?? "", validated);
+				if (configuration?.unsupported !== false)
 					throw new APIError("CONFLICT", { message: "Switch this project to the legacy writer before saving a policy that its configured webhooks cannot support." });
 			}
 			let statement = expectedVersion === 0

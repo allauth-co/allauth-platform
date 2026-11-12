@@ -56,6 +56,9 @@ describe.skipIf(!existsSync(fixturePath))("PostgreSQL configuration races and sc
 		const count = await pool.query<{ total: number }>(`SELECT count(*)::integer AS total FROM "${schema}"."allauthEvent" WHERE type='configuration.updated' AND "targetId"=$1`, [webhookScopeId]);
 		expect(count.rows).toEqual([{ total: 1 }]);
 		await expect(update(1, incompatible, "legacy")).resolves.toMatchObject({ version: 2, policy: incompatible });
+		await pool.query(`UPDATE "${schema}"."allauthWebhookEndpoint" SET "eventTypes"='["api-key.*"]' WHERE id='fixture-mfa'`);
+		const required = { ...incompatible, mfaMode: "required" as const, signUpEnabled: false };
+		await expect(update(2, required, "allauth")).resolves.toMatchObject({ version: 3, policy: required });
 	});
 	it("binds every PG log filter and search literally, including metadata/session-target fallback",async () => {
 		const context = await instance.auth.$context;

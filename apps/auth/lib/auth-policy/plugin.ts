@@ -1,6 +1,7 @@
 import type { BetterAuthPlugin } from "better-auth";
 import { APIError } from "better-auth";
 import { createAuthMiddleware, getAuthoritativeSessionFromCtx } from "better-auth/api";
+import { readLegacyServerSessionBearer } from "../projects/legacy-session-cookie";
 import type { AuthPolicy } from "./policy";
 import { passwordPolicyError } from "./password";
 
@@ -18,7 +19,7 @@ const passwordFields: Record<string, "password" | "newPassword"> = {
 };
 
 /** Applies application password, signup and MFA rules without changing native plugin schemas. */
-export function authPolicyPlugin(policy: AuthPolicy) {
+export function authPolicyPlugin(policy: AuthPolicy, options: { project?: boolean } = {}) {
 	const validateNewPassword = (password: unknown) => {
 		if (typeof password !== "string") return;
 		const message = passwordPolicyError(password, policy.passwordPolicy);
@@ -53,9 +54,24 @@ export function authPolicyPlugin(policy: AuthPolicy) {
 			if (!policy.emailAndPasswordEnabled && ["/sign-in/email", "/sign-in/username", "/set-password", "/change-password", "/reset-password", "/request-password-reset"].includes(ctx.path || "")) throw new APIError("FORBIDDEN", { message: "Password authentication is disabled for this application." });
 			if (policy.mfaMode === "required" && ctx.path === "/two-factor/disable") throw new APIError("FORBIDDEN", { message: "MFA cannot be disabled while this application requires it." });
 			if (!policy.signUpEnabled && ctx.path === "/sign-in/anonymous") throw new APIError("FORBIDDEN", { message: "New guest sessions are disabled for this application." });
-			if (policy.mfaMode !== "required" || ctx.path === "/sign-out") return;
-			const current = await getAuthoritativeSessionFromCtx(ctx);
-			if (current && !current.session.impersonatedBy && (current.user.twoFactorEnabled !== true || current.user.emailVerified !== true)) throw new APIError("FORBIDDEN", { message: "This application requires an already verified account enrolled in MFA." });
+			const projectKeyMutation = options.project &&
+				["/api-key/create", "/api-key/update", "/api-key/delete"].includes(ctx.path || "");
+			const requiresMfa = policy.mfaMode === "required" && ctx.path !== "/sign-out";
+			if (!projectKeyMutation && !requiresMfa) return;
+			const headers = ctx.request?.headers ?? ctx.headers;
+			const signedSession = options.project && ctx.path?.startsWith("/api-key/") && headers
+				? readLegacyServerSessionBearer(headers, ctx.context.secret)
+				: null;
+			// Native bearer headers are merged only after the before hooks finish.
+			// Re-read the verified server session here before it can authorize a key action.
+			const observed = signedSession
+				? await ctx.context.internalAdapter.findSession(signedSession)
+				: await getAuthoritativeSessionFromCtx(ctx);
+			const current = observed && new Date(observed.session.expiresAt).getTime() > Date.now()
+				? observed
+				: null;
+			if (projectKeyMutation && current?.session.impersonatedBy) throw new APIError("FORBIDDEN", { message: "Authentication changes and account deletion are unavailable during impersonation." });
+			if (requiresMfa && current && !current.session.impersonatedBy && (current.user.twoFactorEnabled !== true || current.user.emailVerified !== true)) throw new APIError("FORBIDDEN", { message: "This application requires an already verified account enrolled in MFA." });
 		}) }] },
 	} satisfies BetterAuthPlugin;
 }

@@ -44,6 +44,7 @@ function serverBearer() {
 				matcher: (ctx: Parameters<typeof hook.matcher>[0]) =>
 					!cookieOnlyFeaturePath(ctx.path || "") &&
 					!agentProtocolPath(ctx.path || "") &&
+					!(ctx.request?.headers || ctx.headers)?.has("allauth-proxy-signature") &&
 					isServerTokenRequest(ctx.request?.headers || ctx.headers) &&
 					hook.matcher(ctx),
 			})),
