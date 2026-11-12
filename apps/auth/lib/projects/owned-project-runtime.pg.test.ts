@@ -948,7 +948,11 @@ async function exerciseOwnedApiKeys(
 	return changed;
 }
 
-async function seed(databaseURL: string, protectedAgentRealm = false) {
+async function seed(
+	databaseURL: string,
+	protectedAgentRealm = false,
+	primaryEnvironment: Project["environment"] = "development",
+) {
 	await promisify(execFile)(
 		process.execPath,
 		["scripts/database.mjs", "migrate"],
@@ -1017,6 +1021,7 @@ async function seed(databaseURL: string, protectedAgentRealm = false) {
 			slug: string,
 			origins: string[] = [],
 			workspaceId = workspace.id,
+			environment: Project["environment"] = "development",
 		) {
 			const clientSecret = "disposable-fixture-broker-client-secret";
 			const project = await provisionProject(
@@ -1025,7 +1030,7 @@ async function seed(databaseURL: string, protectedAgentRealm = false) {
 					slug,
 					primaryOrigin: `https://${slug}.runtime.fixture.example`,
 					origins,
-					environment: "development",
+					environment,
 				},
 				{
 					clientId: `fixture-${slug}`,
@@ -1078,6 +1083,7 @@ async function seed(databaseURL: string, protectedAgentRealm = false) {
 			"runtime-owned-fixture",
 			[supportOrigin],
 			protectedAgentRealm ? platformWorkspaceId : workspace.id,
+			primaryEnvironment,
 		);
 		const beta = await provision("runtime-control-fixture", [], protectedAgentRealm ? platformWorkspaceId : workspace.id);
 		await insertAccount(alpha.schemaName, credentials.realmAdmin, "admin");
@@ -1724,7 +1730,7 @@ describe.skipIf(!existsSync(fixture))(
 			}
 		}, 60_000);
 
-		it("delivers enabled mixed webhook subscriptions across an enrolled writer restart and rollback", async () => {
+		it.each(["development", "production"] as const)("delivers enabled mixed webhook subscriptions across an enrolled %s writer restart and rollback", async (environment) => {
 			const local: { container: string; DATABASE_URL: string } = JSON.parse(
 				readFileSync(fixture, "utf8"),
 			);
@@ -1757,13 +1763,15 @@ describe.skipIf(!existsSync(fixture))(
 			try {
 				await admin.query(`CREATE DATABASE "${name}"`);
 				created = true;
-				const { alpha, beta } = await seed(databaseURL);
+				const { alpha, beta } = await seed(databaseURL, false, environment);
 				const state = new Pool({ connectionString: databaseURL, max: 2 });
 				database = state;
+				const production = environment === "production";
+				const selectionSetting = production
+					? productionProjectEngineRevisionsSetting
+					: developmentProjectEngineRevisionsSetting;
 				const rollout = {
-					[developmentProjectEngineRevisionsSetting]: JSON.stringify({
-						[alpha.id]: 0,
-					}),
+					[selectionSetting]: JSON.stringify({ [alpha.id]: 0 }),
 				};
 				const command = async (...args: string[]) => {
 					const { stdout } = await promisify(execFile)(
@@ -1781,7 +1789,7 @@ describe.skipIf(!existsSync(fixture))(
 					return JSON.parse(stdout);
 				};
 				const writer = (...args: string[]) =>
-					command("--development", alpha.id, ...args);
+					command(production ? "--project" : "--development", alpha.id, ...args);
 				const open = (prepared: boolean) =>
 					openProcess(
 						databaseURL,
@@ -2117,7 +2125,12 @@ describe.skipIf(!existsSync(fixture))(
 				expect(nativePending).toHaveLength(5);
 				expect(nativePending.every((row) => row.status === "pending")).toBe(true);
 				expect(await siblingWebhook.rows()).toEqual([]);
-				await command("register-development", alpha.id, alpha.workspaceId);
+				expect(
+					await command(`register-${environment}`, alpha.id, alpha.workspaceId),
+				).toEqual({
+					projectId: alpha.id,
+					workspaceId: alpha.workspaceId,
+				});
 				expect(await writer("status")).toEqual({ writer: "legacy", revision: 0 });
 				await restart(true);
 				await request("/api/health");
@@ -2125,6 +2138,8 @@ describe.skipIf(!existsSync(fixture))(
 					writer: "allauth",
 					revision: 1,
 				});
+				await request("/api/auth/not-installed", { host }, 501);
+				await request("/api/auth/not-installed", { host: siblingHost }, 404);
 				expect(await primaryWebhook.rows()).toEqual(nativePending);
 				const baseline = await assertDeliveries(
 					"Mixed subscription legacy",
@@ -2209,6 +2224,7 @@ describe.skipIf(!existsSync(fixture))(
 				});
 				await restart(false);
 				await request("/api/health");
+				await request("/api/auth/not-installed", { host }, 404);
 				await expectSubscription();
 				const restoredSession = await request(`${direct}/get-session`, {
 					...proxy,
