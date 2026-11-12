@@ -51,6 +51,7 @@ import { backendCredentialRepository } from "./backend-credentials";
 import { projectBrokerTwoFactor } from "./broker-two-factor";
 import { readLegacyProjectKeyring } from "./legacy-project-keyring";
 import { createOwnedEmailVerification } from "./owned-email-verification";
+import { createOwnedProjectApplicationConsole } from "./owned-project-application-console";
 import { createOwnedProjectAppleDeletion } from "./owned-project-apple-deletion";
 import { createOwnedProjectEmailCallbackPolicy } from "./owned-project-email-callback";
 import { createOwnedProjectEngine } from "./owned-project-engine";
@@ -757,6 +758,12 @@ export async function createOwnedProjectRuntimeCandidate(options: Options) {
 	});
 	return {
 		...engine,
+		manageApplicationConsole: createOwnedProjectApplicationConsole({
+			database,
+			project,
+			managementOrigin: platform,
+			readWorkspacePrincipal,
+		}),
 		dispatch(request: Request) {
 			const url = new URL(request.url);
 			if (request.method === "GET" && url.origin === origin) {

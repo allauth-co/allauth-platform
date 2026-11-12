@@ -2,6 +2,8 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { createServer } from "node:http";
 import { APIError } from "better-auth";
 import { GET as openid } from "../../app/.well-known/openid-configuration/route";
+import * as consoleApplicationDetail from "../../app/api/admin/applications/[clientId]/route";
+import * as consoleApplications from "../../app/api/admin/applications/route";
 import * as consoleOrganizationInvitations from "../../app/api/admin/organizations/[organizationId]/invitations/route";
 import * as consoleOrganizationMembers from "../../app/api/admin/organizations/[organizationId]/members/route";
 import * as consoleOrganizationRoles from "../../app/api/admin/organizations/[organizationId]/roles/route";
@@ -86,6 +88,22 @@ async function dispatch(request: Request) {
 		return config(request);
 	if (request.method === "GET" && path === "/oauth/login")
 		return brokerLogin(request);
+	if (path === "/api/admin/applications") {
+		if (request.method === "GET") return consoleApplications.GET(request);
+		if (request.method === "POST") return consoleApplications.POST(request);
+	}
+	const application = /^\/api\/admin\/applications\/([^/]+)$/.exec(path);
+	if (application) {
+		const context = {
+			params: Promise.resolve({
+				clientId: decodeURIComponent(application[1]!),
+			}),
+		};
+		if (request.method === "PATCH")
+			return consoleApplicationDetail.PATCH(request, context);
+		if (request.method === "DELETE")
+			return consoleApplicationDetail.DELETE(request, context);
+	}
 	if (request.method === "GET" && path === "/api/admin/users")
 		return consoleUsers(request);
 	const user = /^\/api\/admin\/users\/([^/]+)(\/metadata)?$/.exec(path);

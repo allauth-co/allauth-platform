@@ -617,6 +617,20 @@ export function withProjectUserConsole(
 	);
 }
 
+export function withProjectApplicationConsole(
+	slug: string,
+	callback: (
+		manage: AuthEngine["manageApplicationConsole"],
+		readLegacy: () => Instance,
+		env: AuthEnvironment,
+		project: Project,
+	) => Promise<Response>,
+) {
+	return withDirectProjectEntry(slug, (entry, project) =>
+		callback(entry.engine.manageApplicationConsole, () => legacyInstance(entry), entry.env, project),
+	);
+}
+
 export async function closeProjectInstances() {
 	await entries.close();
 }

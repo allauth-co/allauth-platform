@@ -74,6 +74,8 @@ const versionedSigningSecret = "isolated-runtime-fixture-current-key-version";
 const versionedEncryption = `7:${versionedSigningSecret},2:isolated-runtime-fixture-previous-key-version`;
 const oauthClientId = "runtime-issuer-fixture-client";
 const oauthRedirectURI = "https://rp.runtime.fixture.example/callback";
+const catalogPrivateMetadata = "synthetic-catalog-private-metadata";
+const catalogClientSecret = "synthetic-catalog-private-client-secret";
 const supportOrigin = "https://support.runtime.fixture.example";
 const supportCallback = `${supportOrigin}/api/allauth/support/callback`;
 const supportTarget = "fixture-support-target";
@@ -159,6 +161,60 @@ function cookie(response: Response) {
 		.filter((item) => !item.includes("Max-Age=0"))
 		.map((item) => item.split(";", 1)[0])
 		.join("; ");
+}
+
+function applicationCatalog(project: Project, clientId?: string) {
+	const detail = clientId ? `/${encodeURIComponent(clientId)}` : "";
+	return `/api/admin/applications${detail}?project=${project.slug}`;
+}
+
+async function runtimeApplicationCatalog(
+	service: Awaited<ReturnType<typeof openProcess>>,
+	project: Project,
+	rootCookie: string,
+) {
+	const response = await service.request(applicationCatalog(project), {
+		cookie: rootCookie,
+	});
+	expect(response.status, await response.clone().text()).toBe(200);
+	expect(response.headers.get("cache-control")).toBe("no-store");
+	const body = await response.text();
+	expect(body).not.toContain(catalogPrivateMetadata);
+	expect(body).not.toContain(catalogClientSecret);
+	const { applications } = JSON.parse(body) as {
+		applications: { client_id: string }[];
+	};
+	return applications.sort((first, second) =>
+		first.client_id.localeCompare(second.client_id),
+	);
+}
+
+async function expectProjectApplicationWriteDirections(
+	service: Awaited<ReturnType<typeof openProcess>>,
+	project: Project,
+	rootCookie: string,
+) {
+	const client = applicationCatalog(project, `${project.slug}+client`);
+	const registration = await service.request(applicationCatalog(project), {
+		cookie: rootCookie,
+		body: {},
+	});
+	expect(registration.status).toBe(400);
+	expect(await registration.json()).toEqual({
+		error:
+			"Use the project's own verified administrator session to register native OAuth clients. App integration settings are managed in Projects.",
+	});
+	for (const method of ["PATCH", "DELETE"] as const) {
+		const result = await service.request(client, {
+			cookie: rootCookie,
+			method,
+		});
+		expect(result.status).toBe(400);
+		expect(await result.json()).toEqual({
+			error:
+				"Use the project's own verified administrator session to manage native OAuth clients.",
+		});
+	}
 }
 
 async function openProcess(
@@ -854,6 +910,23 @@ async function seed(databaseURL: string) {
 					"https://rp.runtime.fixture.example/logout",
 				],
 			);
+			await database.query(
+				`INSERT INTO "${project.schemaName}"."oauthClient"
+				  (id,"clientId",name,"clientSecret","redirectUris","grantTypes",disabled,metadata)
+				 VALUES ($1,$1,$2,$3,$4::jsonb,'["authorization_code"]',TRUE,$5::jsonb)`,
+				[
+					`${project.slug}+client`,
+					`${project.name} catalog application`,
+					catalogClientSecret,
+					JSON.stringify([oauthRedirectURI]),
+					JSON.stringify({
+						allauthOrganizationIds: ["catalog-fixture-organization", null],
+						allauthResourceURI: "https://rp.runtime.fixture.example",
+						allauthAllowLocalhost: true,
+						internal: catalogPrivateMetadata,
+					}),
+				],
+			);
 			return project;
 		}
 		const alpha = await provision("runtime-owned-fixture", [supportOrigin]);
@@ -1099,6 +1172,30 @@ describe.skipIf(!existsSync(fixture))(
 				});
 				expect(rootLogin.status).toBe(200);
 				const rootCookie = cookie(rootLogin);
+				const nativeApplications = await runtimeApplicationCatalog(
+					service,
+					alpha,
+					rootCookie,
+				);
+				expect(nativeApplications).toEqual(
+					expect.arrayContaining([
+						expect.objectContaining({
+							client_id: `${alpha.slug}+client`,
+							client_name: `${alpha.name} catalog application`,
+							grant_types: ["authorization_code"],
+							redirect_uris: [oauthRedirectURI],
+							organizationIds: ["catalog-fixture-organization"],
+							resourceURI: "https://rp.runtime.fixture.example",
+							allowLocalhost: true,
+							disabled: true,
+						}),
+					]),
+				);
+				await expectProjectApplicationWriteDirections(
+					service,
+					alpha,
+					rootCookie,
+				);
 				const realmAdminLogin = await service.request(
 					"/api/auth/sign-in/email",
 					{
@@ -1312,6 +1409,45 @@ describe.skipIf(!existsSync(fixture))(
 				created.push(restored);
 
 				service = await open(restored, true);
+				expect(
+					await runtimeApplicationCatalog(service, alpha, rootCookie),
+				).toEqual(nativeApplications);
+				expect(
+					await runtimeApplicationCatalog(service, beta, rootCookie),
+				).toEqual(
+					expect.arrayContaining([
+						expect.objectContaining({ client_id: `${beta.slug}+client` }),
+					]),
+				);
+				expect(
+					(
+						await service.request(applicationCatalog(alpha), {
+							cookie: realmAdminCookie,
+						})
+					).status,
+				).toBe(403);
+				expect(
+					(
+						await service.request(applicationCatalog(alpha), {
+							cookie: rootCookie,
+							authorization: "Bearer fixture",
+						})
+					).status,
+				).toBe(403);
+				expect(
+					(
+						await service.request(applicationCatalog(alpha), {
+							cookie: rootCookie,
+							origin: alpha.primaryOrigin,
+							body: {},
+						})
+					).status,
+				).toBe(403);
+				await expectProjectApplicationWriteDirections(
+					service,
+					alpha,
+					rootCookie,
+				);
 				expect((await service.request("/api/health")).status).toBe(200);
 				const userDirectory = await service.request(usersPath(alpha), {
 					cookie: rootCookie,
@@ -3690,6 +3826,9 @@ describe.skipIf(!existsSync(fixture))(
 				service = undefined;
 
 				service = await open(restored, false);
+				expect(
+					await runtimeApplicationCatalog(service, alpha, rootCookie),
+				).toEqual(nativeApplications);
 				expect(
 					(
 						await service.request(directSchemaPath, {

@@ -1,23 +1,23 @@
-import { apiRoute, json, requireAdmin, requireSameOrigin } from "@/lib/api";
-import { applicationGrants, applicationMetadata, applicationScopes, applicationSettingsSchema, linkApplicationResource, publicApplication, validateApplicationSettings } from "@/lib/applications";
+import { json, requireAdmin, requireSameOrigin } from "@/lib/api";
+import { applicationGrants, applicationMetadata, applicationScopes, applicationSettingsSchema, linkApplicationResource, publicApplication, rejectProjectConsoleApplicationWrite, validateApplicationSettings } from "@/lib/applications";
+import { consoleApplicationRoute } from "@/lib/console/application-route";
 import { recordAudit } from "@/lib/enterprise";
 import { projectInstance } from "@/lib/projects/runtime";
-import { APIError } from "better-auth";
 
-export const DELETE = async (request: Request, context: { params: Promise<{ clientId: string }> }) => apiRoute(request, async (instance, env) => {
+export const DELETE = async (request: Request, context: { params: Promise<{ clientId: string }> }) => consoleApplicationRoute(request, async (instance, env) => {
 	requireSameOrigin(request, env);
 	const session = await requireAdmin(instance, request.headers);
-	if (projectInstance(instance)) throw new APIError("BAD_REQUEST", { message: "Use the project's own verified administrator session to manage native OAuth clients." });
+	if (projectInstance(instance)) rejectProjectConsoleApplicationWrite(false);
 	const { clientId } = await context.params;
 	await instance.api.deleteOAuthClient({ headers: request.headers, body: { client_id: clientId } });
 	await recordAudit((await instance.$context).adapter, { actorId: session.user.id, action: "application.deleted", targetId: clientId });
 	return json({ success: true });
 });
 
-export const PATCH = async (request: Request, context: { params: Promise<{ clientId: string }> }) => apiRoute(request, async (instance, env) => {
+export const PATCH = async (request: Request, context: { params: Promise<{ clientId: string }> }) => consoleApplicationRoute(request, async (instance, env) => {
 	requireSameOrigin(request, env);
 	const actor = await requireAdmin(instance, request.headers);
-	if (projectInstance(instance)) throw new APIError("BAD_REQUEST", { message: "Use the project's own verified administrator session to manage native OAuth clients." });
+	if (projectInstance(instance)) rejectProjectConsoleApplicationWrite(false);
 	const { clientId } = await context.params;
 	const input = applicationSettingsSchema.parse(await request.json());
 	await validateApplicationSettings(instance, input);

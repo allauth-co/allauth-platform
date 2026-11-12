@@ -1,4 +1,5 @@
 import type { ControlPrincipal } from "./control/types";
+import type { OwnedProjectApplicationConsole } from "./projects/owned-project-application-console";
 import type { OwnedProjectOrganizationConsole } from "./projects/owned-project-organization-console";
 import type { OwnedProjectSCIMConsole } from "./projects/owned-project-scim-console";
 import type { OwnedProjectUserConsole } from "./projects/owned-project-user-console";
@@ -15,6 +16,7 @@ export interface AuthEngine {
 	manageSCIMConsole?: OwnedProjectSCIMConsole;
 	manageOrganizationConsole?: OwnedProjectOrganizationConsole;
 	manageUserConsole?: OwnedProjectUserConsole;
+	manageApplicationConsole?: OwnedProjectApplicationConsole;
 	/** Resolve live identity without trusting the cookie cache. Callers enforce role policy. */
 	readPrincipal(headers: Headers): Promise<ControlPrincipal | null>;
 	/** Read or refresh a session, preserving the HTTP body and response cookies. */
