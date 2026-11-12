@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import * as z from "zod";
 import type { OrganizationRecord } from "./owned-project-organization-store";
 
@@ -258,28 +257,6 @@ export function projectOrganizationLifecycle(
 		await client.query('DELETE FROM "organization" WHERE id = $1', [id]);
 	}
 
-	async function recordOrganizationChange(event: {
-		type: string;
-		path: string;
-		actorId: string;
-		organizationId: string;
-		targetId?: string;
-	}) {
-		await client.query(
-			`INSERT INTO "allauthEvent" (id, type, outcome, "actorId", "userId", "organizationId",
-			 "targetId", "createdAt", metadata)
-			 VALUES ($1, $2, 'success', $3, $3, $4, $5, statement_timestamp(), jsonb_build_object('path', $6::text))`,
-			[
-				randomUUID(),
-				event.type,
-				event.actorId,
-				event.organizationId,
-				event.targetId ?? null,
-				event.path,
-			],
-		);
-	}
-
 	return {
 		lifecycleMember,
 		organizationOwnerCount,
@@ -291,6 +268,5 @@ export function projectOrganizationLifecycle(
 		clearOrganizationSessions,
 		revokeConsoleOrganizationGrants,
 		deleteOrganization,
-		recordOrganizationChange,
 	};
 }

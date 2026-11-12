@@ -2,6 +2,8 @@ import type { Pool, PoolClient } from "pg";
 import * as z from "zod";
 import type { AuthPolicy } from "../auth-policy/policy";
 import { isPlatformAdmin } from "../configuration";
+import { mutationEventType } from "../control/events";
+import type { ControlEventInput } from "../control/types";
 import {
 	activityOrganizationTarget,
 	isControlActivityMutation,
@@ -60,6 +62,9 @@ export interface OwnedProjectOrganizationOptions {
 	): Promise<OrganizationSession | null>;
 	trustedRequest(headers: Headers, mutation: boolean): boolean;
 	readBody(request: Request): Promise<unknown>;
+	auditContext?(
+		request: Request,
+	): Pick<ControlEventInput, "ipAddress" | "userAgent">;
 	/** Null represents the unlimited workspace entitlement. Omission retains the native default. */
 	membershipLimit?(client: PoolClient): Promise<number | null>;
 	/** Deliver after the invitation transaction commits. A resend reuses the pending row. */
@@ -389,6 +394,76 @@ function parseQuery(request: Request) {
 	return Object.fromEntries(new URL(request.url).searchParams);
 }
 
+const organizationAuditTargets: Partial<
+	Record<RoutePath, "invitation" | "member" | "team">
+> = {
+	"/organization/cancel-invitation": "invitation",
+	"/organization/accept-invitation": "invitation",
+	"/organization/reject-invitation": "invitation",
+	"/organization/update-member-role": "member",
+	"/organization/update-team": "team",
+	"/organization/remove-team": "team",
+	"/organization/add-team-member": "team",
+	"/organization/remove-team-member": "team",
+};
+
+function auditField(value: unknown, key: string) {
+	const fieldValue =
+		value && typeof value === "object"
+			? (value as Record<string, unknown>)[key]
+			: undefined;
+	return typeof fieldValue === "string" &&
+		fieldValue &&
+		!fieldValue.includes("\0")
+		? fieldValue
+		: undefined;
+}
+
+async function organizationMutationEvent(
+	client: PoolClient,
+	path: RoutePath,
+	type: string,
+	input: unknown,
+	response: Response,
+): Promise<ControlEventInput> {
+	const body: unknown = await response
+		.clone()
+		.json()
+		.catch(() => undefined);
+	const targetTable = organizationAuditTargets[path];
+	const teamMembership =
+		path === "/organization/add-team-member" ||
+		path === "/organization/remove-team-member";
+	const userId = teamMembership ? auditField(input, "userId") : undefined;
+	const targetId =
+		userId || (targetTable && auditField(input, `${targetTable}Id`));
+	let organizationId =
+		(path === "/organization/create"
+			? undefined
+			: auditField(input, "organizationId")) ||
+		auditField(body, "organizationId");
+	if (!organizationId && targetId && targetTable && !userId) {
+		const { rows } = await client.query<{ organizationId: string }>(
+			`SELECT "organizationId" FROM "${targetTable}" WHERE id=$1`,
+			[targetId],
+		);
+		organizationId = rows[0]?.organizationId;
+	}
+	// The installed browser organization middleware does not set the control hook's actor.
+	const error = response.ok ? undefined : auditField(body, "code");
+	return {
+		type,
+		outcome: response.ok ? "success" : "failure",
+		userId,
+		targetId,
+		organizationId,
+		metadata: {
+			path,
+			...(!response.ok && { errorCode: error || "AUTHENTICATION_FAILED" }),
+		},
+	};
+}
+
 /** Handle project organization operations after the normal owned-engine origin and session checks. */
 export function createOwnedProjectOrganizationHttp(
 	options: OwnedProjectOrganizationOptions,
@@ -451,7 +526,7 @@ export function createOwnedProjectOrganizationHttp(
 					? <T>(work: (client: PoolClient) => Promise<T>) =>
 							retryProjectOrganizationTransaction(() => store.transaction(work))
 					: store.transaction;
-			const result = await runTransaction<RouteResult>(async (client) => {
+			async function dispatch(client: PoolClient): Promise<RouteResult> {
 				if (
 					path === "/organization/list-user-invitations" &&
 					new URL(request.url).searchParams.get("email")
@@ -809,6 +884,26 @@ export function createOwnedProjectOrganizationHttp(
 						);
 					}
 				}
+				throw new Error(`Missing project organization handler for ${path}`);
+			}
+			const eventType = mutation ? mutationEventType(path) : undefined;
+			const result = await runTransaction(async (client) => {
+				const result = await dispatch(client);
+				if (eventType) {
+					const response =
+						result instanceof Response ? result : result.response;
+					await store.recordEvent(client, {
+						...(await organizationMutationEvent(
+							client,
+							path,
+							eventType,
+							input,
+							response,
+						)),
+						...options.auditContext?.(request),
+					});
+				}
+				return result;
 			});
 			const response = result instanceof Response ? result : result.response;
 			if (activitySession && response.ok) {

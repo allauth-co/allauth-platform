@@ -223,13 +223,7 @@ export async function handleProjectOrganizationRole(
 			normalized,
 			JSON.stringify(permission),
 		);
-		await realm.recordOrganizationChange({
-			type: "organization.role.created",
-			path,
-			actorId: principal.user.id,
-			organizationId: allowed.organizationId,
-			targetId: created.id,
-		});
+
 		return json({
 			success: true,
 			roleData: { ...created, permission },
@@ -313,13 +307,7 @@ export async function handleProjectOrganizationRole(
 				"This role is assigned to pending invitations. Cancel them before deleting the role",
 			);
 		await rows.remove(current);
-		await realm.recordOrganizationChange({
-			type: "organization.role.deleted",
-			path,
-			actorId: principal.user.id,
-			organizationId,
-			targetId: current.id,
-		});
+
 		return json({ success: true });
 	}
 	if (!update?.success) return invalidBody();
@@ -347,13 +335,7 @@ export async function handleProjectOrganizationRole(
 		next,
 		permission ? JSON.stringify(permission) : current.permission,
 	);
-	await realm.recordOrganizationChange({
-		type: "organization.role.updated",
-		path,
-		actorId: principal.user.id,
-		organizationId,
-		targetId: current.id,
-	});
+
 	return json({
 		success: true,
 		roleData: {

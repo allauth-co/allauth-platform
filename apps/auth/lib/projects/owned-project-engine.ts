@@ -2555,6 +2555,7 @@ export function createOwnedProjectEngine(
 		currentSession,
 		trustedRequest,
 		readBody: requestBody,
+		auditContext: browserEventContext,
 		collectActivity: analytics
 			? (session, organizationId) =>
 					analytics.session(session, 4, organizationId, true)

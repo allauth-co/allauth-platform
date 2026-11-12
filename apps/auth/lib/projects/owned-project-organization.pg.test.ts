@@ -13,6 +13,7 @@ import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { defaultAuthPolicy } from "../auth-policy/policy";
 import { defaultApplicationBranding } from "../branding/validation";
+import { allauthControl } from "../control";
 import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
 import { readLegacySessionCookie } from "./legacy-session-cookie";
 import { createProjectEngineStore } from "./owned-project-engine-store";
@@ -44,6 +45,8 @@ function request(
 		headers: {
 			cookie,
 			origin: caller,
+			"x-real-ip": "192.0.2.38",
+			"user-agent": "organization-rehearsal",
 			...(body ? { "content-type": "application/json" } : {}),
 		},
 		...(body ? { body: JSON.stringify(body) } : {}),
@@ -63,6 +66,7 @@ async function nativeFixture(
 			session: { cookieCache: { enabled: false } },
 			advanced: { cookiePrefix: "allauth_project_organization-fixture" },
 			plugins: [
+				allauthControl({ ipHeader: "x-real-ip" }),
 				organization({
 					ac: createAccessControl<Statements>(defaultStatements),
 					roles: defaultRoles,
@@ -131,6 +135,7 @@ describe.skipIf(!existsSync(fixturePath))(
 					for (const migration of [
 						"001-initial-auth.sql",
 						"002-control-plane.sql",
+						"004-webhooks.sql",
 						"005-free-plugins.sql",
 					])
 						await client.query(
@@ -193,6 +198,12 @@ describe.skipIf(!existsSync(fixturePath))(
 					);
 				},
 				readBody: (input) => input.json().catch(() => null),
+				auditContext(input) {
+					return {
+						ipAddress: input.headers.get("x-real-ip") ?? undefined,
+						userAgent: input.headers.get("user-agent") ?? undefined,
+					};
+				},
 				sessionCookies(input) {
 					return new Headers({
 						"set-cookie": `${input.headers.get("cookie")}; Path=/; HttpOnly; Secure`,
@@ -290,6 +301,117 @@ describe.skipIf(!existsSync(fixturePath))(
 			);
 			return id;
 		}
+
+		it("delivers the same organization mutation outbox as the native writer", async () => {
+			const owner = await account();
+			const recipient = await account();
+			const secondRecipient = await account();
+			const outsider = await account();
+			const candidate = owned();
+			const organization = await organizationFixture(owner);
+			await member(organization.id, secondRecipient.id, "member");
+			const endpointId = randomUUID();
+			for (const namespace of [schema, other])
+				await database.query(
+					`INSERT INTO "${namespace}"."allauthWebhookEndpoint" (id,url,"eventTypes","encryptedSecret")
+					 VALUES ($1,'https://webhooks.fixture.example/organizations','["organization.*"]','fixture-ciphertext')`,
+					[endpointId],
+				);
+			const controlEvents = async (namespace = schema) =>
+				(
+					await database.query<{ event: Record<string, unknown> }>(
+						`SELECT (payload->'data'->'event') - 'id' - 'createdAt' AS event
+					 FROM "${namespace}"."allauthWebhookDelivery"
+					 WHERE "endpointId"=$1 ORDER BY "createdAt", id`,
+						[endpointId],
+					)
+				).rows.map(({ event }) => event);
+			const operations = async (dispatch: typeof candidate) => {
+				const created = await dispatch("create", owner.cookie, {
+					name: "Webhook example",
+					slug: `webhook-${randomUUID()}`,
+					keepCurrentActiveOrganization: true,
+				});
+				expect(created.status).toBe(200);
+				const updated = await dispatch("update", owner.cookie, {
+					organizationId: organization.id,
+					data: { name: "Webhook change" },
+				});
+				expect(updated.status).toBe(200);
+				const denied = await dispatch("update", outsider.cookie, {
+					organizationId: organization.id,
+					data: { name: "Denied change" },
+				});
+				expect(denied.status).toBe(400);
+				const invited = await dispatch("invite-member", owner.cookie, {
+					organizationId: organization.id,
+					email: recipient.email,
+					role: "member",
+					resend: true,
+				});
+				expect(invited.status).toBe(200);
+				const cancelled = await dispatch("cancel-invitation", owner.cookie, {
+					invitationId: ((await invited.json()) as { id: string }).id,
+				});
+				expect(cancelled.status).toBe(200);
+				const inviteId = await invite(organization.id, owner, secondRecipient);
+				const rejected = await dispatch(
+					"reject-invitation",
+					secondRecipient.cookie,
+					{
+						invitationId: inviteId,
+					},
+				);
+				expect(rejected.status).toBe(200);
+				const team = await dispatch("create-team", owner.cookie, {
+					organizationId: organization.id,
+					name: `Webhook team ${randomUUID()}`,
+				});
+				expect(team.status).toBe(200);
+				const { id: teamId } = (await team.json()) as { id: string };
+				const addTeamMember = await dispatch("add-team-member", owner.cookie, {
+					organizationId: organization.id,
+					teamId,
+					userId: secondRecipient.id,
+				});
+				expect(addTeamMember.status).toBe(200);
+				const removeTeamMember = await dispatch(
+					"remove-team-member",
+					owner.cookie,
+					{
+						teamId,
+						userId: secondRecipient.id,
+					},
+				);
+				expect(removeTeamMember.status).toBe(200);
+			};
+			const nativeDispatch = (endpoint: string, cookie = "", body?: object) =>
+				native(request(endpoint, cookie, body));
+			await operations(nativeDispatch);
+			const byType = (events: Awaited<ReturnType<typeof controlEvents>>) =>
+				events
+					.sort(
+						(a, b) =>
+							String(a.type).localeCompare(String(b.type)) ||
+							String(a.outcome).localeCompare(String(b.outcome)),
+					)
+					.map((event) => ({
+						...event,
+						...(event.targetId &&
+						String(event.type).startsWith("organization.invitation.")
+							? { targetId: "invitation-id" }
+							: {}),
+					}));
+			const expected = byType(await controlEvents());
+			expect(expected).toHaveLength(9);
+			await database.query(
+				`DELETE FROM "${schema}"."allauthWebhookDelivery" WHERE "endpointId"=$1`,
+				[endpointId],
+			);
+			await operations(candidate);
+			expect(byType(await controlEvents())).toEqual(expected);
+			expect(await controlEvents(other)).toEqual([]);
+		});
 
 		it("reads native organizations and writes native-readable ownership, default team and active selection", async () => {
 			const owner = await account();
@@ -1232,8 +1354,10 @@ describe.skipIf(!existsSync(fixturePath))(
 			);
 			expect(ownedAcceptance.status).toBe(200);
 			const events = await database.query(
-				`SELECT type,"targetId" FROM "${schema}"."allauthEvent" WHERE "organizationId"=$1 AND type IN ('organization.team.member-removed','organization.team.removed')`,
-				[selected.id],
+				`SELECT type,"targetId" FROM "${schema}"."allauthEvent"
+				 WHERE ("organizationId"=$1 AND type='organization.team.removed')
+				    OR ("targetId"=$2 AND type='organization.team.member-removed' AND "organizationId" IS NULL)`,
+				[selected.id, target.id],
 			);
 			expect(events.rows).toEqual(
 				expect.arrayContaining([
@@ -1312,12 +1436,19 @@ describe.skipIf(!existsSync(fixturePath))(
 			expect(ownedConflict.status).toBe(legacyConflict.status);
 			expect(await ownedConflict.json()).toEqual(await legacyConflict.json());
 			const audit = await database.query(
-				`SELECT "actorId","organizationId" FROM "${schema}"."allauthEvent" WHERE type='organization.updated' AND "organizationId"=$1`,
+				`SELECT "actorId","organizationId",outcome FROM "${schema}"."allauthEvent"
+				 WHERE type='organization.updated' AND "organizationId"=$1 ORDER BY "createdAt"`,
 				[selected.id],
 			);
-			expect(audit.rows).toEqual([
-				{ actorId: editor.id, organizationId: selected.id },
-			]);
+			expect(audit.rows).toEqual(
+				["success", "success", "failure", "failure", "failure"].map(
+					(outcome) => ({
+						actorId: null,
+						organizationId: selected.id,
+						outcome,
+					}),
+				),
+			);
 		});
 
 		it("updates roles and removes members using legacy response shapes and scoped revocation", async () => {

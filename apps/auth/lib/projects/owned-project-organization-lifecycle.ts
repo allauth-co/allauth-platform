@@ -140,12 +140,7 @@ async function update(
 	}
 	const updated = await realm.updateOrganization(organizationId, data);
 	if (!updated) return noOrganization();
-	await realm.recordOrganizationChange({
-		type: "organization.updated",
-		path: "/organization/update",
-		actorId: principal.user.id,
-		organizationId,
-	});
+
 	return json({
 		...updated,
 		metadata: updated.metadata ? JSON.parse(updated.metadata) : undefined,
@@ -174,12 +169,7 @@ async function removeOrganization(
 			"Remove the organization's SSO and directory configuration before deleting it.",
 		);
 	await realm.deleteOrganization(organizationId);
-	await realm.recordOrganizationChange({
-		type: "organization.deleted",
-		path: "/organization/delete",
-		actorId: principal.user.id,
-		organizationId,
-	});
+
 	return json(allowed);
 }
 
@@ -202,12 +192,7 @@ async function leave(
 		return onlyOwner();
 	const { user: _user, ...record } = member;
 	if (!(await realm.removeOrganizationMember(record))) return noMember();
-	await realm.recordOrganizationChange({
-		type: "organization.member.left",
-		path: "/organization/leave",
-		actorId: principal.user.id,
-		organizationId,
-	});
+
 	return json(record);
 }
 
@@ -255,12 +240,7 @@ async function removeMember(
 		);
 	const { user, ...record } = target;
 	if (!(await realm.removeOrganizationMember(record))) return noMember();
-	await realm.recordOrganizationChange({
-		type: "organization.member.removed",
-		path: "/organization/remove-member",
-		actorId: principal.user.id,
-		organizationId,
-	});
+
 	return json({ member: byEmail ? { ...record, user } : record });
 }
 
@@ -323,13 +303,7 @@ async function updateMemberRole(
 		rolesToSet.join(","),
 	);
 	if (!updated) return noMember();
-	await realm.recordOrganizationChange({
-		type: "organization.member.role-updated",
-		path: "/organization/update-member-role",
-		actorId: principal.user.id,
-		organizationId,
-		targetId: updated.id,
-	});
+
 	return json(updated);
 }
 

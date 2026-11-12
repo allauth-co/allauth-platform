@@ -133,12 +133,7 @@ async function createTeam(
 	if (denied) return denied;
 	if (!organization) return noOrg();
 	const created = await teams.createTeam(parsed.data.name, organizationId);
-	await realm.recordOrganizationChange({
-		type: "organization.team.created",
-		path: "/organization/create-team",
-		actorId: principal.user.id,
-		organizationId,
-	});
+
 	return json(created);
 }
 
@@ -179,13 +174,7 @@ async function updateTeam(
 			? team
 			: await teams.updateTeam(teamId, organizationId, data.name);
 	if (!updated) return noTeam();
-	await realm.recordOrganizationChange({
-		type: "organization.team.updated",
-		path: "/organization/update-team",
-		actorId: principal.user.id,
-		organizationId,
-		targetId: teamId,
-	});
+
 	return json(updated);
 }
 
@@ -236,13 +225,7 @@ async function removeTeam(
 		);
 	if (!organization) return noOrg();
 	await teams.removeTeam(teamId, organizationId);
-	await realm.recordOrganizationChange({
-		type: "organization.team.removed",
-		path: "/organization/remove-team",
-		actorId: principal.user.id,
-		organizationId,
-		targetId: teamId,
-	});
+
 	return json({ message: "Team removed successfully." });
 }
 
@@ -423,15 +406,7 @@ async function changeTeamMember(
 			return noTeamMembership();
 		result = { message: "Team member removed successfully." };
 	}
-	await realm.recordOrganizationChange({
-		type: add
-			? "organization.team.member-added"
-			: "organization.team.member-removed",
-		path,
-		actorId: principal.user.id,
-		organizationId,
-		targetId: userId,
-	});
+
 	return json(result);
 }
 
