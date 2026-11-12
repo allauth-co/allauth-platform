@@ -247,6 +247,7 @@ async function renderHostedAuth(
 	next = destination,
 	strict = false,
 	resetStatus?: HostedPasswordResetStatus,
+	showRecovery = true,
 ) {
 	const container = document.createElement("div");
 	document.body.appendChild(container);
@@ -263,7 +264,7 @@ async function renderHostedAuth(
 			view === "signUp"
 				? legacyPath.replace("/sign-in", "/sign-up")
 				: legacyPath,
-		showRecovery: true,
+		showRecovery,
 		showBroker: true,
 		showPassword: true,
 		showEmail: true,
@@ -306,6 +307,27 @@ it.each([
 		expect(action.searchParams.get("returnTo")).toBe(signed);
 	expect(requests).toHaveBeenCalledOnce();
 	expect(requests.mock.calls[0]?.[0]).toBe(`${basePath}/sdk/config`);
+});
+
+it("offers only sign-in after an expired reset when new reset email is unavailable", async () => {
+	const requests = hostedRequests(() => Response.json({ status: true }));
+	const container = await renderHostedAuth(
+		"resetPassword",
+		destination,
+		false,
+		"invalid",
+		false,
+	);
+	expect(container.textContent).toContain(
+		"This reset link is invalid or has expired",
+	);
+	expect(container.querySelector("form")).toBeNull();
+	const actions = [...container.querySelectorAll("a")].map(
+		(link) => new URL(link.href),
+	);
+	expect(actions.map((action) => action.pathname)).toEqual(["/sign-in"]);
+	expect(actions[0]?.searchParams.get("returnTo")).toBe(destination);
+	expect(requests).not.toHaveBeenCalled();
 });
 
 it("renders the project branding and sends the existing AllAuth broker the exact same-origin return", async () => {

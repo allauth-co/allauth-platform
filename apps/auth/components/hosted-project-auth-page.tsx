@@ -100,13 +100,10 @@ export async function HostedProjectAuthPage({
 					view === "magicLinkSent" ||
 					view === "emailOtp") &&
 					!showEmail) ||
-				(view === "resetLinkSent" && !showPassword) ||
+				((view === "resetPassword" || view === "resetLinkSent") &&
+					!showPassword) ||
+				(view === "forgotPassword" && !showRecovery) ||
 				(view === "enterpriseSignIn" && !showSso)
-			)
-				return null;
-			if (
-				(view === "forgotPassword" || view === "resetPassword") &&
-				!showRecovery
 			)
 				return null;
 			return {

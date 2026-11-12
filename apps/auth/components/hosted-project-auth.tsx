@@ -289,6 +289,7 @@ export function HostedProjectAuth({
 						<HostedProjectResetStatus
 							status={resetStatus}
 							destination={destination}
+							showRecovery={showRecovery}
 						/>
 					) : (
 						<ResetPassword afterSignInUrl={destination} />

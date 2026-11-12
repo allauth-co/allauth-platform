@@ -34,6 +34,7 @@ async function legacyFixture(
 	db: Kysely<Record<string, Record<string, unknown>>>,
 	delivered: string[],
 	resetLinks: string[],
+	deliverReset = true,
 ) {
 	return getTestInstance(
 		{
@@ -52,9 +53,11 @@ async function legacyFixture(
 				autoSignIn: false,
 				revokeSessionsOnPasswordReset: true,
 				password: clerkCompatiblePasswords,
-				async sendResetPassword({ url }) {
-					resetLinks.push(url);
-				},
+				...(deliverReset && {
+					async sendResetPassword({ url }: { url: string }) {
+						resetLinks.push(url);
+					},
+				}),
 			},
 			emailVerification: {
 				autoSignInAfterVerification: false,
@@ -164,6 +167,7 @@ describe.skipIf(!existsSync(fixturePath))(
 		function fixture(
 			options: {
 				limited?: boolean;
+				emailUnavailable?: boolean;
 				preserveBrowserContinuation?: boolean;
 				completeVerification?: CompleteOwnedEmailVerification;
 			} = {},
@@ -195,14 +199,16 @@ describe.skipIf(!existsSync(fixturePath))(
 					};
 				},
 				email: {
-					environment: {
-						EMAIL_FROM: "no-reply@recovery-fixture.example",
-						EMAIL: {
-							async send(message) {
-								deliveries.push(message);
+					environment: options.emailUnavailable
+						? {}
+						: {
+								EMAIL_FROM: "no-reply@recovery-fixture.example",
+								EMAIL: {
+									async send(message) {
+										deliveries.push(message);
+									},
+								},
 							},
-						},
-					},
 				},
 				async checkPasswordSafety() {
 					return "allowed";
@@ -299,6 +305,81 @@ describe.skipIf(!existsSync(fixturePath))(
 			await expect(
 				native.auth.api.signInEmail({ body: { email, password: newPassword } }),
 			).resolves.toMatchObject({ user: { id: user.id } });
+		});
+
+		it("redeems already issued app-proxy reset links in both engines without an email sender", async () => {
+			const nativeIssued = await seed(
+				"native-mail-pause@recovery-fixture.example",
+			);
+			const ownedIssued = await seed(
+				"owned-mail-pause@recovery-fixture.example",
+			);
+			const nativeDelivery = await native.auth.handler(
+				post("/request-password-reset", {
+					email: nativeIssued.email,
+					redirectTo: resetCallback,
+				}),
+			);
+			expect(nativeDelivery.status).toBe(200);
+			const nativeLink = new URL(legacyResetLinks.at(-1)!);
+			const ownedDelivery = fixture();
+			expect(
+				(
+					await ownedDelivery.handler(
+						post("/request-password-reset", {
+							email: ownedIssued.email,
+							redirectTo: resetCallback,
+						}),
+					)
+				)?.status,
+			).toBe(200);
+			await ownedDelivery.flush();
+			const ownedLink = mailedLink(ownedDelivery.deliveries[0].html);
+
+			const ownedWithoutMail = fixture({ emailUnavailable: true });
+			const newRequest = await ownedWithoutMail.handler(
+				post("/request-password-reset", {
+					email: nativeIssued.email,
+					redirectTo: resetCallback,
+				}),
+			);
+			expect(newRequest?.status).toBe(503);
+			expect(ownedWithoutMail.queued).toHaveLength(0);
+			const nativeWithoutMail = await legacyFixture(
+				nativeDatabase!,
+				[],
+				[],
+				false,
+			);
+			const cases = [
+				{
+					user: nativeIssued,
+					click: new Request(nativeLink),
+					handle: ownedWithoutMail.handler,
+				},
+				{
+					user: ownedIssued,
+					click: visit(ownedLink),
+					handle: nativeWithoutMail.auth.handler,
+				},
+			];
+			for (const { user, click, handle } of cases) {
+				const opened = await handle(click);
+				expect(opened?.status).toBe(302);
+				const destination = new URL(opened?.headers.get("location") ?? "");
+				expect(destination.origin + destination.pathname).toBe(resetCallback);
+				const token = destination.searchParams.get("token");
+				expect(token).toBeTruthy();
+				const reset = await handle(
+					post("/reset-password", { token, newPassword }),
+				);
+				expect(reset?.status).toBe(200);
+				await expect(
+					native.auth.api.signInEmail({
+						body: { email: user.email, password: newPassword },
+					}),
+				).resolves.toMatchObject({ user: { id: user.id } });
+			}
 		});
 
 		it("opens actual legacy signed reset mail and retains the nested replacement across rollback", async () => {

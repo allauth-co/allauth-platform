@@ -44,9 +44,11 @@ export function HostedProjectAuthCallback() {
 export function HostedProjectResetStatus({
 	status,
 	destination,
+	showRecovery,
 }: {
 	status: HostedPasswordResetStatus;
 	destination: string;
+	showRecovery: boolean;
 }) {
 	return (
 		<HostedProjectCard
@@ -60,12 +62,14 @@ export function HostedProjectResetStatus({
 				<a href={withAuthReturnTo("/sign-in", destination)}>Back to sign in</a>
 			}
 		>
-			<a
-				className="allauth-primary"
-				href={withAuthReturnTo("/forgot-password", destination)}
-			>
-				Request a new reset link
-			</a>
+			{showRecovery && (
+				<a
+					className="allauth-primary"
+					href={withAuthReturnTo("/forgot-password", destination)}
+				>
+					Request a new reset link
+				</a>
+			)}
 		</HostedProjectCard>
 	);
 }

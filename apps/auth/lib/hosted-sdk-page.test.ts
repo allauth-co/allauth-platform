@@ -303,6 +303,61 @@ it("keeps an invalid reset callback on the verified hosted project and honors th
 	expect((await page({ error: "INVALID_TOKEN" })).type).toBe(AllAuthAuth);
 });
 
+it("keeps a previously issued reset link on the verified accounts host when email delivery is unavailable", async () => {
+	runtime.headers.mockResolvedValue(
+		new Headers({ [portalHeader]: "fixture-proof" }),
+	);
+	let engine = engineConfiguration({ emailPassword: true });
+	runtime.withPortalHeadersEngine.mockImplementation(async (_headers, select) =>
+		select(engine, new Headers(), {
+			kind: "accounts",
+			project,
+			hostname: accountsHostname,
+		}),
+	);
+	const returnTo = "/account/security?from=reset";
+	const searchParams = Promise.resolve({
+		token: "fixture-reset-token",
+		returnTo,
+	});
+	const opened = await HostedProjectAuthPage({
+		view: "resetPassword",
+		searchParams,
+	});
+	expect(opened.type).toBe(HostedProjectAuth);
+	expect(opened.props).toMatchObject({
+		view: "resetPassword",
+		destination: returnTo,
+		showRecovery: false,
+		showEmail: false,
+	});
+	expect(opened.props.resetStatus).toBeUndefined();
+	expect(engine.dispatch.mock.calls[0]?.[0].url).toBe(
+		`https://${accountsHostname}/api/auth/sdk/config`,
+	);
+	const expired = await HostedProjectAuthPage({
+		view: "resetPassword",
+		searchParams: Promise.resolve({ error: "INVALID_TOKEN", returnTo }),
+	});
+	expect(expired.type).toBe(HostedProjectAuth);
+	expect(expired.props).toMatchObject({
+		resetStatus: "invalid",
+		showRecovery: false,
+	});
+	expect(
+		(
+			await HostedProjectAuthPage({
+				view: "forgotPassword",
+				searchParams: Promise.resolve({ returnTo }),
+			})
+		).type,
+	).toBe(AllAuthAuth);
+	engine = engineConfiguration({ emailPassword: false });
+	expect(
+		(await HostedProjectAuthPage({ view: "resetPassword", searchParams })).type,
+	).toBe(AllAuthAuth);
+});
+
 it("keeps production on the standard page even when the immutable ID appears in the preview list", async () => {
 	runtime.headers.mockResolvedValue(
 		new Headers({ [portalHeader]: "fixture-proof" }),
