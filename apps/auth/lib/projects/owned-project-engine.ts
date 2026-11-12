@@ -1606,10 +1606,12 @@ export function createOwnedProjectEngine(
 			trustedRequest,
 			trustedIP: options.trustedIP,
 			readBody: requestBody,
-			async authorizeBrowser(client, request, fresh) {
+			async authorizeBrowser(client, request, mode) {
 				const current = await currentSession(request.headers, client);
-				if (!fresh) return current?.user.id ?? null;
-				if (!current || !freshFeatureSession(current)) return null;
+				if (!current) return null;
+				if (mode === "read") return current.user.id;
+				const fresh = mode === "fresh";
+				if (fresh && !freshFeatureSession(current)) return null;
 				const user = await store.lockUser(client, current.user.id);
 				if (
 					!user ||
@@ -1617,7 +1619,8 @@ export function createOwnedProjectEngine(
 				)
 					return null;
 				const locked = await eligibleSession(current.token, client);
-				return locked?.user.id === user.id && freshFeatureSession(locked)
+				return locked?.user.id === user.id &&
+					(!fresh || freshFeatureSession(locked))
 					? user.id
 					: null;
 			},

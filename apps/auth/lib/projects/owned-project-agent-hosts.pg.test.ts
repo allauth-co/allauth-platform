@@ -377,6 +377,173 @@ describe.skipIf(!existsSync(fixture))(
 			return { hosts, agents };
 		}
 
+		it("lists and reads the signed browser owner's agents and native public grants", async () => {
+			const host = await createHost("Browser agent listing");
+			const [first, second, foreign] = await seedDependents(host.hostId);
+			const schema = `"${alpha.schemaName}"`;
+			await database.query(
+				`UPDATE ${schema}."agent" SET name='',"createdAt"=now()+interval '2 seconds',"activatedAt"=now(),"lastUsedAt"=now(),"expiresAt"=now()+interval '15 minutes' WHERE id=$1`,
+				[first],
+			);
+			await database.query(
+				`UPDATE ${schema}."agent" SET "createdAt"=now()+interval '1 second',metadata='{"existing":"fixture"}' WHERE id=$1`,
+				[second],
+			);
+			await database.query(
+				`UPDATE ${schema}."agent" SET "userId"=$2 WHERE id=$1`,
+				[foreign, peer.id],
+			);
+			await database.query(
+				`INSERT INTO ${schema}."agentCapabilityGrant" (id,"agentId",capability,status,reason,"createdAt","updatedAt") VALUES
+				 ($1,$3,'fixture.read','denied','Earlier grant decision',now(),now()),
+				 ($2,$3,'fixture.previous','consumed',NULL,now(),now())`,
+				[randomUUID(), randomUUID(), first],
+			);
+			const listPath = `/agent/list?host_id=${host.hostId}&mode=delegated`;
+			const listed = await expectSame(
+				`${listPath}&status=active&limit=1`,
+				ownerCookie,
+				200,
+			);
+			expect(listed).toEqual({
+				agents: [
+					expect.objectContaining({
+						agent_id: first,
+						name: `Agent ${first.slice(0, 8)}`,
+						host_name: "Browser agent listing",
+						agent_capability_grants: [
+							{
+								capability: "fixture.read",
+								status: "active",
+								granted_by: owner.id,
+							},
+						],
+					}),
+				],
+			});
+			expect(listed).not.toHaveProperty(["agents", "0", "metadata"]);
+			expect(listed).not.toHaveProperty(["agents", "0", "user_id"]);
+			expect(listed).not.toHaveProperty(["agents", "0", "public_key"]);
+			expect(
+				await expectSame(`${listPath}&limit=1&offset=1`, ownerCookie, 200),
+			).toMatchObject({ agents: [{ agent_id: second }] });
+			expect(await expectSame(listPath, peerCookie, 200)).toMatchObject({
+				agents: [{ agent_id: foreign }],
+			});
+			const detailPath = `/agent/get?agent_id=${second}`;
+			const detail = await expectSame(detailPath, ownerCookie, 200);
+			expect(detail).toMatchObject({
+				agent_id: second,
+				metadata: { existing: "fixture" },
+				user_id: owner.id,
+				status: "pending",
+			});
+			expect(detail).not.toHaveProperty("public_key");
+			expect(detail).not.toHaveProperty("kid");
+			await expectSame(detailPath, peerCookie, 404);
+			await expectSame(detailPath, "", 401);
+			await expectSame("/agent/get", ownerCookie, 400);
+			await expectSame("/agent/list?status=unknown", ownerCookie, 400);
+			expect(
+				(await outside.dispatch(request(beta, detailPath, ownerCookie))).status,
+			).toBe(401);
+			expect(
+				(await disabled.dispatch(request(alpha, detailPath, ownerCookie)))
+					.status,
+			).toBe(501);
+		});
+
+		it("revokes one agent using its ordinary live browser or stored host owner and rolls back to native reads", async () => {
+			const nativeHost = await createHost("Native browser agent revoke");
+			const ownedHost = await createHost("Owned browser agent revoke");
+			const [nativeAgent] = await seedDependents(nativeHost.hostId);
+			const [ownedAgent, unrelatedAgent] = await seedDependents(
+				ownedHost.hostId,
+			);
+			const nativeUnbound = await pendingApproval(nativeHost.hostId, "ciba");
+			const unbound = await pendingApproval(ownedHost.hostId, "ciba");
+			const schema = `"${alpha.schemaName}"`;
+			await database.query(
+				`UPDATE ${schema}."agent" SET "userId"=NULL WHERE id=ANY($1::text[])`,
+				[[nativeUnbound.agentId, unbound.agentId]],
+			);
+			const aged = await signIn(owner.email);
+			const active = await legacy.handler(request(alpha, "/get-session", aged));
+			const { session } = (await active.json()) as { session: { id: string } };
+			await database.query(
+				`UPDATE ${schema}."session" SET "createdAt"=now()-interval '6 minutes' WHERE id=$1`,
+				[session.id],
+			);
+			const path = "/agent/revoke";
+			const body = { agent_id: ownedAgent };
+			await expectSame(path, peerCookie, 403, body);
+			await expectSame(path, "", 401, body);
+			await expectSame(path, ownerCookie, 400, {});
+			await expectSame(path, ownerCookie, 404, { agent_id: randomUUID() });
+			expect(
+				(await outside.dispatch(request(beta, path, ownerCookie, body))).status,
+			).toBe(401);
+			for (const id of [nativeAgent, nativeUnbound.agentId]) {
+				const nativeResponse = await legacy.handler(
+					request(alpha, path, aged, { agent_id: id }),
+				);
+				expect(nativeResponse.status).toBe(200);
+				expect(await nativeResponse.json()).toEqual({
+					agent_id: id,
+					status: "revoked",
+				});
+			}
+			const revoke = (id: string) =>
+				owned.dispatch(request(alpha, path, aged, { agent_id: id }));
+			for (const id of [ownedAgent, unbound.agentId, ownedAgent]) {
+				const result = await revoke(id);
+				expect(result.status).toBe(200);
+				expect(await result.json()).toEqual({
+					agent_id: id,
+					status: "revoked",
+				});
+			}
+			const oldState = await persisted(nativeHost.hostId);
+			const nextState = await persisted(ownedHost.hostId);
+			expect(nextState.agents).toEqual(oldState.agents);
+			expect(nextState.hosts).toEqual([
+				expect.objectContaining({
+					status: "active",
+					kid: "Owned browser agent revoke",
+				}),
+			]);
+			expect(nextState.agents).toContainEqual({
+				name: "active",
+				status: "revoked",
+				publicKey: "",
+				kid: null,
+				grantStatus: "revoked",
+			});
+			const { rows } = await database.query(
+				`SELECT a.status,a."publicKey",a.kid,r.status AS approval FROM ${schema}."agent" a JOIN ${schema}."approvalRequest" r ON r."agentId"=a.id WHERE a.id=$1`,
+				[unbound.agentId],
+			);
+			expect(rows).toEqual([
+				{ status: "revoked", publicKey: "", kid: null, approval: "pending" },
+			]);
+			await database.query(`DELETE FROM ${schema}."session" WHERE id=$1`, [
+				session.id,
+			]);
+			await expectSame(path, aged, 401, { agent_id: unrelatedAgent });
+			legacy = await native(nativePool);
+			const afterRollback = await legacy.handler(
+				request(alpha, `/agent/get?agent_id=${ownedAgent}`, ownerCookie),
+			);
+			expect(afterRollback.status).toBe(200);
+			expect(await afterRollback.json()).toMatchObject({
+				agent_id: ownedAgent,
+				status: "revoked",
+				agent_capability_grants: [
+					{ capability: "fixture.read", status: "revoked" },
+				],
+			});
+		});
+
 		it("revokes the same native-format host and grants atomically and remains readable after rollback", async () => {
 			const oldHost = await createHost("Native comparison");
 			const nextHost = await createHost("Owned comparison");
@@ -485,9 +652,14 @@ describe.skipIf(!existsSync(fixture))(
 			]);
 		});
 
-		it("preserves all prior rows if a grant transition fails", async () => {
-			const host = await createHost("Rollback device");
-			await seedDependents(host.hostId);
+		it.each([
+			"host",
+			"agent",
+		] as const)("preserves all prior rows if a %s grant transition fails", async (target) => {
+			const host = await createHost(`Rollback ${target} device`);
+			const [agent] = await seedDependents(host.hostId);
+			const body =
+				target === "host" ? { host_id: host.hostId } : { agent_id: agent };
 			const prior = await persisted(host.hostId);
 			const schema = `"${alpha.schemaName}"`;
 			await database.query(`CREATE FUNCTION ${schema}."rejectFixtureGrant"() RETURNS trigger LANGUAGE plpgsql AS $$
@@ -498,9 +670,7 @@ describe.skipIf(!existsSync(fixture))(
 					FOR EACH ROW WHEN (NEW.status='revoked') EXECUTE FUNCTION ${schema}."rejectFixtureGrant"()`);
 				await expect(
 					owned.dispatch(
-						request(alpha, "/host/revoke", ownerCookie, {
-							host_id: host.hostId,
-						}),
+						request(alpha, `/${target}/revoke`, ownerCookie, body),
 					),
 				).rejects.toThrow("fixture grant transition failed");
 				expect(await persisted(host.hostId)).toEqual(prior);

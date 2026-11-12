@@ -1,6 +1,7 @@
 import type { JWTPayload } from "jose";
 import type { PoolClient } from "pg";
 import { agentHostJSON as json } from "./owned-project-agent-enrollment";
+import { readOwnedAgentGrants } from "./owned-project-agent-grants";
 import {
 	agentMachineAudience,
 	agentMachineProblem as problem,
@@ -31,85 +32,19 @@ type Agent = {
 	expiresAt: Date | null;
 	lastUsedAt: Date | null;
 };
-type Grant = {
-	capability: string;
-	status: string;
-	grantedBy: string | null;
-	reason: string | null;
-	constraints: string | null;
-	createdAt: Date;
-	expiresAt: Date | null;
-};
-
 const agentFields = `id,name,"hostId","userId","publicKey","jwksUrl",status,mode,"createdAt","activatedAt","expiresAt","lastUsedAt"`;
-const grantRank = new Map([
-	["active", 0],
-	["pending", 1],
-	["denied", 2],
-	["revoked", 3],
-]);
-
 function agentNotFound(status: 401 | 404, origin?: string) {
 	return problem(status, "agent_not_found", "Agent not found", origin);
 }
 
-function parseConstraints(value: string) {
-	try {
-		return JSON.parse(value) as unknown;
-	} catch {
-		return value;
-	}
-}
-
-function publicGrants(grants: Grant[]) {
-	const selected = new Map<string, Grant>();
-	for (const grant of grants) {
-		if (grant.status === "consumed") continue;
-		const previous = selected.get(grant.capability);
-		const rank = grantRank.get(grant.status) ?? 9;
-		const priorRank = previous ? (grantRank.get(previous.status) ?? 9) : 10;
-		if (
-			!previous ||
-			rank < priorRank ||
-			(rank === priorRank && grant.createdAt > previous.createdAt)
-		)
-			selected.set(grant.capability, grant);
-	}
-	return [...selected.values()].map((grant) => {
-		const constraints = grant.constraints
-			? parseConstraints(grant.constraints)
-			: null;
-		return {
-			capability: grant.capability,
-			status: grant.status,
-			...(grant.status === "active"
-				? {
-						...(grant.grantedBy ? { granted_by: grant.grantedBy } : {}),
-						...(constraints ? { constraints } : {}),
-						...(grant.expiresAt
-							? { expires_at: grant.expiresAt.toISOString() }
-							: {}),
-					}
-				: {}),
-			...((grant.status === "pending" || grant.status === "denied") &&
-			grant.reason
-				? { reason: grant.reason }
-				: {}),
-		};
-	});
-}
-
 async function publicAgent(client: PoolClient, agent: Agent) {
-	const { rows: grants } = await client.query<Grant>(
-		`SELECT capability,status,"grantedBy",reason,constraints,"createdAt","expiresAt" FROM "agentCapabilityGrant" WHERE "agentId"=$1`,
-		[agent.id],
-	);
+	const grants = await readOwnedAgentGrants(client, [agent.id]);
 	return json({
 		agent_id: agent.id,
 		name: agent.name,
 		host_id: agent.hostId,
 		status: agent.status,
-		agent_capability_grants: publicGrants(grants),
+		agent_capability_grants: grants.get(agent.id) ?? [],
 		mode: agent.mode,
 		user_id: agent.userId,
 		activated_at: agent.activatedAt,

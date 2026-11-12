@@ -5,6 +5,12 @@ import {
 	listOwnedAgentApprovals,
 } from "./owned-project-agent-approvals";
 import {
+	ownedBrowserAgentQuery,
+	ownedBrowserAgentRevokeInput,
+	readOwnedBrowserAgent,
+	revokeOwnedBrowserAgent,
+} from "./owned-project-agent-browser";
+import {
 	agentHostCapabilities,
 	agentHostJSON as json,
 	createOwnedAgentHost,
@@ -45,7 +51,7 @@ type BrowserHosts = {
 	authorizeBrowser(
 		client: PoolClient,
 		request: Request,
-		fresh: boolean,
+		mode: "read" | "write" | "fresh",
 	): Promise<string | null>;
 };
 
@@ -116,18 +122,40 @@ export function createOwnedProjectAgentHosts(options: BrowserHosts) {
 		const pending = request.method === "GET" && path === "/agent/ciba/pending";
 		const status = request.method === "GET" && path === "/agent/status";
 		const register = request.method === "POST" && path === "/agent/register";
+		const agentRead =
+			request.method === "GET" &&
+			(path === "/agent/get" || path === "/agent/list");
+		const agentRevoke = request.method === "POST" && path === "/agent/revoke";
 		const write =
 			decision ||
+			agentRevoke ||
 			(request.method === "POST" &&
 				(path === "/host/revoke" || path === "/host/create"));
 		const enroll = request.method === "POST" && path === "/host/enroll";
 		const read =
 			request.method === "GET" &&
 			(path === "/host/get" || path === "/host/list");
-		if (!write && !read && !enroll && !pending && !status && !register) return;
+		if (
+			!write &&
+			!read &&
+			!enroll &&
+			!pending &&
+			!status &&
+			!register &&
+			!agentRead
+		)
+			return;
 		const limited = await options.store.transaction((client) =>
 			admitOwnedProjectNativeRoute(client, options.trustedIP(request), path, {
-				max: register ? 10 : decision ? 5 : pending || status ? 300 : 100,
+				max: register
+					? 10
+					: decision
+						? 5
+						: pending || status
+							? 300
+							: agentRead || agentRevoke
+								? 60
+								: 100,
 				windowMs: 60_000,
 			}),
 		);
@@ -174,14 +202,36 @@ export function createOwnedProjectAgentHosts(options: BrowserHosts) {
 				400,
 			);
 		const input = query?.data ?? {};
+		const browserQuery = agentRead
+			? ownedBrowserAgentQuery(path, request)
+			: null;
+		const browserRevoke = agentRevoke
+			? ownedBrowserAgentRevokeInput(body)
+			: null;
+		if (browserQuery instanceof Response) return browserQuery;
+		if (browserRevoke instanceof Response) return browserRevoke;
 		return options.store.transaction(async (client) => {
-			const userId = await options.authorizeBrowser(client, request, write);
-			if (!userId)
+			const userId = await options.authorizeBrowser(
+				client,
+				request,
+				agentRevoke ? "write" : write ? "fresh" : "read",
+			);
+			if (!userId) {
+				if (agentRevoke)
+					return json(
+						{ error: "unauthorized", message: "Authentication required" },
+						401,
+					);
 				return write
 					? forbidden(
 							"Sign in again with a verified account before approving access.",
 						)
 					: json({ code: "UNAUTHORIZED", message: "Unauthorized" }, 401);
+			}
+			if (browserQuery)
+				return readOwnedBrowserAgent(client, userId, browserQuery);
+			if (browserRevoke)
+				return revokeOwnedBrowserAgent(client, userId, browserRevoke);
 			if (decision) return decideOwnedAgentApproval(client, userId, body);
 			if (pending) return listOwnedAgentApprovals(client, userId);
 			if (write) {
