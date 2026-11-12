@@ -36,6 +36,17 @@ import {
 	runtimeFixtureMicrosoft,
 	runtimeProviderFixtureCode,
 } from "./owned-project-runtime-provider-fixture";
+import {
+	createRuntimeSamlKeys,
+	runtimeSamlAuthnRequest,
+	runtimeSamlConfiguration,
+	runtimeSamlEntity,
+	runtimeSamlOrigin,
+	runtimeSamlProvider,
+	runtimeSamlResponse,
+	runtimeSamlSPMetadata,
+	runtimeSamlSubject,
+} from "./owned-project-runtime-saml-fixture";
 import { projectProxySecret } from "./proxy";
 import type { Project } from "./registry";
 import { projectRegistryPool, provisionProject } from "./registry";
@@ -303,6 +314,60 @@ async function fixtureRedirect(response: Response) {
 		((await response.json()) as { url?: string }).url;
 	expect(location).toBeTruthy();
 	return new URL(location!, platformOrigin);
+}
+
+type SamlTransport = {
+	prefix: string;
+	baseURL: string;
+	destination: string;
+	host?: string;
+};
+
+async function startRuntimeSaml(
+	service: Awaited<ReturnType<typeof openProcess>>,
+	transport: SamlTransport,
+) {
+	const started = await service.request(`${transport.prefix}/sign-in/sso`, {
+		host: transport.host,
+		body: {
+			providerId: runtimeSamlProvider,
+			providerType: "saml",
+			callbackURL: transport.destination,
+		},
+	});
+	expect(
+		started.status,
+		started.ok ? undefined : await started.clone().text(),
+	).toBe(200);
+	const url = await fixtureRedirect(started);
+	expect(url.origin).toBe(runtimeSamlOrigin);
+	expect(url.searchParams.has("Signature")).toBe(true);
+	const flow = runtimeSamlAuthnRequest(url);
+	expect(flow.acs).toBe(
+		`${transport.baseURL}/sso/saml2/sp/acs/${runtimeSamlProvider}`,
+	);
+	return { transport, flow };
+}
+
+async function finishRuntimeSaml(
+	service: Awaited<ReturnType<typeof openProcess>>,
+	keys: Awaited<ReturnType<typeof createRuntimeSamlKeys>>,
+	{ flow, transport }: Awaited<ReturnType<typeof startRuntimeSaml>>,
+) {
+	const acs = new URL(flow.acs);
+	const authenticated = await service.request(acs.pathname, {
+		host: transport.host,
+		origin: runtimeSamlOrigin,
+		body: runtimeSamlResponse(keys, flow, credentials.project.email),
+	});
+	expect(authenticated.status).toBe(302);
+	expect(authenticated.headers.get("location")).toBe(transport.destination);
+	const response = await service.request(`${transport.prefix}/get-session`, {
+		host: transport.host,
+		cookie: cookie(authenticated),
+	});
+	expect(await response.json()).toMatchObject({ user: credentials.project });
+	return cookie(authenticated);
 }
 
 async function fixtureVerificationMail(
@@ -705,6 +770,27 @@ async function seed(databaseURL: string) {
 		}
 		const alpha = await provision("runtime-owned-fixture", [supportOrigin]);
 		const beta = await provision("runtime-control-fixture");
+		const samlKeys = await createRuntimeSamlKeys();
+		await database.query(
+			`INSERT INTO "${alpha.schemaName}"."ssoProvider" (id,"providerId",issuer,domain,"domainVerified","userId","samlConfig")
+			 VALUES ($1,$1,$2,'runtime.fixture.example',TRUE,$3,$4)`,
+			[
+				runtimeSamlProvider,
+				runtimeSamlEntity,
+				credentials.project.id,
+				JSON.stringify(runtimeSamlConfiguration(samlKeys)),
+			],
+		);
+		await database.query(
+			`INSERT INTO "${alpha.schemaName}"."account" (id,"accountId","providerId","userId","updatedAt")
+			 VALUES ($1,$2,$3,$4,now())`,
+			[
+				randomUUID(),
+				runtimeSamlSubject,
+				runtimeSamlProvider,
+				credentials.project.id,
+			],
+		);
 		await database.query(
 			`INSERT INTO "${alpha.schemaName}"."user" (id,name,email,"emailVerified",role) VALUES ($1,'Fixture Support Target',$2,true,'user')`,
 			[supportTarget, "support-target@runtime.fixture.example"],
@@ -757,7 +843,7 @@ async function seed(databaseURL: string) {
 			},
 			owner.user.id,
 		);
-		return { alpha, beta };
+		return { alpha, beta, samlKeys };
 	} finally {
 		cwd.mockRestore();
 		await database.end();
@@ -789,7 +875,7 @@ describe.skipIf(!existsSync(fixture))(
 			try {
 				await admin.query(`CREATE DATABASE "${source}"`);
 				created.push(source);
-				const { alpha, beta } = await seed(url(source));
+				const { alpha, beta, samlKeys } = await seed(url(source));
 				const [appleCredentialKeys, appleIssuerKeys] = await Promise.all([
 					generateKeyPair("ES256", { extractable: true }),
 					generateKeyPair("RS256", { extractable: true }),
@@ -826,6 +912,19 @@ describe.skipIf(!existsSync(fixture))(
 					prefix: alphaPath,
 					destination: `${alpha.primaryOrigin}/account`,
 				};
+				const samlTransports: SamlTransport[] = [
+					{
+						prefix: alphaPath,
+						baseURL: directIssuer,
+						destination: `${platformOrigin}/account?from=runtime-saml`,
+					},
+					{
+						prefix: "/api/auth",
+						baseURL: hostedIssuer,
+						host: alphaHost,
+						destination: `https://${alphaHost}/account?from=runtime-saml`,
+					},
+				];
 				const betaHost = `${beta.slug}-accounts.allauth.co`;
 				const login = {
 					email: credentials.project.email,
@@ -881,6 +980,9 @@ describe.skipIf(!existsSync(fixture))(
 				}
 				service = await open(source, false);
 				expect((await service.request("/api/health")).status).toBe(200);
+				const nativeSaml = [];
+				for (const transport of samlTransports)
+					nativeSaml.push(await startRuntimeSaml(service, transport));
 				const rootLogin = await service.request("/api/auth/sign-in/email", {
 					body: {
 						email: credentials.platform.email,
@@ -1039,6 +1141,46 @@ describe.skipIf(!existsSync(fixture))(
 
 				service = await open(restored, true);
 				expect((await service.request("/api/health")).status).toBe(200);
+				const ownedSaml = [];
+				for (const started of nativeSaml) {
+					const { transport } = started;
+					const metadata = await service.request(
+						`${transport.prefix}/sso/saml2/sp/metadata?providerId=${runtimeSamlProvider}`,
+						{ host: transport.host },
+					);
+					expect(metadata.status).toBe(200);
+					expect(await metadata.text()).toContain(
+						`Location="${started.flow.acs}"`,
+					);
+					const samlCookie = await finishRuntimeSaml(
+						service,
+						samlKeys,
+						started,
+					);
+					const customMetadata = await service.request(
+						`${transport.prefix}/sso/update-provider`,
+						{
+							host: transport.host,
+							cookie: samlCookie,
+							body: {
+								providerId: runtimeSamlProvider,
+								samlConfig: {
+									spMetadata: {
+										metadata: runtimeSamlSPMetadata(started.flow.acs),
+									},
+								},
+							},
+						},
+					);
+					expect(
+						customMetadata.status,
+						customMetadata.ok ? undefined : await customMetadata.clone().text(),
+					).toBe(400);
+					expect(await customMetadata.json()).toMatchObject({
+						code: "SSO_CONFIGURATION_UNSUPPORTED",
+					});
+					ownedSaml.push(await startRuntimeSaml(service, transport));
+				}
 				const compatibleWallet = await service.request(
 					`${alphaPath}/siwe/verify`,
 					{ ...directWallet, body: nativeWalletProof },
@@ -1935,6 +2077,8 @@ describe.skipIf(!existsSync(fixture))(
 
 				service = await open(restored, false);
 				expect((await service.request("/api/health")).status).toBe(200);
+				for (const started of ownedSaml)
+					await finishRuntimeSaml(service, samlKeys, started);
 				const rolledBackWallet = await service.request(
 					"/api/auth/siwe/verify",
 					{ ...hostedWallet, body: ownedWalletProof },
@@ -2208,6 +2352,26 @@ describe.skipIf(!existsSync(fixture))(
 					await changed.query(
 						`UPDATE "${alpha.schemaName}"."ssoProvider" SET "samlConfig"=NULL WHERE "providerId"=$1`,
 						[directoryProvider],
+					);
+					const supportedSaml = runtimeSamlConfiguration(samlKeys);
+					for (const spMetadata of [
+						{ metadata: runtimeSamlSPMetadata(nativeSaml[0].flow.acs) },
+						{ isAssertionEncrypted: true },
+					]) {
+						await changed.query(
+							`UPDATE "${alpha.schemaName}"."ssoProvider" SET "samlConfig"=$1 WHERE "providerId"=$2`,
+							[
+								JSON.stringify({ ...supportedSaml, spMetadata }),
+								runtimeSamlProvider,
+							],
+						);
+						await expect(open(restored, true)).rejects.toThrow(
+							"This development project has a configured SAML provider outside the candidate scope.",
+						);
+					}
+					await changed.query(
+						`UPDATE "${alpha.schemaName}"."ssoProvider" SET "samlConfig"=$1 WHERE "providerId"=$2`,
+						[JSON.stringify(supportedSaml), runtimeSamlProvider],
 					);
 					await changed.query(
 						`UPDATE "${alpha.schemaName}"."apikey" SET "rateLimitMax"=101 WHERE id=$1`,

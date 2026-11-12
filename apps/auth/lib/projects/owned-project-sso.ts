@@ -74,8 +74,8 @@ export interface OwnedProjectSsoOptions {
 	tokenKeys?: LegacyMfaKeys;
 	defaultErrorURL: string;
 	signUpEnabled: boolean;
-	/** Enable the isolated candidate for SP-initiated plaintext SAML. */
-	saml?: boolean;
+	/** The generated SP subset uses the selected transport's ACS for every request. */
+	saml?: boolean | "generated-sp";
 	/** Session/MFA admission runs on the same client as the exact account and directory binding. */
 	complete(
 		client: PoolClient,
@@ -162,6 +162,7 @@ export function createOwnedProjectSso(options: OwnedProjectSsoOptions) {
 			cookieAttributes: attributes,
 			signingSecret: options.signingSecret,
 			signUpEnabled: options.signUpEnabled,
+			generatedSPOnly: options.saml === "generated-sp",
 			defaultError,
 			store,
 			allowedReturn: (value) => allowedReturn(value, origin, origins),

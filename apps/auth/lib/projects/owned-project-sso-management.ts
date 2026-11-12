@@ -7,6 +7,7 @@ import {
 	organizationFailure as failure,
 	organizationJson as json,
 } from "./owned-project-organization-response";
+import type { OwnedProjectSsoOptions } from "./owned-project-sso";
 import {
 	checkProjectSsoDomainDns,
 	projectSsoDnsIdentifier,
@@ -67,7 +68,7 @@ export interface OwnedProjectSsoManagementOptions {
 	baseURL: string;
 	trustedOrigins: ReadonlySet<string>;
 	fetch?: SsoFetch;
-	saml?: boolean;
+	saml?: OwnedProjectSsoOptions["saml"];
 	trustedRequest(headers: Headers, mutation: boolean): boolean;
 	readBody(request: Request): Promise<unknown>;
 	readSession(
@@ -174,6 +175,12 @@ export function createOwnedProjectSsoManagement(
 ) {
 	const store = createProjectEngineStore(options.database, options.schemaName);
 	const origin = new URL(options.baseURL).origin;
+	const samlScope = options.saml
+		? {
+				baseURL: options.baseURL,
+				generatedSPOnly: options.saml === "generated-sp",
+			}
+		: undefined;
 
 	async function lockActor(
 		client: PoolClient,
@@ -244,7 +251,7 @@ export function createOwnedProjectSsoManagement(
 			input,
 			options.trustedOrigins,
 			options.fetch,
-			options.saml ? options.baseURL : undefined,
+			samlScope,
 		);
 		if (configuration instanceof Response) return configuration;
 		return registerWithAuthority(async (client, actorId) => {
@@ -295,14 +302,17 @@ export function createOwnedProjectSsoManagement(
 		const config = readStoredSsoConfiguration(provider.samlConfig);
 		try {
 			const acs = projectSamlAcs(options.baseURL, id.data);
-			return new Response(projectSamlServiceMetadata(config, acs), {
-				headers: {
-					"Content-Type": "application/xml",
-					"Cache-Control": "no-store",
-					"Content-Security-Policy": "default-src 'none'; sandbox",
-					"X-Content-Type-Options": "nosniff",
+			return new Response(
+				projectSamlServiceMetadata(config, acs, samlScope?.generatedSPOnly),
+				{
+					headers: {
+						"Content-Type": "application/xml",
+						"Cache-Control": "no-store",
+						"Content-Security-Policy": "default-src 'none'; sandbox",
+						"X-Content-Type-Options": "nosniff",
+					},
 				},
-			});
+			);
 		} catch {
 			return failure(400, "BAD_REQUEST", "Invalid SAML configuration");
 		}
@@ -350,7 +360,7 @@ export function createOwnedProjectSsoManagement(
 							client,
 							provider,
 							input.data,
-							options.saml ? options.baseURL : undefined,
+							samlScope,
 						);
 						if (updated instanceof Response) return updated;
 						await auditProviderChange(client, path, updated, actorId);

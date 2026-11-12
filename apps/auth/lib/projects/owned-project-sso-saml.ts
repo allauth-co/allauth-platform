@@ -122,6 +122,7 @@ export function createOwnedProjectSaml(options: {
 	cookieAttributes: string;
 	signingSecret: string;
 	signUpEnabled: boolean;
+	generatedSPOnly?: boolean;
 	defaultError: URL;
 	store: SsoStore;
 	allowedReturn(value: string): URL | null;
@@ -160,7 +161,7 @@ export function createOwnedProjectSaml(options: {
 			const configured = configureOwnedSaml(
 				provider.samlConfig,
 				acs(provider.providerId),
-				relay,
+				{ relayState: relay, generatedSPOnly: options.generatedSPOnly },
 			);
 			const login = configured.service.createLoginRequest(
 				configured.idp,
@@ -321,7 +322,9 @@ export function createOwnedProjectSaml(options: {
 		let configured: ReturnType<typeof configureOwnedSaml>;
 		let proof: ReturnType<typeof verifyOwnedSaml>;
 		try {
-			configured = configureOwnedSaml(provider.samlConfig, acs(providerId));
+			configured = configureOwnedSaml(provider.samlConfig, acs(providerId), {
+				generatedSPOnly: options.generatedSPOnly,
+			});
 			proof = verifyOwnedSaml(form.response, configured);
 		} catch {
 			return json(

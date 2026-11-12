@@ -11,6 +11,7 @@ import {
 } from "./owned-project-sso-oidc";
 import type { StoredProjectSsoProvider } from "./owned-project-sso-projection";
 import { readStoredSsoConfiguration } from "./owned-project-sso-projection";
+import type { ProjectSamlManagementScope } from "./owned-project-sso-saml-management";
 import {
 	mergeProjectSamlConfiguration,
 	projectSamlAcs,
@@ -73,7 +74,7 @@ export async function updateProjectSsoProvider(
 	client: PoolClient,
 	provider: StoredProjectSsoProvider,
 	input: Update,
-	samlBaseURL?: string,
+	samlScope?: ProjectSamlManagementScope,
 ) {
 	if (!ssoProviderId.safeParse(provider.providerId).success)
 		return failure(
@@ -89,7 +90,7 @@ export async function updateProjectSsoProvider(
 	const domain = input.domain ?? provider.domain;
 	const configuration =
 		provider.samlConfig || input.samlConfig
-			? updateSaml(provider, input, issuer, samlBaseURL)
+			? updateSaml(provider, input, issuer, samlScope)
 			: updateOidc(provider, input, issuer);
 	if (configuration instanceof Response) return configuration;
 	if (issuer !== provider.issuer || configuration.boundaryChanged) {
@@ -158,9 +159,9 @@ function updateSaml(
 	provider: StoredProjectSsoProvider,
 	input: Update,
 	issuer: string,
-	baseURL?: string,
+	scope?: ProjectSamlManagementScope,
 ) {
-	if (!baseURL || provider.oidcConfig || input.oidcConfig)
+	if (!scope || provider.oidcConfig || input.oidcConfig)
 		return unsupportedConfiguration("SAML");
 	const current = readStoredSsoConfiguration(provider.samlConfig);
 	if (!current)
@@ -169,13 +170,14 @@ function updateSaml(
 			"BAD_REQUEST",
 			"Cannot update SAML config for a provider that doesn't have SAML configured",
 		);
-	const acs = projectSamlAcs(baseURL, provider.providerId);
+	const acs = projectSamlAcs(scope.baseURL, provider.providerId);
 	try {
 		const updated = mergeProjectSamlConfiguration(
 			current,
 			input.samlConfig,
 			issuer,
 			acs,
+			scope.generatedSPOnly,
 		);
 		return {
 			boundaryChanged: projectSamlIdentityChanged(current, updated, acs),

@@ -22,7 +22,7 @@ const digest =
 const signature =
 	/^(?:(?:rsa-|ecdsa-)?sha(?:256|384|512)|http:\/\/www\.w3\.org\/2001\/04\/xmldsig-more#(?:rsa|ecdsa)-sha(?:256|384|512))$/i;
 
-export const projectSamlInput = z.strictObject({
+const projectSamlInput = z.strictObject({
 	entryPoint: https,
 	cert: cert.optional(),
 	audience: identifier.optional(),
@@ -71,16 +71,26 @@ export function projectSamlAcs(baseURL: string, providerId: string) {
 	return `${baseURL}/sso/saml2/sp/acs/${encodeURIComponent(providerId)}`;
 }
 
+export interface ProjectSamlManagementScope {
+	baseURL: string;
+	generatedSPOnly: boolean;
+}
+
 export function prepareProjectSamlRegistration(
 	input: unknown,
 	issuer: string,
-	acs: string,
+	providerId: string,
+	scope: ProjectSamlManagementScope,
 ) {
 	ssoHttpsUrl(issuer);
 	const parsed = projectSamlInput.parse(input);
 	const { idpInitiatedCallbackUrl: _disabled, ...fields } = parsed;
 	const configuration = { ...fields, issuer };
-	checkProjectSamlConfiguration({ issuer, samlConfig: configuration }, acs);
+	checkProjectSamlConfiguration(
+		{ issuer, samlConfig: configuration },
+		projectSamlAcs(scope.baseURL, providerId),
+		scope.generatedSPOnly,
+	);
 	return configuration;
 }
 
@@ -91,6 +101,7 @@ export function mergeProjectSamlConfiguration(
 	input: unknown,
 	issuer: string,
 	acs: string,
+	generatedSPOnly: boolean,
 ) {
 	ssoHttpsUrl(issuer);
 	const updates = updateInput.parse(input ?? {});
@@ -109,7 +120,11 @@ export function mergeProjectSamlConfiguration(
 	}
 	if (updates.idpInitiatedCallbackUrl === null)
 		configuration.idpInitiatedCallbackUrl = undefined;
-	checkProjectSamlConfiguration({ issuer, samlConfig: configuration }, acs);
+	checkProjectSamlConfiguration(
+		{ issuer, samlConfig: configuration },
+		acs,
+		generatedSPOnly,
+	);
 	return configuration;
 }
 

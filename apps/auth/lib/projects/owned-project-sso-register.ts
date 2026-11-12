@@ -15,10 +15,8 @@ import {
 	checkProjectOidcConfiguration,
 	resolveProjectOidc,
 } from "./owned-project-sso-oidc";
-import {
-	prepareProjectSamlRegistration,
-	projectSamlAcs,
-} from "./owned-project-sso-saml-management";
+import type { ProjectSamlManagementScope } from "./owned-project-sso-saml-management";
+import { prepareProjectSamlRegistration } from "./owned-project-sso-saml-management";
 import {
 	projectSsoConfigURL,
 	projectSsoOidcInput,
@@ -107,7 +105,7 @@ export async function prepareProjectSsoRegistration(
 	input: Registration,
 	trustedOrigins: ReadonlySet<string>,
 	fetch: SsoFetch = fetchPublicSsoEndpoint,
-	samlBaseURL?: string,
+	samlScope?: ProjectSamlManagementScope,
 ) {
 	if (!supportsProjectSsoDnsIdentifier(input.providerId))
 		return failure(
@@ -118,7 +116,7 @@ export async function prepareProjectSsoRegistration(
 	if (!projectSsoDomainNames(input.domain))
 		return failure(400, "INVALID_DOMAIN", "Invalid domain");
 	if (input.samlConfig) {
-		if (!samlBaseURL || input.oidcConfig || input.overrideUserInfo)
+		if (!samlScope || input.oidcConfig || input.overrideUserInfo)
 			return unsupportedConfig();
 		try {
 			return {
@@ -126,7 +124,8 @@ export async function prepareProjectSsoRegistration(
 				config: prepareProjectSamlRegistration(
 					input.samlConfig,
 					input.issuer,
-					projectSamlAcs(samlBaseURL, input.providerId),
+					input.providerId,
+					samlScope,
 				),
 			};
 		} catch {

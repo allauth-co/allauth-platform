@@ -59,6 +59,9 @@ import { createOwnedProjectInvitationEmail } from "./owned-project-organization-
 import { createOwnedProjectPasswordSafety } from "./owned-project-password-safety";
 import { createOwnedProjectSCIMConsole } from "./owned-project-scim-console";
 import { checkProjectOidcConfiguration } from "./owned-project-sso-oidc";
+import { readStoredSsoConfiguration } from "./owned-project-sso-projection";
+import { checkProjectSamlConfiguration } from "./owned-project-sso-saml-eligibility";
+import { projectSamlAcs } from "./owned-project-sso-saml-management";
 import { ssoProviderId } from "./owned-project-sso-store";
 import type { ProjectAvatarStorage } from "./project-avatar-upload";
 import { verifiedProjectRequest } from "./proxy";
@@ -100,7 +103,7 @@ const authAdmission = {
 	"send-verification-email": [3, 60_000],
 } as const;
 
-async function readSupportedProviders(options: Options) {
+async function readSupportedProviders(options: Options, baseURL: string) {
 	const { database, project, env } = options;
 	if (
 		project.environment !== "development" ||
@@ -155,15 +158,28 @@ async function readSupportedProviders(options: Options) {
 		`SELECT "providerId",issuer,"oidcConfig","samlConfig" FROM "${schema}"."ssoProvider"`,
 	);
 	const enterpriseProviderIds = enterprise.map((entry) => {
-		if (entry.samlConfig || !entry.oidcConfig)
-			throw new Error(
-				"This development project has a configured SAML provider outside the candidate scope.",
-			);
+		const providerId = ssoProviderId.parse(entry.providerId);
+		if (entry.samlConfig || !entry.oidcConfig) {
+			const samlConfig = readStoredSsoConfiguration(entry.samlConfig);
+			try {
+				if (entry.oidcConfig || !samlConfig) throw new Error();
+				checkProjectSamlConfiguration(
+					{ issuer: entry.issuer, samlConfig },
+					projectSamlAcs(baseURL, providerId),
+					true,
+				);
+			} catch {
+				throw new Error(
+					"This development project has a configured SAML provider outside the candidate scope.",
+				);
+			}
+			return providerId;
+		}
 		checkProjectOidcConfiguration({
 			issuer: entry.issuer,
 			oidcConfig: JSON.parse(entry.oidcConfig),
 		});
-		return ssoProviderId.parse(entry.providerId);
+		return providerId;
 	});
 	const providers = [
 		"credential",
@@ -316,7 +332,10 @@ export async function createOwnedProjectRuntimeCandidate(options: Options) {
 		throw new Error(
 			"The development candidate requires an approved project mail transport.",
 		);
-	const { google, microsoft, apple } = await readSupportedProviders(options);
+	const { google, microsoft, apple } = await readSupportedProviders(
+		options,
+		`${origin}${basePath}`,
+	);
 	const callbacks = {
 		primaryOrigin: app,
 		publicOrigin: hosted ? origin : undefined,
@@ -488,6 +507,7 @@ export async function createOwnedProjectRuntimeCandidate(options: Options) {
 		sso: {
 			defaultErrorURL: `${platform}/auth-error`,
 			tokenKeys: encryptionKeys,
+			saml: "generated-sp",
 		},
 		scim: { credentialHashSecret: options.credentialHashSecret },
 		manageSCIMConsole,

@@ -140,7 +140,7 @@ function pem(value: string | undefined) {
 export function configureOwnedSaml(
 	value: unknown,
 	acs: string,
-	relayState?: string,
+	options: { relayState?: string; generatedSPOnly?: boolean } = {},
 ) {
 	const saved = config.parse(value);
 	const sp = saved.spMetadata;
@@ -153,6 +153,7 @@ export function configureOwnedSaml(
 	)
 		invalid();
 	const spMetadata = sp?.metadata;
+	if (options.generatedSPOnly && spMetadata !== undefined) invalid();
 	const spDescriptor =
 		spMetadata && metadataDescriptor(spMetadata, "SPSSODescriptor");
 	const wantAssertion = spDescriptor
@@ -204,7 +205,7 @@ export function configureOwnedSaml(
 		privateKey: requestPrivateKey,
 		privateKeyPass: sp?.privateKeyPass,
 		allowCreate: true,
-		relayState,
+		relayState: options.relayState,
 	});
 	if (requestsSigned && !service.entityMeta.isAuthnRequestSigned()) invalid();
 	if (idp.metadata) metadataDescriptor(idp.metadata, "IDPSSODescriptor");
@@ -241,8 +242,12 @@ export function configureOwnedSaml(
 }
 
 /** Publish only the SP metadata for the callback served by the selected realm transport. */
-export function projectSamlServiceMetadata(value: unknown, acs: string) {
-	const configured = configureOwnedSaml(value, acs);
+export function projectSamlServiceMetadata(
+	value: unknown,
+	acs: string,
+	generatedSPOnly?: boolean,
+) {
+	const configured = configureOwnedSaml(value, acs, { generatedSPOnly });
 	if (!configured.postLocations.includes(acs)) invalid();
 	return configured.service.getMetadata();
 }

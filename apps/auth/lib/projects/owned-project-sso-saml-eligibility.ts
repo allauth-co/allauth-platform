@@ -11,9 +11,10 @@ function certificatePem(certificate: string) {
 export function checkProjectSamlConfiguration(
 	provider: { issuer: string; samlConfig: Record<string, unknown> },
 	acs: string,
+	generatedSPOnly?: boolean,
 ) {
 	try {
-		assertProjectSamlConfiguration(provider, acs);
+		assertProjectSamlConfiguration(provider, acs, generatedSPOnly);
 	} catch {
 		throw new Error(
 			"This configured SAML provider is outside the candidate transport.",
@@ -24,8 +25,11 @@ export function checkProjectSamlConfiguration(
 function assertProjectSamlConfiguration(
 	provider: { issuer: string; samlConfig: Record<string, unknown> },
 	acs: string,
+	generatedSPOnly?: boolean,
 ) {
-	const configuration = configureOwnedSaml(provider.samlConfig, acs);
+	const configuration = configureOwnedSaml(provider.samlConfig, acs, {
+		generatedSPOnly,
+	});
 	const { saved, service, idp, postLocations, requestsSigned } = configuration;
 	const logout = service.entityMeta.getSingleLogoutService(undefined);
 	if (
