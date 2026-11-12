@@ -29,7 +29,7 @@ export type HostedProjectAuthPageProps = {
 	searchParams: Promise<HostedSdkSearchParams>;
 };
 
-/** Only a reverified accounts hostname can select the allowlisted project view. */
+/** Select the project view only on a reverified project hostname. */
 export async function HostedProjectAuthPage({
 	view,
 	searchParams,
@@ -64,8 +64,7 @@ export async function HostedProjectAuthPage({
 		async (engine, _bound, binding) => {
 			if (
 				!binding ||
-				binding.kind !== "accounts" ||
-				!(await hostedSdkSelected(env, binding.project))
+				!(await hostedSdkSelected(env, binding.project, binding.kind))
 			)
 				return null;
 			if (view === "authRedirect") {
@@ -73,6 +72,7 @@ export async function HostedProjectAuthPage({
 				const request = hostedAuthRedirectRequest(
 					params,
 					`https://${binding.hostname}`,
+					binding.kind,
 				);
 				if (
 					!request ||
@@ -91,7 +91,7 @@ export async function HostedProjectAuthPage({
 					: request.signIn;
 				return { kind: "redirect", destination } as const;
 			}
-			const request = hostedSdkViewRequest(view, params);
+			const request = hostedSdkViewRequest(view, params, binding.kind);
 			if (!request) return null;
 			if (
 				request.oauthQuery &&

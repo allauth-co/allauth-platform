@@ -8576,6 +8576,204 @@ describe.skipIf(!existsSync(fixture))(
 			}
 		}, 180_000);
 
+		it("preserves dormant direct Google links and active sessions across cutover and rollback", async () => {
+			const local: { container: string; DATABASE_URL: string } = JSON.parse(
+				readFileSync(fixture, "utf8"),
+			);
+			const base = new URL(local.DATABASE_URL);
+			if (
+				local.container !== "allauth-production-test-20261007" ||
+				base.hostname !== "127.0.0.1" ||
+				base.port !== "55445"
+			)
+				throw new Error(
+					"The dormant provider rehearsal requires isolated PostgreSQL.",
+				);
+
+			const admin = new Pool({ connectionString: base.href, max: 1 });
+			const name = `allauth_hosted_${randomUUID().replaceAll("-", "")}`;
+			const databaseURL = new URL(`/${name}`, base).href;
+			let created = false;
+			let database: Pool | undefined;
+			let service: Awaited<ReturnType<typeof openProcess>> | undefined;
+			try {
+				await admin.query(`CREATE DATABASE "${name}"`);
+				created = true;
+				const { alpha } = await seed(databaseURL, true);
+				const state = new Pool({ connectionString: databaseURL, max: 1 });
+				database = state;
+				const host = `${alpha.slug}-accounts.allauth.co`;
+				const path = "/api/auth";
+				const origin = `https://${host}`;
+				const destination = `${origin}/account`;
+				const settingPath = `/api/admin/projects/${alpha.slug}/providers/google`;
+				const open = () => openProcess(databaseURL, alpha, {});
+				async function writer(...args: string[]) {
+					const { stdout } = await promisify(execFile)(
+						process.execPath,
+						["scripts/project-engine-writer.mjs", ...args],
+						{
+							cwd: appRoot,
+							env: {
+								...childEnvironment(),
+								DATABASE_URL: databaseURL,
+								ALLAUTH_PROJECT_ENGINE_INTERNAL_ID: alpha.id,
+							},
+						},
+					);
+					return JSON.parse(stdout);
+				}
+				async function request(
+					endpoint: string,
+					options?: Parameters<NonNullable<typeof service>["request"]>[1],
+					expected = 200,
+				) {
+					if (!service) throw new Error("The runtime process is unavailable.");
+					const response = await service.request(endpoint, options);
+					expect(
+						response.status,
+						`${endpoint}: ${await response.clone().text()}`,
+					).toBe(expected);
+					return response;
+				}
+				async function session(browserCookie: string) {
+					const response = await request(`${path}/get-session`, {
+						host,
+						cookie: browserCookie,
+					});
+					const { session, user } = (await response.json()) as {
+						session: { id: string };
+						user: { id: string; email: string };
+					};
+					return { id: session.id, userId: user.id, email: user.email };
+				}
+				async function link() {
+					const { rows } = await state.query<{
+						id: string;
+						userId: string;
+						accountId: string;
+						hasAccessToken: boolean;
+						fingerprint: string;
+					}>(
+						`SELECT id,"userId","accountId","accessToken" IS NOT NULL AS "hasAccessToken",
+						 encode(sha256(convert_to(to_jsonb(a)::text,'UTF8')),'hex') AS fingerprint
+						 FROM "${alpha.schemaName}"."account" a WHERE "providerId"='google'`,
+					);
+					expect(rows).toHaveLength(1);
+					return rows[0]!;
+				}
+				async function googleSignIn() {
+					const begun = await startFixtureProvider(service!, "google", {
+						prefix: path,
+						callback: `${origin}${path}/callback/google`,
+						destination,
+						host,
+					});
+					const completed = await request(
+						begun.path,
+						{ host, cookie: begun.cookie },
+						302,
+					);
+					expect(completed.headers.get("location")).toBe(destination);
+					return cookie(completed);
+				}
+				const password = {
+					email: credentials.project.email,
+					password: credentials.password,
+				};
+				service = await open();
+				await request("/api/health");
+				const rootCookie = cookie(
+					await request(`${path}/sign-in/email`, {
+						body: { ...password, email: credentials.platform.email },
+					}),
+				);
+				async function changeGoogle(version: number, enabled: boolean) {
+					const result = await request(settingPath, {
+						method: "PATCH",
+						cookie: rootCookie,
+						body: { version, google: { enabled, clientId: "" } },
+					});
+					expect(await result.json()).toMatchObject({
+						version: version + 1,
+						google: { enabled, clientSecretConfigured: true },
+					});
+				}
+				const legacyCookie = await googleSignIn();
+				const legacySession = await session(legacyCookie);
+				expect(legacySession.email).toBe(runtimeFixtureGoogle.email);
+				const original = await link();
+				expect(original).toMatchObject({
+					userId: legacySession.userId,
+					accountId: runtimeFixtureGoogle.subject,
+					hasAccessToken: true,
+				});
+				await changeGoogle(1, false);
+				await request("/api/health");
+				expect(await writer("switch", "legacy", "0", "allauth")).toEqual({
+					writer: "allauth",
+					revision: 1,
+				});
+
+				const config = await request(`${path}/sdk/config`, { host });
+				expect(await config.json()).toMatchObject({
+					google: false,
+					googleProvider: null,
+				});
+				const disabled = await request(
+					`${path}/sign-in/social`,
+					{
+						host,
+						body: {
+							provider: "google",
+							callbackURL: destination,
+							disableRedirect: true,
+						},
+					},
+					404,
+				);
+				expect(await disabled.json()).toMatchObject({
+					code: "PROVIDER_NOT_FOUND",
+				});
+				expect(await session(legacyCookie)).toEqual(legacySession);
+				expect(await link()).toEqual(original);
+				const ownedCookie = cookie(
+					await request(`${path}/sign-in/email`, { host, body: password }),
+				);
+				const ownedSession = await session(ownedCookie);
+				expect(ownedSession.userId).toBe(credentials.project.id);
+				await changeGoogle(2, true);
+				expect(
+					await (await request(`${path}/sdk/config`, { host })).json(),
+				).toMatchObject({ google: true, googleProvider: "google" });
+				await changeGoogle(3, false);
+				expect(await session(ownedCookie)).toEqual(ownedSession);
+				expect(await link()).toEqual(original);
+				expect(await writer("switch", "allauth", "1", "legacy")).toEqual({
+					writer: "legacy",
+					revision: 2,
+				});
+				await service.stop();
+				service = undefined;
+				service = await open();
+				await request("/api/health");
+				expect(await session(legacyCookie)).toEqual(legacySession);
+				expect(await session(ownedCookie)).toEqual(ownedSession);
+				await changeGoogle(4, true);
+				expect((await session(await googleSignIn())).userId).toBe(
+					legacySession.userId,
+				);
+				expect((await link()).id).toBe(original.id);
+			} finally {
+				try {
+					await Promise.all([service?.stop(), database?.end()]);
+					if (created) await dropClosedFixtureDatabase(admin, name);
+				} finally {
+					await admin.end();
+				}
+			}
+		}, 45_000);
+
 		it("pins a synthetic encrypted SAML provider across direct, hosted, and rollback transports", async () => {
 			const local: { container: string; DATABASE_URL: string } = JSON.parse(
 				readFileSync(fixture, "utf8"),

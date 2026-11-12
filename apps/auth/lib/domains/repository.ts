@@ -178,16 +178,18 @@ const activeHostnamePairs = `FROM public."allauthCustomHostname" h
 		WHERE s."pairId"=d.id AND s."ownershipVerifiedAt" IS NOT NULL AND s."providerStatus"='active'
 			AND s."sslStatus"='active' AND s."routingVerifiedAt" IS NOT NULL AND s."lastIssue" IS NULL)=2`;
 
-/** Read saved active accounts names even when deployment hosting settings are missing. */
-export async function listStoredActiveProjectAccountsHostnames(
+/** Read saved active hostname bindings even when deployment hosting settings are missing. */
+export async function listStoredActiveProjectHostnames(
 	projectId: string,
 	database: WorkspaceDatabase,
-): Promise<string[]> {
-	const { rows } = await database.query<{ hostname: string }>(
-		`SELECT h.hostname ${activeHostnamePairs} AND p.id=$1 AND h.kind='accounts' ORDER BY h.hostname`,
+) {
+	const { rows } = await database.query<
+		Pick<StoredCustomHostname, "kind" | "hostname">
+	>(
+		`SELECT h.kind,h.hostname ${activeHostnamePairs} AND p.id=$1 ORDER BY h.hostname`,
 		[projectId],
 	);
-	return rows.map(({ hostname }) => hostname);
+	return rows;
 }
 
 /** Only a completely active pair can select a tenant; caller-supplied origin headers are not authority. */

@@ -2,7 +2,7 @@ import type { Pool } from "pg";
 import type { AuthEnvironment } from "../configuration";
 import { setting } from "../configuration";
 import { resolveHostedBinding } from "../domains/hosting";
-import { listStoredActiveProjectAccountsHostnames } from "../domains/repository";
+import { listStoredActiveProjectHostnames } from "../domains/repository";
 import { domainDefaults } from "../domains/validation";
 import { projectEngineEnrollment } from "./project-engine-binding";
 import { projectEngineSelected } from "./project-engine-internal-selection";
@@ -24,6 +24,7 @@ async function verifyProjectTransports(
 	env: AuthEnvironment,
 	id: string,
 ) {
+	// cspell:ignore tgrelid tgname tgenabled tgfoid
 	const {
 		rows: [row],
 	} = await database.query<{ slug: string; webhookGuardInstalled: boolean }>(
@@ -46,9 +47,8 @@ async function verifyProjectTransports(
 	const lease = projectWriterLease(project, env);
 	if (!lease) throw new Error("The project writer is unavailable.");
 	await lease.withCurrent(async () => {
-		const managed = new URL(domainDefaults(project.slug, env).accounts)
-			.hostname;
-		const custom = await listStoredActiveProjectAccountsHostnames(
+		const managed = domainDefaults(project.slug, env);
+		const custom = await listStoredActiveProjectHostnames(
 			project.id,
 			database,
 		);
@@ -57,43 +57,47 @@ async function verifyProjectTransports(
 			setting(env, "ALLAUTH_DEPLOYMENT_MODE") === "self-hosted" &&
 			setting(env, "CLOUDFLARE_SAAS_READY") !== "true" &&
 			custom.length === 0;
+		const hosted = directOnly
+			? []
+			: [
+					{ kind: "accounts", hostname: new URL(managed.accounts).hostname },
+					{ kind: "frontend-api", hostname: new URL(managed.frontendApi).hostname },
+					...custom,
+				];
 		const bindings = await Promise.all(
-			(directOnly ? [] : [managed, ...custom]).map(async (hostname) => {
+			hosted.map(async ({ kind, hostname }) => {
 				const binding = await resolveHostedBinding(hostname, env);
 				if (
-					binding?.kind !== "accounts" ||
+					binding?.kind !== kind ||
 					binding.hostname !== hostname ||
 					!sameProject(project, binding.project) ||
 					!projectEngineSelected(env, binding.project)
 				)
-					throw new Error(
-						"The project accounts hostname is unavailable.",
-					);
+					throw new Error(`The project ${kind} hostname is unavailable.`);
 				return binding;
 			}),
 		);
-		await Promise.all([
-			confirmProjectEngine(project, env),
-			...bindings.map(({ project, hostname }) =>
-				confirmProjectEngine(project, env, hostname),
-			),
-		]);
+		// A realm with three custom pairs has more transports than the runtime cache can reserve at once.
+		await confirmProjectEngine(project, env);
+		for (const binding of bindings)
+			await confirmProjectEngine(binding.project, env, binding.hostname);
 		const currentProject = await getProject(project.slug, env);
 		if (!sameProject(project, currentProject) || !projectEngineSelected(env, currentProject))
 			throw new Error(
 				"The project selection changed during readiness.",
 			);
-		const current = await listStoredActiveProjectAccountsHostnames(
+		const current = await listStoredActiveProjectHostnames(
 			project.id,
 			database,
 		);
 		if (
 			current.length !== custom.length ||
-			current.some((hostname, index) => hostname !== custom[index])
+			current.some(
+				({ kind, hostname }, index) =>
+					kind !== custom[index]?.kind || hostname !== custom[index]?.hostname,
+			)
 		)
-			throw new Error(
-				"The project accounts hostnames changed during readiness.",
-			);
+			throw new Error("The project hosted hostnames changed during readiness.");
 	});
 }
 

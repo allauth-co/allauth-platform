@@ -9,13 +9,14 @@ import {
 	hostedSdkSelected,
 } from "./hosted-sdk-selection";
 import { withPortalHeadersEngine } from "./hosting";
+import type { DomainKind } from "./types";
 
 const signIn = "/sign-in";
 const providerProof =
 	/^(?:token|code|otp|error|errordescription|(?:access|refresh|id|session)token|sig|oauthquery|state)$/i;
 
-function localRetry(callback: string) {
-	if (callback.length > 2048 || hostedSdkReturnPath(callback) !== callback)
+function localRetry(callback: string, kind: DomainKind) {
+	if (callback.length > 2048 || hostedSdkReturnPath(callback, kind) !== callback)
 		return false;
 	const target = new URL(callback, "https://allauth.invalid");
 	return (
@@ -26,7 +27,7 @@ function localRetry(callback: string) {
 	);
 }
 
-function retryIntent(params: HostedSdkSearchParams) {
+function retryIntent(params: HostedSdkSearchParams, kind: DomainKind) {
 	const callback = params.callbackUrl;
 	if (callback !== undefined) {
 		if (
@@ -43,7 +44,7 @@ function retryIntent(params: HostedSdkSearchParams) {
 					"https://allauth.invalid",
 				).searchParams.toString(),
 			};
-		if (localRetry(callback)) return { callback };
+		if (localRetry(callback, kind)) return { callback };
 		return {};
 	}
 	if (typeof params.client_id !== "string" || typeof params.sig !== "string")
@@ -57,7 +58,7 @@ function retryIntent(params: HostedSdkSearchParams) {
 	return query ? { query: query.toString() } : {};
 }
 
-/** Error pages keep safe retry destinations only after proving the exact development realm. */
+/** Error pages keep safe retry destinations only after proving the exact project realm. */
 export async function hostedAuthErrorRetry(
 	headers: Headers,
 	params: HostedSdkSearchParams,
@@ -68,11 +69,11 @@ export async function hostedAuthErrorRetry(
 	if (!hasHostedSdkSelection(env)) return undefined;
 	return withPortalHeadersEngine(headers, async (engine, _bound, binding) => {
 		if (
-			binding?.kind !== "accounts" ||
-			!(await hostedSdkSelected(env, binding.project))
+			!binding ||
+			!(await hostedSdkSelected(env, binding.project, binding.kind))
 		)
 			return undefined;
-		const { query, callback } = retryIntent(params);
+		const { query, callback } = retryIntent(params, binding.kind);
 		if (
 			query &&
 			(await verifiedHostedOAuthContinuation(engine, binding.hostname, query))

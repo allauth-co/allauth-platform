@@ -32,8 +32,7 @@ async function handle(request: Request) {
 	return withPortalAuthEngine(request, async (engine, env, bound, binding) => {
 		if (
 			!binding ||
-			binding.kind !== "accounts" ||
-			!hostedSdkTransportEnabled(env, binding.project)
+			!hostedSdkTransportEnabled(env, binding.project, binding.kind)
 		)
 			return hostedSdkFailure(404, "Authentication route is unavailable.");
 		const url = new URL(bound.url);

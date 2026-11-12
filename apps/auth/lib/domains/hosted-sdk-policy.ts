@@ -1,5 +1,6 @@
 import { applicationMfaCallback } from "../mfa-continuation";
 import { oauthBrowserQuery, oauthBrowserReturnPath } from "../oauth-browser";
+import type { DomainKind } from "./types";
 
 export const hostedSdkBasePath = "/api/auth/hosted-ui";
 export const hostedSdkProjectIdsSetting =
@@ -60,8 +61,11 @@ export function hostedSdkProjectEnabled(
 }
 
 /** Retain the hosted portal's existing local post-authentication destinations. */
-export function hostedSdkReturnPath(value: string | undefined) {
-	if (!value) return "/console";
+export function hostedSdkReturnPath(
+	value: string | undefined,
+	kind: DomainKind = "accounts",
+) {
+	if (!value) return kind === "accounts" ? "/console" : "/account";
 	if (!value.startsWith("/") || value.startsWith("//")) return "/account";
 	const destination = applicationMfaCallback(
 		value,
@@ -71,7 +75,8 @@ export function hostedSdkReturnPath(value: string | undefined) {
 	if (!destination) return "/account";
 	const target = new URL(destination, localOrigin);
 	if (destination === "/") return destination;
-	if (target.pathname === "/console" && !target.hash) return destination;
+	if (kind === "accounts" && target.pathname === "/console" && !target.hash)
+		return destination;
 	if (
 		/^\/(account|organizations|accept-invitation)(\/|$)/.test(target.pathname)
 	)
@@ -159,23 +164,49 @@ function normalizedCallbackValue(value: string | string[] | undefined) {
 	return typeof value === "string" ? value.trim().toLowerCase().replace(/[\s-]+/g, "_") : "";
 }
 
-function hostedCallbackRequest(params: HostedSdkSearchParams): HostedViewRequest | null {
-	if (Object.entries(params).some(([name, value]) =>
-		value !== undefined && (!callbackParameters.has(name) || typeof value !== "string")))
+function hostedCallbackRequest(
+	params: HostedSdkSearchParams,
+	kind: DomainKind,
+): HostedViewRequest | null {
+	if (
+		Object.entries(params).some(
+			([name, value]) =>
+				value !== undefined &&
+				(!callbackParameters.has(name) || typeof value !== "string"),
+		)
+	)
 		return null;
-	const result = normalizedCallbackValue(params.result) || normalizedCallbackValue(params.status);
+	const result =
+		normalizedCallbackValue(params.result) ||
+		normalizedCallbackValue(params.status);
 	const flow = normalizedCallbackValue(params.flow ?? params.source);
-	const callbackStatus = result === "success" ? callbackSuccessFlows.get(flow) : callbackStatuses.get(result);
+	const callbackStatus =
+		result === "success"
+			? callbackSuccessFlows.get(flow)
+			: callbackStatuses.get(result);
 	const raw = params.redirectTo ?? params.returnTo;
 	if (!callbackStatus && (result || flow || raw !== undefined)) return null;
-	const continuation = typeof raw === "string" && raw.startsWith("/") && !raw.startsWith("//")
-		? applicationMfaCallback(raw, localOrigin, hostedSdkBasePath)
-		: undefined;
+	const continuation =
+		typeof raw === "string" && raw.startsWith("/") && !raw.startsWith("//")
+			? applicationMfaCallback(raw, localOrigin, hostedSdkBasePath)
+			: undefined;
 	if (raw !== undefined && !continuation) return null;
-	const destination = callbackStatus === "passwordReset"
-		? "/sign-in"
-		: continuation ?? (callbackStatus === "accountLinked" ? "/account/security" : "/sign-in");
-	return { destination, legacyPath: "/auth-callback?interface=legacy", callbackStatus };
+	const destination =
+		callbackStatus === "passwordReset"
+			? "/sign-in"
+			: (continuation ??
+				(callbackStatus === "accountLinked"
+					? "/account/security"
+					: "/sign-in"));
+	return {
+		destination:
+			kind === "frontend-api" &&
+			new URL(destination, localOrigin).pathname === "/console"
+				? "/account"
+				: destination,
+		legacyPath: "/auth-callback?interface=legacy",
+		callbackStatus,
+	};
 }
 
 type HostedAuthRedirectRequest =
@@ -193,10 +224,11 @@ function signInForRedirect(
 	};
 }
 
-/** Resolve a browser redirect against the verified accounts hostname, with separate issuer continuations. */
+/** Resolve a browser redirect against the verified hostname or its project issuer. */
 export function hostedAuthRedirectRequest(
 	params: HostedSdkSearchParams,
 	origin: string,
+	kind: DomainKind = "accounts",
 ): HostedAuthRedirectRequest | null {
 	const raw = params.redirectTo;
 	if (raw === undefined && params.client_id !== undefined) {
@@ -252,7 +284,7 @@ export function hostedAuthRedirectRequest(
 		)
 			return { destination, issuer: true };
 		return hostedSdkReturnPath(destination) === destination
-			? signInForRedirect(destination)
+			? signInForRedirect(hostedSdkReturnPath(destination, kind))
 			: null;
 	} catch {
 		return null;
@@ -263,8 +295,9 @@ export function hostedAuthRedirectRequest(
 export function hostedSdkViewRequest(
 	view: Exclude<HostedSdkView, "authRedirect">,
 	params: HostedSdkSearchParams,
+	kind: DomainKind = "accounts",
 ): HostedViewRequest | null {
-	if (view === "authCallback") return hostedCallbackRequest(params);
+	if (view === "authCallback") return hostedCallbackRequest(params, kind);
 	if (
 		(view === "verifyEmail" ||
 			view === "resetLinkSent" ||
@@ -305,6 +338,7 @@ export function hostedSdkViewRequest(
 	const raw = params.returnTo ?? params.callbackUrl;
 	const destination = hostedSdkReturnPath(
 		typeof raw === "string" ? raw : undefined,
+		kind,
 	);
 	const fallback = new URL(views[view], localOrigin);
 	fallback.searchParams.set("interface", "legacy");

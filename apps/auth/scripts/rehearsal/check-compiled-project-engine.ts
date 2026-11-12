@@ -81,6 +81,7 @@ const platform = railway
 const portalDomain = "allauth.example.com";
 const customDomain = "project-engine-rehearsal.example.com";
 const host = `accounts.${customDomain}`;
+const customApi = `api.${customDomain}`;
 const oldPassword = `Rehearsal-original-${randomUUID()}!`;
 const newPassword = `Rehearsal-updated-${randomUUID()}!`;
 const accountId = randomUUID();
@@ -468,6 +469,35 @@ function sessionCookie(response: Awaited<ReturnType<typeof request>>) {
 	return cookie.split(";", 1)[0];
 }
 
+function frontendSessionCookie(
+	response: Awaited<ReturnType<typeof request>>,
+	hostname: string,
+) {
+	const cookie = sessionCookie(response);
+	const issued = response.cookies.find((value) =>
+		value.startsWith(`${cookie};`),
+	);
+	assert.ok(issued, `${hostname} issues the project session cookie.`);
+	assert.match(cookie, /^__Secure-allauth_project_/);
+	for (const attribute of [
+		/;\s*Secure(?:;|$)/i,
+		/;\s*HttpOnly(?:;|$)/i,
+		/;\s*SameSite=Lax(?:;|$)/i,
+		/;\s*Path=\/(?:;|$)/i,
+	])
+		assert.match(
+			issued,
+			attribute,
+			`${hostname} sets the browser cookie attributes.`,
+		);
+	assert.doesNotMatch(
+		issued,
+		/;\s*Domain=/i,
+		`${hostname} issues a host-only cookie.`,
+	);
+	return cookie;
+}
+
 function deviceCookie(
 	response: Awaited<ReturnType<typeof request>>,
 	realm: Realm,
@@ -656,7 +686,7 @@ async function seed() {
 		(id,"pairId","projectId",kind,hostname,"proofToken","ownershipVerifiedAt","providerId","providerStatus","sslStatus","routingVerifiedAt")
 		VALUES
 		 ('${randomUUID()}','${pairId}','${owned.id}','accounts','${host}','${randomUUID()}',now(),'${randomUUID()}','active','active',now()),
-		 ('${randomUUID()}','${pairId}','${owned.id}','frontend-api','api.${customDomain}','${randomUUID()}',now(),'${randomUUID()}','active','active',now());
+		 ('${randomUUID()}','${pairId}','${owned.id}','frontend-api','${customApi}','${randomUUID()}',now(),'${randomUUID()}','active','active',now());
 	`,
 	);
 	return { owned, control, unselected, rootCookie: cookie };
@@ -817,7 +847,14 @@ try {
 	const connected = fencedSelection ? await startConnectedApplication(owned, originalHostedCookie) : undefined;
 	const managedHost = `${owned.slug}-accounts.${portalDomain}`;
 	const managedApi = `${owned.slug}-api.${portalDomain}`;
-	const nativeHostedSessions: { hostname: string; cookie: string; id: string }[] = [];
+	const frontendHosts = [
+		{ hostname: managedApi, clientIP: "192.0.2.63" },
+		{ hostname: customApi, clientIP: "192.0.2.64" },
+	];
+	type HostedSession = { hostname: string; cookie: string; id: string };
+	const nativeHostedSessions: HostedSession[] = [];
+	const nativeFrontendSessions: HostedSession[] = [];
+	const ownedFrontendSessions: HostedSession[] = [];
 	let ownedManagedCookie: string | undefined;
 	if (fencedSelection) {
 		for (const { hostname, clientIP } of [
@@ -839,6 +876,27 @@ try {
 				native.cookies
 					.filter((cookie) => cookie.includes(".session_token="))
 					.every((cookie) => !/; domain=/i.test(cookie)),
+			);
+		}
+		for (const { hostname, clientIP } of frontendHosts) {
+			await hostedPage(hostname, false);
+			expectStatus(
+				await request("/api/auth/hosted-ui/sdk/config", { host: hostname }),
+				404,
+				"An unselected frontend hostname keeps its existing hosted UI boundary.",
+			);
+			const native = await request("/api/auth/sign-in/email", {
+				host: hostname,
+				clientIP,
+				body: ownedLogin,
+			});
+			expectStatus(
+				native,
+				200,
+				"Native signs in on the verified frontend hostname.",
+			);
+			nativeFrontendSessions.push(
+				await captureFrontendSession(native, hostname, false),
 			);
 		}
 		const redirects = await query(
@@ -929,8 +987,12 @@ try {
 		return JSON.parse(output) as { writer: string; revision: number };
 	}
 
-	async function hostedPage(hostname: string, firstParty: boolean) {
-		const page = await request("/sign-in", { host: hostname });
+	async function hostedPage(
+		hostname: string,
+		firstParty: boolean,
+		path = "/sign-in",
+	) {
+		const page = await request(path, { host: hostname });
 		expectStatus(page, 200, "Render sign-in for the verified project hostname.");
 		assert.equal(page.body.includes("/api/auth/hosted-ui"), firstParty);
 	}
@@ -968,6 +1030,43 @@ try {
 			});
 			assert.equal(current?.user.id, accountId);
 			assert.equal(current?.session.id, id);
+		}
+	}
+
+	async function captureFrontendSession(
+		response: Awaited<ReturnType<typeof request>>,
+		hostname: string,
+		firstParty: boolean,
+	): Promise<HostedSession> {
+		const cookie = frontendSessionCookie(response, hostname);
+		const current = await readSession(
+			firstParty ? "/api/auth/hosted-ui/get-session" : "/api/auth/get-session",
+			{ host: hostname, cookie, accept: "application/json" },
+		);
+		assert.equal(current?.user.id, accountId);
+		assert.ok(current?.session.id);
+		await checkFrontendConsole(hostname, cookie);
+		return { hostname, cookie, id: current.session.id };
+	}
+
+	async function checkFrontendConsole(hostname: string, cookie: string) {
+		expectStatus(
+			await request("/console", { host: hostname, cookie }),
+			404,
+			"The gateway denies console access from a signed-in frontend hostname.",
+		);
+	}
+
+	async function checkFrontendSessions(sessions: HostedSession[]) {
+		for (const { hostname, cookie, id } of sessions) {
+			const current = await readSession("/api/auth/hosted-ui/get-session", {
+				host: hostname,
+				cookie,
+				accept: "application/json",
+			});
+			assert.equal(current?.user.id, accountId);
+			assert.equal(current?.session.id, id);
+			await checkFrontendConsole(hostname, cookie);
 		}
 	}
 
@@ -1045,6 +1144,16 @@ try {
 		await assert.rejects(projectWriter("switch", "legacy", "0", "allauth"));
 		await hostedPage(managedHost, true);
 		await hostedPage(host, true);
+		for (const { hostname } of frontendHosts) {
+			await hostedPage(hostname, true);
+			expectStatus(
+				await request("/api/auth/hosted-ui/sdk/config", { host: hostname }),
+				200,
+				"The selected writer serves first-party configuration on the frontend hostname.",
+			);
+		}
+		assert.equal(nativeFrontendSessions.length, frontendHosts.length);
+		await checkFrontendSessions(nativeFrontendSessions);
 		await configuredWebhook?.rotate();
 		expectStatus(
 			await request("/api/auth/hosted-ui/sdk/config", { host }),
@@ -1052,48 +1161,68 @@ try {
 			"The selected realm uses the first-party hosted API.",
 		);
 		if (connected) {
-			const authorization = new URLSearchParams(connected.queryString);
-			const state = `${"signed-application-state".repeat(355)}+one&two`;
-			authorization.set("state", state);
-			const oauthQuery = signProjectIssuerQuery(authorization, authSecret).toString();
-			const callbackURL = `https://${host}/oauth2/continue?${oauthQuery}`;
-			const transport = {
-				host,
-				clientIP: "192.0.2.62",
-				accept: "application/json",
-			};
-			const body = { ...ownedLogin, callbackURL };
-			assert.ok(Buffer.byteLength(JSON.stringify(body)) > 8192);
-			const signedIn = await request("/api/auth/hosted-ui/sign-in/email", {
-				...transport,
-				body,
-			});
-			expectStatus(
-				signedIn,
-				200,
-				"Password sign-in accepts a long signed app return.",
-			);
-			const signInResult = JSON.parse(signedIn.body);
-			assert.equal(signInResult.url, callbackURL);
-			assert.equal(signInResult.user.id, accountId);
-			const continued = await request("/api/auth/oauth2/continue", {
-				...transport,
-				cookie: sessionCookie(signedIn),
-				body: { selected: true, oauth_query: oauthQuery },
-			});
-			expectStatus(
-				continued,
-				200,
-				"The compiled issuer finishes the same signed app return.",
-			);
-			const redirect = new URL(JSON.parse(continued.body).url);
-			assert.equal(
-				redirect.origin + redirect.pathname,
-				authorization.get("redirect_uri"),
-			);
-			assert.ok(redirect.searchParams.get("state") === state);
-			assert.ok(redirect.searchParams.has("code"));
+			for (const { hostname, clientIP } of [
+				{ hostname: host, clientIP: "192.0.2.62" },
+				...frontendHosts,
+			]) {
+				const authorization: URLSearchParams = new URLSearchParams(
+					connected.queryString,
+				);
+				const frontend = hostname !== host;
+				const state = frontend
+					? `${randomUUID()}+one&two`
+					: `${"signed-application-state".repeat(355)}+one&two`;
+				authorization.set("state", state);
+				const oauthQuery = signProjectIssuerQuery(
+					authorization,
+					authSecret,
+				).toString();
+				const callbackURL = `https://${hostname}/oauth2/continue?${oauthQuery}`;
+				const transport = {
+					host: hostname,
+					clientIP,
+					accept: "application/json",
+				};
+				const body = { ...ownedLogin, callbackURL };
+				if (frontend) await hostedPage(hostname, true, `/sign-in?${oauthQuery}`);
+				else assert.ok(Buffer.byteLength(JSON.stringify(body)) > 8192);
+				const signedIn = await request("/api/auth/hosted-ui/sign-in/email", {
+					...transport,
+					body,
+				});
+				expectStatus(
+					signedIn,
+					200,
+					"Password sign-in accepts the signed app return.",
+				);
+				const signInResult = JSON.parse(signedIn.body);
+				assert.equal(signInResult.url, callbackURL);
+				assert.equal(signInResult.user.id, accountId);
+				const signedSession = frontend
+					? await captureFrontendSession(signedIn, hostname, true)
+					: undefined;
+				if (signedSession) ownedFrontendSessions.push(signedSession);
+				const continued = await request("/api/auth/oauth2/continue", {
+					...transport,
+					cookie: signedSession?.cookie ?? sessionCookie(signedIn),
+					body: { selected: true, oauth_query: oauthQuery },
+				});
+				expectStatus(
+					continued,
+					200,
+					"The compiled issuer finishes the same signed app return.",
+				);
+				const redirect = new URL(JSON.parse(continued.body).url);
+				assert.equal(
+					redirect.origin + redirect.pathname,
+					authorization.get("redirect_uri"),
+				);
+				assert.equal(redirect.searchParams.get("state"), state);
+				assert.equal(redirect.searchParams.get("iss"), `https://${hostname}/api/auth`);
+				assert.ok(redirect.searchParams.has("code"));
+			}
 		}
+		assert.equal(ownedFrontendSessions.length, frontendHosts.length);
 		if (!railway && connected) {
 			const authorization = new URLSearchParams(connected.queryString);
 			authorization.set("state", `${"signed-application-state".repeat(171)}+one&two`);
@@ -1302,11 +1431,6 @@ try {
 			200,
 			"The managed accounts hostname uses the first-party hosted API.",
 		);
-		expectStatus(
-			await request("/api/auth/hosted-ui/sdk/config", { host: managedApi }),
-			404,
-			"The frontend API hostname keeps its existing hosted UI boundary.",
-		);
 		await checkOriginalHostedSessions();
 		const ownedManaged = await request("/api/auth/hosted-ui/sign-in/email", {
 			host: managedHost,
@@ -1385,12 +1509,17 @@ try {
 		expectStatus(await request("/api/health"), 200, "The restored writer remains ready.");
 		await hostedPage(managedHost, false);
 		await hostedPage(host, false);
+		for (const { hostname } of frontendHosts) await hostedPage(hostname, false);
 		expectStatus(
 			await request("/api/auth/hosted-ui/sdk/config", { host: managedHost }),
 			200,
 			"A first-party page already open at rollback keeps its transport.",
 		);
 		await checkOriginalHostedSessions();
+		await checkFrontendSessions([
+			...nativeFrontendSessions,
+			...ownedFrontendSessions,
+		]);
 	} else await start(releaseImage, restored, selected);
 	expectStatus(
 		await request(`${direct}/not-installed`, { realm: owned }),

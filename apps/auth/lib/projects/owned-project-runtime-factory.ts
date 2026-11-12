@@ -280,13 +280,20 @@ async function readSupportedProviders(
 		registered.id,
 		env,
 	);
+	const googleId = googleClientId.safeParse(storedGoogle.clientId);
+	const hasGoogleClientId =
+		googleId.success &&
+		Boolean(googleId.data) &&
+		googleId.data === storedGoogle.clientId;
+	// Disabling the configured client leaves its links available for re-enablement.
+	const dormantGoogle =
+		!storedGoogle.enabled &&
+		hasGoogleClientId &&
+		Boolean(storedGoogle.encryptedClientSecret);
 	if (google) {
-		const id = googleClientId.safeParse(google.clientId);
 		const secret = googleClientSecret.safeParse(google.clientSecret);
 		if (
-			!id.success ||
-			!id.data ||
-			id.data !== google.clientId ||
+			!hasGoogleClientId ||
 			!secret.success ||
 			!secret.data ||
 			secret.data !== google.clientSecret
@@ -346,7 +353,9 @@ async function readSupportedProviders(
 		 EXISTS (
 		  SELECT 1 FROM "${schema}"."account" a JOIN "${schema}"."user" u ON u.id=a."userId"
 		  CROSS JOIN LATERAL (SELECT u."privateMetadata"->'allauthClerkMigration' AS value) provenance
-		  WHERE a."providerId" <> ALL($1::text[]) AND NOT COALESCE((
+		  WHERE a."providerId" <> ALL($1::text[])
+		   AND NOT ($5::boolean AND a."providerId" = 'google' AND a.password IS NULL)
+		   AND NOT COALESCE((
 		   a."providerId" IN ('google','apple') AND a.password IS NULL AND a.scope IS NULL AND
 		   a."accessToken" IS NULL AND a."refreshToken" IS NULL AND a."idToken" IS NULL AND
 		   a."accessTokenExpiresAt" IS NULL AND a."refreshTokenExpiresAt" IS NULL AND
@@ -365,7 +374,13 @@ async function readSupportedProviders(
 		  ), FALSE)
 		 )
 		) AS incompatible`,
-		[providers, ownedAvatarSelected(env, project.id), project.id, agentHosts],
+		[
+			providers,
+			ownedAvatarSelected(env, project.id),
+			project.id,
+			agentHosts,
+			dormantGoogle,
+		],
 	);
 	if (!snapshot || snapshot.incompatible)
 		throw new Error(

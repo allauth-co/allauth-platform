@@ -10,6 +10,7 @@ import * as consoleOrganizationRoles from "../../app/api/admin/organizations/[or
 import * as consoleOrganizationDetail from "../../app/api/admin/organizations/[organizationId]/route";
 import * as consoleOrganizationTeams from "../../app/api/admin/organizations/[organizationId]/teams/route";
 import * as consoleOrganizations from "../../app/api/admin/organizations/route";
+import { PATCH as consoleGoogleProvider } from "../../app/api/admin/projects/[slug]/providers/google/route";
 import { PATCH as consoleUserMetadata } from "../../app/api/admin/users/[userId]/metadata/route";
 import { GET as consoleUser } from "../../app/api/admin/users/[userId]/route";
 import { GET as consoleUsers } from "../../app/api/admin/users/route";
@@ -90,6 +91,12 @@ async function dispatch(request: Request) {
 		return config(request);
 	if (request.method === "GET" && path === "/oauth/login")
 		return brokerLogin(request);
+	const googleProvider =
+		/^\/api\/admin\/projects\/([^/]+)\/providers\/google$/.exec(path);
+	if (googleProvider && request.method === "PATCH")
+		return consoleGoogleProvider(request, {
+			params: Promise.resolve({ slug: decodeURIComponent(googleProvider[1]!) }),
+		});
 	if (path === "/api/admin/applications") {
 		if (request.method === "GET") return consoleApplications.GET(request);
 		if (request.method === "POST") return consoleApplications.POST(request);

@@ -10,7 +10,7 @@ import type { AuthEnvironment } from "../configuration";
 import type { ControlPrincipal } from "../control/types";
 import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
 import { requireWorkspacePrincipal } from "../workspaces/authorization";
-import { createProjectDomains, deleteProjectDomains, listProjectDomains, listStoredActiveProjectAccountsHostnames, lookupActiveHostname, verifyProjectDomains } from "./repository";
+import { createProjectDomains, deleteProjectDomains, listProjectDomains, listStoredActiveProjectHostnames, lookupActiveHostname, verifyProjectDomains } from "./repository";
 import type { DomainDns, HostnameProvider, ProviderHostname, StoredCustomHostname } from "./types";
 
 const fixturePath = new URL("../../../../.secrets/local-postgres.json", import.meta.url);
@@ -120,7 +120,7 @@ describe.skipIf(!existsSync(fixturePath))("actual PostgreSQL domain ownership an
 		routingWrong = false; await verifyProjectDomains(alice, aliceProject, value.domain.id, env, deps()); expect(await lookupActiveHostname("accounts.acme-customer.com", env, pool)).toBeTruthy();
 		proofMissing = true; await verifyProjectDomains(alice, aliceProject, value.domain.id, env, deps()); expect(await lookupActiveHostname("accounts.acme-customer.com", env, pool)).toBeNull();
 	});
-	it("lists only complete active custom accounts pairs for the exact project", async () => {
+	it("lists both kinds of complete active custom hostname pairs for the exact project", async () => {
 		const active = await create();
 		const pending = await create("pending-customer.com");
 		const deleting = await create("deleting-customer.com");
@@ -133,10 +133,19 @@ describe.skipIf(!existsSync(fixturePath))("actual PostgreSQL domain ownership an
 		failRemove = true;
 		await deleteProjectDomains(alice, aliceProject, deleting.domain.id, env, deps());
 
-		await expect(listStoredActiveProjectAccountsHostnames(aliceProject, pool)).resolves.toEqual(["accounts.acme-customer.com"]);
-		await expect(listStoredActiveProjectAccountsHostnames(bobProject, pool)).resolves.toEqual(["accounts.other-customer.com"]);
-		await expect(listStoredActiveProjectAccountsHostnames(randomUUID(), pool)).resolves.toEqual([]);
-		await expect(lookupActiveHostname("accounts.acme-customer.com", { ...env, CLOUDFLARE_SAAS_READY: "false" }, pool)).resolves.toBeNull();
+		await expect(listStoredActiveProjectHostnames(aliceProject, pool)).resolves.toEqual([
+			{ kind: "accounts", hostname: "accounts.acme-customer.com" },
+			{ kind: "frontend-api", hostname: "frontend-api.acme-customer.com" },
+		]);
+		await expect(listStoredActiveProjectHostnames(bobProject, pool)).resolves.toEqual([
+			{ kind: "accounts", hostname: "accounts.other-customer.com" },
+			{ kind: "frontend-api", hostname: "frontend-api.other-customer.com" },
+		]);
+		await expect(listStoredActiveProjectHostnames(randomUUID(), pool)).resolves.toEqual([]);
+		await expect(lookupActiveHostname("frontend-api.acme-customer.com", env, pool)).resolves.toMatchObject({
+			kind: "frontend-api", project: { id: aliceProject },
+		});
+		await expect(lookupActiveHostname("frontend-api.acme-customer.com", { ...env, CLOUDFLARE_SAAS_READY: "false" }, pool)).resolves.toBeNull();
 	});
 	it("disables routing before cleanup, retains failed cleanup reservations, and confirms provider deletion", async () => {
 		const value = await create(); await verifyProjectDomains(alice, aliceProject, value.domain.id, env, deps()); failRemove = true;

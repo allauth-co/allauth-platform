@@ -2,6 +2,7 @@ import type { Pool } from "pg";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AuthEnvironment } from "../configuration";
 import { projectEmailAliasVariable } from "../project-email-alias-config";
+import type { createOwnedProjectRuntimeCandidate } from "./owned-project-runtime-factory";
 import type { Project } from "./registry";
 import { verifyProjectEngineReadiness } from "./project-engine-internal-readiness";
 import { closeProjectInstances, withHostedProjectAuthEngine, withProjectAuth, withProjectAuthEngine } from "./runtime";
@@ -16,7 +17,7 @@ const fixture = vi.hoisted(() => {
 		resolveHostedBinding: vi.fn(),
 		admitted: { writer: "legacy" as "legacy" | "allauth", revision: 0 },
 		readGoogleProvider: vi.fn(async () => ({ version: 0, enabled: false, clientId: "", encryptedClientSecret: "", updatedAt: null as string | null })),
-		createOwned: vi.fn(async (_options: unknown) => ({
+		createOwned: vi.fn(async (_options: Parameters<typeof createOwnedProjectRuntimeCandidate>[0]) => ({
 			dispatch: async () => new Response(null, { status: 202 }),
 		})),
 		createAuth: vi.fn((..._arguments: unknown[]) => ({
@@ -285,7 +286,7 @@ it("uses the production writer only for the registered immutable project and rej
 	expect((await hosted(reselected)).status).toBe(202);
 });
 
-it("rejects readiness when either verified transport loses the exact internal realm", async () => {
+it("requires exact managed transport bindings before preparing the selected internal realm", async () => {
 	const id = "8d0da368-94b3-4897-988e-39c320a3e852";
 	const internal: Project = {
 		...project(),
@@ -300,32 +301,47 @@ it("rejects readiness when either verified transport loses the exact internal re
 	query.mockResolvedValueOnce({ rows: [{ slug: internal.slug, webhookGuardInstalled: false }] });
 	await expect(verifyProjectEngineReadiness(database, selected, [id]))
 		.rejects.toThrow("The project webhook writer migration is unavailable.");
-	const hostname = "fixture-app-accounts.allauth.co";
+	const accounts = "fixture-app-accounts.allauth.co";
+	const frontendApi = "fixture-app-api.allauth.co";
 	fixture.getProject.mockReset().mockResolvedValue(internal);
-	fixture.resolveHostedBinding.mockResolvedValueOnce({
-		kind: "accounts", hostname, project: { ...internal, schemaName: project().schemaName },
+	const binding = (hostname: string) => ({
+		kind: hostname === frontendApi ? "frontend-api" : "accounts",
+		hostname,
+		project: internal,
 	});
-	await expect(verifyProjectEngineReadiness(database, selected, [id])).rejects.toThrow(
-		"The project accounts hostname is unavailable.",
-	);
-	expect(fixture.createOwned).not.toHaveBeenCalled();
-	fixture.resolveHostedBinding.mockResolvedValueOnce({ kind: "accounts", hostname, project: internal });
-	fixture.getProject
-		.mockResolvedValueOnce(internal)
-		.mockResolvedValueOnce({ ...internal, id: "0953c4f5-a783-4e91-9055-a05ead278cd0" });
+	fixture.resolveHostedBinding.mockReset().mockImplementation(async (hostname: string) => binding(hostname));
 	const confirm = vi.spyOn(projectRuntime, "confirmProjectEngine").mockResolvedValue(undefined);
 	try {
+		fixture.resolveHostedBinding.mockResolvedValueOnce({
+			kind: "accounts", hostname: accounts, project: { ...internal, schemaName: project().schemaName },
+		});
+		await expect(verifyProjectEngineReadiness(database, selected, [id])).rejects.toThrow(
+			"The project accounts hostname is unavailable.",
+		);
+		fixture.resolveHostedBinding.mockImplementation(async (hostname: string) =>
+			hostname === frontendApi ? { ...binding(hostname), kind: "accounts" } : binding(hostname),
+		);
+		await expect(verifyProjectEngineReadiness(database, selected, [id])).rejects.toThrow(
+			"The project frontend-api hostname is unavailable.",
+		);
+		expect(confirm).not.toHaveBeenCalled();
+		fixture.resolveHostedBinding.mockImplementation(async (hostname: string) => binding(hostname));
+		fixture.getProject
+			.mockResolvedValueOnce(internal)
+			.mockResolvedValueOnce({ ...internal, id: "0953c4f5-a783-4e91-9055-a05ead278cd0" });
 		await expect(verifyProjectEngineReadiness(database, selected, [id])).rejects.toThrow(
 			"The project selection changed during readiness.",
 		);
-		expect(confirm).toHaveBeenNthCalledWith(1, internal, selected);
-		expect(confirm).toHaveBeenNthCalledWith(2, internal, selected, hostname);
+		expect(confirm.mock.calls).toEqual([
+			[internal, selected], [internal, selected, accounts], [internal, selected, frontendApi],
+		]);
 	} finally {
+		fixture.resolveHostedBinding.mockReset();
 		confirm.mockRestore();
 	}
 });
 
-it("requires each active custom accounts transport to prepare the selected project", async () => {
+it("prepares every active custom transport and rejects a custom binding change during readiness", async () => {
 	const id = "8d0da368-94b3-4897-988e-39c320a3e852";
 	const internal: Project = {
 		...project(),
@@ -335,23 +351,29 @@ it("requires each active custom accounts transport to prepare the selected proje
 		environment: "development",
 	};
 	const selected = { ...environment, ALLAUTH_PROJECT_ENGINE_INTERNAL_ID: id };
-	const managed = "fixture-app-accounts.allauth.co";
-	const custom = "accounts.customer.fixture.example";
-	const additional = "accounts.other.fixture.example";
-	let customHostnames = [custom, additional];
+	const managedAccounts = "fixture-app-accounts.allauth.co";
+	const managedFrontendApi = "fixture-app-api.allauth.co";
+	const customAccounts = { kind: "accounts", hostname: "accounts.customer.fixture.example" };
+	const customFrontendApi = { kind: "frontend-api", hostname: "frontend-api.customer.fixture.example" };
+	let customHostnames = [customAccounts, customFrontendApi];
 	const query = vi.fn(async (sql: string) => ({
 		rows: sql.includes('"allauthCustomHostname"')
-			? customHostnames.map((hostname) => ({ hostname }))
+			? customHostnames
 			: [{ slug: internal.slug, webhookGuardInstalled: true }],
 	}));
 	const database = { query } as unknown as Pick<Pool, "query">;
 	fixture.getProject.mockReset().mockResolvedValue(internal);
-	fixture.resolveHostedBinding.mockImplementation(async (hostname: string) => ({
-		kind: "accounts", hostname, project: internal,
-	}));
+	const binding = (hostname: string) => ({
+		kind: hostname === managedFrontendApi || hostname === customFrontendApi.hostname
+			? "frontend-api"
+			: "accounts",
+		hostname,
+		project: internal,
+	});
+	fixture.resolveHostedBinding.mockImplementation(async (hostname: string) => binding(hostname));
 	const confirm = vi.spyOn(projectRuntime, "confirmProjectEngine").mockImplementation(
 		async (_project, _settings, hostname) => {
-			if (hostname === custom) throw new Error("Fixture custom transport is unavailable.");
+			if (hostname === customFrontendApi.hostname) throw new Error("Fixture custom transport is unavailable.");
 		},
 	);
 	try {
@@ -359,30 +381,137 @@ it("requires each active custom accounts transport to prepare the selected proje
 			"Fixture custom transport is unavailable.",
 		);
 		expect(confirm).toHaveBeenCalledWith(internal, selected);
-		for (const hostname of [managed, custom, additional])
+		for (const hostname of [
+			managedAccounts, managedFrontendApi, customAccounts.hostname, customFrontendApi.hostname,
+		])
 			expect(confirm).toHaveBeenCalledWith(internal, selected, hostname);
 		confirm.mockResolvedValue(undefined);
 		await expect(verifyProjectEngineReadiness(database, selected, [id])).resolves.toBeUndefined();
 		fixture.resolveHostedBinding.mockImplementation(async (hostname: string) => ({
-			kind: "accounts",
-			hostname,
-			project: hostname === custom ? { ...internal, id: "0953c4f5-a783-4e91-9055-a05ead278cd0" } : internal,
+			...binding(hostname),
+			project: hostname === customFrontendApi.hostname ? { ...internal, id: "0953c4f5-a783-4e91-9055-a05ead278cd0" } : internal,
 		}));
 		await expect(verifyProjectEngineReadiness(database, selected, [id])).rejects.toThrow(
-			"The project accounts hostname is unavailable.",
+			"The project frontend-api hostname is unavailable.",
 		);
-		fixture.resolveHostedBinding.mockImplementation(async (hostname: string) => ({
-			kind: "accounts", hostname, project: internal,
-		}));
+		fixture.resolveHostedBinding.mockImplementation(async (hostname: string) => binding(hostname));
 		confirm.mockImplementation(async (_project, _settings, hostname) => {
-			if (hostname === managed) customHostnames = [custom];
+			if (hostname === managedAccounts)
+				customHostnames = [
+					{ ...customAccounts, kind: "frontend-api" },
+					{ ...customFrontendApi, kind: "accounts" },
+				];
 		});
 		await expect(verifyProjectEngineReadiness(database, selected, [id])).rejects.toThrow(
-			"The project accounts hostnames changed during readiness.",
+			"The project hosted hostnames changed during readiness.",
 		);
 	} finally {
 		fixture.resolveHostedBinding.mockReset();
 		confirm.mockRestore();
+	}
+});
+
+it("allows direct-only self-hosted development without an active custom pair and detects a pair activated during readiness", async () => {
+	const id = "8d0da368-94b3-4897-988e-39c320a3e852";
+	const development: Project = {
+		...project(),
+		id,
+		schemaName: `allauth_project_${id.replaceAll("-", "")}`,
+		environment: "development",
+		projectEngineFenced: true,
+	};
+	const selected = {
+		...environment,
+		ALLAUTH_PROJECT_ENGINE_DEVELOPMENT_REVISIONS: JSON.stringify({ [id]: 0 }),
+		ALLAUTH_DEPLOYMENT_MODE: "self-hosted",
+		CLOUDFLARE_SAAS_READY: "false",
+	};
+	const frontendApi = "frontend-api.customer.fixture.example";
+	const pair = [
+		{ kind: "accounts", hostname: "accounts.customer.fixture.example" },
+		{ kind: "frontend-api", hostname: frontendApi },
+	];
+	let customHostnames: typeof pair = [];
+	const query = vi.fn(async (sql: string) => ({
+		rows: sql.includes('"allauthCustomHostname"')
+			? customHostnames
+			: [{ slug: development.slug, webhookGuardInstalled: true }],
+	}));
+	const database = { query } as unknown as Pick<Pool, "query">;
+	fixture.getProject.mockReset().mockResolvedValue(development);
+	fixture.resolveHostedBinding.mockReset().mockResolvedValue(null);
+	const confirm = vi.spyOn(projectRuntime, "confirmProjectEngine").mockResolvedValue(undefined);
+	try {
+		await expect(verifyProjectEngineReadiness(database, selected, [id])).resolves.toBeUndefined();
+		expect(confirm.mock.calls).toEqual([[development, selected]]);
+		expect(fixture.resolveHostedBinding).not.toHaveBeenCalled();
+		confirm.mockImplementation(async () => { customHostnames = pair; });
+		await expect(verifyProjectEngineReadiness(database, selected, [id])).rejects.toThrow(
+			"The project hosted hostnames changed during readiness.",
+		);
+		await expect(verifyProjectEngineReadiness(database, selected, [id])).rejects.toThrow(
+			"The project accounts hostname is unavailable.",
+		);
+		expect(fixture.resolveHostedBinding).toHaveBeenCalledWith(frontendApi, selected);
+		expect(confirm).toHaveBeenCalledTimes(2);
+	} finally {
+		fixture.resolveHostedBinding.mockReset();
+		confirm.mockRestore();
+	}
+});
+
+it("prepares direct and hosted writers for a realm with three active custom domain pairs", async () => {
+	const id = "8d0da368-94b3-4897-988e-39c320a3e852";
+	const internal: Project = {
+		...project(),
+		id,
+		schemaName: `allauth_project_${id.replaceAll("-", "")}`,
+		workspaceId: platformWorkspaceId,
+		environment: "development",
+	};
+	const selected = { ...environment, ALLAUTH_PROJECT_ENGINE_INTERNAL_ID: id };
+	const custom = ["accounts", "frontend-api"].flatMap((kind) =>
+		["first", "second", "third"].map((name) => ({
+			kind,
+			hostname: `${kind}.${name}.fixture.example`,
+		})),
+	);
+	const hosted = [
+		{ kind: "accounts", hostname: "fixture-app-accounts.allauth.co" },
+		{ kind: "frontend-api", hostname: "fixture-app-api.allauth.co" },
+		...custom,
+	];
+	const query = vi.fn(async (sql: string) => ({
+		rows: sql.includes('"allauthCustomHostname"')
+			? custom
+			: [{ slug: internal.slug, webhookGuardInstalled: true }],
+	}));
+	const database = { query } as unknown as Pick<Pool, "query">;
+	fixture.getProject.mockReset().mockResolvedValue(internal);
+	fixture.readAuthPolicy.mockResolvedValue(defaultStoredAuthPolicy());
+	fixture.resolveHostedBinding.mockReset().mockImplementation(async (hostname: string) => {
+		const target = hosted.find((host) => host.hostname === hostname);
+		return target ? { ...target, project: internal } : null;
+	});
+	try {
+		await fixture.createOwned.withImplementation(
+			async () => {
+				await new Promise<void>((resolve) => setImmediate(resolve));
+				return { dispatch: async () => new Response(null, { status: 202 }) };
+			},
+			async () => {
+				await expect(verifyProjectEngineReadiness(database, selected, [id])).resolves.toBeUndefined();
+			},
+		);
+		const prepared = fixture.createOwned.mock.calls.map(([options]) => options);
+		expect(prepared.map(({ project }) => project.id)).toEqual(Array(hosted.length + 1).fill(id));
+		expect(prepared.map(({ transport }) => transport)).toEqual([
+			{ kind: "direct" },
+			...hosted.map(({ hostname }) => ({ kind: "hosted", origin: `https://${hostname}` })),
+		]);
+		expect(fixture.createAuth).not.toHaveBeenCalled();
+	} finally {
+		fixture.resolveHostedBinding.mockReset();
 	}
 });
 
@@ -408,31 +537,39 @@ it("prepares every selected production realm and rejects a hostname rebound to a
 		ALLAUTH_PROJECT_ENGINE_PRODUCTION_REVISIONS: JSON.stringify({ [firstId]: 0, [secondId]: 2 }),
 	};
 	const firstHostname = `${first.slug}-accounts.allauth.co`;
+	const firstFrontendApi = `${first.slug}-api.allauth.co`;
 	const secondHostname = `${second.slug}-accounts.allauth.co`;
-	const secondCustom = "accounts.fixture-second.example";
+	const secondFrontendApi = `${second.slug}-api.allauth.co`;
+	const secondCustomAccounts = { kind: "accounts", hostname: "accounts.fixture-second.example" };
+	const secondCustomFrontendApi = { kind: "frontend-api", hostname: "frontend-api.fixture-second.example" };
 	const query = vi.fn(async (sql: string, [id]: string[]) => {
 		if (sql.includes('"allauthCustomHostname"'))
-			return { rows: id === secondId ? [{ hostname: secondCustom }] : [] };
+			return { rows: id === secondId ? [secondCustomAccounts, secondCustomFrontendApi] : [] };
 		return { rows: [{ slug: id === firstId ? first.slug : second.slug, webhookGuardInstalled: true }] };
 	});
 	const database = { query } as unknown as Pick<Pool, "query">;
 	fixture.getProject.mockReset().mockImplementation(async (slug: string) => slug === first.slug ? first : second);
-	let customProject = second;
+	let customFrontendApiProject = second;
 	fixture.resolveHostedBinding.mockImplementation(async (hostname: string) => ({
-		kind: "accounts",
+		kind: [firstFrontendApi, secondFrontendApi, secondCustomFrontendApi.hostname].includes(hostname)
+			? "frontend-api"
+			: "accounts",
 		hostname,
-		project: hostname === firstHostname ? first : hostname === secondCustom ? customProject : second,
+		project: [firstHostname, firstFrontendApi].includes(hostname)
+			? first
+			: hostname === secondCustomFrontendApi.hostname ? customFrontendApiProject : second,
 	}));
 	const confirm = vi.spyOn(projectRuntime, "confirmProjectEngine").mockResolvedValue(undefined);
 	try {
 		await expect(verifyProjectEngineReadiness(database, selected, [firstId, secondId])).resolves.toBeUndefined();
 		expect(confirm.mock.calls).toEqual([
-			[first, selected], [first, selected, firstHostname],
-			[second, selected], [second, selected, secondHostname], [second, selected, secondCustom],
+			[first, selected], [first, selected, firstHostname], [first, selected, firstFrontendApi],
+			[second, selected], [second, selected, secondHostname], [second, selected, secondFrontendApi],
+			[second, selected, secondCustomAccounts.hostname], [second, selected, secondCustomFrontendApi.hostname],
 		]);
-		customProject = first;
+		customFrontendApiProject = first;
 		await expect(verifyProjectEngineReadiness(database, selected, [firstId, secondId])).rejects.toThrow(
-			"The project accounts hostname is unavailable.",
+			"The project frontend-api hostname is unavailable.",
 		);
 		fixture.getProject.mockResolvedValueOnce({ ...second, projectEngineFenced: false });
 		await expect(verifyProjectEngineReadiness(database, selected, [secondId])).rejects.toThrow(

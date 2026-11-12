@@ -15,6 +15,7 @@ import {
 	hostedSdkProjectEnabled,
 	hostedSdkProjectIdsSetting,
 } from "./hosted-sdk-policy";
+import type { DomainKind } from "./types";
 
 export function hasHostedSdkSelection(env: AuthEnvironment) {
 	return Boolean(
@@ -25,10 +26,14 @@ export function hasHostedSdkSelection(env: AuthEnvironment) {
 	);
 }
 
-function independentlyPreviewed(env: AuthEnvironment, project: Project) {
-	return hostedSdkProjectEnabled(
-		setting(env, hostedSdkProjectIdsSetting),
-		project,
+function independentlyPreviewed(
+	env: AuthEnvironment,
+	project: Project,
+	kind: DomainKind,
+) {
+	return (
+		kind === "accounts" &&
+		hostedSdkProjectEnabled(setting(env, hostedSdkProjectIdsSetting), project)
 	);
 }
 
@@ -36,9 +41,10 @@ function independentlyPreviewed(env: AuthEnvironment, project: Project) {
 export function hostedSdkTransportEnabled(
 	env: AuthEnvironment,
 	project: Project,
+	kind: DomainKind,
 ) {
 	return (
-		independentlyPreviewed(env, project) ||
+		independentlyPreviewed(env, project, kind) ||
 		projectEngineEnrollment(project) !== undefined ||
 		projectEngineSelected(env, project)
 	);
@@ -48,8 +54,9 @@ export function hostedSdkTransportEnabled(
 export async function hostedSdkSelected(
 	env: AuthEnvironment,
 	project: Project,
+	kind: DomainKind,
 ) {
-	const previewed = independentlyPreviewed(env, project);
+	const previewed = independentlyPreviewed(env, project, kind);
 	const lease = projectWriterLease(project, env);
 	if (!lease) return previewed;
 	const { writer, revision } = await lease.read();

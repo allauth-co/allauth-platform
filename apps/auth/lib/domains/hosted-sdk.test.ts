@@ -9,6 +9,7 @@ import { productionTwoFactor } from "../mfa";
 import { projectWriterUnavailable } from "../projects/project-engine-unavailable";
 import { edgeHeaders } from "./edge";
 import {
+	hostedAuthRedirectRequest,
 	hostedSdkBasePath,
 	hostedSdkEndpoint,
 	hostedSdkProjectEnabled,
@@ -18,6 +19,7 @@ import {
 import { hostedSdkResponse } from "./hosted-sdk-response";
 
 const origin = "https://accounts.customer.example";
+const frontendOrigin = "https://frontend-api.customer.example";
 const id = "018dad31-1be5-4f84-9196-68949a8db228";
 const otherId = "018dad31-1be5-4f84-9196-68949a8db229";
 const slug = "fixture-project";
@@ -70,7 +72,7 @@ function verifiedFixture(
 	gateway.withPortalAuthEngine.mockImplementation(
 		async (incoming: Request, callback) => {
 			const url = new URL(incoming.url);
-			url.host = new URL(origin).host;
+			url.host = new URL(kind === "frontend-api" ? frontendOrigin : origin).host;
 			return callback(
 				{ dispatch: gateway.dispatch },
 				{ [envKey]: configured },
@@ -124,6 +126,39 @@ describe("first-party hosted SDK selection", () => {
 		expect(hostedSdkViewRequest("signIn", {})?.destination).toBe("/console");
 	});
 
+	it("returns frontend API sign-in to the account on the same hostname", () => {
+		for (const params of [{}, { callbackUrl: "/console?view=apps" }]) {
+			const view = hostedSdkViewRequest("signIn", params, "frontend-api");
+			expect(view?.destination).toBe("/account");
+			expect(
+				new URL(view!.legacyPath, frontendOrigin).searchParams.get(
+					"callbackUrl",
+				),
+			).toBe("/account");
+		}
+		expect(
+			hostedSdkViewRequest(
+				"signIn",
+				{ returnTo: "/account/security" },
+				"frontend-api",
+			)?.destination,
+		).toBe("/account/security");
+		expect(
+			hostedSdkViewRequest(
+				"authCallback",
+				{ result: "email_verified", returnTo: "/console" },
+				"frontend-api",
+			)?.destination,
+		).toBe("/account");
+		expect(
+			hostedAuthRedirectRequest(
+				{ redirectTo: "/console" },
+				frontendOrigin,
+				"frontend-api",
+			)?.destination,
+		).toBe("/account");
+	});
+
 	it.each([
 		"//elsewhere.example/account",
 		"https://accounts.customer.example/account",
@@ -168,16 +203,42 @@ describe("first-party hosted SDK selection", () => {
 });
 
 describe("hosted SDK transport", () => {
-	it.each(["development", "production"])("keeps an open %s form connected to the restored legacy writer", async (environment) => {
-		verifiedFixture("", "accounts", id, environment, true);
+	it.each([
+		["development", "accounts"],
+		["development", "frontend-api"],
+		["production", "accounts"],
+		["production", "frontend-api"],
+	])("keeps an open %s form on %s connected to the restored writer", async (environment, kind) => {
+		verifiedFixture("", kind, id, environment, true);
 		gateway.dispatch.mockResolvedValue(Response.json({ emailPassword: true }));
 		const response = await GET(request("sdk/config"));
 		expect(response.status).toBe(200);
 		expect(await response.json()).toEqual({ emailPassword: true });
 		expect(gateway.dispatch).toHaveBeenCalledOnce();
-		verifiedFixture("", "accounts", otherId, environment);
+		verifiedFixture("", kind, otherId, environment);
 		expect((await GET(request("sdk/config"))).status).toBe(404);
 		expect(gateway.dispatch).toHaveBeenCalledOnce();
+	});
+
+	it("binds enrolled frontend API sign-in to its verified browser origin", async () => {
+		verifiedFixture("", "frontend-api", id, "development", true);
+		gateway.dispatch.mockResolvedValue(Response.json({ status: true }));
+		const unsigned = await POST(
+			request("sign-in/email", "POST", {
+				origin: frontendOrigin,
+				signed: false,
+			}),
+		);
+		expect(unsigned.status).toBe(404);
+		const foreign = await POST(request("sign-in/email", "POST", { origin }));
+		expect(foreign.status).toBe(403);
+		expect(gateway.dispatch).not.toHaveBeenCalled();
+		const own = await POST(
+			request("sign-in/email", "POST", { origin: frontendOrigin }),
+		);
+		expect(own.status).toBe(200);
+		const dispatched = gateway.dispatch.mock.calls[0]?.[0] as Request;
+		expect(dispatched.url).toBe(`${frontendOrigin}/api/auth/sign-in/email`);
 	});
 
 	it("returns a private 503 without fallback when the active project writer is unavailable", async () => {

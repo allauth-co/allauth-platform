@@ -692,7 +692,10 @@ it("selects email status views only for an enabled hosted project without a bear
 	expect(runtime.withPortalHeadersEngine).toHaveBeenCalledTimes(2);
 });
 
-it("uses the first-party sign-in on the verified accounts domain of the selected internal writer", async () => {
+it.each([
+	"accounts",
+	"frontend-api",
+] as const)("follows the selected internal writer on the verified %s hostname", async (kind) => {
 	runtime.getAuthEnvironment.mockResolvedValue({
 		ALLAUTH_PROJECT_ENGINE_INTERNAL_ID: project.id,
 	});
@@ -705,10 +708,12 @@ it("uses the first-party sign-in on the verified accounts domain of the selected
 		workspaceId: platformWorkspaceId,
 		schemaName: `allauth_project_${project.id.replaceAll("-", "")}`,
 	};
+	const hostname =
+		kind === "accounts" ? accountsHostname : "frontend-api.fixture.example";
 	let binding = {
-		kind: "accounts",
+		kind,
 		project: internal,
-		hostname: accountsHostname,
+		hostname,
 	};
 	runtime.withPortalHeadersEngine.mockImplementation(async (_headers, select) =>
 		select(engine, new Headers(), binding),
@@ -721,15 +726,20 @@ it("uses the first-party sign-in on the verified accounts domain of the selected
 	runtime.readWriter.mockResolvedValue({ writer: "legacy", revision: 0 });
 	expect((await read()).type).toBe(AllAuthAuth);
 	runtime.readWriter.mockResolvedValue({ writer: "allauth", revision: 1 });
-	expect((await read()).type).toBe(HostedProjectAuth);
+	const page = await read();
+	expect(page.type).toBe(HostedProjectAuth);
+	expect(page.props).toMatchObject({
+		destination: kind === "accounts" ? "/console" : "/account",
+	});
+	expect(engine.dispatch.mock.lastCall?.[0].url).toBe(
+		`https://${hostname}/api/auth/sdk/config`,
+	);
 	runtime.readWriter.mockResolvedValue({ writer: "legacy", revision: 2 });
 	expect((await read()).type).toBe(AllAuthAuth);
 	runtime.readWriter.mockResolvedValue({ writer: "allauth", revision: 3 });
-	binding = { ...binding, kind: "frontend-api" };
-	expect((await read()).type).toBe(AllAuthAuth);
+	expect((await read()).type).toBe(HostedProjectUnavailable);
 	binding = {
 		...binding,
-		kind: "accounts",
 		project: { ...internal, workspaceId: "customer-workspace" },
 	};
 	expect((await read()).type).toBe(AllAuthAuth);

@@ -2,7 +2,7 @@
 
 An app environment has two default addresses: `https://<environment-slug>-accounts.allauth.co` and `https://<environment-slug>-api.allauth.co`. Flat names fit the zone's first-level wildcard certificate. Clients can add `accounts.<customer-domain>` and `frontend-api.<customer-domain>` from the selected environment's Domains screen.
 
-Each address resolves an exact project registry entry and uses that environment's existing PostgreSQL schema and native Better Auth instance. Unrecognized, deleted or inactive customer domains return an error; they never fall through to the platform authentication instance. Both hostnames can serve native authentication and continuation screens so their own host-only challenge cookies remain available.
+Each address resolves an exact project registry entry and uses that environment's existing PostgreSQL schema and assigned authentication writer. The gateway rejects unrecognized, deleted or inactive customer domains before authentication dispatch. Both hostname types serve authentication and continuation screens using their own host-only challenge cookies. A project using the AllAuth writer serves first-party sign-in on both verified hostname types. The frontend API hostname opens the account page after sign-in when no return destination was supplied.
 
 Cookies are host-only. The accounts and frontend API addresses do not automatically share a browser session. Use the same chosen authentication hostname consistently, or use the supplied app-side server proxy integration. AllAuth's central OAuth broker bridges social login into a realm; it does not merge different apps' user databases. Passkeys are tied to the enrolled hostname and may need re-enrollment after a domain change.
 
