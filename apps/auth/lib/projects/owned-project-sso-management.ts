@@ -27,6 +27,7 @@ import {
 	projectSsoRegistrationInput,
 	registerProjectSsoProvider,
 } from "./owned-project-sso-register";
+import { allowsEncryptedSamlFixtureProvider } from "./owned-project-sso-saml-fixture-admission";
 import {
 	projectSamlAcs,
 	publicSamlRegistration,
@@ -69,6 +70,7 @@ export interface OwnedProjectSsoManagementOptions {
 	trustedOrigins: ReadonlySet<string>;
 	fetch?: SsoFetch;
 	saml?: OwnedProjectSsoOptions["saml"];
+	encryptedSamlFixture?: OwnedProjectSsoOptions["encryptedSamlFixture"];
 	trustedRequest(headers: Headers, mutation: boolean): boolean;
 	readBody(request: Request): Promise<unknown>;
 	readSession(
@@ -302,8 +304,18 @@ export function createOwnedProjectSsoManagement(
 		const config = readStoredSsoConfiguration(provider.samlConfig);
 		try {
 			const acs = projectSamlAcs(options.baseURL, id.data);
+			const allowEncrypted = allowsEncryptedSamlFixtureProvider(
+				options.encryptedSamlFixture,
+				options.schemaName,
+				{ ...provider, samlConfig: config },
+			);
 			return new Response(
-				projectSamlServiceMetadata(config, acs, samlScope?.generatedSPOnly),
+				projectSamlServiceMetadata(
+					config,
+					acs,
+					samlScope?.generatedSPOnly,
+					allowEncrypted,
+				),
 				{
 					headers: {
 						"Content-Type": "application/xml",

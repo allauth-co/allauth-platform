@@ -283,8 +283,12 @@ export function projectSamlServiceMetadata(
 	value: unknown,
 	acs: string,
 	generatedSPOnly?: boolean,
+	allowEncrypted?: boolean,
 ) {
-	const configured = configureOwnedSaml(value, acs, { generatedSPOnly });
+	const configured = configureOwnedSaml(value, acs, {
+		generatedSPOnly,
+		allowEncrypted,
+	});
 	if (!configured.postLocations.includes(acs)) invalid();
 	return configured.service.getMetadata();
 }

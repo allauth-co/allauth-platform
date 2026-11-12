@@ -1,4 +1,5 @@
 import { createHmac } from "node:crypto";
+import type { JWTPayload } from "jose";
 import {
 	createRemoteJWKSet,
 	decodeJwt,
@@ -10,12 +11,21 @@ import type { Pool, PoolClient } from "pg";
 import * as z from "zod";
 import { validAvatarPath } from "../avatars/protocol";
 import type { LegacyMfaKeys } from "./legacy-mfa-record";
+import { sealLegacyMfaRecord } from "./legacy-mfa-record";
 import { readLegacySessionCookie } from "./legacy-session-cookie";
+import {
+	linkedProviderProfile,
+	readLinkedOAuthToken,
+} from "./owned-project-account-info";
 import type {
 	AuthorizeLinkedAccounts,
+	LinkedAccountGrant,
 	OwnedProjectOAuthUnlink,
 } from "./owned-project-linked-accounts";
-import { createOwnedProjectLinkedAccounts } from "./owned-project-linked-accounts";
+import {
+	createOwnedProjectLinkedAccounts,
+	linkedAccessTokenNearExpiry,
+} from "./owned-project-linked-accounts";
 
 export { ownedProjectOAuthUnlinkInput } from "./owned-project-linked-accounts";
 
@@ -171,6 +181,9 @@ export interface OwnedProjectOAuthOptions {
 		},
 	): Promise<Response>;
 	authorizeLinkedAccounts?: AuthorizeLinkedAccounts;
+	passwordSignIn?: boolean;
+	passkeySignIn?: boolean;
+	otherLinkedSignIn?(client: PoolClient, user: ProjectUser): Promise<boolean>;
 	fetch?: ProjectOAuthFetch;
 }
 
@@ -244,15 +257,24 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 		throw new Error("Invalid project OAuth configuration.");
 	const defaultError = safeURL(options.defaultErrorURL, origin, origins);
 	if (!defaultError) throw new Error("Invalid project OAuth error URL.");
+	const tokenKeys = options.tokenKeys ?? { secret: options.signingSecret };
 	const store = createProjectOAuthStore(
 		options.database,
 		options.project.schemaName,
-		options.tokenKeys ?? { secret: options.signingSecret },
+		tokenKeys,
 	);
 	const linked = createOwnedProjectLinkedAccounts(
 		options.database,
 		options.project.schemaName,
 		options.authorizeLinkedAccounts,
+		{
+			socialProviders: projectOAuthProvider.options.filter((provider) =>
+				credentials(provider),
+			),
+			passwordSignIn: options.passwordSignIn !== false,
+			passkeySignIn: options.passkeySignIn === true,
+			otherSignIn: options.otherLinkedSignIn,
+		},
 	);
 	const secure = origin.startsWith("https:");
 	const stateCookie = `${secure ? "__Secure-" : ""}allauth_project_${slug}.state`;
@@ -261,10 +283,12 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 	const expireState = `${stateCookie}=; Max-Age=0; ${attributes}`;
 	const network: ProjectOAuthFetch = (input, init) =>
 		(options.fetch ?? globalThis.fetch)(input, init);
+	const providerNetwork: ProjectOAuthFetch = (input, init) =>
+		network(input, { ...init, redirect: "error" });
 	const appleKeys =
 		options.apple &&
 		createRemoteJWKSet(new URL(appleMetadata.jwks_uri!), {
-			[joseFetch]: network,
+			[joseFetch]: providerNetwork,
 			timeoutDuration: 7000,
 		});
 	const appleBindingFailures = {
@@ -843,6 +867,342 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 			: publicJSON({ status: true }, 200);
 	}
 
+	function providerTokenServer(
+		provider: ProjectOAuthProvider,
+		as: oauth.AuthorizationServer,
+		claims: JWTPayload,
+	) {
+		// Google publishes two issuer spellings. The network endpoints and keys remain pinned.
+		if (provider === "google" && claims.iss === "accounts.google.com")
+			return { ...as, issuer: "accounts.google.com" };
+		if (provider === "microsoft")
+			return {
+				...as,
+				issuer: microsoftIssuer(options.microsoft!.tenantId, claims),
+			};
+		return as;
+	}
+
+	async function verifyProviderToken(
+		provider: ProjectOAuthProvider,
+		as: oauth.AuthorizationServer,
+		tokenServer: oauth.AuthorizationServer,
+		token: string,
+		clientId: string,
+		currentDate?: Date,
+	) {
+		const jwks = as.jwks_uri!;
+		const resolverKey = provider === "microsoft" ? tokenServer.issuer : jwks;
+		let resolver = resolvers.get(resolverKey);
+		if (!resolver) {
+			if (resolvers.size >= 32) resolvers.clear();
+			resolver = createRemoteJWKSet(new URL(jwks), {
+				[joseFetch]:
+					provider === "microsoft"
+						? async (input, init) => {
+								const keys = await providerNetwork(input, init);
+								if (!keys.ok) return keys;
+								const data = z
+									.object({
+										keys: z
+											.array(z.looseObject({ issuer: z.string().optional() }))
+											.max(64),
+									})
+									.parse(await keys.json());
+								return Response.json({
+									keys: data.keys.filter(
+										({ issuer }) =>
+											issuer === undefined ||
+											issuer === tokenServer.issuer ||
+											issuer ===
+												"https://login.microsoftonline.com/{tenantid}/v2.0",
+									),
+								});
+							}
+						: providerNetwork,
+				timeoutDuration: 7000,
+			});
+			resolvers.set(resolverKey, resolver);
+		}
+		const algorithms =
+			as.id_token_signing_alg_values_supported?.filter((value) =>
+				trustedSigningAlgorithms.includes(value),
+			) ?? trustedSigningAlgorithms;
+		const { payload } = await jwtVerify(token, resolver, {
+			issuer: tokenServer.issuer,
+			audience: clientId,
+			algorithms,
+			requiredClaims: ["sub", "iat", "exp"],
+			...(currentDate
+				? { currentDate }
+				: provider !== "allauth"
+					? { maxTokenAge: 3600 }
+					: {}),
+		});
+		return payload;
+	}
+
+	function savedProviderToken(token: string) {
+		if (token.length > 32768) throw new Error("Invalid provider ID token.");
+		return decodeJwt(token);
+	}
+
+	function linkedClientId(
+		provider: ProjectOAuthProvider,
+		config: Credentials | AppleCredentials,
+		claims?: JWTPayload,
+	) {
+		if (provider !== "apple" || !claims) return config.clientId;
+		const audience = appleTokenAudience(claims.aud, config);
+		if (!audience) throw new Error("Invalid linked Apple audience.");
+		return audience;
+	}
+
+	async function linkedIdentityToken(
+		provider: ProjectOAuthProvider,
+		as: oauth.AuthorizationServer,
+		token: string,
+		clientId: string,
+		historic: boolean,
+	) {
+		const claims = savedProviderToken(token);
+		let signedAt: Date | undefined;
+		if (historic) {
+			if (
+				!Number.isSafeInteger(claims.iat) ||
+				!claims.iat ||
+				claims.iat < 0 ||
+				claims.iat > Date.now() / 1000 + 60
+			)
+				throw new Error("Invalid stored provider ID token time.");
+			// A stored claim is verified at issuance for account display only. It is never reused to sign in.
+			signedAt = new Date(claims.iat * 1000);
+		}
+		return verifyProviderToken(
+			provider,
+			as,
+			providerTokenServer(provider, as, claims),
+			token,
+			clientId,
+			signedAt,
+		);
+	}
+
+	async function refreshLinkedAccount(
+		request: Request,
+		provider: ProjectOAuthProvider,
+		config: Credentials | AppleCredentials,
+		as: oauth.AuthorizationServer,
+		account: LinkedAccountGrant,
+	) {
+		const refreshToken = readLinkedOAuthToken(account.refreshToken, tokenKeys);
+		if (!refreshToken) throw new Error("Missing stored refresh grant.");
+		const savedClaims =
+			provider === "apple" && account.idToken
+				? savedProviderToken(account.idToken)
+				: undefined;
+		const clientId = linkedClientId(provider, config, savedClaims);
+		const client: oauth.Client = { client_id: clientId };
+		const secret =
+			typeof config.clientSecret === "string"
+				? config.clientSecret
+				: await config.clientSecret(clientId);
+		const authenticate =
+			provider === "allauth"
+				? oauth.ClientSecretBasic(secret)
+				: oauth.ClientSecretPost(secret);
+		const response = await oauth.refreshTokenGrantRequest(
+			as,
+			client,
+			authenticate,
+			refreshToken,
+			{
+				[oauth.customFetch]: providerNetwork,
+				signal: AbortSignal.any([request.signal, AbortSignal.timeout(7000)]),
+				...(provider === "microsoft" && {
+					additionalParameters: { scope: "openid profile email" },
+				}),
+			},
+		);
+		let tokenServer = as;
+		if (response.ok && (provider === "google" || provider === "microsoft")) {
+			const raw: unknown = await response.clone().json();
+			if (
+				raw &&
+				typeof raw === "object" &&
+				"id_token" in raw &&
+				typeof raw.id_token === "string"
+			)
+				tokenServer = providerTokenServer(
+					provider,
+					as,
+					savedProviderToken(raw.id_token),
+				);
+		}
+		const tokens = await oauth.processRefreshTokenResponse(
+			tokenServer,
+			client,
+			response,
+		);
+		if (
+			tokens.token_type !== "bearer" ||
+			tokens.access_token.length > 32768 ||
+			(tokens.refresh_token?.length ?? 0) > 32768
+		)
+			throw new Error("Invalid linked provider token response.");
+		if (tokens.id_token)
+			linkedProviderProfile(
+				account,
+				provider,
+				await linkedIdentityToken(
+					provider,
+					as,
+					tokens.id_token,
+					clientId,
+					false,
+				),
+			);
+		return {
+			accessToken: sealLegacyMfaRecord(tokens.access_token, tokenKeys),
+			accessTokenExpiresAt: boundedExpiry(tokens.expires_in) ?? null,
+			refreshToken: tokens.refresh_token
+				? sealLegacyMfaRecord(tokens.refresh_token, tokenKeys)
+				: account.refreshToken,
+			refreshTokenExpiresAt:
+				boundedExpiry(tokens.refresh_token_expires_in) ??
+				account.refreshTokenExpiresAt,
+			idToken: tokens.id_token ?? account.idToken,
+		};
+	}
+
+	async function accountInfo(request: Request) {
+		if (!browserRequest(request, "account-info", "GET"))
+			return publicFailure(
+				"FORBIDDEN",
+				"This authentication request is not permitted.",
+				403,
+			);
+		const query = new URL(request.url).searchParams;
+		const accountId = query.get("accountId");
+		if (
+			!accountId ||
+			accountId.length > 512 ||
+			query.getAll("accountId").length !== 1 ||
+			query.getAll("userId").length > 1 ||
+			[...query.keys()].some(
+				(name) => name !== "accountId" && name !== "userId",
+			)
+		)
+			return publicFailure("INVALID_QUERY", "Select a linked account.", 400);
+		const token = browserToken(request);
+		const loaded = await linked.info(request, token, accountId);
+		if (loaded.status === "rejected") return rejectedResponse(loaded);
+		let { account } = loaded;
+		const provider = projectOAuthProvider.safeParse(account.providerId);
+		const config = provider.success ? credentials(provider.data) : undefined;
+		if (!provider.success || !config)
+			return publicFailure(
+				"PROVIDER_NOT_CONFIGURED",
+				"Account is not associated with a configured social provider.",
+				400,
+			);
+		let as: oauth.AuthorizationServer;
+		let accessToken: string | undefined;
+		try {
+			as = await metadata(provider.data);
+			if (linkedAccessTokenNearExpiry(account)) {
+				const refreshed = await linked.info(
+					request,
+					token,
+					accountId,
+					(current) => {
+						if (
+							current.providerId !== account.providerId ||
+							current.accountId !== account.accountId
+						)
+							throw new Error("Linked provider account changed.");
+						return refreshLinkedAccount(
+							request,
+							provider.data,
+							config,
+							as,
+							current,
+						);
+					},
+				);
+				if (refreshed.status === "rejected") return rejectedResponse(refreshed);
+				account = refreshed.account;
+			}
+			accessToken = readLinkedOAuthToken(account.accessToken, tokenKeys);
+		} catch {
+			return publicFailure(
+				"FAILED_TO_GET_ACCESS_TOKEN",
+				"Failed to get a valid access token",
+				400,
+			);
+		}
+		if (!accessToken)
+			return publicFailure(
+				"ACCESS_TOKEN_NOT_FOUND",
+				"Access token not found",
+				400,
+			);
+		try {
+			const claims = account.idToken
+				? savedProviderToken(account.idToken)
+				: undefined;
+			const clientId = linkedClientId(provider.data, config, claims);
+			let profile = account.idToken
+				? await linkedIdentityToken(
+						provider.data,
+						as,
+						account.idToken,
+						clientId,
+						provider.data !== "allauth",
+					)
+				: undefined;
+			if (
+				provider.data === "allauth" &&
+				!profile?.email &&
+				as.userinfo_endpoint
+			) {
+				const client: oauth.Client = { client_id: clientId };
+				profile = await oauth.processUserInfoResponse(
+					as,
+					client,
+					account.accountId,
+					await oauth.userInfoRequest(as, client, accessToken, {
+						[oauth.customFetch]: providerNetwork,
+						signal: AbortSignal.any([
+							request.signal,
+							AbortSignal.timeout(7000),
+						]),
+					}),
+				);
+			}
+			if (!profile) throw new Error("Missing linked provider profile.");
+			const value = linkedProviderProfile(account, provider.data, profile);
+			const current = await linked.info(request, token, accountId);
+			if (current.status === "rejected") return rejectedResponse(current);
+			if (
+				current.account.providerId !== account.providerId ||
+				current.account.accountId !== account.accountId
+			)
+				return publicFailure("ACCOUNT_NOT_FOUND", "Account not found", 400);
+			return publicJSON(
+				value,
+				200,
+				new Headers({ "referrer-policy": "no-referrer" }),
+			);
+		} catch {
+			return publicFailure(
+				"FAILED_TO_GET_USER_INFO",
+				"Failed to get user info",
+				401,
+			);
+		}
+	}
+
 	async function getIdentity(
 		provider: ProjectOAuthProvider,
 		config: Credentials | AppleCredentials,
@@ -887,14 +1247,7 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 				body.id_token.length <= 32768
 			) {
 				const claims = decodeJwt(body.id_token);
-				// Google publishes two issuer spellings. The network endpoints and keys remain pinned.
-				if (provider === "google" && claims.iss === "accounts.google.com")
-					tokenServer = { ...as, issuer: "accounts.google.com" };
-				if (provider === "microsoft")
-					tokenServer = {
-						...as,
-						issuer: microsoftIssuer(options.microsoft!.tenantId, claims),
-					};
+				tokenServer = providerTokenServer(provider, as, claims);
 				if (provider === "apple" && expectedNonce)
 					expectedNonce = appleNonce(expectedNonce, claims.nonce);
 			}
@@ -910,50 +1263,13 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 		);
 		if (!tokens.id_token || tokens.token_type !== "bearer")
 			throw new Error("Invalid provider token response.");
-		const jwks = as.jwks_uri!;
-		const resolverKey = provider === "microsoft" ? tokenServer.issuer : jwks;
-		let resolver = resolvers.get(resolverKey);
-		if (!resolver) {
-			if (resolvers.size >= 32) resolvers.clear();
-			resolver = createRemoteJWKSet(new URL(jwks), {
-				[joseFetch]:
-					provider === "microsoft"
-						? async (input, init) => {
-								const keys = await network(input, init);
-								if (!keys.ok) return keys;
-								const data = z
-									.object({
-										keys: z
-											.array(z.looseObject({ issuer: z.string().optional() }))
-											.max(64),
-									})
-									.parse(await keys.json());
-								return Response.json({
-									keys: data.keys.filter(
-										({ issuer }) =>
-											issuer === undefined ||
-											issuer === tokenServer.issuer ||
-											issuer ===
-												"https://login.microsoftonline.com/{tenantid}/v2.0",
-									),
-								});
-							}
-						: network,
-				timeoutDuration: 7000,
-			});
-			resolvers.set(resolverKey, resolver);
-		}
-		const algorithms =
-			as.id_token_signing_alg_values_supported?.filter((value) =>
-				trustedSigningAlgorithms.includes(value),
-			) ?? trustedSigningAlgorithms;
-		const { payload } = await jwtVerify(tokens.id_token, resolver, {
-			issuer: tokenServer.issuer,
-			audience: config.clientId,
-			algorithms,
-			requiredClaims: ["sub", "iat", "exp"],
-			...(provider !== "allauth" ? { maxTokenAge: 3600 } : {}),
-		});
+		const payload = await verifyProviderToken(
+			provider,
+			as,
+			tokenServer,
+			tokens.id_token,
+			config.clientId,
+		);
 		const subject = provider === "microsoft" ? payload.oid : payload.sub;
 		if (
 			typeof subject !== "string" ||
@@ -1126,5 +1442,12 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 		}
 	}
 
-	return { start, startLink, listAccounts, unlinkAccount, callback };
+	return {
+		start,
+		startLink,
+		listAccounts,
+		accountInfo,
+		unlinkAccount,
+		callback,
+	};
 }

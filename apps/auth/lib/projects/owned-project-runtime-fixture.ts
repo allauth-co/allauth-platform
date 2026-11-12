@@ -6,8 +6,8 @@ import * as consoleOrganizations from "../../app/api/admin/organizations/route";
 import * as hosted from "../../app/api/auth/[...all]/route";
 import { GET as config } from "../../app/api/config/route";
 import { GET as health } from "../../app/api/health/route";
-import * as scimConsole from "../../app/api/organizations/[organizationId]/scim/route";
 import { POST as rotateDirectory } from "../../app/api/organizations/[organizationId]/scim/[connectionId]/rotate/route";
+import * as scimConsole from "../../app/api/organizations/[organizationId]/scim/route";
 import * as projectAuth from "../../app/api/projects/[slug]/auth/[...all]/route";
 import { GET as brokerLogin } from "../../app/oauth/login/route";
 import { authOrigin } from "../configuration";
@@ -15,6 +15,7 @@ import { resolveHostedBinding } from "../domains/hosting";
 import { readProjectAppleProvider } from "../project-providers/apple";
 import { createOwnedProjectRuntimeCandidate } from "./owned-project-runtime-factory";
 import { runtimeProviderFixtureFetch } from "./owned-project-runtime-provider-fixture";
+import type { ProjectEncryptedSamlFixtureAdmission } from "./owned-project-sso-saml-fixture-admission";
 import { getProject, projectRegistryPool } from "./registry";
 import {
 	closeProjectInstances,
@@ -30,6 +31,7 @@ export interface ProjectRuntimeFixtureBoot {
 	schemaName: string;
 	owned: boolean;
 	appleIssuerKey?: string;
+	encryptedSamlFixture?: ProjectEncryptedSamlFixtureAdmission;
 }
 
 const trustedFixtureIP = "192.0.2.55";
@@ -149,6 +151,9 @@ async function boot(selection: ProjectRuntimeFixtureBoot) {
 		},
 	);
 	const pending = new Set<Promise<void>>();
+	const encryptedSamlFixture =
+		selection.encryptedSamlFixture &&
+		Object.freeze({ ...selection.encryptedSamlFixture });
 	if (selection.owned) {
 		const env = {
 			...process.env,
@@ -188,6 +193,7 @@ async function boot(selection: ProjectRuntimeFixtureBoot) {
 							: { kind: "direct" },
 					signingSecret,
 					credentialHashSecret,
+					encryptedSamlFixture,
 					trustedIP: (request) => request.headers.get("x-real-ip"),
 					defer(work) {
 						const operation = Promise.resolve()

@@ -114,7 +114,7 @@ function json(value: unknown, status: number, headers = new Headers()) {
 	return Response.json(value, { status, headers });
 }
 
-/** Realm-scoped, SP-initiated plaintext SAML sign-in and assertion consumer. */
+/** Realm-scoped SP-initiated SAML sign-in and assertion consumer. */
 export function createOwnedProjectSaml(options: {
 	origin: string;
 	basePath: string;
@@ -123,7 +123,7 @@ export function createOwnedProjectSaml(options: {
 	signingSecret: string;
 	signUpEnabled: boolean;
 	generatedSPOnly?: boolean;
-	allowEncrypted?: boolean;
+	allowEncrypted(provider: SsoProvider): boolean;
 	defaultError: URL;
 	store: SsoStore;
 	allowedReturn(value: string): URL | null;
@@ -133,6 +133,20 @@ export function createOwnedProjectSaml(options: {
 	const acs = (providerId: string) =>
 		`${options.origin}${options.basePath}/sso/saml2/sp/acs/${providerId}`;
 	const clear = `${options.cookieName}=; Max-Age=0; ${options.cookieAttributes}`;
+
+	function currentProviderMatches(
+		provider: SsoProvider | null,
+		reference: ReturnType<typeof ssoProviderReference>,
+	): provider is SsoProvider {
+		if (!provider?.samlConfig || !sameSsoProvider(provider, reference))
+			return false;
+		try {
+			options.allowEncrypted(provider);
+			return true;
+		} catch {
+			return false;
+		}
+	}
 
 	function finish(response: Response) {
 		const headers = new Headers(response.headers);
@@ -165,7 +179,7 @@ export function createOwnedProjectSaml(options: {
 				{
 					relayState: relay,
 					generatedSPOnly: options.generatedSPOnly,
-					allowEncrypted: options.allowEncrypted,
+					allowEncrypted: options.allowEncrypted(provider),
 				},
 			);
 			const login = configured.service.createLoginRequest(
@@ -186,8 +200,7 @@ export function createOwnedProjectSaml(options: {
 			const reference = ssoProviderReference(provider);
 			const issued = await store.transaction(async (client) => {
 				const current = await store.getProvider(provider.providerId, client);
-				if (!current?.samlConfig || !sameSsoProvider(current, reference))
-					return false;
+				if (!currentProviderMatches(current, reference)) return false;
 				const now = Date.now();
 				await client.query(
 					`INSERT INTO "verification"(id, identifier, value, "expiresAt")
@@ -252,7 +265,7 @@ export function createOwnedProjectSaml(options: {
 		const reference = ssoProviderReference(provider);
 		return store.transaction(async (client) => {
 			const current = await store.getProvider(providerId, client);
-			if (!current?.samlConfig || !sameSsoProvider(current, reference))
+			if (!currentProviderMatches(current, reference))
 				return "invalid_state" as const;
 			const requestRow = await verification(
 				client,
@@ -329,7 +342,7 @@ export function createOwnedProjectSaml(options: {
 		try {
 			configured = configureOwnedSaml(provider.samlConfig, acs(providerId), {
 				generatedSPOnly: options.generatedSPOnly,
-				allowEncrypted: options.allowEncrypted,
+				allowEncrypted: options.allowEncrypted(provider),
 			});
 			proof = await verifyOwnedSaml(form.response, configured);
 		} catch {
@@ -356,10 +369,7 @@ export function createOwnedProjectSaml(options: {
 			return finish(
 				await store.transaction(async (client) => {
 					const current = await store.getProvider(providerId, client);
-					if (
-						!current?.samlConfig ||
-						!sameSsoProvider(current, consumed.reference)
-					) {
+					if (!currentProviderMatches(current, consumed.reference)) {
 						rejection = "invalid_state";
 						throw abort;
 					}

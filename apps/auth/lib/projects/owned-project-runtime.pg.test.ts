@@ -24,7 +24,6 @@ import type { ControlPrincipal } from "../control/types";
 import { signEdgeRequest } from "../domains/edge";
 import { googleProviderRepository } from "../project-providers/repository";
 import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
-import { createWorkspace } from "../workspaces/repository";
 import { signProjectIssuerQuery } from "./owned-project-issuer-authorization-query";
 import { projectOpenApiPath } from "./owned-project-openapi";
 import type { ProjectRuntimeFixtureBoot } from "./owned-project-runtime-fixture";
@@ -48,9 +47,10 @@ import {
 	runtimeSamlSPMetadata,
 	runtimeSamlSubject,
 } from "./owned-project-runtime-saml-fixture";
+import type { ProjectEncryptedSamlFixtureAdmission } from "./owned-project-sso-saml-fixture-admission";
+import { encryptedSamlFixtureConfigurationDigest } from "./owned-project-sso-saml-fixture-admission";
 import { projectProxySecret } from "./proxy";
 import type { Project } from "./registry";
-import { projectRegistryPool, provisionProject } from "./registry";
 
 const fixture = new URL(
 	"../../../../.secrets/local-postgres.json",
@@ -156,6 +156,7 @@ async function openProcess(
 	owned: boolean,
 	microsoftProject = project.slug,
 	apple?: AppleFixture,
+	encryptedSamlFixture?: ProjectEncryptedSamlFixtureAdmission,
 ) {
 	const child = fork(worker, [], {
 		cwd: appRoot,
@@ -185,6 +186,7 @@ async function openProcess(
 		schemaName: project.schemaName,
 		owned,
 		appleIssuerKey: apple?.issuerKey,
+		encryptedSamlFixture,
 	};
 	child.send(boot);
 	try {
@@ -358,12 +360,18 @@ async function finishRuntimeSaml(
 	service: Awaited<ReturnType<typeof openProcess>>,
 	keys: Awaited<ReturnType<typeof createRuntimeSamlKeys>>,
 	{ flow, transport }: Awaited<ReturnType<typeof startRuntimeSaml>>,
+	encryption?: { certificate: string; dataAlgorithm?: string },
 ) {
 	const acs = new URL(flow.acs);
 	const authenticated = await service.request(acs.pathname, {
 		host: transport.host,
 		origin: runtimeSamlOrigin,
-		body: runtimeSamlResponse(keys, flow, credentials.project.email),
+		body: await runtimeSamlResponse(
+			keys,
+			flow,
+			credentials.project.email,
+			encryption,
+		),
 	});
 	expect(authenticated.status).toBe(302);
 	expect(authenticated.headers.get("location")).toBe(transport.destination);
@@ -700,6 +708,13 @@ async function seed(databaseURL: string) {
 		},
 	);
 	const env = { ...childEnvironment(), DATABASE_URL: databaseURL };
+	// The production registry owns one pool per process. Each isolated test seeds its own database.
+	vi.resetModules();
+	const [{ projectRegistryPool, provisionProject }, { createWorkspace }] =
+		await Promise.all([
+			import("./registry"),
+			import("../workspaces/repository"),
+		]);
 	const database = projectRegistryPool(env);
 	const cwd = vi.spyOn(process, "cwd").mockReturnValue(appRoot);
 	try {
@@ -1030,10 +1045,12 @@ describe.skipIf(!existsSync(fixture))(
 					authorization: "Bearer fixture-other-credential",
 				};
 				expect(
-					(await service.request(hostedSchemaPath, mixedSchemaCredentials)).status,
+					(await service.request(hostedSchemaPath, mixedSchemaCredentials))
+						.status,
 				).toBe(403);
 				expect(
-					(await service.request("/api/auth/reference", { host: alphaHost })).status,
+					(await service.request("/api/auth/reference", { host: alphaHost }))
+						.status,
 				).toBe(404);
 				const nativeRealmSupport = await service.request(
 					"/api/auth/admin/impersonate-user",
@@ -1242,23 +1259,32 @@ describe.skipIf(!existsSync(fixture))(
 						).toBe(403);
 				}
 				expect(
-					(await service.request(hostedSchemaPath, mixedSchemaCredentials)).status,
+					(await service.request(hostedSchemaPath, mixedSchemaCredentials))
+						.status,
 				).toBe(403);
 				expect(
-					(await service.request(directSchemaPath, {
-						...mixedSchemaCredentials,
-						host: undefined,
-					})).status,
+					(
+						await service.request(directSchemaPath, {
+							...mixedSchemaCredentials,
+							host: undefined,
+						})
+					).status,
 				).toBe(403);
 				expect(
-					(await service.request(`${betaPath}${projectOpenApiPath}`, {
-						cookie: realmAdminCookie,
-					})).status,
+					(
+						await service.request(`${betaPath}${projectOpenApiPath}`, {
+							cookie: realmAdminCookie,
+						})
+					).status,
 				).toBe(403);
 				expect(
-					(await service.request("/api/auth/reference", { host: alphaHost })).status,
+					(await service.request("/api/auth/reference", { host: alphaHost }))
+						.status,
 				).toBe(404);
-				const schemaAuthority = new Pool({ connectionString: url(restored), max: 1 });
+				const schemaAuthority = new Pool({
+					connectionString: url(restored),
+					max: 1,
+				});
 				try {
 					for (const [role, verified, banned] of [
 						["user", true, false],
@@ -1270,7 +1296,11 @@ describe.skipIf(!existsSync(fixture))(
 							[credentials.realmAdmin.id, role, verified, banned],
 						);
 						expect(
-							(await service.request(directSchemaPath, { cookie: realmAdminCookie })).status,
+							(
+								await service.request(directSchemaPath, {
+									cookie: realmAdminCookie,
+								})
+							).status,
 						).toBe(403);
 					}
 					await schemaAuthority.query(
@@ -1295,16 +1325,23 @@ describe.skipIf(!existsSync(fixture))(
 				);
 				for (const browserCookie of [ownedSchemaCookie, revokedSchemaCookie])
 					expect(
-						(await service.request(directSchemaPath, { cookie: browserCookie })).status,
+						(await service.request(directSchemaPath, { cookie: browserCookie }))
+							.status,
 					).toBe(200);
 				expect(
-					(await service.request(`${alphaPath}/sign-out`, {
-						cookie: revokedSchemaCookie,
-						body: {},
-					})).status,
+					(
+						await service.request(`${alphaPath}/sign-out`, {
+							cookie: revokedSchemaCookie,
+							body: {},
+						})
+					).status,
 				).toBe(200);
 				expect(
-					(await service.request(directSchemaPath, { cookie: revokedSchemaCookie })).status,
+					(
+						await service.request(directSchemaPath, {
+							cookie: revokedSchemaCookie,
+						})
+					).status,
 				).toBe(403);
 				const realmSupport = await service.request("/api/auth/get-session", {
 					host: alphaHost,
@@ -2293,7 +2330,11 @@ describe.skipIf(!existsSync(fixture))(
 
 				service = await open(restored, false);
 				expect(
-					(await service.request(directSchemaPath, { cookie: ownedSchemaCookie })).status,
+					(
+						await service.request(directSchemaPath, {
+							cookie: ownedSchemaCookie,
+						})
+					).status,
 				).toBe(200);
 				expect((await service.request("/api/health")).status).toBe(200);
 				const nativeRealmStop = await service.request(
@@ -2648,6 +2689,254 @@ describe.skipIf(!existsSync(fixture))(
 					}
 				} finally {
 					await admin.end();
+				}
+			}
+		}, 90_000);
+
+		it("pins a synthetic encrypted SAML provider across direct, hosted, and rollback transports", async () => {
+			const local: { container: string; DATABASE_URL: string } = JSON.parse(
+				readFileSync(fixture, "utf8"),
+			);
+			const base = new URL(local.DATABASE_URL);
+			if (
+				local.container !== "allauth-production-test-20261007" ||
+				base.hostname !== "127.0.0.1" ||
+				base.port !== "55445"
+			)
+				throw new Error(
+					"Encrypted SAML runtime checks require isolated local PostgreSQL.",
+				);
+			const name = `allauth_hosted_${randomUUID().replaceAll("-", "")}`;
+			const databaseURL = new URL(`/${name}`, base).href;
+			const admin = new Pool({ connectionString: base.href, max: 1 });
+			let created = false;
+			let database: Pool | undefined;
+			let service: Awaited<ReturnType<typeof openProcess>> | undefined;
+			try {
+				await admin.query(`CREATE DATABASE "${name}"`);
+				created = true;
+				const { alpha, beta, samlKeys } = await seed(databaseURL);
+				const encryptionKeys = await createRuntimeSamlKeys();
+				const signing = runtimeSamlConfiguration(samlKeys);
+				const samlConfig = {
+					...signing,
+					idpMetadata: { ...signing.idpMetadata, isAssertionEncrypted: true },
+					spMetadata: {
+						isAssertionEncrypted: true,
+						encPrivateKey: encryptionKeys.privateKey,
+					},
+				};
+				const provider = {
+					id: runtimeSamlProvider,
+					providerId: runtimeSamlProvider,
+					issuer: runtimeSamlEntity,
+					domain: "runtime.fixture.example",
+					organizationId: null,
+					samlConfig,
+				};
+				const admission = {
+					projectId: alpha.id,
+					schemaName: alpha.schemaName,
+					providerId: provider.providerId,
+					recordId: provider.id,
+					configurationDigest:
+						encryptedSamlFixtureConfigurationDigest(provider),
+				};
+				const encryption = { certificate: encryptionKeys.certificate };
+				database = new Pool({ connectionString: databaseURL, max: 1 });
+				const scoped = database;
+				async function setSamlConfiguration(config: object) {
+					await scoped.query(
+						`UPDATE "${alpha.schemaName}"."ssoProvider" SET "samlConfig"=$1 WHERE id=$2`,
+						[JSON.stringify(config), provider.id],
+					);
+				}
+				await setSamlConfiguration(samlConfig);
+				const unsupported =
+					"configured SAML provider outside the candidate scope";
+				await expect(openProcess(databaseURL, alpha, true)).rejects.toThrow(
+					unsupported,
+				);
+				await expect(
+					openProcess(databaseURL, alpha, true, alpha.slug, undefined, {
+						...admission,
+						projectId: beta.id,
+					}),
+				).rejects.toThrow("invalid encrypted SAML fixture binding");
+				await expect(
+					openProcess(databaseURL, alpha, true, alpha.slug, undefined, {
+						...admission,
+						recordId: randomUUID(),
+					}),
+				).rejects.toThrow(unsupported);
+
+				const prefix = `/api/projects/${alpha.slug}/auth`;
+				const host = `${alpha.slug}-accounts.allauth.co`;
+				const direct: SamlTransport = {
+					prefix,
+					baseURL: `${platformOrigin}${prefix}`,
+					destination: `${platformOrigin}/account?from=encrypted-saml`,
+				};
+				const hosted: SamlTransport = {
+					prefix: "/api/auth",
+					host,
+					baseURL: `https://${host}/api/auth`,
+					destination: `https://${host}/account?from=encrypted-saml`,
+				};
+				const metadataPath = (transport: SamlTransport) =>
+					`${transport.prefix}/sso/saml2/sp/metadata?providerId=${runtimeSamlProvider}`;
+				service = await openProcess(databaseURL, alpha, false);
+				const legacyDirect = await startRuntimeSaml(service, direct);
+				const legacyHosted = await startRuntimeSaml(service, hosted);
+				const legacyMetadata = await service.request(metadataPath(hosted), {
+					host,
+				});
+				expect(legacyMetadata.status).toBe(200);
+				const expectedMetadata = await legacyMetadata.text();
+				await service.stop();
+				service = undefined;
+
+				service = await openProcess(
+					databaseURL,
+					alpha,
+					true,
+					alpha.slug,
+					undefined,
+					admission,
+				);
+				const observedMetadata = await service.request(metadataPath(hosted), {
+					host,
+				});
+				expect(observedMetadata.status).toBe(200);
+				expect(await observedMetadata.text()).toBe(expectedMetadata);
+				const directMetadata = await service.request(metadataPath(direct));
+				expect(directMetadata.status).toBe(200);
+				expect(await directMetadata.text()).toContain(
+					`Location="${legacyDirect.flow.acs}"`,
+				);
+				const wrongTransport = await service.request(
+					new URL(legacyDirect.flow.acs).pathname,
+					{
+						origin: runtimeSamlOrigin,
+						body: await runtimeSamlResponse(
+							samlKeys,
+							legacyHosted.flow,
+							credentials.project.email,
+							encryption,
+						),
+					},
+				);
+				expect(wrongTransport.status).toBe(400);
+				expect(cookie(wrongTransport)).toBe("");
+				const cbc = await service.request(
+					new URL(legacyHosted.flow.acs).pathname,
+					{
+						host,
+						origin: runtimeSamlOrigin,
+						body: await runtimeSamlResponse(
+							samlKeys,
+							legacyHosted.flow,
+							credentials.project.email,
+							{
+								...encryption,
+								dataAlgorithm: "http://www.w3.org/2001/04/xmlenc#aes256-cbc",
+							},
+						),
+					},
+				);
+				expect(cbc.status).toBe(400);
+				expect(cookie(cbc)).toBe("");
+				await finishRuntimeSaml(service, samlKeys, legacyDirect, encryption);
+				await finishRuntimeSaml(service, samlKeys, legacyHosted, encryption);
+
+				const ownedDirect = await startRuntimeSaml(service, direct);
+				const ownedHosted = await startRuntimeSaml(service, hosted);
+				await scoped.query(
+					`UPDATE "${alpha.schemaName}"."ssoProvider" SET "oidcConfig"=(SELECT "oidcConfig" FROM "${alpha.schemaName}"."ssoProvider" WHERE "providerId"=$2) WHERE id=$1`,
+					[provider.id, directoryProvider],
+				);
+				const mixedProtocol = await service.request(
+					`${hosted.prefix}/sign-in/sso`,
+					{
+						host,
+						body: {
+							providerId: provider.providerId,
+							providerType: "oidc",
+							callbackURL: hosted.destination,
+						},
+					},
+				);
+				expect(mixedProtocol.status).toBe(400);
+				expect(await mixedProtocol.json()).toMatchObject({
+					code: "INVALID_OIDC_CONFIGURATION",
+				});
+				await scoped.query(
+					`UPDATE "${alpha.schemaName}"."ssoProvider" SET "oidcConfig"=NULL WHERE id=$1`,
+					[provider.id],
+				);
+				await setSamlConfiguration({
+					...samlConfig,
+					spMetadata: {
+						...samlConfig.spMetadata,
+						encPrivateKey: samlKeys.privateKey,
+					},
+				});
+				const changedMetadata = await service.request(metadataPath(hosted), {
+					host,
+				});
+				expect(changedMetadata.status).toBe(400);
+				const changedKey = await service.request(
+					new URL(ownedHosted.flow.acs).pathname,
+					{
+						host,
+						origin: runtimeSamlOrigin,
+						body: await runtimeSamlResponse(
+							samlKeys,
+							ownedHosted.flow,
+							credentials.project.email,
+							encryption,
+						),
+					},
+				);
+				expect(changedKey.status).toBe(400);
+				expect(cookie(changedKey)).toBe("");
+				await setSamlConfiguration(samlConfig);
+				await service.stop();
+				service = undefined;
+
+				service = await openProcess(databaseURL, alpha, false);
+				await finishRuntimeSaml(service, samlKeys, ownedDirect, encryption);
+				await finishRuntimeSaml(service, samlKeys, ownedHosted, encryption);
+				await service.stop();
+				service = undefined;
+
+				const custom = {
+					...samlConfig,
+					spMetadata: {
+						...samlConfig.spMetadata,
+						metadata: runtimeSamlSPMetadata(legacyDirect.flow.acs),
+					},
+				};
+				await setSamlConfiguration(custom);
+				await expect(
+					openProcess(databaseURL, alpha, true, alpha.slug, undefined, {
+						...admission,
+						configurationDigest: encryptedSamlFixtureConfigurationDigest({
+							...provider,
+							samlConfig: custom,
+						}),
+					}),
+				).rejects.toThrow(unsupported);
+			} finally {
+				try {
+					await service?.stop();
+				} finally {
+					try {
+						await database?.end();
+						if (created) await dropClosedFixtureDatabase(admin, name);
+					} finally {
+						await admin.end();
+					}
 				}
 			}
 		}, 90_000);

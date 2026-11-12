@@ -19,6 +19,8 @@ import {
 	ssoScope,
 } from "./owned-project-sso-oidc";
 import { createOwnedProjectSaml } from "./owned-project-sso-saml";
+import type { ProjectEncryptedSamlFixtureAdmission } from "./owned-project-sso-saml-fixture-admission";
+import { allowsEncryptedSamlFixtureProvider } from "./owned-project-sso-saml-fixture-admission";
 import type {
 	SsoIdentity,
 	SsoProvider,
@@ -76,6 +78,7 @@ export interface OwnedProjectSsoOptions {
 	signUpEnabled: boolean;
 	/** The generated SP subset uses the selected transport's ACS for every request. */
 	saml?: boolean | "generated-sp" | "encrypted-fixture";
+	encryptedSamlFixture?: ProjectEncryptedSamlFixtureAdmission;
 	/** Session/MFA admission runs on the same client as the exact account and directory binding. */
 	complete(
 		client: PoolClient,
@@ -163,7 +166,13 @@ export function createOwnedProjectSso(options: OwnedProjectSsoOptions) {
 			signingSecret: options.signingSecret,
 			signUpEnabled: options.signUpEnabled,
 			generatedSPOnly: options.saml === "generated-sp",
-			allowEncrypted: options.saml === "encrypted-fixture",
+			allowEncrypted: (provider) =>
+				options.saml === "encrypted-fixture" ||
+				allowsEncryptedSamlFixtureProvider(
+					options.encryptedSamlFixture,
+					options.project.schemaName,
+					provider,
+				),
 			defaultError,
 			store,
 			allowedReturn: (value) => allowedReturn(value, origin, origins),
@@ -301,7 +310,10 @@ export function createOwnedProjectSso(options: OwnedProjectSsoOptions) {
 				requestSignUp: body.requestSignUp,
 			});
 		}
-		if (!provider.oidcConfig)
+		if (
+			!provider.oidcConfig ||
+			provider.providerId === options.encryptedSamlFixture?.providerId
+		)
 			return json(
 				{
 					code: "INVALID_OIDC_CONFIGURATION",
@@ -480,6 +492,7 @@ export function createOwnedProjectSso(options: OwnedProjectSsoOptions) {
 		if (
 			request.method !== "GET" ||
 			!url ||
+			providerId === options.encryptedSamlFixture?.providerId ||
 			!ssoProviderId.safeParse(providerId).success
 		)
 			return failure("invalid_request");

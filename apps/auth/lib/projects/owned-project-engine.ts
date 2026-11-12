@@ -10,6 +10,7 @@ import type { ApplicationBranding } from "../branding/types";
 import { clerkCompatiblePasswords } from "../clerk-password";
 import { isPlatformAdmin } from "../configuration";
 import { discoveryHeaders } from "../discovery";
+import { emailConfigured } from "../email/send";
 import { isServerTokenRequest } from "../features/helpers";
 import { applicationMfaCallback } from "../mfa-continuation";
 import { oauthBrowserReturnPath } from "../oauth-browser";
@@ -200,6 +201,9 @@ interface OwnedProjectEngineOptions {
 		| "signUpEnabled"
 		| "requireEmailVerification"
 		| "authorizeLinkedAccounts"
+		| "passwordSignIn"
+		| "passkeySignIn"
+		| "otherLinkedSignIn"
 		| "readGuestUserId"
 		| "complete"
 	>;
@@ -668,9 +672,30 @@ export function createOwnedProjectEngine(
 			activeOrganizationId: prior?.activeOrganizationId,
 			activeTeamId: prior?.activeTeamId,
 		});
-		await store.record(client, "session.created", "success", path, user.id, id);
-		if (!prior)
-			await store.record(client, "auth.sign-in", "success", path, user.id, id);
+		await store.recordEvent(client, {
+			type: "session.created",
+			outcome: "success",
+			userId: user.id,
+			targetId: id,
+			metadata: { path },
+		});
+		if (!prior) {
+			const passwordMethod =
+				path === "/sign-in/email"
+					? "email"
+					: path === "/sign-in/username"
+						? "username"
+						: undefined;
+			await store.recordEvent(client, {
+				type: "auth.sign-in",
+				outcome: "success",
+				actorId: user.id,
+				userId: user.id,
+				targetId: id,
+				...(passwordMethod ? browserEventContext(request) : {}),
+				metadata: { path, method: passwordMethod },
+			});
+		}
 		const maxAge = rememberMe ? policy.sessionExpiresInSeconds : undefined;
 		writeCookie(headers, sessionCookie, token, maxAge);
 		if (existing.length - owned.length < 5 || prior) {
@@ -1072,6 +1097,13 @@ export function createOwnedProjectEngine(
 		}
 	}
 
+	function browserEventContext(request: Request) {
+		return {
+			ipAddress: security.trustedIP(request) ?? undefined,
+			userAgent: request.headers.get("user-agent") ?? undefined,
+		};
+	}
+
 	async function signIn(
 		request: Request,
 		field: "email" | "username" = "email",
@@ -1111,6 +1143,13 @@ export function createOwnedProjectEngine(
 			"email" in body.data ? body.data.email : body.data.username
 		).toLowerCase();
 		const identity = field === "email" ? { email: login } : { username: login };
+		const recordFailure = (client: PoolClient) =>
+			store.recordEvent(client, {
+				type: "auth.sign-in",
+				outcome: "failure",
+				...browserEventContext(request),
+				metadata: { path, errorCode: invalidCode },
+			});
 		if (
 			await store.transaction((client) =>
 				security.admit(client, request, identity),
@@ -1151,7 +1190,7 @@ export function createOwnedProjectEngine(
 			if (!hash) await clerkCompatiblePasswords.hash(body.data.password);
 			await store.transaction(async (client) => {
 				await security.failed(client, request, path, identity);
-				await store.record(client, "auth.sign-in", "failure", path);
+				await recordFailure(client);
 			});
 			return failure(401, invalidCode, invalidMessage);
 		}
@@ -1164,6 +1203,7 @@ export function createOwnedProjectEngine(
 				current.password !== hash
 			) {
 				await security.failed(client, request, path, identity);
+				await recordFailure(client);
 				return failure(401, invalidCode, invalidMessage);
 			}
 			const result = await primaryResult(
@@ -1250,15 +1290,26 @@ export function createOwnedProjectEngine(
 				...valid.map((entry) => entry.token),
 			]),
 		];
-		if (tokens.length) {
-			const removed = await store.revoke(
-				{ tokens },
-				"/sign-out",
-				Boolean(backchannel),
-			);
-			if (!removed) return unsupported();
-			await backchannel?.(removed.targets);
-		}
+		const logoutTargets = await store.transaction(async (client) => {
+			const removed = tokens.length
+				? await store.revoke(
+						{ tokens },
+						"/sign-out",
+						Boolean(backchannel),
+						client,
+					)
+				: { targets: [] };
+			if (!removed) return null;
+			await store.recordEvent(client, {
+				type: "session.signed-out",
+				outcome: "success",
+				...browserEventContext(request),
+				metadata: { path: "/sign-out" },
+			});
+			return removed.targets;
+		});
+		if (!logoutTargets) return unsupported();
+		await backchannel?.(logoutTargets);
 		const headers = new Headers();
 		clearSessionCookies(headers);
 		for (const { name } of valid) writeCookie(headers, name, "", 0);
@@ -2062,6 +2113,15 @@ export function createOwnedProjectEngine(
 			signingSecret: options.signingSecret,
 			signUpEnabled: policy.signUpEnabled,
 			requireEmailVerification: policy.requireEmailVerification,
+			passwordSignIn: policy.emailAndPasswordEnabled,
+			passkeySignIn: Boolean(options.passkeys),
+			async otherLinkedSignIn(_client, user) {
+				return Boolean(
+					user.emailVerified &&
+						options.emailSignIn &&
+						emailConfigured(options.emailSignIn.email.environment),
+				);
+			},
 			async authorizeLinkedAccounts(client, { request, user }) {
 				const active = await currentSession(request.headers, client);
 				return active?.user.id === user.id;
@@ -2226,6 +2286,7 @@ export function createOwnedProjectEngine(
 			trustedOrigins: acceptedOrigins,
 			fetch: options.sso?.fetch,
 			saml: options.sso?.saml,
+			encryptedSamlFixture: options.sso?.encryptedSamlFixture,
 			trustedRequest,
 			readBody: requestBody,
 			readSession: (request, client) => currentSession(request.headers, client),
@@ -2634,6 +2695,8 @@ export function createOwnedProjectEngine(
 		if (organizationResponse) return organizationResponse;
 		if (oauth && path === "/list-accounts" && request.method === "GET")
 			return oauth.listAccounts(request);
+		if (oauth && path === "/account-info" && request.method === "GET")
+			return oauth.accountInfo(request);
 		if (oauth && path === "/unlink-account" && request.method === "POST") {
 			if (!trustedRequest(request.headers, true)) return forbidden();
 			const body = ownedProjectOAuthUnlinkInput.safeParse(

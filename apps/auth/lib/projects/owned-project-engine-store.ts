@@ -1,4 +1,9 @@
 import type { Pool, PoolClient } from "pg";
+import {
+	controlEventAttributes,
+	sanitizeControlMetadata,
+} from "../control/event-metadata";
+import type { ControlEventInput } from "../control/types";
 import type { ProjectBackchannelTarget } from "./owned-project-backchannel-logout";
 import { checkedProjectSchema } from "./validation";
 
@@ -336,15 +341,14 @@ export function createProjectEngineStore(database: Pool, schemaName: string) {
 				ids,
 			]);
 			for (const row of selected.rows)
-				await record(
-					client,
-					"session.deleted",
-					"success",
-					path,
-					row.userId,
-					row.id,
-					actorId,
-				);
+				await recordEvent(client, {
+					type: "session.deleted",
+					outcome: "success",
+					actorId: path === "/sign-out" ? undefined : (actorId ?? row.userId),
+					userId: row.userId,
+					targetId: row.id,
+					metadata: { path },
+				});
 			return { ids, targets };
 		}
 		return client ? remove(client) : transaction(remove);
@@ -359,17 +363,34 @@ export function createProjectEngineStore(database: Pool, schemaName: string) {
 		targetId?: string,
 		actorId = userId,
 	) {
+		return recordEvent(client, {
+			type,
+			outcome,
+			actorId,
+			userId,
+			targetId,
+			metadata: { path },
+		});
+	}
+
+	async function recordEvent(client: PoolClient, event: ControlEventInput) {
+		const fields = controlEventAttributes(event);
 		await client.query(
-			`INSERT INTO "allauthEvent" (id, type, outcome, "actorId", "userId", "targetId", "createdAt", metadata)
-			 VALUES ($1, $2, $3, $4, $5, $6, statement_timestamp(), jsonb_build_object('path', $7::text))`,
+			`INSERT INTO "allauthEvent" (id, type, outcome, "actorId", "userId", "organizationId", "clientId", "targetId", "ipAddress", "userAgent", "createdAt", metadata)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, COALESCE($11::timestamptz, statement_timestamp()), $12::jsonb)`,
 			[
-				crypto.randomUUID(),
-				type,
-				outcome,
-				actorId ?? null,
-				userId ?? null,
-				targetId ?? null,
-				path,
+				event.id ?? crypto.randomUUID(),
+				event.type.slice(0, 128),
+				event.outcome,
+				fields.actorId ?? null,
+				fields.userId ?? null,
+				fields.organizationId ?? null,
+				fields.clientId ?? null,
+				fields.targetId ?? null,
+				fields.ipAddress ?? null,
+				fields.userAgent ?? null,
+				event.createdAt ?? null,
+				JSON.stringify(sanitizeControlMetadata(event.metadata)),
 			],
 		);
 	}
@@ -382,6 +403,7 @@ export function createProjectEngineStore(database: Pool, schemaName: string) {
 		lockSession,
 		lockUser,
 		record,
+		recordEvent,
 		refresh,
 		revoke,
 		session,

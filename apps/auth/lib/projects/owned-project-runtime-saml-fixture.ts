@@ -96,10 +96,11 @@ export function runtimeSamlSPMetadata(acs: string) {
 		.getMetadata();
 }
 
-export function runtimeSamlResponse(
+export async function runtimeSamlResponse(
 	keys: Awaited<ReturnType<typeof createRuntimeSamlKeys>>,
 	input: ReturnType<typeof runtimeSamlAuthnRequest>,
 	email: string,
+	encryption?: { certificate: string; dataAlgorithm?: string },
 ) {
 	const now = new Date().toISOString();
 	const expires = new Date(Date.now() + 120_000).toISOString();
@@ -131,8 +132,50 @@ export function runtimeSamlResponse(
 			},
 		},
 	});
+	const encoded = encryption
+		? await encryptRuntimeSamlAssertion(signed, input.acs, encryption)
+		: Buffer.from(signed).toString("base64");
 	return new URLSearchParams({
-		SAMLResponse: Buffer.from(signed).toString("base64"),
+		SAMLResponse: encoded,
 		RelayState: input.relay,
 	});
+}
+
+function encryptRuntimeSamlAssertion(
+	signed: string,
+	acs: string,
+	encryption: { certificate: string; dataAlgorithm?: string },
+) {
+	const receiver = saml.ServiceProvider({
+		entityID: runtimeSamlEntity,
+		assertionConsumerService: [
+			{
+				Binding: "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST",
+				Location: acs,
+			},
+		],
+		encryptCert: encryption.certificate,
+	});
+	// Samlify consumes the encryption algorithms at runtime.
+	const senderSettings: Parameters<typeof saml.IdentityProvider>[0] & {
+		dataEncryptionAlgorithm: string;
+		keyEncryptionAlgorithm: string;
+	} = {
+		entityID: runtimeSamlIssuer,
+		isAssertionEncrypted: true,
+		singleSignOnService: [
+			{
+				Binding: "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect",
+				Location: `${runtimeSamlOrigin}/saml/redirect`,
+			},
+		],
+		dataEncryptionAlgorithm:
+			encryption.dataAlgorithm ?? "http://www.w3.org/2009/xmlenc11#aes256-gcm",
+		keyEncryptionAlgorithm: "http://www.w3.org/2001/04/xmlenc#rsa-oaep-mgf1p",
+	};
+	return saml.SamlLib.encryptAssertion(
+		saml.IdentityProvider(senderSettings),
+		receiver,
+		signed,
+	);
 }

@@ -757,6 +757,20 @@ describe.skipIf(!existsSync(fixturePath))(
 					query: { disableRefresh: true },
 				});
 				expect(session?.user).toMatchObject({ email, emailVerified: false });
+				const record = await database.query<{ id: string }>(
+					`SELECT id FROM "${schema}"."account" WHERE "userId"=$1 AND "providerId"='microsoft'`,
+					[session!.user.id],
+				);
+				const info = accountRequest(
+					`/account-info?accountId=${record.rows[0]!.id}`,
+					cookiePairs(first),
+				);
+				const profile = await candidate.dispatch(info);
+				expect(profile.status, await profile.clone().text()).toBe(200);
+				expect(await profile.json()).toMatchObject({
+					account: { accountId: oid, providerId: "microsoft" },
+					user: { email, name: "Enterprise owner", emailVerified: false },
+				});
 				const ownedStart = await candidate.dispatch(
 					post(origin, "/sign-in/social", input),
 				);
@@ -903,6 +917,20 @@ describe.skipIf(!existsSync(fixturePath))(
 					email,
 					emailVerified: true,
 					name: "Private Fixture",
+				});
+				const record = await database.query<{ id: string }>(
+					`SELECT id FROM "${schema}"."account" WHERE "userId"=$1 AND "providerId"='apple'`,
+					[before!.user.id],
+				);
+				const info = accountRequest(
+					`/account-info?accountId=${record.rows[0]!.id}`,
+					cookiePairs(signedIn),
+				);
+				const profile = await candidate.dispatch(info);
+				expect(profile.status, await profile.clone().text()).toBe(200);
+				expect(await profile.json()).toMatchObject({
+					account: { accountId: subject, providerId: "apple" },
+					user: { email, emailVerified: true },
 				});
 
 				const ownedStart = await candidate.dispatch(
@@ -1249,12 +1277,13 @@ describe.skipIf(!existsSync(fixturePath))(
 			});
 			expect(session?.user.email).toBe(brokerEmail);
 			const { rows } = await database.query<{
+				id: string;
 				userId: string;
 				accountId: string;
 				accessToken: string;
 				idToken: string;
 			}>(
-				`SELECT "userId", "accountId", "accessToken", "idToken" FROM "${schema}"."account" WHERE "providerId" = 'allauth'`,
+				`SELECT id, "userId", "accountId", "accessToken", "idToken" FROM "${schema}"."account" WHERE "providerId" = 'allauth'`,
 			);
 			expect(rows).toHaveLength(1);
 			expect(rows[0]).toMatchObject({
@@ -1274,6 +1303,41 @@ describe.skipIf(!existsSync(fixturePath))(
 				sub: brokerUserId,
 				email: brokerEmail,
 			});
+			const profile = await owned().accountInfo(
+				accountRequest(
+					`/account-info?accountId=${rows[0]!.id}`,
+					cookiePairs(response),
+				),
+			);
+			expect(profile.status, await profile.clone().text()).toBe(200);
+			expect(await profile.json()).toMatchObject({
+				account: { accountId: brokerUserId, providerId: "allauth" },
+				user: { email: brokerEmail },
+			});
+			await database.query(
+				`UPDATE "${schema}"."account" SET "idToken"=NULL WHERE id=$1`,
+				[rows[0]!.id],
+			);
+			try {
+				const userInfoFallback = await owned().accountInfo(
+					accountRequest(
+						`/account-info?accountId=${rows[0]!.id}`,
+						cookiePairs(response),
+					),
+				);
+				expect(
+					userInfoFallback.status,
+					await userInfoFallback.clone().text(),
+				).toBe(200);
+				expect(await userInfoFallback.json()).toMatchObject({
+					user: { email: brokerEmail },
+				});
+			} finally {
+				await database.query(
+					`UPDATE "${schema}"."account" SET "idToken"=$2 WHERE id=$1`,
+					[rows[0]!.id, rows[0]!.idToken],
+				);
+			}
 			const replay = await owned().callback(request, "allauth");
 			expect(
 				new URL(replay.headers.get("location")!).searchParams.get("error"),
@@ -1519,6 +1583,228 @@ describe.skipIf(!existsSync(fixturePath))(
 			const bearer = accountRequest("/list-accounts", owner.cookie);
 			bearer.headers.set("authorization", "Bearer fixture-browser-bearer");
 			expect((await owned().listAccounts(bearer)).status).toBe(403);
+		});
+
+		it("reads linked Google profiles with opaque ownership and writes a rotated grant the native engine can still read", async () => {
+			const owner = await accountOwner();
+			const peer = await accountOwner();
+			const foreign = await accountOwner(foreignSchema);
+			const account = await persistedAccount(owner.userId, "google");
+			const disabled = await persistedAccount(owner.userId, "microsoft");
+			const keys = await generateKeyPair("RS256");
+			const jwk = {
+				...(await exportJWK(keys.publicKey)),
+				kid: "linked-profile-key",
+				alg: "RS256",
+			};
+			const sign = (name: string) =>
+				new SignJWT({
+					name,
+					email: "provider-profile@fixture.example",
+					email_verified: true,
+					username: "fixture-link",
+					fixtureSecret: "never-return-raw-claims",
+				})
+					.setProtectedHeader({ alg: "RS256", kid: jwk.kid })
+					.setIssuer("accounts.google.com")
+					.setAudience(google.clientId)
+					.setSubject(account.accountId)
+					.setIssuedAt()
+					.setExpirationTime("10m")
+					.sign(keys.privateKey);
+			const oldRefresh = await symmetricEncrypt({
+				key,
+				data: "fixture-old-refresh-grant",
+			});
+			const oldAccess = await symmetricEncrypt({
+				key,
+				data: "fixture-old-access-grant",
+			});
+			await database.query(
+				`UPDATE "${schema}"."account" SET "idToken"=$2,"accessToken"=$3,"refreshToken"=$4,"accessTokenExpiresAt"=now()+interval '10 minutes' WHERE id=$1`,
+				[
+					account.id,
+					await sign("Original linked profile"),
+					oldAccess,
+					oldRefresh,
+				],
+			);
+			const fetch = vi.fn(
+				async (input: URL | RequestInfo, init?: RequestInit) => {
+					const request = new Request(input, init);
+					if (request.url === "https://www.googleapis.com/oauth2/v3/certs")
+						return Response.json({ keys: [jwk] });
+					expect(request.url).toBe("https://oauth2.googleapis.com/token");
+					expect(request.redirect).toBe("error");
+					const params = new URLSearchParams(await request.text());
+					expect(params.get("grant_type")).toBe("refresh_token");
+					expect(params.get("refresh_token")).toBe("fixture-old-refresh-grant");
+					expect(params.get("client_id")).toBe(google.clientId);
+					return Response.json({
+						token_type: "Bearer",
+						access_token: "fixture-rotated-access",
+						refresh_token: "fixture-rotated-refresh",
+						expires_in: 600,
+						id_token: await sign("Rotated linked profile"),
+					});
+				},
+			);
+			externalNetwork = fetch;
+			try {
+				const candidate = owned();
+				const infoPath = `/account-info?accountId=${account.id}`;
+				const request = accountRequest(infoPath, owner.cookie);
+				const original = await native.handler(request);
+				expect(original.status).toBe(200);
+				expect(await original.json()).toMatchObject({
+					user: { name: "Original linked profile" },
+					account: { id: account.id },
+				});
+				for (const cookie of [peer.cookie, foreign.cookie]) {
+					const denied = await candidate.accountInfo(
+						accountRequest(`${infoPath}&userId=${owner.userId}`, cookie),
+					);
+					expect(denied.status).toBe(cookie === peer.cookie ? 400 : 401);
+				}
+				expect(
+					(
+						await candidate.accountInfo(
+							accountRequest(
+								`/account-info?accountId=${account.accountId}`,
+								owner.cookie,
+							),
+						)
+					).status,
+				).toBe(400);
+				expect(
+					await (
+						await candidate.accountInfo(
+							accountRequest(
+								`/account-info?accountId=${disabled.id}`,
+								owner.cookie,
+							),
+						)
+					).json(),
+				).toMatchObject({ code: "PROVIDER_NOT_CONFIGURED" });
+				expect(fetch).not.toHaveBeenCalled();
+				const current = await candidate.accountInfo(request);
+				expect(current.headers.get("cache-control")).toBe("no-store");
+				expect(await current.json()).toEqual({
+					account: {
+						id: account.id,
+						accountId: account.accountId,
+						providerId: "google",
+					},
+					user: {
+						email: "provider-profile@fixture.example",
+						name: "Original linked profile",
+						emailVerified: true,
+					},
+					data: { username: "fixture-link" },
+				});
+				await database.query(
+					`UPDATE "${schema}"."account" SET "accessTokenExpiresAt"=now()-interval '1 second' WHERE id=$1`,
+					[account.id],
+				);
+				const both = await Promise.all([
+					candidate.accountInfo(request),
+					candidate.accountInfo(request),
+				]);
+				for (const response of both) {
+					expect(response.status).toBe(200);
+					const result: unknown = await response.json();
+					expect(result).toMatchObject({
+						user: { name: "Rotated linked profile" },
+					});
+					expect(JSON.stringify(result)).not.toContain(
+						"fixture-rotated-access",
+					);
+					expect(JSON.stringify(result)).not.toContain(
+						"never-return-raw-claims",
+					);
+				}
+				expect(
+					fetch.mock.calls.filter(
+						([input]) =>
+							(input instanceof Request ? input.url : String(input)) ===
+							"https://oauth2.googleapis.com/token",
+					),
+				).toHaveLength(1);
+				const stored = await database.query<{
+					accessToken: string;
+					refreshToken: string;
+				}>(
+					`SELECT "accessToken","refreshToken" FROM "${schema}"."account" WHERE id=$1`,
+					[account.id],
+				);
+				expect(
+					await symmetricDecrypt({ key, data: stored.rows[0]!.accessToken }),
+				).toBe("fixture-rotated-access");
+				expect(
+					await symmetricDecrypt({ key, data: stored.rows[0]!.refreshToken }),
+				).toBe("fixture-rotated-refresh");
+				expect(await (await native.handler(request)).json()).toMatchObject({
+					user: { name: "Rotated linked profile" },
+					account: { id: account.id },
+				});
+			} finally {
+				externalNetwork = undefined;
+			}
+		});
+
+		it("unlinks exact historical or credential rows while preserving an enabled way to sign in", async () => {
+			const owner = await accountOwner();
+			const credential = await persistedAccount(owner.userId, "credential");
+			const historical = await persistedAccount(
+				owner.userId,
+				"historical-provider",
+			);
+			const peer = await accountOwner();
+			const peerHistorical = await persistedAccount(
+				peer.userId,
+				"historical-provider",
+			);
+			const candidate = owned();
+			const request = (accountId: string) =>
+				accountRequest("/unlink-account", owner.cookie, { accountId });
+			const unlink = (accountId: string) =>
+				candidate.unlinkAccount(request(accountId), { accountId });
+			for (const wrong of [historical.accountId, peerHistorical.id])
+				expect(await (await unlink(wrong)).json()).toMatchObject({
+					code: "ACCOUNT_NOT_FOUND",
+				});
+			expect(await (await unlink(credential.id)).json()).toMatchObject({
+				code: "FAILED_TO_UNLINK_LAST_ACCOUNT",
+			});
+			expect(await (await unlink(historical.id)).json()).toEqual({
+				status: true,
+			});
+			expect(await (await unlink(credential.id)).json()).toMatchObject({
+				code: "FAILED_TO_UNLINK_LAST_ACCOUNT",
+			});
+			const googleAccount = await persistedAccount(owner.userId, "google");
+			expect(await (await unlink(credential.id)).json()).toEqual({
+				status: true,
+			});
+			expect(
+				await (
+					await native.handler(accountRequest("/list-accounts", owner.cookie))
+				).json(),
+			).toMatchObject([googleAccount]);
+			const nativeCredential = await persistedAccount(
+				owner.userId,
+				"credential",
+			);
+			expect(
+				await (await native.handler(request(nativeCredential.id))).json(),
+			).toEqual({ status: true });
+			expect(
+				await (
+					await candidate.listAccounts(
+						accountRequest("/list-accounts", owner.cookie),
+					)
+				).json(),
+			).toMatchObject([googleAccount]);
 		});
 
 		it("serializes concurrent unlink requests and leaves the last linked sign-in account", async () => {

@@ -18,6 +18,7 @@ import {
 	authConfiguration,
 	authOrigin,
 	projectEmailEnvironment,
+	setting,
 } from "../configuration";
 import { canonicalIP } from "../control/security-policy";
 import { authenticationEmail } from "../email/authentication";
@@ -61,6 +62,8 @@ import { createOwnedProjectSCIMConsole } from "./owned-project-scim-console";
 import { checkProjectOidcConfiguration } from "./owned-project-sso-oidc";
 import { readStoredSsoConfiguration } from "./owned-project-sso-projection";
 import { checkProjectSamlConfiguration } from "./owned-project-sso-saml-eligibility";
+import type { ProjectEncryptedSamlFixtureAdmission } from "./owned-project-sso-saml-fixture-admission";
+import { allowsEncryptedSamlFixtureProvider } from "./owned-project-sso-saml-fixture-admission";
 import { projectSamlAcs } from "./owned-project-sso-saml-management";
 import { ssoProviderId } from "./owned-project-sso-store";
 import type { ProjectAvatarStorage } from "./project-avatar-upload";
@@ -88,6 +91,7 @@ type Options = {
 	defer(work: () => Promise<void>): void;
 	/** Only the isolated fixture supplies alternate egress. */
 	fetchPasswordRange?: Parameters<typeof createOwnedProjectPasswordSafety>[0];
+	encryptedSamlFixture?: ProjectEncryptedSamlFixtureAdmission;
 	postBackchannelLogout?: NonNullable<
 		EngineOptions["backchannelLogout"]
 	>["post"];
@@ -105,6 +109,24 @@ const authAdmission = {
 
 async function readSupportedProviders(options: Options, baseURL: string) {
 	const { database, project, env } = options;
+	const admission = options.encryptedSamlFixture;
+	if (admission) {
+		const databaseURL = new URL(setting(env, "DATABASE_URL"));
+		if (
+			process.env.NODE_ENV !== "test" ||
+			!/^postgres(?:ql)?:$/.test(databaseURL.protocol) ||
+			databaseURL.hostname !== "127.0.0.1" ||
+			databaseURL.port !== "55445" ||
+			!/^\/allauth_hosted_[a-f0-9]{32}$/.test(databaseURL.pathname) ||
+			database.options.connectionString !== databaseURL.href ||
+			database.options.options !== `-c search_path=${project.schemaName}` ||
+			admission.projectId !== project.id ||
+			admission.schemaName !== project.schemaName
+		)
+			throw new Error(
+				"This development project has an invalid encrypted SAML fixture binding.",
+			);
+	}
 	if (
 		project.environment !== "development" ||
 		!/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(project.id) ||
@@ -150,23 +172,41 @@ async function readSupportedProviders(options: Options, baseURL: string) {
 	}
 	const schema = checkedProjectSchema(project.schemaName);
 	const { rows: enterprise } = await database.query<{
+		id: string;
 		providerId: string;
 		issuer: string;
+		domain: string;
+		organizationId: string | null;
 		oidcConfig: string | null;
 		samlConfig: string | null;
 	}>(
-		`SELECT "providerId",issuer,"oidcConfig","samlConfig" FROM "${schema}"."ssoProvider"`,
+		`SELECT id,"providerId",issuer,domain,"organizationId","oidcConfig","samlConfig" FROM "${schema}"."ssoProvider"`,
 	);
+	if (
+		admission &&
+		!enterprise.some(
+			(row) => row.providerId === admission.providerId && row.samlConfig,
+		)
+	)
+		throw new Error(
+			"This development project has an invalid encrypted SAML fixture binding.",
+		);
 	const enterpriseProviderIds = enterprise.map((entry) => {
 		const providerId = ssoProviderId.parse(entry.providerId);
 		if (entry.samlConfig || !entry.oidcConfig) {
 			const samlConfig = readStoredSsoConfiguration(entry.samlConfig);
 			try {
 				if (entry.oidcConfig || !samlConfig) throw new Error();
+				const encrypted = allowsEncryptedSamlFixtureProvider(
+					admission,
+					schema,
+					{ ...entry, samlConfig },
+				);
 				checkProjectSamlConfiguration(
 					{ issuer: entry.issuer, samlConfig },
 					projectSamlAcs(baseURL, providerId),
 					true,
+					encrypted,
 				);
 			} catch {
 				throw new Error(
@@ -509,6 +549,7 @@ export async function createOwnedProjectRuntimeCandidate(options: Options) {
 			defaultErrorURL: `${platform}/auth-error`,
 			tokenKeys: encryptionKeys,
 			saml: "generated-sp",
+			encryptedSamlFixture: options.encryptedSamlFixture,
 		},
 		scim: { credentialHashSecret: options.credentialHashSecret },
 		manageSCIMConsole,

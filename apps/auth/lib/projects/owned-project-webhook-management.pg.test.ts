@@ -26,6 +26,7 @@ import {
 	createControlWebhooks,
 	deliverPendingWebhooks,
 } from "../control/webhooks";
+import type { ControlWebhookEnvelope } from "../control/webhooks";
 import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
 import { createOwnedProjectEngine } from "./owned-project-engine";
 import { projectSecret } from "./runtime";
@@ -99,7 +100,7 @@ async function native(
 	realm?: typeof alpha,
 	readRoot?: (headers: Headers) => Promise<ControlPrincipal | null>,
 ) {
-	const control = allauthControl();
+	const control = allauthControl({ ipHeader: "x-real-ip" });
 	const webhooks =
 		realm &&
 		createControlWebhooks({
@@ -604,6 +605,121 @@ describe.skipIf(!existsSync(fixture))(
 					})),
 				),
 			);
+		});
+
+		it("delivers the same public password sign-in and sign-out events from either writer", async () => {
+			const created = await send("legacy", `${base}/create`, {
+				url: "https://payload.webhook.fixture.example/receive",
+				eventTypes: ["auth.sign-in", "session.*", "session.created"],
+			});
+			expect(created.status).toBe(200);
+			const { secret, endpoint } = (await created.json()) as {
+				secret: string;
+				endpoint: ControlWebhookEndpoint;
+			};
+			const incorrectPassword = "Disposable-invalid-attempt-0!";
+			async function exercise(writer: "legacy" | "owned") {
+				const attempt = await send(
+					writer,
+					"/sign-in/email",
+					{
+						email: userEmail,
+						password: incorrectPassword,
+					},
+					"",
+				);
+				expect(attempt.status).toBe(401);
+				const signedIn = await send(
+					writer,
+					"/sign-in/email",
+					{
+						email: userEmail,
+						password,
+					},
+					"",
+				);
+				expect(signedIn.status).toBe(200);
+				const cookie = signedIn.headers
+					.getSetCookie()
+					.find((value) =>
+						value.startsWith(
+							`__Secure-allauth_project_${alpha.slug}.session_token=`,
+						),
+					)
+					?.split(";", 1)[0];
+				expect(cookie).toBeTruthy();
+				const active = await send(writer, "/get-session", undefined, cookie);
+				const { session } = (await active.json()) as {
+					session: { id: string };
+				};
+				expect(session.id).toBeTruthy();
+				expect((await send(writer, "/sign-out", {}, cookie)).status).toBe(200);
+				const delivered: Array<{
+					body: string;
+					headers: Record<string, string>;
+				}> = [];
+				const result = await deliverPendingWebhooks({
+					database: projectDatabase,
+					secret: alpha.secret,
+					resolver,
+					now: () => new Date(Date.now() + 1_000),
+					transport: async ({ body, headers }) => {
+						delivered.push({ body, headers });
+						return 204;
+					},
+				});
+				expect(result).toMatchObject({
+					claimed: delivered.length,
+					delivered: delivered.length,
+				});
+				const events = [];
+				const eventIds = new Set<string>();
+				for (const { body, headers } of delivered) {
+					const { id, type, timestamp, data } = JSON.parse(
+						body,
+					) as ControlWebhookEnvelope;
+					expect(data.event).toMatchObject({ id, type, createdAt: timestamp });
+					expect(headers["webhook-signature"]).toBe(
+						await webhookSignature(
+							secret,
+							headers["webhook-id"],
+							headers["webhook-timestamp"],
+							body,
+						),
+					);
+					eventIds.add(id);
+					expect(data.user).toBeUndefined();
+					for (const privateValue of [
+						userEmail,
+						password,
+						incorrectPassword,
+						cookie,
+					])
+						expect(body).not.toContain(privateValue);
+					const { id: _id, createdAt: _timestamp, ...event } = data.event;
+					if (event.targetId) {
+						expect(event.targetId).toBe(session.id);
+						event.targetId = "session";
+					}
+					events.push(event);
+				}
+				expect(eventIds.size).toBe(delivered.length);
+				return events.sort((a, b) =>
+					`${a.type}:${a.outcome}`.localeCompare(`${b.type}:${b.outcome}`),
+				);
+			}
+			const nativeEvents = await exercise("legacy");
+			expect(nativeEvents.map((event) => event.type)).toEqual([
+				"auth.sign-in",
+				"auth.sign-in",
+				"session.created",
+				"session.deleted",
+				"session.signed-out",
+			]);
+			expect(await exercise("owned")).toEqual(nativeEvents);
+			expect(
+				(await send("owned", `${base}/delete`, { id: endpoint.id })).status,
+			).toBe(200);
 		});
 	},
 );

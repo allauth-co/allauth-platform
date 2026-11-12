@@ -2,71 +2,13 @@ import type { GenericEndpointContext } from "@better-auth/core";
 import { getCurrentAdapter } from "@better-auth/core/context";
 import type { DBTransactionAdapter } from "@better-auth/core/db/adapter";
 import { APIError } from "better-auth";
+import {
+	controlEventAttributes,
+	sanitizeControlMetadata,
+} from "./event-metadata";
 import type { ControlEvent, ControlEventInput } from "./types";
 
-const metadataFields = new Set([
-	"path",
-	"method",
-	"provider",
-	"errorCode",
-	"reason",
-	"status",
-	"fields",
-	"sessionId",
-	"newDevice",
-	"knownDevice",
-	"riskScore",
-	"signal",
-	"ruleId",
-	"ruleType",
-	"policy",
-	"monitor",
-	"legacy",
-	"version",
-	"action",
-	"count",
-	"windowSeconds",
-	"blockedUntil",
-	"expiresAt",
-	"applicationAuditId",
-	"actorKind",
-	"contextKind",
-	"contextId",
-]);
-const credentialKey =
-	/password|secret|token|cookie|authorization|credential|otp|backup.?code|private.?metadata|access.?key|email|address/i;
-
-/** Drop unknown and credential-bearing metadata, and bound strings/arrays before storage. */
-export function sanitizeControlMetadata(
-	metadata: Record<string, unknown> | undefined,
-): Record<string, unknown> {
-	const result: Record<string, unknown> = {};
-	for (const [key, value] of Object.entries(metadata || {}).slice(0, 32)) {
-		if (!metadataFields.has(key) || credentialKey.test(key)) continue;
-		if (typeof value === "string")
-			result[key] = value.slice(0, 256).replace(/[\u0000-\u001f]/g, "");
-		else if (
-			typeof value === "boolean" ||
-			(typeof value === "number" && Number.isFinite(value)) ||
-			value === null
-		)
-			result[key] = value;
-		else if (Array.isArray(value))
-			result[key] = value
-				.filter(
-					(item): item is string =>
-						typeof item === "string" && !credentialKey.test(item),
-				)
-				.slice(0, 20)
-				.map((item) => item.slice(0, 80));
-	}
-	return result;
-}
-
-const optionalString = (value: unknown, length: number) =>
-	typeof value === "string" && value
-		? value.slice(0, length).replace(/[\u0000-\u001f]/g, "")
-		: undefined;
+export { sanitizeControlMetadata } from "./event-metadata";
 
 /** Persist an immutable event through Better Auth's current transaction adapter. */
 export async function writeControlEvent(
@@ -79,21 +21,7 @@ export async function writeControlEvent(
 		createdAt: event.createdAt || new Date(),
 		metadata: sanitizeControlMetadata(event.metadata),
 	};
-	for (const field of [
-		"actorId",
-		"userId",
-		"organizationId",
-		"clientId",
-		"targetId",
-		"ipAddress",
-		"userAgent",
-	] as const) {
-		const value = optionalString(
-			event[field],
-			field === "userAgent" ? 512 : 160,
-		);
-		if (value) data[field] = value;
-	}
+	Object.assign(data, controlEventAttributes(event));
 	if (event.id) data.id = event.id;
 	// Database hooks can run before a parent transaction commits. Reuse its adapter so
 	// audit rows are atomic with the mutation and never wait on their own transaction.
@@ -141,21 +69,7 @@ export function publicControlEvent(
 				: undefined,
 		),
 	};
-	for (const field of [
-		"actorId",
-		"userId",
-		"organizationId",
-		"clientId",
-		"targetId",
-		"ipAddress",
-		"userAgent",
-	] as const) {
-		const value = optionalString(
-			event[field],
-			field === "userAgent" ? 512 : 160,
-		);
-		if (value) result[field] = value;
-	}
+	Object.assign(result, controlEventAttributes(event));
 	return result;
 }
 
