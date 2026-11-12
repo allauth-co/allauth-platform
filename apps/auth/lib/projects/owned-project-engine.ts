@@ -1348,15 +1348,13 @@ export function createOwnedProjectEngine(
 				: "Invalid username or password";
 		if (!trustedRequest(request.headers, true)) return forbidden();
 		const ip = security.trustedIP(request);
-		if (ip) {
-			const limited = await store.transaction((client) =>
-				admitOwnedProjectNativeRoute(client, ip, path, {
-					max: 3,
-					windowMs: 10_000,
-				}),
-			);
-			if (limited) return limited;
-		}
+		const limited = await store.transaction((client) =>
+			admitOwnedProjectNativeRoute(client, ip, path, {
+				max: 3,
+				windowMs: 10_000,
+			}),
+		);
+		if (limited) return limited;
 		if (!policy.emailAndPasswordEnabled)
 			return failure(
 				400,

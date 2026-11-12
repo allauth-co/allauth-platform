@@ -1459,12 +1459,13 @@ describe.skipIf(!existsSync(fixture))(
 				);
 				return id;
 			}
-			const attempt = (dispatch: typeof stock.handler, ip: string) => {
+			const attempt = (dispatch: typeof stock.handler, ip: string | null) => {
 				const incoming = request(`${alpha.path}${path}`, {
 					email: eventEmail,
 					password: incorrectPassword,
 				});
-				incoming.headers.set("x-real-ip", ip);
+				if (ip) incoming.headers.set("x-real-ip", ip);
+				else incoming.headers.delete("x-real-ip");
 				incoming.headers.set("x-forwarded-for", spoofedAddress);
 				return dispatch(incoming);
 			};
@@ -1528,6 +1529,20 @@ describe.skipIf(!existsSync(fixture))(
 					);
 					expect(rows[0]?.count).toBe(3);
 				}
+				const sharedKey = `no-trusted-ip|${path}`;
+				rates.push(sharedKey);
+				await database.query(
+					`INSERT INTO ${realm}."rateLimit" (id,"key",count,"lastRequest") VALUES ($1,$2,3,$3)`,
+					[randomUUID(), sharedKey, Date.now()],
+				);
+				// The native test environment substitutes localhost for an absent IP.
+				// The candidate uses the installed production shared bucket.
+				const withoutTrustedIP = await attempt(candidate.dispatch, null);
+				expect(withoutTrustedIP.status).toBe(429);
+				expect(await withoutTrustedIP.json()).toEqual({
+					message: "Too many requests. Please try again later.",
+				});
+				expect(await observe()).toEqual([]);
 				for (const [dispatch, ip] of [
 					[stock.handler, "192.0.2.232"],
 					[candidate.dispatch, "192.0.2.233"],
