@@ -87,7 +87,7 @@ export async function storedProjectWebhookSelectors(
 
 function unavailable() {
 	return new Error(
-		"This project's configured webhooks are outside the candidate scope.",
+		"This development project's configured webhooks are outside the candidate scope.",
 	);
 }
 

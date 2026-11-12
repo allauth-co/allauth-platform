@@ -35,7 +35,10 @@ import {
 	productionAgentReplayBridgeIdsSetting,
 	verifyAgentReplayDrainEvidence,
 } from "../../scripts/project-agent-replay-evidence.mjs";
-import { productionProjectEngineRevisionsSetting } from "../../scripts/project-engine-rollout-selection.mjs";
+import {
+	developmentProjectEngineRevisionsSetting,
+	productionProjectEngineRevisionsSetting,
+} from "../../scripts/project-engine-rollout-selection.mjs";
 import { defaultAuthPolicy } from "../auth-policy/policy";
 import { lockProjectSettings } from "../auth-policy/serialization";
 import { authPolicyRepository } from "../auth-policy/storage";
@@ -47,8 +50,10 @@ import {
 	newWebhookSigningSecret,
 	webhookSignature,
 } from "../control/webhook-contract";
+import type { ControlWebhookEnvelope } from "../control/webhook-delivery";
 import { deliverPendingWebhooks } from "../control/webhooks";
 import { signEdgeRequest } from "../domains/edge";
+import { postgresDatabase } from "../postgres-database";
 import { googleProviderRepository } from "../project-providers/repository";
 import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
 import { platformWorkspaceId } from "../workspaces/types";
@@ -1343,6 +1348,14 @@ describe.skipIf(!existsSync(fixture))(
 						"mfa.*",
 						"api-key.*",
 						"session.created",
+						"user.*",
+						"user.created",
+						"user.updated",
+						"user.deleted",
+						"admin.*",
+						"directory.*",
+						"organization.*",
+						"security.*",
 						"passkey.*",
 					],
 				});
@@ -1710,6 +1723,443 @@ describe.skipIf(!existsSync(fixture))(
 				}
 			}
 		}, 60_000);
+
+		it("delivers enabled mixed webhook subscriptions across an enrolled writer restart and rollback", async () => {
+			const local: { container: string; DATABASE_URL: string } = JSON.parse(
+				readFileSync(fixture, "utf8"),
+			);
+			const base = new URL(local.DATABASE_URL);
+			if (
+				local.container !== "allauth-production-test-20261007" ||
+				base.hostname !== "127.0.0.1" ||
+				base.port !== "55445"
+			)
+				throw new Error(
+					"The mixed webhook rehearsal requires isolated local PostgreSQL.",
+				);
+
+			const admin = new Pool({ connectionString: base.href, max: 1 });
+			const name = `allauth_hosted_${randomUUID().replaceAll("-", "")}`;
+			const databaseURL = new URL(`/${name}`, base).href;
+			const selectors = [
+				"admin.*",
+				"directory.*",
+				"organization.*",
+				"user.*",
+				"security.*",
+			];
+			const workerDatabases: Array<ReturnType<typeof postgresDatabase>["db"]> =
+				[];
+			let created = false;
+			let database: Pool | undefined;
+			let service: Awaited<ReturnType<typeof openProcess>> | undefined;
+
+			try {
+				await admin.query(`CREATE DATABASE "${name}"`);
+				created = true;
+				const { alpha, beta } = await seed(databaseURL);
+				const state = new Pool({ connectionString: databaseURL, max: 2 });
+				database = state;
+				const rollout = {
+					[developmentProjectEngineRevisionsSetting]: JSON.stringify({
+						[alpha.id]: 0,
+					}),
+				};
+				const command = async (...args: string[]) => {
+					const { stdout } = await promisify(execFile)(
+						process.execPath,
+						["scripts/project-engine-writer.mjs", ...args],
+						{
+							cwd: appRoot,
+							env: {
+								...childEnvironment(),
+								DATABASE_URL: databaseURL,
+								...rollout,
+							},
+						},
+					);
+					return JSON.parse(stdout);
+				};
+				const writer = (...args: string[]) =>
+					command("--development", alpha.id, ...args);
+				const open = (prepared: boolean) =>
+					openProcess(
+						databaseURL,
+						alpha,
+						false,
+						alpha.slug,
+						undefined,
+						undefined,
+						{
+							EMAIL_PROVIDER: "cloudflare",
+							EMAIL_FROM: "mixed-webhooks@runtime.fixture.example",
+							CLOUDFLARE_ACCOUNT_ID: "a".repeat(32),
+							CLOUDFLARE_EMAIL_API_TOKEN: "synthetic-mixed-webhooks-mail-token",
+							...(prepared && rollout),
+						},
+					);
+				async function request(
+					path: string,
+					options?: Parameters<NonNullable<typeof service>["request"]>[1],
+					status = 200,
+				) {
+					if (!service) throw new Error("The runtime process is unavailable.");
+					const response = await service.request(path, options);
+					expect(
+						response.status,
+						`${path}: ${await response.clone().text()}`,
+					).toBe(status);
+					return response;
+				}
+				async function restart(prepared: boolean) {
+					await service?.stop();
+					service = undefined;
+					service = await open(prepared);
+				}
+
+				const host = `${alpha.slug}-accounts.allauth.co`;
+				const siblingHost = `${beta.slug}-accounts.allauth.co`;
+				async function signIn(email: string, accountsHost?: string) {
+					return cookie(
+						await request("/api/auth/sign-in/email", {
+							host: accountsHost,
+							body: { email, password: credentials.password },
+						}),
+					);
+				}
+				service = await open(false);
+				const rootCookie = await signIn(credentials.platform.email);
+				const realmAdmin = await signIn(credentials.realmAdmin.email, host);
+				const owner = await signIn(credentials.project.email, host);
+				const sibling = await signIn(credentials.project.email, siblingHost);
+				const direct = `/api/projects/${alpha.slug}/auth`;
+				const scim = `/api/organizations/${directoryOrg}/scim`;
+				const directory = await request(
+					`${scim}?project=${alpha.slug}`,
+					{
+						cookie: rootCookie,
+						body: { providerId: directoryProvider },
+					},
+					201,
+				);
+				const { connection, token: originalDirectoryToken } =
+					(await directory.json()) as {
+						connection: { connectionId: string };
+						token: string;
+					};
+				let directoryToken = originalDirectoryToken;
+				const webhookId = randomUUID();
+				async function expectSubscription() {
+					const response = await request(`${direct}/control/webhooks`, {
+						cookie: rootCookie,
+					});
+					expect(await response.json()).toMatchObject({
+						endpoints: [{ id: webhookId, enabled: true, eventTypes: selectors }],
+					});
+				}
+
+				async function subscribe(project: Project) {
+					const schema = `"${project.schemaName}"`;
+					const url = `https://${project.slug}.webhook.fixture.example/events`;
+					const key = projectSecret(childEnvironment(), project.id);
+					const secret = newWebhookSigningSecret();
+					await state.query(
+						`INSERT INTO ${schema}."allauthWebhookEndpoint"(id,url,"eventTypes","encryptedSecret",enabled)
+							 VALUES ($1,$2,$3,$4,true)`,
+						[
+							webhookId,
+							url,
+							JSON.stringify(selectors),
+							await symmetricEncrypt({ key, data: secret }),
+						],
+					);
+					const workerDatabase = postgresDatabase(
+						new Pool({
+							connectionString: databaseURL,
+							max: 1,
+							options: `-c search_path=${project.schemaName}`,
+						}),
+					).db;
+					workerDatabases.push(workerDatabase);
+
+					async function rows() {
+						return (
+							await state.query<{
+								id: string;
+								eventId: string;
+								eventType: string;
+								status: string;
+								attempts: number;
+							}>(
+								`SELECT id,"eventId","eventType",status,attempts FROM ${schema}."allauthWebhookDelivery"
+							    WHERE "endpointId"=$1 ORDER BY id`,
+								[webhookId],
+							)
+						).rows;
+					}
+					async function drain(expectedCount: number, redacted: string[]) {
+						const pending = (await rows()).filter(
+							(row) => row.status === "pending",
+						);
+						expect(pending).toHaveLength(expectedCount);
+						const delivered = new Map<string, ControlWebhookEnvelope>();
+						const stats = await deliverPendingWebhooks({
+							database: workerDatabase,
+							secret: key,
+							resolver: async () => [{ address: "93.184.216.34", family: 4 }],
+							now: () => new Date(Date.now() + 1_000),
+							transport: async ({ destination, headers, body }) => {
+								expect(destination.url.href).toBe(url);
+								const id = headers["webhook-id"]!;
+								expect(delivered.has(id)).toBe(false);
+								const signature = createHmac(
+									"sha256",
+									Buffer.from(secret.slice(6), "base64"),
+								)
+									.update(`${id}.${headers["webhook-timestamp"]}.${body}`)
+									.digest("base64");
+								expect(headers["webhook-signature"]).toBe(`v1,${signature}`);
+								for (const value of [...redacted, secret, key])
+									expect(body).not.toContain(value);
+								const envelope = JSON.parse(body) as ControlWebhookEnvelope;
+								expect(envelope.id).toBe(envelope.data.event.id);
+								expect(envelope.timestamp).toBe(envelope.data.event.createdAt);
+								expect(envelope.type).toBe(envelope.data.event.type);
+								delivered.set(id, envelope);
+								return 204;
+							},
+						});
+						expect(stats).toEqual({
+							claimed: expectedCount,
+							delivered: expectedCount,
+							failed: 0,
+							retried: 0,
+						});
+						const completed = await rows();
+						for (const { id, eventId, eventType } of pending) {
+							expect(delivered.get(id)).toMatchObject({
+								id: eventId,
+								type: eventType,
+							});
+							expect(completed.find((row) => row.id === id)).toMatchObject({
+								status: "delivered",
+								attempts: 1,
+							});
+						}
+						return [...delivered.values()];
+					}
+					return { rows, drain };
+				}
+				const primaryWebhook = await subscribe(alpha);
+				const siblingWebhook = await subscribe(beta);
+
+				async function mutate(label: string) {
+					await request("/api/auth/admin/update-user", {
+						host,
+						cookie: realmAdmin,
+						body: { userId: supportTarget, data: { name: label } },
+					});
+					await request("/api/auth/organization/update", {
+						host,
+						cookie: owner,
+						body: { organizationId: directoryOrg, data: { name: label } },
+					});
+					const rotation = await request(
+						`${scim}/${connection.connectionId}/rotate?project=${alpha.slug}`,
+						{
+							cookie: rootCookie,
+							body: {},
+						},
+					);
+					const { token } = (await rotation.json()) as { token: string };
+					expect(token).not.toBe(directoryToken);
+					directoryToken = token;
+					const rule = await request(`${direct}/control/security/rules/add`, {
+						cookie: rootCookie,
+						body: {
+							type: "ip",
+							value: "192.0.2.180",
+							reason: "Mixed subscription fixture",
+						},
+					});
+					const { rule: saved } = (await rule.json()) as { rule: { id: string } };
+					return saved.id;
+				}
+				async function assertDeliveries(
+					label: string,
+					ruleId: string,
+					tokens: string[],
+				) {
+					const messages = await primaryWebhook.drain(5, [
+						...tokens,
+						credentials.password,
+					]);
+					const delivered = new Map(
+						messages.map((message) => [message.type, message.data]),
+					);
+					expect([...delivered.keys()].sort()).toEqual([
+						"admin.update-user",
+						"directory.credential.rotated",
+						"organization.updated",
+						"security.rule.added",
+						"user.updated",
+					]);
+					const adminEvent = {
+						outcome: "success",
+						actorId: credentials.realmAdmin.id,
+						userId: supportTarget,
+						targetId: supportTarget,
+						metadata: { path: "/admin/update-user" },
+					};
+					expect(delivered.get("admin.update-user")).toMatchObject({
+						event: adminEvent,
+					});
+					expect(delivered.get("user.updated")).toMatchObject({
+						event: adminEvent,
+						user: {
+							id: supportTarget,
+							name: label,
+							email: "support-target@runtime.fixture.example",
+							emailVerified: true,
+						},
+					});
+					expect(delivered.get("directory.credential.rotated")).toMatchObject({
+						event: {
+							outcome: "success",
+							actorId: credentials.platform.id,
+							organizationId: directoryOrg,
+							targetId: connection.connectionId,
+						},
+					});
+					expect(delivered.get("organization.updated")).toMatchObject({
+						event: {
+							outcome: "success",
+							organizationId: directoryOrg,
+						},
+					});
+					expect(delivered.get("security.rule.added")).toMatchObject({
+						event: {
+							outcome: "success",
+							actorId: credentials.platform.id,
+							targetId: ruleId,
+						},
+					});
+					const comparable = messages
+						.map(
+							({
+								type,
+								data: {
+									event: { id, createdAt, ...event },
+									user,
+								},
+							}) => ({
+								type,
+								event,
+								...(user && { user: { ...user, name: "updated fixture name" } }),
+							}),
+						)
+						.sort((left, right) => left.type.localeCompare(right.type));
+					await primaryWebhook.drain(0, []);
+					return comparable;
+				}
+				const nativeRule = await mutate("Mixed subscription legacy");
+				const nativeToken = directoryToken;
+				const nativePending = await primaryWebhook.rows();
+				expect(nativePending).toHaveLength(5);
+				expect(nativePending.every((row) => row.status === "pending")).toBe(true);
+				expect(await siblingWebhook.rows()).toEqual([]);
+				await command("register-development", alpha.id, alpha.workspaceId);
+				expect(await writer("status")).toEqual({ writer: "legacy", revision: 0 });
+				await restart(true);
+				await request("/api/health");
+				expect(await writer("switch", "legacy", "0", "allauth")).toEqual({
+					writer: "allauth",
+					revision: 1,
+				});
+				expect(await primaryWebhook.rows()).toEqual(nativePending);
+				const baseline = await assertDeliveries(
+					"Mixed subscription legacy",
+					nativeRule,
+					[originalDirectoryToken, nativeToken],
+				);
+
+				const ownedRule = await mutate("Mixed subscription AllAuth");
+				const ownedToken = directoryToken;
+				await request("/api/auth/update-user", {
+					host: siblingHost,
+					cookie: sibling,
+					body: { name: "Sibling-only profile" },
+				});
+				const ownedPending = await primaryWebhook.rows();
+				expect(
+					ownedPending.filter((row) => row.status === "pending"),
+				).toHaveLength(5);
+				const siblingPending = await siblingWebhook.rows();
+				expect(siblingPending.map((row) => row.eventType)).toEqual([
+					"user.updated",
+					"user.updated",
+				]);
+				await restart(true);
+				await request("/api/health");
+				expect(await writer("status")).toEqual({
+					writer: "allauth",
+					revision: 1,
+				});
+				await expectSubscription();
+				expect(await primaryWebhook.rows()).toEqual(ownedPending);
+				expect(await siblingWebhook.rows()).toEqual(siblingPending);
+
+				expect(await writer("switch", "allauth", "1", "legacy")).toEqual({
+					writer: "legacy",
+					revision: 2,
+				});
+				await restart(false);
+				await request("/api/health");
+				await expectSubscription();
+				expect(await primaryWebhook.rows()).toEqual(ownedPending);
+				expect(
+					await assertDeliveries("Mixed subscription AllAuth", ownedRule, [
+						nativeToken,
+						ownedToken,
+					]),
+				).toEqual(baseline);
+				expect(await siblingWebhook.rows()).toEqual(siblingPending);
+				const siblingMessages = await siblingWebhook.drain(2, [
+					ownedToken,
+					credentials.password,
+				]);
+				for (const message of siblingMessages)
+					expect(message).toMatchObject({
+						type: "user.updated",
+						data: {
+							user: { id: credentials.project.id, name: "Sibling-only profile" },
+						},
+					});
+
+				const restoredRule = await mutate("Mixed subscription rollback");
+				expect(
+					await assertDeliveries("Mixed subscription rollback", restoredRule, [
+						ownedToken,
+						directoryToken,
+					]),
+				).toEqual(baseline);
+				await siblingWebhook.drain(0, []);
+			} finally {
+				try {
+					await service?.stop();
+				} finally {
+					try {
+						await Promise.all([
+							database?.end(),
+							...workerDatabases.map((db) => db.destroy()),
+						]);
+						if (created) await dropClosedFixtureDatabase(admin, name);
+					} finally {
+						await admin.end();
+					}
+				}
+			}
+		}, 90_000);
 
 		it("preserves SDK and credential-safe native session lists across project writers", async () => {
 			const local: { container: string; DATABASE_URL: string } = JSON.parse(

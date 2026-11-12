@@ -186,6 +186,7 @@ export function selectProjectEngine(
 			"./owned-project-sso-saml-approval"
 		);
 		const hosted = basePath === "/api/auth";
+		const securityConsole = `${basePath}/control/security`;
 		return createOwnedProjectRuntimeCandidate({
 			database,
 			project,
@@ -203,11 +204,15 @@ export function selectProjectEngine(
 				writer,
 			),
 			agentReplayApproved: projectAgentReplayApproved(project, env, writer),
-			// The accounts gateway and signed application proxy verify these values before dispatch.
 			trustedIP(request) {
+				// Hosted auth and app proxies verify the forwarded client address.
 				if (hosted) return request.headers.get("x-real-ip");
-				return request.headers.has("allauth-proxy-signature")
-					? request.headers.get("allauth-proxy-ip")
+				if (request.headers.has("allauth-proxy-signature"))
+					return request.headers.get("allauth-proxy-ip");
+				// Direct workspace security calls use the same ingress address as the legacy console.
+				const path = new URL(request.url).pathname;
+				return path === securityConsole || path.startsWith(`${securityConsole}/`)
+					? request.headers.get("x-real-ip")
 					: null;
 			},
 			defer: (work) => after(work),
