@@ -589,6 +589,7 @@ export function SSOManagement({
 				<SCIMManagement
 					organizationId={organizationId}
 					providers={providers.data ?? []}
+					hosted={Boolean(hosted)}
 				/>
 			)}
 		</div>

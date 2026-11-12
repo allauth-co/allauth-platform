@@ -3,6 +3,7 @@ import { hostedSdkReturnPath } from "./hosted-sdk-policy";
 
 const privateFields = new Set([
 	"token",
+	"tokendigest",
 	"otp",
 	"backupcodes",
 	"totpuri",
@@ -223,6 +224,21 @@ export async function hostedSdkResponse(
 
 	try {
 		const data: unknown = await response.json();
+		if (endpoint.startsWith("scim/") && response.ok) {
+			const input = record(data);
+			const visible = record(browserValue(data));
+			if (input && visible) {
+				if (typeof input.baseURL === "string")
+					visible.baseURL = `${origin}/api/auth/scim/v2`;
+				if (
+					(endpoint === "scim/create" || endpoint === "scim/rotate") &&
+					typeof input.token === "string" &&
+					input.token
+				)
+					visible.token = input.token;
+				return Response.json(visible, { status: response.status, headers });
+			}
+		}
 		if (
 			response.ok &&
 			(endpoint === "sso/register" ||

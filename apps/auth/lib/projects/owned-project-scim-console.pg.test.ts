@@ -4,9 +4,12 @@ import { fileURLToPath } from "node:url";
 import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { GET as hostedGET } from "../../app/api/auth/[...all]/route";
+import {
+	GET as hostedConsoleGET,
+	POST as hostedConsolePOST,
+} from "../../app/api/auth/hosted-ui/[...all]/route";
 import { POST as retire } from "../../app/api/organizations/[organizationId]/scim/[connectionId]/decommission/route";
 import { POST as revoke } from "../../app/api/organizations/[organizationId]/scim/[connectionId]/revoke/route";
-import { POST as rotate } from "../../app/api/organizations/[organizationId]/scim/[connectionId]/rotate/route";
 import {
 	POST as create,
 	GET as list,
@@ -274,6 +277,7 @@ describe.skipIf(!existsSync(fixturePath))(
 				);
 			}
 			alpha = await provision("scim-console-alpha", owner.principal);
+			vi.stubEnv("ALLAUTH_PROJECT_HOSTED_UI_PROJECT_IDS", alpha.id);
 			beta = await provision("scim-console-beta", unrelated.principal);
 			await registry.query(
 				`INSERT INTO public."allauthDomainPair" (id,"projectId",domain) VALUES ('fixture-active-pair',$1,'scim-alpha-client.net')`,
@@ -374,6 +378,46 @@ describe.skipIf(!existsSync(fixturePath))(
 				"192.0.2.95",
 			);
 			return hostedGET(new Request(`${gateway}${path}`, { headers }));
+		}
+
+		async function hostedConsole(
+			path: string,
+			options: {
+				cookie?: string;
+				hostname?: string;
+				requestOrigin?: string;
+				body?: string;
+				authorization?: string;
+			} = {},
+		) {
+			const hostname = options.hostname ?? accountsHost;
+			const url = new URL(
+				`/api/auth/hosted-ui/scim/${path}`,
+				`https://${hostname}`,
+			);
+			const headers = new Headers({ accept: "application/json" });
+			if (options.cookie) headers.set("cookie", options.cookie);
+			if (options.authorization)
+				headers.set("authorization", options.authorization);
+			if (options.body) {
+				headers.set("content-type", "application/json");
+				headers.set("origin", options.requestOrigin ?? url.origin);
+			}
+			const method = options.body ? "POST" : "GET";
+			const signed = await signEdgeRequest(
+				new Request(url, { method, headers, body: options.body }),
+				edgeSecret,
+				hostname,
+				"192.0.2.95",
+			);
+			const request = new Request(new URL(url.pathname + url.search, gateway), {
+				method,
+				headers: signed,
+				body: options.body,
+			});
+			return options.body
+				? hostedConsolePOST(request)
+				: hostedConsoleGET(request);
 		}
 
 		it("runs create, list, rotate, revoke and retirement through existing console and hosted SCIM routes", async () => {
@@ -479,17 +523,61 @@ describe.skipIf(!existsSync(fixturePath))(
 			expect(catalogText).toContain(first.credential.credentialId);
 			expect(catalogText).not.toContain(first.token);
 			expect(catalogText).not.toContain("tokenDigest");
-			connectorHost = accountsHost;
-			const rotated = await rotate(
-				consoleRequest(alpha.slug, {
-					path: `/${connectionId}/rotate`,
-					method: "POST",
-					cookie: localAdminCookie,
-					body: "{}",
-				}),
-				detail(connectionId),
+			const hostedList = `list?organizationId=${organizationId}`;
+			const hostedCatalog = await hostedConsole(hostedList, {
+				cookie: localAdminCookie,
+			});
+			expect(hostedCatalog.status, await hostedCatalog.clone().text()).toBe(
+				200,
 			);
-			expect(rotated.status).toBe(200);
+			expect(hostedCatalog.headers.get("cache-control")).toContain("no-store");
+			const hostedState = await hostedCatalog.text();
+			expect(hostedState).toContain(first.credential.credentialId);
+			expect(hostedState).not.toContain(first.token);
+			expect(hostedState).not.toContain("tokenDigest");
+			for (const cookie of [rootCookie, localMemberCookie, betaAdminCookie]) {
+				expect((await hostedConsole(hostedList, { cookie })).ok).toBe(false);
+			}
+			expect(
+				(
+					await hostedConsole(`${hostedList}&project=${beta.slug}`, {
+						cookie: localAdminCookie,
+					})
+				).status,
+			).toBe(400);
+			expect(
+				(
+					await hostedConsole(hostedList, {
+						cookie: localAdminCookie,
+						hostname: frontendHost,
+					})
+				).status,
+			).toBe(404);
+			const hostedRotate = `rotate?organizationId=${organizationId}&connectionId=${connectionId}`;
+			expect(
+				(
+					await hostedConsole(hostedRotate, {
+						cookie: localAdminCookie,
+						requestOrigin: origin,
+						body: "{}",
+					})
+				).status,
+			).toBe(403);
+			expect(
+				(
+					await hostedConsole(hostedRotate, {
+						cookie: localAdminCookie,
+						authorization: "Bearer synthetic-credential",
+						body: "{}",
+					})
+				).status,
+			).toBe(403);
+			connectorHost = accountsHost;
+			const rotated = await hostedConsole(hostedRotate, {
+				cookie: localAdminCookie,
+				body: "{}",
+			});
+			expect(rotated.status, await rotated.clone().text()).toBe(200);
 			const second = (await rotated.json()) as Issued;
 			expect(second.baseURL).toBe(`https://${accountsHost}/api/auth/scim/v2`);
 			expect((await hosted(accountsHost, second.token)).status).toBe(200);

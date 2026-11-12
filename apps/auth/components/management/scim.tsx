@@ -15,6 +15,7 @@ import {
 } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { hostedSdkBasePath } from "@/lib/domains/hosted-sdk-policy";
 import { managementRequest } from "./applications-utils";
 
 interface Connection {
@@ -55,12 +56,36 @@ function dateLabel(value: string | null): string {
 export function SCIMManagement({
 	organizationId,
 	providers,
+	hosted = false,
 }: {
 	organizationId: string;
 	providers: Provider[];
+	hosted?: boolean;
 }) {
 	const queryClient = useQueryClient();
 	const path = `/api/organizations/${encodeURIComponent(organizationId)}/scim`;
+	const queryKey = ["scim", hosted ? "hosted" : "console", organizationId];
+	function directoryRequest<T>(
+		operation: "list" | "create" | "rotate" | "revoke" | "decommission",
+		body?: object,
+		connectionId?: string,
+	) {
+		const query = new URLSearchParams({
+			organizationId,
+			...(connectionId && { connectionId }),
+		});
+		const url = hosted
+			? `${hostedSdkBasePath}/scim/${operation}?${query}`
+			: connectionId
+				? `${path}/${encodeURIComponent(connectionId)}/${operation}`
+				: path;
+		const headers = new Headers({ Accept: "application/json" });
+		if (body) headers.set("Content-Type", "application/json");
+		return managementRequest<T>(url, {
+			headers,
+			...(body && { method: "POST", body: JSON.stringify(body) }),
+		});
+	}
 	const [providerId, setProviderId] = useState("");
 	const [busy, setBusy] = useState(false);
 	const [created, setCreated] = useState<CredentialCreation | null>(null);
@@ -70,10 +95,10 @@ export function SCIMManagement({
 		operation: "revoke" | "decommission";
 	} | null>(null);
 	const connections = useQuery({
-		queryKey: ["scim", organizationId],
+		queryKey,
 		queryFn: () =>
-			managementRequest<{ connections: ManagedConnection[]; baseURL: string }>(
-				path,
+			directoryRequest<{ connections: ManagedConnection[]; baseURL: string }>(
+				"list",
 			),
 	});
 	const availableProviders = providers.filter(
@@ -95,7 +120,7 @@ export function SCIMManagement({
 			);
 		} finally {
 			await queryClient.invalidateQueries({
-				queryKey: ["scim", organizationId],
+				queryKey,
 			});
 			setBusy(false);
 		}
@@ -111,10 +136,8 @@ export function SCIMManagement({
 				throw new Error(
 					"Choose a verified identity provider for this organization.",
 				);
-			const result = await managementRequest<CredentialCreation>(path, {
-				method: "POST",
-				headers: { "Content-Type": "application/json" },
-				body: JSON.stringify({ providerId }),
+			const result = await directoryRequest<CredentialCreation>("create", {
+				providerId,
 			});
 			setCreated(result);
 			setConfirmation(null);
@@ -239,13 +262,10 @@ export function SCIMManagement({
 											onClick={() =>
 												perform(async () => {
 													const result =
-														await managementRequest<CredentialCreation>(
-															`${path}/${encodeURIComponent(entry.connection.connectionId)}/rotate`,
-															{
-																method: "POST",
-																headers: { "Content-Type": "application/json" },
-																body: "{}",
-															},
+														await directoryRequest<CredentialCreation>(
+															"rotate",
+															{},
+															entry.connection.connectionId,
 														);
 													setCreated(result);
 													setConfirmation(null);
@@ -273,22 +293,12 @@ export function SCIMManagement({
 													disabled={busy || Boolean(created)}
 													onClick={() =>
 														perform(async () => {
-															await managementRequest(
-																`${path}/${encodeURIComponent(confirmation.connectionId)}/${confirmation.operation}`,
-																{
-																	method: "POST",
-																	headers: {
-																		"Content-Type": "application/json",
-																	},
-																	body: JSON.stringify(
-																		confirmation.operation === "revoke"
-																			? {
-																					credentialId:
-																						confirmation.credentialId,
-																				}
-																			: {},
-																	),
-																},
+															await directoryRequest(
+																confirmation.operation,
+																confirmation.operation === "revoke"
+																	? { credentialId: confirmation.credentialId }
+																	: {},
+																confirmation.connectionId,
 															);
 															setConfirmation(null);
 															toast.success(
@@ -382,7 +392,9 @@ export function SCIMManagement({
 									onValueChange={(selection) => setProviderId(selection)}
 									required
 								>
-									<AppSelectOption value="">Select an identity provider</AppSelectOption>
+									<AppSelectOption value="">
+										Select an identity provider
+									</AppSelectOption>
 									{availableProviders.map((provider) => (
 										<AppSelectOption
 											key={provider.providerId}

@@ -1,4 +1,4 @@
-import { setting } from "@/lib/configuration";
+import { authOrigin, setting } from "@/lib/configuration";
 import { edgeHeaders } from "@/lib/domains/edge";
 import {
 	hostedSdkEndpoint,
@@ -9,7 +9,9 @@ import {
 	hostedSdkFailure,
 	hostedSdkResponse,
 } from "@/lib/domains/hosted-sdk-response";
+import { hostedScimConsoleRequest } from "@/lib/domains/hosted-scim-console";
 import { withPortalAuthEngine } from "@/lib/domains/hosting";
+import { scimConsoleRoute } from "@/lib/scim-management";
 
 async function handle(request: Request) {
 	const endpoint = hostedSdkEndpoint(
@@ -73,6 +75,24 @@ async function handle(request: Request) {
 			return hostedSdkFailure(403, "A browser session is required.");
 		if (endpoint.startsWith("sso/") && request.headers.has("authorization"))
 			return hostedSdkFailure(403, "A browser session is required.");
+		if (endpoint.startsWith("scim/")) {
+			if (request.headers.has("authorization"))
+				return hostedSdkFailure(403, "A browser session is required.");
+			const operation = hostedScimConsoleRequest(
+				bound,
+				endpoint,
+				binding.project.slug,
+				authOrigin(env),
+			);
+			if (!operation)
+				return hostedSdkFailure(400, "Invalid directory management request.");
+			return hostedSdkResponse(
+				await scimConsoleRoute(operation.request, operation.route),
+				endpoint,
+				url.origin,
+				binding.project.slug,
+			);
+		}
 
 		// The gateway verifies the original URL and body before this dispatch.
 		url.pathname = `/api/auth/${endpoint}`;
