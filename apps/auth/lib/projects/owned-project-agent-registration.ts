@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { PoolClient } from "pg";
 import * as z from "zod";
 import { hasRemoteAgentKeys } from "../features/helpers";
+import { issueOwnedAgentCibaRegistrationRetry } from "./owned-project-agent-ciba";
 import {
 	issueOwnedPendingAgentDeviceCode,
 	writeOwnedAgentDeviceCode,
@@ -182,15 +183,21 @@ export async function registerOwnedProjectAgent(
 			: undefined,
 	};
 	if (sameKey.length === 1 && sameKey[0].status === "pending") {
-		if (host.status !== "active" || parsed.data.preferred_method === "ciba")
-			return unsupported();
+		if (host.status !== "active") return unsupported();
 		const pending = sameKey[0];
-		const approval = await issueOwnedPendingAgentDeviceCode(client, request, {
+		const target = {
 			agentId: pending.id,
 			hostId: host.id,
 			ownerId: host.userId,
 			...approvalFields,
-		});
+		};
+		const approval =
+			parsed.data.preferred_method === "ciba"
+				? await issueOwnedAgentCibaRegistrationRetry(client, {
+						...target,
+						agentName: pending.name,
+					})
+				: await issueOwnedPendingAgentDeviceCode(client, request, target);
 		if (approval instanceof Response) return approval;
 		return json({
 			agent_id: pending.id,
@@ -199,7 +206,10 @@ export async function registerOwnedProjectAgent(
 			mode: "delegated",
 			status: "pending",
 			agent_capability_grants: [],
-			approval: { method: "device_authorization", ...approval },
+			approval:
+				"method" in approval
+					? approval
+					: { method: "device_authorization", ...approval },
 		});
 	}
 	if (sameKey.length)

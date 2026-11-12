@@ -21,6 +21,7 @@ const input = z.object({
 });
 const expiresIn = 300;
 const interval = 5;
+type CibaTarget = { agentId: string; hostId: string; ownerId: string };
 
 function bindingMessage(value: string | undefined) {
 	return value
@@ -30,6 +31,81 @@ function bindingMessage(value: string | undefined) {
 				.trim()
 				.slice(0, 500)
 		: null;
+}
+
+function newCibaReceipt() {
+	return { auth_req_id: randomUUID(), expires_in: expiresIn, interval };
+}
+
+async function verifiedOwnerEmail(client: PoolClient, ownerId: string) {
+	const {
+		rows: [owner],
+	} = await client.query<{ email: string }>(
+		`SELECT email FROM "user" WHERE id=$1 AND "emailVerified" IS TRUE`,
+		[ownerId],
+	);
+	return owner?.email;
+}
+
+async function issueOwnedCibaApproval(
+	client: PoolClient,
+	target: CibaTarget,
+	email: string,
+	message: string | null,
+) {
+	const denied = await prepareOwnedPendingAgentApproval(client, target);
+	if (denied) return denied;
+	const receipt = newCibaReceipt();
+	await client.query(
+		`INSERT INTO "approvalRequest" (id,method,"agentId","hostId","userId",status,"loginHint","bindingMessage","deliveryMode",interval,"expiresAt","createdAt","updatedAt")
+		 VALUES ($1,'ciba',$2,$3,$4,'pending',$5,$6,'poll',$7,statement_timestamp()+$8::int*interval '1 second',statement_timestamp(),statement_timestamp())`,
+		[
+			receipt.auth_req_id,
+			target.agentId,
+			target.hostId,
+			target.ownerId,
+			email,
+			message,
+			interval,
+			expiresIn,
+		],
+	);
+	return receipt;
+}
+
+/** An authorized registration retry returns the native summary, with the proof ID in the owner's approval list. */
+export async function issueOwnedAgentCibaRegistrationRetry(
+	client: PoolClient,
+	target: CibaTarget & {
+		agentName: string;
+		loginHint?: string;
+		bindingMessage?: string;
+	},
+) {
+	const email = await verifiedOwnerEmail(client, target.ownerId);
+	if (
+		!email ||
+		(target.loginHint !== undefined &&
+			email.toLowerCase() !== target.loginHint.toLowerCase())
+	)
+		return problem(
+			403,
+			"unauthorized",
+			"Caller is not authorized for this operation",
+		);
+	const result = await issueOwnedCibaApproval(
+		client,
+		target,
+		email,
+		target.bindingMessage ?? `Agent "${target.agentName}" requesting approval`,
+	);
+	return result instanceof Response
+		? result
+		: {
+				method: "ciba" as const,
+				expires_in: result.expires_in,
+				interval: result.interval,
+			};
 }
 
 /** Start poll-only CIBA for a pending delegated agent under its verified host owner. */
@@ -72,40 +148,20 @@ export async function authorizeOwnedAgentCiba(
 			"invalid_request",
 			"A pending agent on this host is required.",
 		);
-	const {
-		rows: [owner],
-	} = await client.query<{ email: string }>(
-		`SELECT email FROM "user" WHERE id=$1 AND "emailVerified" IS TRUE`,
-		[principal.ownerId],
-	);
-	const receipt = {
-		auth_req_id: randomUUID(),
-		expires_in: expiresIn,
-		interval,
-	};
+	const email = await verifiedOwnerEmail(client, principal.ownerId);
 	// Use the native unknown-recipient response for all other login hints.
-	if (!owner || owner.email.toLowerCase() !== hint.toLowerCase())
-		return json(receipt);
+	if (!email || email.toLowerCase() !== hint.toLowerCase())
+		return json(newCibaReceipt());
 	const target = {
 		agentId,
 		hostId: principal.host.id,
 		ownerId: principal.ownerId,
 	};
-	const denied = await prepareOwnedPendingAgentApproval(client, target);
-	if (denied) return denied;
-	await client.query(
-		`INSERT INTO "approvalRequest" (id,method,"agentId","hostId","userId",status,"loginHint","bindingMessage","deliveryMode",interval,"expiresAt","createdAt","updatedAt")
-		 VALUES ($1,'ciba',$2,$3,$4,'pending',$5,$6,'poll',$7,statement_timestamp()+$8::int*interval '1 second',statement_timestamp(),statement_timestamp())`,
-		[
-			receipt.auth_req_id,
-			agentId,
-			target.hostId,
-			target.ownerId,
-			owner.email,
-			bindingMessage(message),
-			interval,
-			expiresIn,
-		],
+	const result = await issueOwnedCibaApproval(
+		client,
+		target,
+		email,
+		bindingMessage(message),
 	);
-	return json(receipt);
+	return result instanceof Response ? result : json(result);
 }

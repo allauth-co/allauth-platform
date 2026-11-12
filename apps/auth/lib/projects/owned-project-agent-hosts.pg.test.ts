@@ -4877,6 +4877,281 @@ describe.skipIf(!existsSync(fixture))(
 			);
 		});
 
+		it("retries a pending delegated registration with CIBA and keeps the proof usable across writers", async () => {
+			const scope = `"${alpha.schemaName}"`;
+			const host = await nativeMachineHost(
+				"CIBA registration retry host",
+				registrationCookie,
+			);
+			const hostAuthorization = `Bearer ${await hostProof(host)}`;
+			const retryOptions = { force_approval: true, preferred_method: "ciba" };
+			async function start(name: string, writer: "native" | "owned") {
+				const key = await generateKeyPair("EdDSA", { extractable: true });
+				const input = machineRegistration(
+					await registerProof(host, key),
+					name,
+					retryOptions,
+					"192.0.2.126",
+				);
+				const response =
+					writer === "native"
+						? await legacy.handler(input)
+						: await owned.dispatch(input);
+				expect(response.status).toBe(200);
+				const body = (await response.json()) as {
+					agent_id: string;
+					approval: { method: string; device_code: string };
+				};
+				expect(body).toMatchObject({
+					name,
+					status: "pending",
+					approval: {
+						method: "device_authorization",
+						device_code: expect.any(String),
+					},
+				});
+				return {
+					id: body.agent_id,
+					deviceId: body.approval.device_code,
+					name,
+					key,
+				};
+			}
+			function retry(
+				proof: string,
+				properties: object = {},
+				ip = "192.0.2.127",
+			) {
+				return machineRegistration(
+					proof,
+					"Retry uses the saved name",
+					{ ...retryOptions, ...properties },
+					ip,
+				);
+			}
+			async function ciba(agentId: string) {
+				return (
+					await database.query<{ id: string }>(
+						`SELECT id,method,"agentId","hostId","userId",status,capabilities,"userCodeHash","loginHint","bindingMessage","deliveryMode",
+					 interval,"lastPolledAt","clientNotificationEndpoint","clientNotificationToken",extract(epoch FROM "expiresAt"-"createdAt")::int AS lifetime
+					 FROM ${scope}."approvalRequest" WHERE "agentId"=$1 AND method='ciba'`,
+						[agentId],
+					)
+				).rows;
+			}
+			async function verifyRetry(
+				response: Response,
+				pending: Awaited<ReturnType<typeof start>>,
+				binding: string,
+			) {
+				expect(response.status).toBe(200);
+				expect(await response.json()).toEqual({
+					agent_id: pending.id,
+					host_id: host.hostId,
+					name: pending.name,
+					mode: "delegated",
+					status: "pending",
+					agent_capability_grants: [],
+					approval: { method: "ciba", expires_in: 300, interval: 5 },
+				});
+				const rows = await ciba(pending.id);
+				expect(rows).toEqual([
+					{
+						id: expect.any(String),
+						method: "ciba",
+						agentId: pending.id,
+						hostId: host.hostId,
+						userId: registrationOwner.id,
+						status: "pending",
+						capabilities: null,
+						userCodeHash: null,
+						loginHint: registrationOwner.email,
+						bindingMessage: binding,
+						deliveryMode: "poll",
+						interval: 5,
+						lastPolledAt: null,
+						clientNotificationEndpoint: null,
+						clientNotificationToken: null,
+						lifetime: 300,
+					},
+				]);
+				return rows[0].id;
+			}
+			function decide(proofId: string, cookie: string, ip: string) {
+				return approvalDecision(
+					cookie,
+					{ approval_id: proofId, action: "approve" },
+					ip,
+				);
+			}
+			async function confirm(
+				response: Response,
+				agentId: string,
+				writer: "native" | "owned",
+				proofId: string,
+			) {
+				expect(response.status).toBe(200);
+				expect(await response.json()).toEqual({
+					status: "approved",
+					agentId,
+					added: [],
+				});
+				expect(await ciba(agentId)).toMatchObject([
+					{ id: proofId, status: "approved" },
+				]);
+				const status = await expectSame(
+					`${statusPath}?agent_id=${agentId}`,
+					"",
+					200,
+					undefined,
+					hostAuthorization,
+				);
+				expect(status).toMatchObject({
+					status: "active",
+					user_id: registrationOwner.id,
+					host_id: host.hostId,
+				});
+				const retire = request(
+					alpha,
+					"/agent/revoke",
+					"",
+					{ agent_id: agentId },
+					hostAuthorization,
+				);
+				expect(
+					(writer === "native"
+						? await legacy.handler(retire)
+						: await owned.dispatch(retire)
+					).status,
+				).toBe(200);
+			}
+
+			const first = await start("Native CIBA retry fixture", "native");
+			const fromNative = await verifyRetry(
+				await legacy.handler(retry(await registerProof(host, first.key))),
+				first,
+				`Agent "${first.name}" requesting approval`,
+			);
+			const ownedList = await owned.dispatch(
+				request(alpha, "/agent/ciba/pending", registrationCookie),
+			);
+			expect(await ownedList.json()).toMatchObject({
+				requests: expect.arrayContaining([
+					expect.objectContaining({
+						approval_id: fromNative,
+						method: "ciba",
+						agent_id: first.id,
+					}),
+				]),
+			});
+			await confirm(
+				await owned.dispatch(
+					decide(fromNative, registrationCookie, "192.0.2.128"),
+				),
+				first.id,
+				"owned",
+				fromNative,
+			);
+
+			const next = await start(
+				"AllAuth CIBA retry of native pending",
+				"native",
+			);
+			const foreign = await owned.dispatch(
+				retry(await registerProof(host, next.key), { login_hint: peer.email }),
+			);
+			expect(foreign.status).toBe(403);
+			const disallowedScope = await owned.dispatch(
+				retry(await registerProof(host, next.key), {
+					capabilities: ["fixture.unconfigured"],
+				}),
+			);
+			expect(disallowedScope.status).toBe(400);
+			const otherHost = await nativeMachineHost(
+				"Other CIBA retry host",
+				peerCookie,
+			);
+			const wrongKey = await owned.dispatch(
+				retry(
+					await registerProof(
+						{ ...host, hostKey: otherHost.hostKey },
+						next.key,
+					),
+				),
+			);
+			expect(wrongKey.status).toBe(401);
+			expect(await ciba(next.id)).toEqual([]);
+			const signed = await registerProof(host, next.key);
+			const cross = request(
+				beta,
+				"/agent/register",
+				"",
+				{ name: "Sibling realm", mode: "delegated", ...retryOptions },
+				`Bearer ${signed}`,
+			);
+			expect((await outside.dispatch(cross)).status).toBe(403);
+			const metadata = {
+				login_hint: registrationOwner.email.toUpperCase(),
+				binding_message: "<b>Review this agent</b>",
+			};
+			await database.query(
+				`ALTER TABLE ${scope}."approvalRequest" ADD CONSTRAINT fixture_reject_ciba_retry CHECK (method<>'ciba') NOT VALID`,
+			);
+			try {
+				await expect(
+					owned.dispatch(retry(signed, metadata)),
+				).rejects.toMatchObject({ code: "23514" });
+			} finally {
+				await database.query(
+					`ALTER TABLE ${scope}."approvalRequest" DROP CONSTRAINT fixture_reject_ciba_retry`,
+				);
+			}
+			expect(await ciba(next.id)).toEqual([]);
+			const prior = await expectSame(
+				`${statusPath}?agent_id=${next.id}`,
+				"",
+				200,
+				undefined,
+				hostAuthorization,
+			);
+			expect(prior).toMatchObject({ status: "pending", user_id: null });
+			const fromOwned = await verifyRetry(
+				await owned.dispatch(retry(signed, metadata)),
+				next,
+				"Review this agent",
+			);
+			expect(
+				(await candidate(alpha, true).dispatch(retry(signed, metadata))).status,
+			).toBe(401);
+			expect(await ciba(next.id)).toHaveLength(1);
+			expect(
+				(
+					await database.query(
+						`SELECT "userId" FROM ${scope}."approvalRequest" WHERE id=$1`,
+						[next.deviceId],
+					)
+				).rows,
+			).toEqual([{ userId: registrationOwner.id }]);
+			legacy = await native(nativePool);
+			const forbidden = await legacy.handler(
+				decide(fromOwned, peerCookie, "192.0.2.129"),
+			);
+			expect(forbidden.status).toBe(403);
+			await confirm(
+				await legacy.handler(
+					decide(fromOwned, registrationCookie, "192.0.2.130"),
+				),
+				next.id,
+				"native",
+				fromOwned,
+			);
+
+			await start(
+				"New owned forced registration still uses device approval",
+				"owned",
+			);
+		});
+
 		it("serializes the native five-active-agent limit across hosts for the same owner", async () => {
 			const first = await nativeMachineHost(
 				"Limit host one",
