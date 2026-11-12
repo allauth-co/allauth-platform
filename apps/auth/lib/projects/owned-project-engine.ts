@@ -2761,6 +2761,7 @@ export function createOwnedProjectEngine(
 			emailAliases,
 			denyProvisioning: security.denyStandaloneSignup,
 			beforeDelete: beforeGuestDelete,
+			auditContext: browserEventContext,
 			async revoke(client, request, userId, path) {
 				const removed = await store.revoke(
 					{ userId },
@@ -2789,14 +2790,35 @@ export function createOwnedProjectEngine(
 
 	async function guestSession(request: Request, path: string) {
 		if (!guest) return unsupported();
-		if (!trustedRequest(request.headers, true)) return forbidden();
 		if (path === "/delete-anonymous-user") {
+			const limited = await store.transaction((client) =>
+				admitOwnedProjectNativeRoute(client, options.trustedIP(request), path, {
+					max: 100,
+					windowMs: 60_000,
+				}),
+			);
+			if (limited) return limited;
+			if (!trustedRequest(request.headers, true)) return forbidden();
+			const reject = async (
+				status: number,
+				code: string,
+				message: string,
+				userId?: string,
+			) => {
+				await guest.recordDeletionFailure(request, code, userId);
+				return failure(status, code, message);
+			};
 			const unauthorizedGuest = () =>
-				failure(401, "UNAUTHORIZED", "Unauthorized");
+				reject(401, "UNAUTHORIZED", "Unauthorized");
 			const current = await currentSession(request.headers);
 			if (!current) return unauthorizedGuest();
 			if (!current.user.isAnonymous)
-				return failure(403, "USER_IS_NOT_ANONYMOUS", "User is not anonymous");
+				return reject(
+					403,
+					"USER_IS_NOT_ANONYMOUS",
+					"User is not anonymous",
+					current.user.id,
+				);
 			const result = await guest.erase(request, { token: current.token }, path);
 			if (result.status === "missing") return unauthorizedGuest();
 			if (result.status === "ineligible") return forbidden();
@@ -2822,6 +2844,7 @@ export function createOwnedProjectEngine(
 			);
 			return json({ success: true }, 200, headers);
 		}
+		if (!trustedRequest(request.headers, true)) return forbidden();
 		if (!policy.signUpEnabled)
 			return failure(
 				403,

@@ -1,7 +1,11 @@
 import { createHash, createHmac, randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { betterAuth } from "better-auth";
-import { symmetricDecrypt, symmetricEncrypt } from "better-auth/crypto";
+import {
+	hashPassword,
+	symmetricDecrypt,
+	symmetricEncrypt,
+} from "better-auth/crypto";
 import { exportJWK, generateKeyPair, SignJWT } from "jose";
 import { Kysely, PostgresDialect } from "kysely";
 import { Pool } from "pg";
@@ -178,6 +182,366 @@ describe.skipIf(!existsSync(fixturePath))(
 				await connection.query("RESET search_path");
 			} finally {
 				connection.release();
+			}
+		});
+
+		it("delivers the native user events for direct guest deletion once", async () => {
+			const path = "/delete-anonymous-user";
+			const address = "192.0.2.186";
+			const rateKey = `${address}|${path}`;
+			const nativeEngine = native(nativeDatabase);
+			const candidate = createOwnedProjectEngine({
+				database,
+				project: { schemaName: schema, slug },
+				baseURL: origin,
+				basePath,
+				trustedOrigins: [],
+				signingSecret: secret,
+				trustedIP: (request) => request.headers.get("x-real-ip"),
+				policy: defaultAuthPolicy,
+				accountLinks: {
+					publicLinkBaseURL: `${origin}${basePath}`,
+					defer: () => {},
+					deliver: async () => {},
+					beforeDelete: async () => undefined,
+				},
+			});
+			const account = randomUUID();
+			const email = "guest-deletion-control@fixture.example";
+			const password = "Synthetic-Registered-Password-42";
+			const privateValue = "synthetic-private-guest-deletion-marker";
+			const request = (route: string, cookie?: string, body = {}) =>
+				new Request(`${origin}${basePath}${route}`, {
+					method: "POST",
+					headers: {
+						origin,
+						"content-type": "application/json",
+						"x-real-ip": address,
+						"user-agent": rawUserAgent,
+						...(cookie ? { cookie } : {}),
+					},
+					body: JSON.stringify(body),
+				});
+			const cookies = (response: Response) =>
+				response.headers
+					.getSetCookie()
+					.filter((value) => !/;\s*Max-Age=0(?:;|$)/i.test(value))
+					.map((value) => value.split(";", 1)[0])
+					.join("; ");
+			await database.query(
+				`INSERT INTO ${scope}."user" (id,name,email,"emailVerified","publicMetadata","privateMetadata")
+				 VALUES ($1,'Registered fixture',$2,true,'{"source":"fixture"}',$3)`,
+				[account, email, { privateValue }],
+			);
+			await database.query(
+				`INSERT INTO ${scope}."account" (id,"userId","accountId","providerId",password,"updatedAt")
+				 VALUES ($1,$2,$2,'credential',$3,now())`,
+				[randomUUID(), account, await hashPassword(password)],
+			);
+			const registered = await nativeEngine.handler(
+				request("/sign-in/email", undefined, { email, password }),
+			);
+			expect(registered.status).toBe(200);
+			const registeredCookie = cookies(registered);
+			expect(registeredCookie).toContain(".session_token=");
+			const registeredSession = await nativeEngine.api.getSession({
+				headers: new Headers({ cookie: registeredCookie }),
+			});
+			expect(registeredSession?.user.id).toBe(account);
+			const clientId = randomUUID();
+			const otherGrant = randomUUID();
+			const shadow = `"${sibling}"`;
+			for (const realm of [scope, shadow])
+				await database.query(
+					`INSERT INTO ${realm}."oauthClient" (id,"clientId","redirectUris") VALUES ($1,$1,'[]')`,
+					[clientId],
+				);
+			await database.query(
+				`INSERT INTO ${scope}."oauthRefreshToken" (id,token,"sessionId","userId","clientId","expiresAt","createdAt",scopes)
+				 VALUES ($1,$1,$2,$3,$4,now()+interval '1 day',now(),'["offline_access"]')`,
+				[otherGrant, registeredSession?.session.id, account, clientId],
+			);
+
+			async function exercise(dispatch: Dispatch) {
+				const created = await nativeEngine.handler(
+					request("/sign-in/anonymous"),
+				);
+				expect(created.status).toBe(200);
+				const guestCookie = cookies(created);
+				const guest = await nativeEngine.api.getSession({
+					headers: new Headers({ cookie: guestCookie }),
+				});
+				if (!guest) throw new Error("Expected a native guest session.");
+				expect(guest.user).toMatchObject({ role: "guest", isAnonymous: true });
+				const id = guest.user.id;
+				const secondSession = randomUUID();
+				const guestGrant = randomUUID();
+				const accessGrant = randomUUID();
+				const recipient = "https://guest-deletion-hook.fixture.example/events";
+				const subscription = newWebhookSigningSecret();
+				const encryptedSecret = await symmetricEncrypt({
+					key: secret,
+					data: subscription,
+				});
+				const endpoint = randomUUID();
+				await database.query(
+					`INSERT INTO ${shadow}."user" (id,name,email,role,"isAnonymous","emailVerified")
+					 VALUES ($1,'Guest shadow',$2,'guest',true,false)`,
+					[id, guest.user.email],
+				);
+				for (const realm of [scope, shadow]) {
+					await database.query(
+						`INSERT INTO ${realm}."session" (id,token,"userId","expiresAt","updatedAt")
+						 VALUES ($1,$1,$2,now()+interval '1 day',now())`,
+						[secondSession, id],
+					);
+					await database.query(
+						`INSERT INTO ${realm}."oauthRefreshToken" (id,token,"sessionId","userId","clientId","expiresAt","createdAt",scopes)
+						 VALUES ($1,$1,$2,$3,$4,now()+interval '1 day',now(),'["offline_access"]')`,
+						[guestGrant, secondSession, id, clientId],
+					);
+					await database.query(
+						`INSERT INTO ${realm}."oauthAccessToken" (id,token,"sessionId","userId","clientId","expiresAt","createdAt",scopes)
+						 VALUES ($1,$1,$2,$3,$4,now()+interval '1 day',now(),'["openid"]')`,
+						[accessGrant, secondSession, id, clientId],
+					);
+					await database.query(
+						`INSERT INTO ${realm}."allauthWebhookEndpoint" (id,url,"eventTypes","encryptedSecret")
+						 VALUES ($1,$2,'["user.*"]',$3)`,
+						[endpoint, recipient, encryptedSecret],
+					);
+				}
+				const counts = async (realm: string, owner: string) =>
+					(
+						await database.query(
+							`SELECT (SELECT count(*)::int FROM ${realm}."user" WHERE id=$1) AS users,
+						 (SELECT count(*)::int FROM ${realm}."session" WHERE "userId"=$1) AS sessions,
+						 (SELECT count(*)::int FROM ${realm}."oauthRefreshToken" WHERE "userId"=$1 AND revoked IS NULL) AS refresh,
+						 (SELECT count(*)::int FROM ${realm}."oauthAccessToken" WHERE "userId"=$1 AND revoked IS NULL) AS access`,
+							[owner],
+						)
+					).rows[0];
+				try {
+					await database.query(
+						`INSERT INTO ${scope}."rateLimit" (id,"key",count,"lastRequest") VALUES ($1,$2,96,$3)`,
+						[randomUUID(), rateKey, Date.now()],
+					);
+					const unauthorized = await dispatch(request(path));
+					expect(unauthorized.status).toBe(401);
+					expect(await unauthorized.json()).toEqual({
+						code: "UNAUTHORIZED",
+						message: "Unauthorized",
+					});
+					const ineligible = await dispatch(request(path, registeredCookie));
+					expect(ineligible.status).toBe(403);
+					expect(await ineligible.json()).toEqual({
+						code: "USER_IS_NOT_ANONYMOUS",
+						message: "User is not anonymous",
+					});
+					expect(await counts(scope, id)).toEqual({
+						users: 1,
+						sessions: 2,
+						refresh: 1,
+						access: 1,
+					});
+
+					const erased = await dispatch(request(path, guestCookie));
+					expect(erased.status).toBe(200);
+					expect(await erased.json()).toEqual({ success: true });
+					expect(erased.headers.getSetCookie()).toEqual(
+						expect.arrayContaining([
+							expect.stringMatching(/\.session_token=;.*Max-Age=0/),
+						]),
+					);
+					const repeated = await dispatch(request(path, guestCookie));
+					expect(repeated.status).toBe(401);
+					expect(await repeated.json()).toEqual({
+						code: "UNAUTHORIZED",
+						message: "Unauthorized",
+					});
+					const snapshot = async () =>
+						(
+							await database.query(
+								`SELECT
+								   (SELECT count FROM ${scope}."rateLimit" WHERE "key"=$1) AS requests,
+								   (SELECT count(*)::int FROM ${scope}."allauthEvent" WHERE type='user.anonymous-deleted' AND "ipAddress"=$2) AS events,
+								   (SELECT count(*)::int FROM ${scope}."allauthWebhookDelivery" WHERE "endpointId"=$3) AS deliveries`,
+								[rateKey, address, endpoint],
+							)
+						).rows[0];
+					const beforeLimit = await snapshot();
+					const limited = await dispatch(request(path));
+					expect(limited.status).toBe(429);
+					expect(await limited.json()).toEqual({
+						message: "Too many requests. Please try again later.",
+					});
+					const retryAfter = Number(limited.headers.get("x-retry-after"));
+					expect(retryAfter).toBeGreaterThan(0);
+					// Native treats PostgreSQL's bigint timestamp as a string here.
+					if (dispatch === candidate.dispatch)
+						expect(retryAfter).toBeLessThanOrEqual(60);
+					expect(beforeLimit).toMatchObject({ requests: 100, deliveries: 5 });
+					expect(await snapshot()).toEqual(beforeLimit);
+					expect(await counts(scope, id)).toEqual({
+						users: 0,
+						sessions: 0,
+						refresh: 0,
+						access: 0,
+					});
+					expect(await counts(shadow, id)).toEqual({
+						users: 1,
+						sessions: 1,
+						refresh: 1,
+						access: 1,
+					});
+					expect(await counts(scope, account)).toEqual({
+						users: 1,
+						sessions: 1,
+						refresh: 1,
+						access: 0,
+					});
+					expect(
+						(
+							await database.query(
+								`SELECT id FROM ${shadow}."allauthWebhookDelivery" WHERE "endpointId"=$1`,
+								[endpoint],
+							)
+						).rows,
+					).toEqual([]);
+
+					const deliveries: unknown[] = [];
+					const delivered = await deliverPendingWebhooks({
+						database: nativeDatabase,
+						secret,
+						now: () => new Date(Date.now() + 2_000),
+						resolver: async () => [{ address: "93.184.216.34", family: 4 }],
+						async transport({ destination, body, headers }) {
+							expect(destination.url.href).toBe(recipient);
+							const signature = createHmac(
+								"sha256",
+								Buffer.from(subscription.slice(6), "base64"),
+							)
+								.update(
+									`${headers["webhook-id"]}.${headers["webhook-timestamp"]}.${body}`,
+								)
+								.digest("base64");
+							expect(headers["webhook-signature"]).toBe(`v1,${signature}`);
+							expect(body).not.toContain(privateValue);
+							expect(body).not.toContain(guest.user.email);
+							expect(body).not.toContain(guest.session.token);
+							const envelope = JSON.parse(body) as ControlWebhookEnvelope;
+							const { id: eventId, createdAt, ...event } = envelope.data.event;
+							expect(envelope).toEqual({
+								id: eventId,
+								type: event.type,
+								timestamp: createdAt,
+								data: envelope.data,
+							});
+							deliveries.push({
+								...envelope.data,
+								event: Object.fromEntries(
+									Object.entries(event).map(([key, value]) => [
+										key,
+										value === id ? "guest" : value,
+									]),
+								),
+							});
+							return 204;
+						},
+					});
+					expect(delivered).toEqual({
+						claimed: deliveries.length,
+						delivered: deliveries.length,
+						retried: 0,
+						failed: 0,
+					});
+					return deliveries.sort((left, right) =>
+						JSON.stringify(left).localeCompare(JSON.stringify(right)),
+					);
+				} finally {
+					await database.query(
+						`DELETE FROM ${scope}."rateLimit" WHERE "key"=$1`,
+						[rateKey],
+					);
+					for (const realm of [scope, shadow]) {
+						await database.query(
+							`DELETE FROM ${realm}."allauthWebhookEndpoint" WHERE id=$1`,
+							[endpoint],
+						);
+						await database.query(`DELETE FROM ${realm}."user" WHERE id=$1`, [
+							id,
+						]);
+					}
+				}
+			}
+
+			try {
+				const expected = await exercise(nativeEngine.handler);
+				const routeEvent = {
+					type: "user.anonymous-deleted",
+					ipAddress: address,
+					userAgent,
+				};
+				const unauthenticated = {
+					event: {
+						...routeEvent,
+						outcome: "failure",
+						metadata: { path, errorCode: "UNAUTHORIZED" },
+					},
+				};
+				expect(expected).toEqual([
+					unauthenticated,
+					unauthenticated,
+					{
+						event: {
+							...routeEvent,
+							outcome: "failure",
+							actorId: account,
+							userId: account,
+							metadata: { path, errorCode: "USER_IS_NOT_ANONYMOUS" },
+						},
+						user: {
+							id: account,
+							name: "Registered fixture",
+							email,
+							emailVerified: true,
+							publicMetadata: { source: "fixture" },
+						},
+					},
+					{
+						event: {
+							...routeEvent,
+							outcome: "success",
+							actorId: "guest",
+							userId: "guest",
+							metadata: { path },
+						},
+					},
+					{
+						event: {
+							type: "user.deleted",
+							outcome: "success",
+							actorId: "guest",
+							userId: "guest",
+							targetId: "guest",
+							metadata: { path },
+						},
+					},
+				]);
+				expect(await exercise(candidate.dispatch)).toEqual(expected);
+			} finally {
+				await database.query(
+					`DELETE FROM ${scope}."allauthSecurityCounter" WHERE key=$1`,
+					[await securitySubject(secret, "signup-ip", address)],
+				);
+				await database.query(`DELETE FROM ${scope}."user" WHERE id=$1`, [
+					account,
+				]);
+				for (const realm of [scope, shadow])
+					await database.query(
+						`DELETE FROM ${realm}."oauthClient" WHERE id=$1`,
+						[clientId],
+					);
 			}
 		});
 

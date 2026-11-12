@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { PoolClient } from "pg";
+import type { ControlEventInput } from "../control/types";
 import type { OwnedProjectAccountDeletionOptions } from "./owned-project-account-deletion";
 import {
 	claimProjectUserDeletion,
@@ -15,6 +16,7 @@ export type ProjectGuestProof = { token: string } | { userId: string };
 type Erasure =
 	| { status: "deleted"; userId: string }
 	| { status: "missing" | "ineligible" | "pending" | "unavailable" };
+const deletePath = "/delete-anonymous-user";
 
 /** Read and retire guest records using the same deletion fence as other project accounts. */
 export function createOwnedProjectGuest(options: {
@@ -26,6 +28,9 @@ export function createOwnedProjectGuest(options: {
 		email: string,
 	): Promise<boolean>;
 	beforeDelete: OwnedProjectAccountDeletionOptions["beforeDelete"];
+	auditContext(
+		request: Request,
+	): Pick<ControlEventInput, "ipAddress" | "userAgent">;
 	revoke(
 		client: PoolClient,
 		request: Request,
@@ -34,6 +39,22 @@ export function createOwnedProjectGuest(options: {
 	): Promise<void>;
 }) {
 	const { store } = options;
+
+	function recordDeletion(
+		client: PoolClient,
+		request: Request,
+		userId?: string,
+		errorCode?: string,
+	) {
+		return store.recordEvent(client, {
+			type: "user.anonymous-deleted",
+			outcome: errorCode ? "failure" : "success",
+			actorId: userId,
+			userId,
+			...options.auditContext(request),
+			metadata: { path: deletePath, ...(errorCode && { errorCode }) },
+		});
+	}
 
 	async function authority(client: PoolClient, proof: ProjectGuestProof) {
 		const byToken = "token" in proof;
@@ -61,6 +82,15 @@ export function createOwnedProjectGuest(options: {
 	}
 
 	return {
+		recordDeletionFailure(
+			request: Request,
+			errorCode: string,
+			userId?: string,
+		) {
+			return store.transaction((client) =>
+				recordDeletion(client, request, userId, errorCode),
+			);
+		},
 		async create(client: PoolClient, request: Request) {
 			const id = randomUUID();
 			const email = `${id}@anonymous.placeholder.invalid`;
@@ -113,6 +143,7 @@ export function createOwnedProjectGuest(options: {
 						await options.revoke(client, request, id, path);
 						await eraseLockedProjectUser(client, id, claim.key);
 						await store.record(client, "user.deleted", "success", path, id, id);
+						if (path === deletePath) await recordDeletion(client, request, id);
 						return { status: "deleted", userId: id };
 					},
 				);
