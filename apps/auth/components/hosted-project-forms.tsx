@@ -415,10 +415,17 @@ export function HostedProjectSso({
 		event.preventDefault();
 		const submittedEmail = email.trim();
 		void run(async (request) => {
+			const origin = window.location.origin;
+			const errorCallback = new URL("/auth-error", origin);
+			errorCallback.searchParams.set("callbackUrl", destination);
 			const result = await request("sign-in/sso", {
 				email: submittedEmail,
 				loginHint: submittedEmail,
-				callbackURL: appCallback(destination, window.location.origin),
+				callbackURL: appCallback(destination, origin),
+				// The SSO state format limits each absolute callback URL to 2048 characters.
+				...(errorCallback.href.length <= 2048 && {
+					errorCallbackURL: errorCallback.href,
+				}),
 			});
 			if (result.status === 404) {
 				setNoProvider(true);

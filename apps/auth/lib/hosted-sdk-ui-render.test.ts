@@ -597,6 +597,7 @@ it("preserves the enterprise email in the password fallback when no provider is 
 		email: "work@customer.example",
 		loginHint: "work@customer.example",
 		callbackURL: `https://accounts.customer.example${destination}`,
+		errorCallbackURL: `https://accounts.customer.example/auth-error?${new URLSearchParams({ callbackUrl: destination })}`,
 	});
 	expect(container.textContent).toContain(
 		"No organization sign-in provider was found",
@@ -605,6 +606,39 @@ it("preserves the enterprise email in the password fallback when no provider is 
 		container.querySelector<HTMLInputElement>('input[name="email"]')?.value,
 	).toBe("work@customer.example");
 	expect(container.querySelector('input[name="password"]')).not.toBeNull();
+});
+
+it("keeps the exact signed authorization return on enterprise callback failure", async () => {
+	const idp = "https://identity.customer.example/authorize?state=synthetic";
+	const requests = hostedRequests(() =>
+		Response.json({ url: idp, redirect: true }),
+	);
+	const navigate = vi
+		.spyOn(window.location, "assign")
+		.mockImplementation(() => {});
+	const signed =
+		"/oauth2/continue?client_id=fixture&resource=one&resource=two&sig=fixture%2Bproof&ba_param=client_id&ba_param=resource";
+	const container = await renderHostedAuth("enterpriseSignIn", signed);
+	await enter(container, "email", "work@customer.example");
+	await submit(container);
+	const error = requests.mock.calls[0]?.[1].errorCallbackURL;
+	expect(error).toBe(
+		`https://accounts.customer.example/auth-error?${new URLSearchParams({ callbackUrl: signed })}`,
+	);
+	expect(navigate).toHaveBeenCalledExactlyOnceWith(idp);
+});
+
+it("keeps a supported SSO start when nesting its return would exceed the error URL limit", async () => {
+	const requests = hostedRequests(() => Response.json({}, { status: 404 }));
+	const destination = `/account/security?from=${"%2B".repeat(500)}`;
+	const container = await renderHostedAuth("enterpriseSignIn", destination);
+	await enter(container, "email", "work@customer.example");
+	await submit(container);
+	expect(requests).toHaveBeenCalledExactlyOnceWith("sign-in/sso", {
+		email: "work@customer.example",
+		loginHint: "work@customer.example",
+		callbackURL: `https://accounts.customer.example${destination}`,
+	});
 });
 
 it("sends the dedicated verification form's recovery code and trust-device choice", async () => {

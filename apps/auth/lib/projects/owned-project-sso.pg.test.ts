@@ -508,6 +508,52 @@ describe.skipIf(!existsSync(fixturePath))(
 			).rows[0];
 		}
 
+		it.each([
+			"native",
+			"owned",
+		] as const)("returns a configured %s provider denial to the same accounts host with its exact authorization return", async (engine) => {
+			const continuation =
+				"/oauth2/continue?client_id=fixture&resource=one&resource=two&sig=fixture%2Bproof&ba_param=client_id&ba_param=resource";
+			const errorCallback = new URL("/auth-error", origin);
+			errorCallback.searchParams.set("callbackUrl", continuation);
+			const input = {
+				...body,
+				callbackURL: origin + continuation,
+				errorCallbackURL: errorCallback.href,
+			};
+			const candidate = owned();
+			const start = startRequest(input);
+			const started = await (engine === "native"
+				? native.handler(start)
+				: candidate.start(start, input));
+			expect(started.status, await started.clone().text()).toBe(200);
+			const { url } = (await started.json()) as { url: string };
+			const authorization = new URL(url);
+			expect(authorization.searchParams.get("redirect_uri")).toBe(callbackURL);
+			const state = authorization.searchParams.get("state");
+			expect(state).toBeTruthy();
+			const callback = new URL(callbackURL);
+			callback.searchParams.set("state", state!);
+			callback.searchParams.set("error", "access_denied");
+			const request = new Request(callback, {
+				headers: { cookie: cookies(started), "sec-fetch-mode": "navigate" },
+			});
+			const before = tokenRequests;
+			const result = await (engine === "native"
+				? native.handler(request)
+				: candidate.callback(request, providerId));
+			expect(result.status).toBe(302);
+			const location = new URL(result.headers.get("location")!);
+			expect(location.origin).toBe(origin);
+			expect(location.pathname).toBe("/auth-error");
+			expect(location.searchParams.getAll("callbackUrl")).toEqual([
+				continuation,
+			]);
+			expect(location.searchParams.get("error")).toBeTruthy();
+			expect(cookies(result)).not.toContain("session_token");
+			expect(tokenRequests).toBe(before);
+		});
+
 		it("finishes a native pending SSO callback with the exact active directory identity", async () => {
 			const callback = await authorize(await native.handler(startRequest()));
 			const foreign = await owned(otherSchema).callback(callback, providerId);
