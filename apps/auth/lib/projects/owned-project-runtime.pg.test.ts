@@ -118,6 +118,9 @@ function childEnvironment(
 		ALLAUTH_ASSET_ORIGIN: runtimeFixtureAssetOrigin,
 		ALLAUTH_ASSET_SECRET: runtimeFixtureAssetSecret,
 		CLOUDFLARE_SAAS_READY: "true",
+		CLOUDFLARE_SAAS_ZONE_ID: "a".repeat(32),
+		CLOUDFLARE_SAAS_API_TOKEN: "fixture-only-domain-readiness-token",
+		CLOUDFLARE_SAAS_CNAME_TARGET: "domains.allauth.co",
 		ALLAUTH_HOSTING_BASE_DOMAIN: "allauth.co",
 		...(microsoftProject
 			? {
@@ -328,14 +331,17 @@ type SamlTransport = {
 	baseURL: string;
 	destination: string;
 	host?: string;
+	clientIP?: string;
 };
 
 async function startRuntimeSaml(
 	service: Awaited<ReturnType<typeof openProcess>>,
 	transport: SamlTransport,
+	acs = `${transport.baseURL}/sso/saml2/sp/acs/${runtimeSamlProvider}`,
 ) {
 	const started = await service.request(`${transport.prefix}/sign-in/sso`, {
 		host: transport.host,
+		clientIP: transport.clientIP,
 		body: {
 			providerId: runtimeSamlProvider,
 			providerType: "saml",
@@ -350,9 +356,7 @@ async function startRuntimeSaml(
 	expect(url.origin).toBe(runtimeSamlOrigin);
 	expect(url.searchParams.has("Signature")).toBe(true);
 	const flow = runtimeSamlAuthnRequest(url);
-	expect(flow.acs).toBe(
-		`${transport.baseURL}/sso/saml2/sp/acs/${runtimeSamlProvider}`,
-	);
+	expect(flow.acs).toBe(acs);
 	return { transport, flow };
 }
 
@@ -1226,11 +1230,15 @@ describe.skipIf(!existsSync(fixture))(
 						avatarBase,
 					),
 				).toBe(true);
-				expect((await service.request(userPath(alpha, true), {
-					cookie: rootCookie,
-					method: "PATCH",
-					body: { publicMetadata: nativePublicMetadata },
-				})).status).toBe(200);
+				expect(
+					(
+						await service.request(userPath(alpha, true), {
+							cookie: rootCookie,
+							method: "PATCH",
+							body: { publicMetadata: nativePublicMetadata },
+						})
+					).status,
+				).toBe(200);
 				const nativeDirectKey = await runtimeCreateApiKey(
 					service,
 					{ prefix: alphaPath, cookie: legacyCookie },
@@ -1292,37 +1300,69 @@ describe.skipIf(!existsSync(fixture))(
 
 				service = await open(restored, true);
 				expect((await service.request("/api/health")).status).toBe(200);
-				const userDirectory = await service.request(usersPath(alpha), { cookie: rootCookie });
-				expect(userDirectory.status, await userDirectory.clone().text()).toBe(200);
+				const userDirectory = await service.request(usersPath(alpha), {
+					cookie: rootCookie,
+				});
+				expect(userDirectory.status, await userDirectory.clone().text()).toBe(
+					200,
+				);
 				expect(await userDirectory.json()).toMatchObject({
-					users: [{ id: credentials.project.id, publicMetadata: nativePublicMetadata }],
+					users: [
+						{
+							id: credentials.project.id,
+							publicMetadata: nativePublicMetadata,
+						},
+					],
 					total: 1,
 					limit: 1,
 					offset: 0,
 				});
-				expect((await service.request(usersPath(alpha), { cookie: legacyCookie })).status).toBe(401);
-				expect((await service.request(userPath(alpha, true), {
+				expect(
+					(await service.request(usersPath(alpha), { cookie: legacyCookie }))
+						.status,
+				).toBe(401);
+				expect(
+					(
+						await service.request(userPath(alpha, true), {
+							cookie: rootCookie,
+							origin: alpha.primaryOrigin,
+							method: "PATCH",
+							body: { publicMetadata: ownedPublicMetadata },
+						})
+					).status,
+				).toBe(403);
+				expect(
+					(
+						await service.request(userPath(alpha, true), {
+							cookie: rootCookie,
+							method: "PATCH",
+							body: {
+								publicMetadata: ownedPublicMetadata,
+								privateMetadata: ownedPrivateMetadata,
+							},
+						})
+					).status,
+				).toBe(200);
+				const userDetail = await service.request(userPath(alpha), {
 					cookie: rootCookie,
-					origin: alpha.primaryOrigin,
-					method: "PATCH",
-					body: { publicMetadata: ownedPublicMetadata },
-				})).status).toBe(403);
-				expect((await service.request(userPath(alpha, true), {
-					cookie: rootCookie,
-					method: "PATCH",
-					body: { publicMetadata: ownedPublicMetadata, privateMetadata: ownedPrivateMetadata },
-				})).status).toBe(200);
-				const userDetail = await service.request(userPath(alpha), { cookie: rootCookie });
+				});
 				expect(userDetail.status).toBe(200);
 				const ownedDetail = await userDetail.json();
 				expect(ownedDetail).toMatchObject({
-					user: { id: credentials.project.id, publicMetadata: ownedPublicMetadata },
-					accounts: expect.arrayContaining([expect.objectContaining({ providerId: "credential" })]),
+					user: {
+						id: credentials.project.id,
+						publicMetadata: ownedPublicMetadata,
+					},
+					accounts: expect.arrayContaining([
+						expect.objectContaining({ providerId: "credential" }),
+					]),
 				});
 				expect(JSON.stringify(ownedDetail)).not.toContain("fixtureInternal");
 				expect(JSON.stringify(ownedDetail)).not.toContain('"password"');
 				expect(JSON.stringify(ownedDetail)).not.toContain('"token"');
-				const siblingDetail = await service.request(userPath(beta), { cookie: rootCookie });
+				const siblingDetail = await service.request(userPath(beta), {
+					cookie: rootCookie,
+				});
 				expect(siblingDetail.status).toBe(200);
 				expect(await siblingDetail.text()).not.toContain("consoleLabel");
 				for (const [path, host, issuer] of [
@@ -1535,9 +1575,9 @@ describe.skipIf(!existsSync(fixture))(
 					expect(
 						customMetadata.status,
 						customMetadata.ok ? undefined : await customMetadata.clone().text(),
-					).toBe(400);
+					).toBe(409);
 					expect(await customMetadata.json()).toMatchObject({
-						code: "SSO_CONFIGURATION_UNSUPPORTED",
+						code: "CONFLICT",
 					});
 					ownedSaml.push(await startRuntimeSaml(service, transport));
 				}
@@ -3362,10 +3402,15 @@ describe.skipIf(!existsSync(fixture))(
 					).status,
 				).toBe(200);
 				expect((await service.request("/api/health")).status).toBe(200);
-				const rollbackUser = await service.request(userPath(alpha), { cookie: rootCookie });
+				const rollbackUser = await service.request(userPath(alpha), {
+					cookie: rootCookie,
+				});
 				expect(rollbackUser.status).toBe(200);
 				expect(await rollbackUser.json()).toMatchObject({
-					user: { id: credentials.project.id, publicMetadata: ownedPublicMetadata },
+					user: {
+						id: credentials.project.id,
+						publicMetadata: ownedPublicMetadata,
+					},
 				});
 				const userAudit = new Pool({ connectionString: url(restored), max: 1 });
 				try {
@@ -3373,15 +3418,22 @@ describe.skipIf(!existsSync(fixture))(
 						`SELECT "privateMetadata" FROM "${alpha.schemaName}"."user" WHERE id=$1`,
 						[credentials.project.id],
 					);
-					expect(metadata.rows).toEqual([{ privateMetadata: ownedPrivateMetadata }]);
-					for (const [table, column] of [["allauthAudit", "action"], ["allauthEvent", "type"]]) {
+					expect(metadata.rows).toEqual([
+						{ privateMetadata: ownedPrivateMetadata },
+					]);
+					for (const [table, column] of [
+						["allauthAudit", "action"],
+						["allauthEvent", "type"],
+					]) {
 						const events = await userAudit.query(
 							`SELECT "actorId", "targetId" FROM "${alpha.schemaName}"."${table}" WHERE "${column}"='user.metadata.updated'`,
 						);
-						expect(events.rows).toEqual(Array.from({ length: 2 }, () => ({
-							actorId: credentials.platform.id,
-							targetId: credentials.project.id,
-						})));
+						expect(events.rows).toEqual(
+							Array.from({ length: 2 }, () => ({
+								actorId: credentials.platform.id,
+								targetId: credentials.project.id,
+							})),
+						);
 					}
 				} finally {
 					await userAudit.end();
@@ -3734,7 +3786,11 @@ describe.skipIf(!existsSync(fixture))(
 					);
 					const supportedSaml = runtimeSamlConfiguration(samlKeys);
 					for (const spMetadata of [
-						{ metadata: runtimeSamlSPMetadata(nativeSaml[0].flow.acs) },
+						{
+							metadata: runtimeSamlSPMetadata(
+								nativeSaml[0].flow.acs.replace(alpha.slug, beta.slug),
+							),
+						},
 						{ isAssertionEncrypted: true },
 					]) {
 						await changed.query(
@@ -3784,6 +3840,246 @@ describe.skipIf(!existsSync(fixture))(
 					}
 				} finally {
 					await admin.end();
+				}
+			}
+		}, 90_000);
+
+		it("preserves signed custom SAML metadata at its exact verified accounts receiver across process restarts", async () => {
+			const local: { container: string; DATABASE_URL: string } = JSON.parse(
+				readFileSync(fixture, "utf8"),
+			);
+			const base = new URL(local.DATABASE_URL);
+			if (
+				local.container !== "allauth-production-test-20261007" ||
+				base.hostname !== "127.0.0.1" ||
+				base.port !== "55445"
+			)
+				throw new Error(
+					"Custom SAML transport tests require the isolated local PostgreSQL fixture.",
+				);
+			const admin = new Pool({ connectionString: base.href, max: 1 });
+			const name = `allauth_hosted_${randomUUID().replaceAll("-", "")}`;
+			const databaseURL = new URL(`/${name}`, base).href;
+			let created = false;
+			let database: Pool | undefined;
+			let service: Awaited<ReturnType<typeof openProcess>> | undefined;
+			try {
+				await admin.query(`CREATE DATABASE "${name}"`);
+				created = true;
+				const { alpha, beta, samlKeys } = await seed(databaseURL);
+				database = new Pool({ connectionString: databaseURL });
+				const directPrefix = `/api/projects/${alpha.slug}/auth`;
+				const defaultHost = `${alpha.slug}-accounts.allauth.co`;
+				const custom = "runtime-allauth-saml-fixture.net";
+				const other = "runtime-allauth-saml-control.net";
+				const customHost = `accounts.${custom}`;
+				const callbackPath = `/api/auth/sso/saml2/sp/acs/${runtimeSamlProvider}`;
+				const canonicalAcs = `https://${customHost}${callbackPath}`;
+				const pair = randomUUID();
+				for (const [domain, projectId, id] of [
+					[custom, alpha.id, pair],
+					[other, beta.id, randomUUID()],
+				]) {
+					await database.query(
+						`INSERT INTO public."allauthDomainPair" (id,"projectId",domain) VALUES ($1,$2,$3)`,
+						[id, projectId, domain],
+					);
+					for (const [kind, label] of [
+						["accounts", "accounts"],
+						["frontend-api", "api"],
+					]) {
+						await database.query(
+							`INSERT INTO public."allauthCustomHostname" (id,"pairId","projectId",kind,hostname,"proofToken","ownershipVerifiedAt","providerStatus","sslStatus","routingVerifiedAt")
+							 VALUES ($1,$2,$3,$4,$5,'fixture-domain-proof',now(),'active','active',now())`,
+							[randomUUID(), id, projectId, kind, `${label}.${domain}`],
+						);
+					}
+				}
+				const setReceiver = async (acs: string) => {
+					const metadata = runtimeSamlSPMetadata(acs);
+					const samlConfig = {
+						...runtimeSamlConfiguration(samlKeys),
+						spMetadata: { metadata },
+					};
+					await database!.query(
+						`UPDATE "${alpha.schemaName}"."ssoProvider" SET "samlConfig"=$1 WHERE "providerId"=$2`,
+						[JSON.stringify(samlConfig), runtimeSamlProvider],
+					);
+					return metadata;
+				};
+				const unsupported =
+					"This development project has a configured SAML provider outside the candidate scope.";
+				for (const denied of [
+					`https://accounts.${other}${callbackPath}`,
+					`https://api.${custom}${callbackPath}`,
+					`${canonicalAcs}?variant=unknown`,
+				]) {
+					await setReceiver(denied);
+					await expect(openProcess(databaseURL, alpha, true)).rejects.toThrow(
+						unsupported,
+					);
+				}
+				const metadata = await setReceiver(canonicalAcs);
+				const direct = {
+					prefix: directPrefix,
+					baseURL: `${platformOrigin}${directPrefix}`,
+					destination: `${platformOrigin}/account?from=custom-saml-direct`,
+				};
+				const hosted = {
+					prefix: "/api/auth",
+					baseURL: `https://${defaultHost}/api/auth`,
+					host: defaultHost,
+					clientIP: "192.0.2.171",
+					destination: `https://${defaultHost}/account?from=custom-saml-hosted`,
+				};
+				const sameHost = {
+					prefix: "/api/auth",
+					baseURL: `https://${customHost}/api/auth`,
+					host: customHost,
+					clientIP: "192.0.2.172",
+					destination: `https://${customHost}/account?from=custom-saml-hosted`,
+				};
+				const start = (writer: Awaited<ReturnType<typeof openProcess>>) =>
+					Promise.all([
+						startRuntimeSaml(writer, direct, canonicalAcs),
+						startRuntimeSaml(writer, hosted, canonicalAcs),
+						startRuntimeSaml(writer, sameHost, canonicalAcs),
+					]);
+				const finish = async (
+					writer: Awaited<ReturnType<typeof openProcess>>,
+					pending: Awaited<ReturnType<typeof startRuntimeSaml>>,
+					checkAlternate = false,
+				) => {
+					const form = await runtimeSamlResponse(
+						samlKeys,
+						pending.flow,
+						credentials.project.email,
+					);
+					if (checkAlternate) {
+						const alternate = await writer.request(callbackPath, {
+							host: defaultHost,
+							origin: runtimeSamlOrigin,
+							body: form,
+						});
+						expect(alternate.status).toBe(400);
+						expect(alternate.headers.getSetCookie()).toEqual([]);
+					}
+					const response = await writer.request(callbackPath, {
+						host: customHost,
+						clientIP: pending.transport.clientIP ?? "192.0.2.170",
+						origin: runtimeSamlOrigin,
+						body: form,
+					});
+					expect(response.status, await response.clone().text()).toBe(302);
+					expect(response.headers.get("location")).toBe(
+						pending.transport.host === defaultHost
+							? `https://${customHost}`
+							: pending.transport.destination,
+					);
+					const signedIn = await writer.request("/api/auth/get-session", {
+						host: customHost,
+						cookie: cookie(response),
+					});
+					expect(await signedIn.json()).toMatchObject({
+						user: credentials.project,
+					});
+				};
+				service = await openProcess(databaseURL, alpha, false);
+				const nativePending = await start(service);
+				await service.stop();
+				service = undefined;
+
+				service = await openProcess(databaseURL, alpha, true);
+				for (const [prefix, host] of [
+					[directPrefix, undefined],
+					["/api/auth", defaultHost],
+					["/api/auth", customHost],
+				] as const) {
+					const document = await service.request(
+						`${prefix}/sso/saml2/sp/metadata?providerId=${runtimeSamlProvider}`,
+						{ host },
+					);
+					expect(document.status).toBe(200);
+					expect(await document.text()).toBe(metadata);
+				}
+				for (const pending of nativePending)
+					await finish(service, pending, true);
+				const ownedPending = await start(service);
+				await service.stop();
+				service = undefined;
+
+				service = await openProcess(databaseURL, alpha, false);
+				for (const pending of ownedPending) await finish(service, pending);
+				const directAcs = `${direct.baseURL}/sso/saml2/sp/acs/${runtimeSamlProvider}`;
+				await setReceiver(directAcs);
+				const directPending = await startRuntimeSaml(
+					service,
+					direct,
+					directAcs,
+				);
+				await service.stop();
+				service = undefined;
+
+				service = await openProcess(databaseURL, alpha, true);
+				const directSession = await service.request(
+					new URL(directAcs).pathname,
+					{
+						origin: runtimeSamlOrigin,
+						body: await runtimeSamlResponse(
+							samlKeys,
+							directPending.flow,
+							credentials.project.email,
+						),
+					},
+				);
+				expect(directSession.status).toBe(302);
+				expect(directSession.headers.get("location")).toBe(direct.destination);
+				const directPrincipal = await service.request(
+					`${directPrefix}/get-session`,
+					{ cookie: cookie(directSession) },
+				);
+				expect(await directPrincipal.json()).toMatchObject({
+					user: credentials.project,
+				});
+				await setReceiver(canonicalAcs);
+				await database.query(
+					`DELETE FROM public."allauthDomainPair" WHERE id=$1 AND "projectId"=$2`,
+					[pair, alpha.id],
+				);
+				const stopped = await service.request(`${directPrefix}/sign-in/sso`, {
+					body: {
+						providerId: runtimeSamlProvider,
+						providerType: "saml",
+						callbackURL: direct.destination,
+					},
+				});
+				expect(stopped.status).toBe(400);
+				expect(await stopped.json()).toMatchObject({
+					code: "INVALID_SAML_CONFIGURATION",
+				});
+				expect(
+					(
+						await service.request(
+							`/api/auth/sso/saml2/sp/metadata?providerId=${runtimeSamlProvider}`,
+							{ host: customHost },
+						)
+					).status,
+				).toBe(404);
+				await service.stop();
+				service = undefined;
+				await expect(openProcess(databaseURL, alpha, true)).rejects.toThrow(
+					unsupported,
+				);
+			} finally {
+				try {
+					await service?.stop();
+				} finally {
+					try {
+						await database?.end();
+						if (created) await dropClosedFixtureDatabase(admin, name);
+					} finally {
+						await admin.end();
+					}
 				}
 			}
 		}, 90_000);

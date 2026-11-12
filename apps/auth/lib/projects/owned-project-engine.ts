@@ -2334,6 +2334,7 @@ export function createOwnedProjectEngine(
 			trustedOrigins: acceptedOrigins,
 			fetch: options.sso?.fetch,
 			saml: options.sso?.saml,
+			customSamlTransport: options.sso?.customSamlTransport,
 			encryptedSamlFixture: options.sso?.encryptedSamlFixture,
 			trustedRequest,
 			readBody: requestBody,

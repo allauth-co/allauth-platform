@@ -2,10 +2,9 @@ import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
 import type { PoolClient } from "pg";
 import * as z from "zod";
 import type { OwnedProjectSsoOptions } from "./owned-project-sso";
-import {
-	configureOwnedSaml,
-	verifyOwnedSaml,
-} from "./owned-project-sso-saml-protocol";
+import type { ProjectCustomSamlTransport } from "./owned-project-sso-saml-eligibility";
+import { configureProjectSamlTransport } from "./owned-project-sso-saml-eligibility";
+import { verifyOwnedSaml } from "./owned-project-sso-saml-protocol";
 import type {
 	createProjectSsoStore,
 	SsoProvider,
@@ -123,6 +122,7 @@ export function createOwnedProjectSaml(options: {
 	signingSecret: string;
 	signUpEnabled: boolean;
 	generatedSPOnly?: boolean;
+	customTransport?: ProjectCustomSamlTransport;
 	allowEncrypted(provider: SsoProvider): boolean;
 	defaultError: URL;
 	store: SsoStore;
@@ -156,10 +156,22 @@ export function createOwnedProjectSaml(options: {
 		return new Response(response.body, { status: response.status, headers });
 	}
 
-	function failure(code: string, flow?: SsoState) {
+	function returnURL(value?: string, receiver?: string) {
+		if (!value) return null;
+		const url = options.allowedReturn(value);
+		if (
+			receiver &&
+			url?.origin === options.origin &&
+			url.pathname === new URL(receiver).pathname
+		)
+			return null;
+		return url;
+	}
+
+	function failure(code: string, flow?: SsoState, receiver?: string) {
 		const destination =
-			(flow?.errorURL && options.allowedReturn(flow.errorURL)) ||
-			(flow && options.allowedReturn(flow.callbackURL)) ||
+			returnURL(flow?.errorURL, receiver) ||
+			returnURL(flow?.callbackURL, receiver) ||
 			new URL(options.defaultError.href);
 		destination.searchParams.set("error", code);
 		return finish(
@@ -172,13 +184,15 @@ export function createOwnedProjectSaml(options: {
 
 	async function start(provider: SsoProvider, flow: StartFlow) {
 		try {
+			if (!provider.samlConfig) throw new Error("Invalid SAML provider.");
 			const relay = randomBytes(32).toString("base64url");
-			const configured = configureOwnedSaml(
-				provider.samlConfig,
+			const { configured } = await configureProjectSamlTransport(
+				{ ...provider, samlConfig: provider.samlConfig },
 				acs(provider.providerId),
 				{
 					relayState: relay,
 					generatedSPOnly: options.generatedSPOnly,
+					customTransport: options.customTransport,
 					allowEncrypted: options.allowEncrypted(provider),
 				},
 			);
@@ -337,14 +351,21 @@ export function createOwnedProjectSaml(options: {
 			);
 		const provider = await store.getProvider(providerId);
 		if (!provider?.samlConfig) return failure("invalid_provider");
-		let configured: ReturnType<typeof configureOwnedSaml>;
+		let selected: Awaited<ReturnType<typeof configureProjectSamlTransport>>;
 		let proof: Awaited<ReturnType<typeof verifyOwnedSaml>>;
 		try {
-			configured = configureOwnedSaml(provider.samlConfig, acs(providerId), {
-				generatedSPOnly: options.generatedSPOnly,
-				allowEncrypted: options.allowEncrypted(provider),
-			});
-			proof = await verifyOwnedSaml(form.response, configured);
+			selected = await configureProjectSamlTransport(
+				{ ...provider, samlConfig: provider.samlConfig },
+				acs(providerId),
+				{
+					generatedSPOnly: options.generatedSPOnly,
+					customTransport: options.customTransport,
+					allowEncrypted: options.allowEncrypted(provider),
+				},
+			);
+			if (selected.custom && request.url !== selected.acs)
+				throw new Error("This transport is not the registered SAML receiver.");
+			proof = await verifyOwnedSaml(form.response, selected.configured);
 		} catch {
 			return json(
 				{ code: "INVALID_SAML_RESPONSE", message: "Invalid SAML response." },
@@ -359,13 +380,16 @@ export function createOwnedProjectSaml(options: {
 			if (typeof consumed === "string") return failure(consumed);
 			flow = consumed.flow ?? undefined;
 			const fallback =
-				configured.saved.idpInitiatedCallbackUrl ||
-				configured.saved.callbackUrl;
-			const destination = flow
-				? options.allowedReturn(flow.callbackURL)
-				: (fallback && options.allowedReturn(fallback)) ||
-					new URL(options.origin);
-			if (!destination) return failure("invalid_state", flow);
+				selected.configured.saved.idpInitiatedCallbackUrl ||
+				selected.configured.saved.callbackUrl;
+			const receiver = selected.custom ? selected.acs : undefined;
+			let destination = returnURL(flow?.callbackURL, receiver)?.href;
+			if (!destination && (selected.custom || !flow)) {
+				destination =
+					returnURL(fallback, receiver)?.href ??
+					(selected.custom ? options.origin : new URL(options.origin).href);
+			}
+			if (!destination) return failure("invalid_state", flow, receiver);
 			return finish(
 				await store.transaction(async (client) => {
 					const current = await store.getProvider(providerId, client);
@@ -388,7 +412,7 @@ export function createOwnedProjectSaml(options: {
 						request,
 						...linked,
 						providerId,
-						destination: destination.href,
+						destination,
 						protocol: "saml",
 					});
 					if (response.status >= 400) throw abort;
@@ -399,6 +423,7 @@ export function createOwnedProjectSaml(options: {
 			return failure(
 				error === abort ? rejection : "internal_server_error",
 				flow,
+				selected.custom ? selected.acs : undefined,
 			);
 		}
 	}

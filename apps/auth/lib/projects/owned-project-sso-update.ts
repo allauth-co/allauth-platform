@@ -90,7 +90,7 @@ export async function updateProjectSsoProvider(
 	const domain = input.domain ?? provider.domain;
 	const configuration =
 		provider.samlConfig || input.samlConfig
-			? updateSaml(provider, input, issuer, samlScope)
+			? await updateSaml(provider, input, issuer, samlScope)
 			: updateOidc(provider, input, issuer);
 	if (configuration instanceof Response) return configuration;
 	if (issuer !== provider.issuer || configuration.boundaryChanged) {
@@ -155,7 +155,7 @@ function updateOidc(
 	};
 }
 
-function updateSaml(
+async function updateSaml(
 	provider: StoredProjectSsoProvider,
 	input: Update,
 	issuer: string,
@@ -172,12 +172,12 @@ function updateSaml(
 		);
 	const acs = projectSamlAcs(scope.baseURL, provider.providerId);
 	try {
-		const updated = mergeProjectSamlConfiguration(
+		const updated = await mergeProjectSamlConfiguration(
 			current,
 			input.samlConfig,
 			issuer,
-			acs,
-			scope.generatedSPOnly,
+			provider.providerId,
+			scope,
 		);
 		return {
 			boundaryChanged: projectSamlIdentityChanged(current, updated, acs),

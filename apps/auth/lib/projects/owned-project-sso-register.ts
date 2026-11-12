@@ -121,7 +121,7 @@ export async function prepareProjectSsoRegistration(
 		try {
 			return {
 				type: "saml" as const,
-				config: prepareProjectSamlRegistration(
+				config: await prepareProjectSamlRegistration(
 					input.samlConfig,
 					input.issuer,
 					input.providerId,

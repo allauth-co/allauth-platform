@@ -60,14 +60,16 @@ import { createOwnedProjectOrganizationConsole } from "./owned-project-organizat
 import { createOwnedProjectInvitationEmail } from "./owned-project-organization-email";
 import { createOwnedProjectPasswordSafety } from "./owned-project-password-safety";
 import { createOwnedProjectSCIMConsole } from "./owned-project-scim-console";
-import { createOwnedProjectUserConsole } from "./owned-project-user-console";
 import { checkProjectOidcConfiguration } from "./owned-project-sso-oidc";
 import { readStoredSsoConfiguration } from "./owned-project-sso-projection";
-import { checkProjectSamlConfiguration } from "./owned-project-sso-saml-eligibility";
+import type { ProjectCustomSamlTransport } from "./owned-project-sso-saml-eligibility";
+import { configureProjectSamlTransport } from "./owned-project-sso-saml-eligibility";
 import type { ProjectEncryptedSamlFixtureAdmission } from "./owned-project-sso-saml-fixture-admission";
 import { allowsEncryptedSamlFixtureProvider } from "./owned-project-sso-saml-fixture-admission";
 import { projectSamlAcs } from "./owned-project-sso-saml-management";
+import { createProjectCustomSamlTransport } from "./owned-project-sso-saml-transport";
 import { ssoProviderId } from "./owned-project-sso-store";
+import { createOwnedProjectUserConsole } from "./owned-project-user-console";
 import type { ProjectAvatarStorage } from "./project-avatar-upload";
 import { verifiedProjectRequest } from "./proxy";
 import type { Project } from "./registry";
@@ -109,7 +111,11 @@ const authAdmission = {
 	"send-verification-email": [3, 60_000],
 } as const;
 
-async function readSupportedProviders(options: Options, baseURL: string) {
+async function readSupportedProviders(
+	options: Options,
+	baseURL: string,
+	customSamlTransport: ProjectCustomSamlTransport,
+) {
 	const { database, project, env } = options;
 	const admission = options.encryptedSamlFixture;
 	if (admission) {
@@ -193,36 +199,42 @@ async function readSupportedProviders(options: Options, baseURL: string) {
 		throw new Error(
 			"This development project has an invalid encrypted SAML fixture binding.",
 		);
-	const enterpriseProviderIds = enterprise.map((entry) => {
-		const providerId = ssoProviderId.parse(entry.providerId);
-		if (entry.samlConfig || !entry.oidcConfig) {
-			const samlConfig = readStoredSsoConfiguration(entry.samlConfig);
-			try {
-				if (entry.oidcConfig || !samlConfig) throw new Error();
-				const encrypted = allowsEncryptedSamlFixtureProvider(
-					admission,
-					schema,
-					{ ...entry, samlConfig },
-				);
-				checkProjectSamlConfiguration(
-					{ issuer: entry.issuer, samlConfig },
-					projectSamlAcs(baseURL, providerId),
-					true,
-					encrypted,
-				);
-			} catch {
-				throw new Error(
-					"This development project has a configured SAML provider outside the candidate scope.",
-				);
+	const enterpriseProviderIds = await Promise.all(
+		enterprise.map(async (entry) => {
+			const providerId = ssoProviderId.parse(entry.providerId);
+			if (entry.samlConfig || !entry.oidcConfig) {
+				const samlConfig = readStoredSsoConfiguration(entry.samlConfig);
+				try {
+					if (entry.oidcConfig || !samlConfig) throw new Error();
+					const encrypted = allowsEncryptedSamlFixtureProvider(
+						admission,
+						schema,
+						{ ...entry, samlConfig },
+					);
+					await configureProjectSamlTransport(
+						{ ...entry, samlConfig },
+						projectSamlAcs(baseURL, providerId),
+						{
+							generatedSPOnly: true,
+							allowEncrypted: encrypted,
+							customTransport: customSamlTransport,
+							validateAll: true,
+						},
+					);
+				} catch {
+					throw new Error(
+						"This development project has a configured SAML provider outside the candidate scope.",
+					);
+				}
+				return providerId;
 			}
+			checkProjectOidcConfiguration({
+				issuer: entry.issuer,
+				oidcConfig: JSON.parse(entry.oidcConfig),
+			});
 			return providerId;
-		}
-		checkProjectOidcConfiguration({
-			issuer: entry.issuer,
-			oidcConfig: JSON.parse(entry.oidcConfig),
-		});
-		return providerId;
-	});
+		}),
+	);
 	const providers = [
 		"credential",
 		"allauth",
@@ -368,6 +380,11 @@ export async function createOwnedProjectRuntimeCandidate(options: Options) {
 	const app = projectOrigin.parse(project.primaryOrigin);
 	const browserOrigin = hosted ? origin : app;
 	const trustedOrigins = [...new Set([platform, app, ...project.origins])];
+	const customSamlTransport = createProjectCustomSamlTransport(
+		project,
+		platform,
+		env,
+	);
 	const linkBase = hosted ? `${origin}${basePath}` : `${app}/api/allauth`;
 	const mailEnvironment = projectEmailEnvironment(env, project.slug);
 	if (!emailConfigured(mailEnvironment))
@@ -377,6 +394,7 @@ export async function createOwnedProjectRuntimeCandidate(options: Options) {
 	const { google, microsoft, apple } = await readSupportedProviders(
 		options,
 		`${origin}${basePath}`,
+		customSamlTransport,
 	);
 	const callbacks = {
 		primaryOrigin: app,
@@ -563,6 +581,7 @@ export async function createOwnedProjectRuntimeCandidate(options: Options) {
 			defaultErrorURL: `${platform}/auth-error`,
 			tokenKeys: encryptionKeys,
 			saml: "generated-sp",
+			customSamlTransport,
 			encryptedSamlFixture: options.encryptedSamlFixture,
 		},
 		scim: { credentialHashSecret: options.credentialHashSecret },

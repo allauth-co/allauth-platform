@@ -68,7 +68,11 @@ describe("project error localization", () => {
 				body: JSON.stringify(login),
 			});
 			const [native, owned] = await Promise.all([
-				legacy.handler(request.clone()),
+				legacy.api.signInEmail({
+					body: login,
+					headers: { "accept-language": acceptLanguage },
+					asResponse: true,
+				}),
 				candidate.dispatch(request),
 			]);
 			expect(native.status).toBe(401);

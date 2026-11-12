@@ -135,6 +135,71 @@ function metadataDescriptor(
 	return child(root, metadataNS, name);
 }
 
+function metadataFlag(element: XmlElement, name: string) {
+	const value = element.getAttribute(name)?.trim();
+	if (value === undefined || value === "false" || value === "0") return false;
+	if (value === "true" || value === "1") return true;
+	return invalid();
+}
+
+/** Read only the direct, namespace-qualified SP elements consumed by native SAML. */
+function configuredServiceMetadata(xml: string) {
+	if (new TextEncoder().encode(xml).length > 102400) invalid();
+	const document = parseXML(xml);
+	const root = document.documentElement;
+	if (
+		root?.localName !== "EntityDescriptor" ||
+		root.namespaceURI !== metadataNS
+	)
+		invalid();
+	const descriptor = child(root, metadataNS, "SPSSODescriptor");
+	const entityID = root.getAttribute("entityID");
+	if (!entityID || entityID.length > 2048 || entityID !== entityID.trim())
+		invalid();
+	for (const node of Array.from(root.getElementsByTagName("*"))) {
+		if (
+			node.localName === "EntityDescriptor" ||
+			(node.localName === "SPSSODescriptor" && node !== descriptor) ||
+			((node.localName === "AssertionConsumerService" ||
+				node.localName === "NameIDFormat") &&
+				(node.namespaceURI !== metadataNS || node.parentNode !== descriptor))
+		)
+			invalid();
+	}
+	const consumers = children(
+		descriptor,
+		metadataNS,
+		"AssertionConsumerService",
+	);
+	const postLocations = consumers
+		.filter((item) => item.getAttribute("Binding") === post)
+		.map((item) => item.getAttribute("Location") ?? "");
+	return {
+		entityID,
+		postLocations,
+		consumerCount: consumers.length,
+		wantAssertion: metadataFlag(descriptor, "WantAssertionsSigned"),
+		requestsSigned: metadataFlag(descriptor, "AuthnRequestsSigned"),
+	};
+}
+
+/** The configured transport may admit one signed, plaintext POST receiver from saved custom SP metadata. */
+export function declaredSignedSamlAcs(value: unknown) {
+	const saved = config.parse(value);
+	const metadata = saved.spMetadata?.metadata;
+	if (metadata === undefined) return undefined;
+	const custom = configuredServiceMetadata(metadata);
+	if (
+		!custom.requestsSigned ||
+		custom.consumerCount !== 1 ||
+		custom.postLocations.length !== 1 ||
+		saved.idpMetadata.isAssertionEncrypted ||
+		saved.spMetadata?.isAssertionEncrypted
+	)
+		invalid();
+	return custom.postLocations[0]!;
+}
+
 function pem(value: string | undefined) {
 	return value
 		?.split(/\r?\n/)
@@ -188,19 +253,14 @@ export function configureOwnedSaml(
 	const encPrivateKey = decryptionKey(idp, sp, options.allowEncrypted);
 	const spMetadata = sp?.metadata;
 	if (options.generatedSPOnly && spMetadata !== undefined) invalid();
-	const spDescriptor =
-		spMetadata && metadataDescriptor(spMetadata, "SPSSODescriptor");
-	const wantAssertion = spDescriptor
-		? ["true", "1"].includes(
-				spDescriptor.getAttribute("WantAssertionsSigned")?.trim() ?? "",
-			)
-		: saved.wantAssertionsSigned === true;
+	const custom =
+		spMetadata === undefined
+			? undefined
+			: configuredServiceMetadata(spMetadata);
+	const wantAssertion =
+		custom?.wantAssertion ?? saved.wantAssertionsSigned === true;
 	if (saved.wantAssertionsSigned && !wantAssertion) invalid();
-	const postLocations = spDescriptor
-		? children(spDescriptor, metadataNS, "AssertionConsumerService")
-				.filter((item) => item.getAttribute("Binding") === post)
-				.map((item) => item.getAttribute("Location") ?? "")
-		: [acs];
+	const postLocations = custom?.postLocations ?? [acs];
 	if (!postLocations.length) invalid();
 	for (const location of postLocations) {
 		const parsed = new URL(location);
@@ -209,18 +269,13 @@ export function configureOwnedSaml(
 			/[\\\u0000-\u0020\u007f]/.test(location) ||
 			parsed.username ||
 			parsed.password ||
-			parsed.hash
+			location.includes("#")
 		)
 			invalid();
 	}
 	const requestPrivateKey = pem(sp?.privateKey || saved.privateKey);
-	const metadataRequestsSigned =
-		spDescriptor &&
-		["true", "1"].includes(
-			spDescriptor.getAttribute("AuthnRequestsSigned")?.trim() ?? "",
-		);
 	const requestsSigned =
-		saved.authnRequestsSigned === true || metadataRequestsSigned === true;
+		saved.authnRequestsSigned === true || custom?.requestsSigned === true;
 	if (requestsSigned && !requestPrivateKey) invalid();
 	const service = saml.ServiceProvider({
 		metadata:
@@ -243,6 +298,12 @@ export function configureOwnedSaml(
 		relayState: options.relayState,
 	});
 	if (requestsSigned && !service.entityMeta.isAuthnRequestSigned()) invalid();
+	const advertisedAcs = postLocations.at(-1)!;
+	if (
+		service.entityMeta.getAssertionConsumerService("post") !== advertisedAcs ||
+		(custom && service.entityMeta.getEntityID() !== custom.entityID)
+	)
+		invalid();
 	if (idp.metadata) metadataDescriptor(idp.metadata, "IDPSSODescriptor");
 	const configuredCerts = idp.cert ?? saved.cert;
 	const certs =
@@ -276,21 +337,6 @@ export function configureOwnedSaml(
 		recipients: new Set([...postLocations, acs]),
 		saved,
 	};
-}
-
-/** Publish only the SP metadata for the callback served by the selected realm transport. */
-export function projectSamlServiceMetadata(
-	value: unknown,
-	acs: string,
-	generatedSPOnly?: boolean,
-	allowEncrypted?: boolean,
-) {
-	const configured = configureOwnedSaml(value, acs, {
-		generatedSPOnly,
-		allowEncrypted,
-	});
-	if (!configured.postLocations.includes(acs)) invalid();
-	return configured.service.getMetadata();
 }
 
 type ConfiguredSaml = ReturnType<typeof configureOwnedSaml>;

@@ -1,6 +1,7 @@
 import * as z from "zod";
 import { ssoHttpsUrl } from "./owned-project-sso-network";
-import { checkProjectSamlConfiguration } from "./owned-project-sso-saml-eligibility";
+import type { ProjectCustomSamlTransport } from "./owned-project-sso-saml-eligibility";
+import { configureProjectSamlTransport } from "./owned-project-sso-saml-eligibility";
 import { configureOwnedSaml } from "./owned-project-sso-saml-protocol";
 
 const identifier = z.string().min(1).max(2048);
@@ -74,9 +75,10 @@ export function projectSamlAcs(baseURL: string, providerId: string) {
 export interface ProjectSamlManagementScope {
 	baseURL: string;
 	generatedSPOnly: boolean;
+	customTransport?: ProjectCustomSamlTransport;
 }
 
-export function prepareProjectSamlRegistration(
+export async function prepareProjectSamlRegistration(
 	input: unknown,
 	issuer: string,
 	providerId: string,
@@ -86,22 +88,22 @@ export function prepareProjectSamlRegistration(
 	const parsed = projectSamlInput.parse(input);
 	const { idpInitiatedCallbackUrl: _disabled, ...fields } = parsed;
 	const configuration = { ...fields, issuer };
-	checkProjectSamlConfiguration(
-		{ issuer, samlConfig: configuration },
+	await configureProjectSamlTransport(
+		{ issuer, providerId, samlConfig: configuration },
 		projectSamlAcs(scope.baseURL, providerId),
-		scope.generatedSPOnly,
+		{ ...scope, validateAll: true },
 	);
 	return configuration;
 }
 
 const updateInput = projectSamlInput.partial();
 
-export function mergeProjectSamlConfiguration(
+export async function mergeProjectSamlConfiguration(
 	current: Record<string, unknown>,
 	input: unknown,
 	issuer: string,
-	acs: string,
-	generatedSPOnly: boolean,
+	providerId: string,
+	scope: ProjectSamlManagementScope,
 ) {
 	ssoHttpsUrl(issuer);
 	const updates = updateInput.parse(input ?? {});
@@ -120,10 +122,10 @@ export function mergeProjectSamlConfiguration(
 	}
 	if (updates.idpInitiatedCallbackUrl === null)
 		configuration.idpInitiatedCallbackUrl = undefined;
-	checkProjectSamlConfiguration(
-		{ issuer, samlConfig: configuration },
-		acs,
-		generatedSPOnly,
+	await configureProjectSamlTransport(
+		{ issuer, providerId, samlConfig: configuration },
+		projectSamlAcs(scope.baseURL, providerId),
+		{ ...scope, validateAll: true },
 	);
 	return configuration;
 }

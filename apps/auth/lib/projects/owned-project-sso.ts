@@ -19,6 +19,7 @@ import {
 	ssoScope,
 } from "./owned-project-sso-oidc";
 import { createOwnedProjectSaml } from "./owned-project-sso-saml";
+import type { ProjectCustomSamlTransport } from "./owned-project-sso-saml-eligibility";
 import type { ProjectEncryptedSamlFixtureAdmission } from "./owned-project-sso-saml-fixture-admission";
 import { allowsEncryptedSamlFixtureProvider } from "./owned-project-sso-saml-fixture-admission";
 import type {
@@ -78,6 +79,7 @@ export interface OwnedProjectSsoOptions {
 	signUpEnabled: boolean;
 	/** The generated SP subset uses the selected transport's ACS for every request. */
 	saml?: boolean | "generated-sp" | "encrypted-fixture";
+	customSamlTransport?: ProjectCustomSamlTransport;
 	encryptedSamlFixture?: ProjectEncryptedSamlFixtureAdmission;
 	/** Session/MFA admission runs on the same client as the exact account and directory binding. */
 	complete(
@@ -166,6 +168,7 @@ export function createOwnedProjectSso(options: OwnedProjectSsoOptions) {
 			signingSecret: options.signingSecret,
 			signUpEnabled: options.signUpEnabled,
 			generatedSPOnly: options.saml === "generated-sp",
+			customTransport: options.customSamlTransport,
 			allowEncrypted: (provider) =>
 				options.saml === "encrypted-fixture" ||
 				allowsEncryptedSamlFixtureProvider(

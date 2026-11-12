@@ -27,12 +27,12 @@ import {
 	projectSsoRegistrationInput,
 	registerProjectSsoProvider,
 } from "./owned-project-sso-register";
+import { configureProjectSamlTransport } from "./owned-project-sso-saml-eligibility";
 import { allowsEncryptedSamlFixtureProvider } from "./owned-project-sso-saml-fixture-admission";
 import {
 	projectSamlAcs,
 	publicSamlRegistration,
 } from "./owned-project-sso-saml-management";
-import { projectSamlServiceMetadata } from "./owned-project-sso-saml-protocol";
 import { ssoProviderId } from "./owned-project-sso-store";
 import {
 	projectSsoUpdateInput,
@@ -70,6 +70,7 @@ export interface OwnedProjectSsoManagementOptions {
 	trustedOrigins: ReadonlySet<string>;
 	fetch?: SsoFetch;
 	saml?: OwnedProjectSsoOptions["saml"];
+	customSamlTransport?: OwnedProjectSsoOptions["customSamlTransport"];
 	encryptedSamlFixture?: OwnedProjectSsoOptions["encryptedSamlFixture"];
 	trustedRequest(headers: Headers, mutation: boolean): boolean;
 	readBody(request: Request): Promise<unknown>;
@@ -181,6 +182,7 @@ export function createOwnedProjectSsoManagement(
 		? {
 				baseURL: options.baseURL,
 				generatedSPOnly: options.saml === "generated-sp",
+				customTransport: options.customSamlTransport,
 			}
 		: undefined;
 
@@ -303,28 +305,28 @@ export function createOwnedProjectSsoManagement(
 			);
 		const config = readStoredSsoConfiguration(provider.samlConfig);
 		try {
+			if (!config) throw new Error("Invalid SAML configuration");
 			const acs = projectSamlAcs(options.baseURL, id.data);
 			const allowEncrypted = allowsEncryptedSamlFixtureProvider(
 				options.encryptedSamlFixture,
 				options.schemaName,
 				{ ...provider, samlConfig: config },
 			);
-			return new Response(
-				projectSamlServiceMetadata(
-					config,
-					acs,
-					samlScope?.generatedSPOnly,
-					allowEncrypted,
-				),
-				{
-					headers: {
-						"Content-Type": "application/xml",
-						"Cache-Control": "no-store",
-						"Content-Security-Policy": "default-src 'none'; sandbox",
-						"X-Content-Type-Options": "nosniff",
-					},
-				},
+			const selected = await configureProjectSamlTransport(
+				{ ...provider, samlConfig: config },
+				acs,
+				{ ...samlScope, allowEncrypted },
 			);
+			if (!selected.configured.postLocations.includes(selected.acs))
+				throw new Error("Invalid SAML configuration");
+			return new Response(selected.configured.service.getMetadata(), {
+				headers: {
+					"Content-Type": "application/xml",
+					"Cache-Control": "no-store",
+					"Content-Security-Policy": "default-src 'none'; sandbox",
+					"X-Content-Type-Options": "nosniff",
+				},
+			});
 		} catch {
 			return failure(400, "BAD_REQUEST", "Invalid SAML configuration");
 		}

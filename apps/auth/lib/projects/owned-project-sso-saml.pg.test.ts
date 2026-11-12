@@ -207,7 +207,7 @@ async function pending(response: Response) {
 	const relay = redirect.searchParams.get("RelayState");
 	expect(requestId).toBeTruthy();
 	expect(relay).toBeTruthy();
-	return { requestId: requestId!, relay: relay! };
+	return { requestId: requestId!, relay: relay!, redirect, document: root! };
 }
 
 function signedResponse(
@@ -873,6 +873,131 @@ describe.skipIf(!existsSync(fixturePath))(
 					`UPDATE "${schema}"."ssoProvider" SET "samlConfig" = $1 WHERE "providerId" = $2`,
 					[JSON.stringify(configuration()), providerId],
 				);
+			}
+		});
+
+		it("publishes saved custom SP metadata and completes signed requests across native and owned writers", async () => {
+			const entity = "urn:allauth:fixture:custom-service-provider";
+			const rawMetadata = saml
+				.SPMetadata({
+					entityID: entity,
+					authnRequestsSigned: true,
+					wantAssertionsSigned: true,
+					signingCert: fixtureKeys.certificate,
+					nameIDFormat: [
+						"urn:oasis:names:tc:SAML:2.0:nameid-format:persistent",
+					],
+					assertionConsumerService: [
+						{
+							Binding: "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST",
+							Location: acs,
+						},
+					],
+				})
+				.getMetadata()
+				.replace(
+					"<EntityDescriptor ",
+					'<EntityDescriptor ID="_fixture-custom-sp-metadata" ',
+				);
+			const metadataRoot = "/*[local-name(.)='EntityDescriptor']";
+			const metadata = saml.SamlLib.constructSAMLSignature({
+				rawSamlMessage: rawMetadata,
+				referenceTagXPath: metadataRoot,
+				privateKey: fixtureKeys.privateKey,
+				signatureAlgorithm,
+				signingCert: saml.Utility.normalizeCerString(fixtureKeys.certificate),
+				isBase64Output: false,
+				signatureConfig: {
+					prefix: "ds",
+					location: {
+						reference: `${metadataRoot}/*[local-name(.)='SPSSODescriptor']`,
+						action: "before",
+					},
+				},
+			});
+			const custom = {
+				...configuration(),
+				authnRequestsSigned: true,
+				spMetadata: { metadata, privateKey: fixtureKeys.privateKey },
+			};
+			await storeSamlConfiguration(custom);
+			try {
+				checkProjectSamlConfiguration({ issuer: sp, samlConfig: custom }, acs);
+				expect(() =>
+					checkProjectSamlConfiguration(
+						{
+							issuer: sp,
+							samlConfig: {
+								...custom,
+								spMetadata: {
+									...custom.spMetadata,
+									privateKey: fixtureEncryptionKeys.privateKey,
+								},
+							},
+						},
+						acs,
+					),
+				).toThrow("outside the candidate transport");
+				const metadataRequest = new Request(
+					`${origin}/api/auth/sso/saml2/sp/metadata?providerId=${providerId}`,
+				);
+				const selected = managementEngine();
+				for (const response of [
+					await native.handler(metadataRequest),
+					await selected.dispatch(metadataRequest),
+				]) {
+					expect(response.status).toBe(200);
+					expect(response.headers.get("content-type")).toBe("application/xml");
+					expect(await response.text()).toBe(metadata);
+				}
+				const candidate = owned();
+				const started = [
+					await native.handler(startRequest()),
+					await candidate.start(startRequest(), body),
+				];
+				for (const [index, response] of started.entries()) {
+					const state = await pending(response);
+					expect(
+						state.document.getElementsByTagNameNS(
+							"urn:oasis:names:tc:SAML:2.0:assertion",
+							"Issuer",
+						)[0]?.textContent,
+					).toBe(entity);
+					const signature = state.redirect.searchParams.get("Signature");
+					const signed = state.redirect.search
+						.slice(1)
+						.split("&")
+						.filter((value) => !value.startsWith("Signature="))
+						.join("&");
+					expect(
+						createVerify("RSA-SHA256")
+							.update(signed)
+							.verify(fixtureKeys.certificate, signature!, "base64"),
+					).toBe(true);
+					const assertion = signedResponse(state.requestId, {
+						audience: entity,
+					});
+					const completion = callback(assertion.encoded, state.relay);
+					await assertSession(
+						await (index === 0
+							? candidate.samlCallback(completion, providerId)
+							: native.handler(completion)),
+					);
+				}
+				const wrongAudience = await pending(
+					await native.handler(startRequest()),
+				);
+				const denied = await candidate.samlCallback(
+					callback(
+						signedResponse(wrongAudience.requestId, { audience: sp }).encoded,
+						wrongAudience.relay,
+					),
+					providerId,
+				);
+				expect(denied.status).toBe(400);
+				expect(cookies(denied)).toBe("");
+			} finally {
+				await storeSamlConfiguration(configuration());
 			}
 		});
 

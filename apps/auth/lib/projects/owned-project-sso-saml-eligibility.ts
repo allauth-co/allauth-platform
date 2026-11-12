@@ -1,5 +1,8 @@
 import { createPrivateKey, X509Certificate } from "node:crypto";
-import { configureOwnedSaml } from "./owned-project-sso-saml-protocol";
+import {
+	configureOwnedSaml,
+	declaredSignedSamlAcs,
+} from "./owned-project-sso-saml-protocol";
 
 function certificatePem(certificate: string) {
 	return certificate.includes("-----BEGIN CERTIFICATE-----")
@@ -7,20 +10,33 @@ function certificatePem(certificate: string) {
 		: `-----BEGIN CERTIFICATE-----\n${certificate}\n-----END CERTIFICATE-----`;
 }
 
+export type AuthorizeCustomSamlAcs = (
+	url: string,
+	providerId: string,
+) => Promise<boolean>;
+
+export interface ProjectCustomSamlTransport {
+	authorizeAcs: AuthorizeCustomSamlAcs;
+}
+
+type StoredSamlProvider = {
+	issuer: string;
+	samlConfig: Record<string, unknown>;
+};
+
 /** Check that a persisted plaintext SAML provider can serve the exact selected transport. */
 export function checkProjectSamlConfiguration(
-	provider: { issuer: string; samlConfig: Record<string, unknown> },
+	provider: StoredSamlProvider,
 	acs: string,
 	generatedSPOnly?: boolean,
 	allowEncrypted?: boolean,
 ) {
 	try {
-		assertProjectSamlConfiguration(
-			provider,
-			acs,
+		const configured = configureOwnedSaml(provider.samlConfig, acs, {
 			generatedSPOnly,
 			allowEncrypted,
-		);
+		});
+		assertProjectSamlConfiguration(provider, acs, configured, allowEncrypted);
 	} catch {
 		throw new Error(
 			"This configured SAML provider is outside the candidate transport.",
@@ -28,16 +44,53 @@ export function checkProjectSamlConfiguration(
 	}
 }
 
+/** Resolve the saved receiver through project transport authority before configuring the protocol. */
+export async function configureProjectSamlTransport(
+	provider: StoredSamlProvider & { providerId: string },
+	localAcs: string,
+	options: {
+		generatedSPOnly?: boolean;
+		allowEncrypted?: boolean;
+		customTransport?: ProjectCustomSamlTransport;
+		relayState?: string;
+		validateAll?: boolean;
+	},
+) {
+	const authorize = options.allowEncrypted
+		? undefined
+		: options.customTransport?.authorizeAcs;
+	const declared = authorize && declaredSignedSamlAcs(provider.samlConfig);
+	if (
+		authorize &&
+		declared !== undefined &&
+		!(await authorize(declared, provider.providerId))
+	)
+		throw new Error(
+			"This configured SAML provider is outside the candidate transport.",
+		);
+	const acs = declared ?? localAcs;
+	const configured = configureOwnedSaml(provider.samlConfig, acs, {
+		generatedSPOnly: options.generatedSPOnly && !authorize,
+		allowEncrypted: options.allowEncrypted,
+		relayState: options.relayState,
+	});
+	const custom = declared !== undefined;
+	if (custom || options.validateAll)
+		assertProjectSamlConfiguration(
+			provider,
+			acs,
+			configured,
+			options.allowEncrypted,
+		);
+	return { configured, acs, custom };
+}
+
 function assertProjectSamlConfiguration(
-	provider: { issuer: string; samlConfig: Record<string, unknown> },
+	provider: StoredSamlProvider,
 	acs: string,
-	generatedSPOnly?: boolean,
+	configuration: ReturnType<typeof configureOwnedSaml>,
 	allowEncrypted?: boolean,
 ) {
-	const configuration = configureOwnedSaml(provider.samlConfig, acs, {
-		generatedSPOnly,
-		allowEncrypted,
-	});
 	const { saved, service, idp, postLocations, requestsSigned } = configuration;
 	const logout = service.entityMeta.getSingleLogoutService(undefined);
 	if (
@@ -64,18 +117,42 @@ function assertProjectSamlConfiguration(
 			);
 	}
 	if (requestsSigned) {
-		const privateKey = saved.spMetadata?.privateKey || saved.privateKey;
+		const privateKey = service.entitySetting.privateKey;
 		if (!privateKey)
 			throw new Error(
 				"This configured SAML provider is missing its signing key.",
 			);
 		const key = createPrivateKey({
-			key: privateKey.trim(),
+			key: privateKey,
 			passphrase: saved.spMetadata?.privateKeyPass,
 		});
 		if (key.asymmetricKeyType !== "rsa")
 			throw new Error(
 				"This configured SAML provider uses an unsupported request signing key.",
 			);
+		if (saved.spMetadata?.metadata) {
+			if (
+				(key.asymmetricKeyDetails?.modulusLength ?? 0) < 2048 ||
+				!idp.entityMeta.isWantAuthnRequestsSigned()
+			)
+				throw new Error(
+					"This configured SAML provider has incompatible request signing settings.",
+				);
+			const declared = service.entityMeta.getX509Certificate("signing");
+			const certificates = Array.isArray(declared)
+				? declared
+				: declared
+					? [declared]
+					: [];
+			if (
+				certificates.length &&
+				!certificates.some((certificate) =>
+					new X509Certificate(certificatePem(certificate)).checkPrivateKey(key),
+				)
+			)
+				throw new Error(
+					"The configured SAML service metadata does not describe the request signing key.",
+				);
+		}
 	}
 }
