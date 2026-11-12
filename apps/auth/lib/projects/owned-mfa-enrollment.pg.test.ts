@@ -52,7 +52,11 @@ async function nativeInstance(
 				database: { db: database, type: "postgres" },
 				baseURL: origin,
 				appName: issuer,
-				session: { expiresIn: 86400, cookieCache: { enabled: false } },
+				session: {
+					expiresIn: 86400,
+					updateAge: 43200,
+					cookieCache: { enabled: false },
+				},
 				secret,
 				emailAndPassword: { enabled: true, password: clerkCompatiblePasswords },
 				advanced: {
@@ -516,6 +520,162 @@ describe.skipIf(!existsSync(fixturePath))(
 				{ method: "totp", code: await verifyCode(user.id) },
 			);
 			expect(checked).toMatchObject({ status: "rotated" });
+		});
+
+		it("preserves the native MFA boundary on a due browser session refresh", async () => {
+			const legacy = await nativeInstance(nativeDatabase!, true);
+			const engine = createOwnedProjectEngine({
+				database,
+				project: { schemaName: schema, slug },
+				baseURL: origin,
+				basePath: "/api/auth",
+				trustedOrigins: [],
+				signingSecret: secret,
+				policy: {
+					...defaultAuthPolicy,
+					requireEmailVerification: false,
+					sessionExpiresInSeconds: 86400,
+				},
+				trustedIP: (input) => input.headers.get("x-real-ip"),
+			});
+			function postFactor(path: string, body: unknown, cookie: string) {
+				const request = post(path, body, cookie);
+				request.headers.set("x-real-ip", "192.0.2.31");
+				return request;
+			}
+			function read(cookie: string, disableRefresh = false) {
+				return new Request(
+					`${origin}/api/auth/get-session${disableRefresh ? "?disableRefresh=true" : ""}`,
+					{
+						headers: { origin, cookie, "x-real-ip": "192.0.2.31" },
+					},
+				);
+			}
+			function legacyRead(request: Request, disableRefresh = false) {
+				return legacy.api.getSession({
+					headers: request.headers,
+					request,
+					query: { disableCookieCache: true, disableRefresh },
+					asResponse: true,
+				});
+			}
+			for (const [writer, trusted] of [
+				["native", false],
+				["owned", false],
+				["native", true],
+				["owned", true],
+			] as const) {
+				const user = await signedIn();
+				const setup = await legacy.handler(
+					postFactor("/two-factor/enable", { password }, user.cookie),
+				);
+				expect(setup.status).toBe(200);
+				const { backupCodes } = (await setup.json()) as {
+					backupCodes: string[];
+				};
+				const enrolled = await legacy.handler(
+					postFactor(
+						"/two-factor/verify-totp",
+						{ code: await verifyCode(user.id) },
+						user.cookie,
+					),
+				);
+				expect(enrolled.status).toBe(200);
+				let cookie = cookies(enrolled);
+				const trust = (input: string) =>
+					input
+						.split("; ")
+						.find((value) => value.startsWith(`${prefix}trust_device=`));
+				if (trusted) {
+					const pending = await legacy.handler(
+						postFactor("/sign-in/email", { email: user.email, password }, ""),
+					);
+					const signedIn = await legacy.handler(
+						postFactor(
+							"/two-factor/verify-backup-code",
+							{ code: backupCodes[0], trustDevice: true },
+							cookies(pending),
+						),
+					);
+					expect(signedIn.status).toBe(200);
+					cookie = cookies(signedIn);
+					expect(trust(cookie)).toBeTruthy();
+				}
+				const initial = await legacy.api.getSession({
+					headers: new Headers({ cookie }),
+					query: { disableRefresh: true },
+				});
+				const sessionId = initial?.session.id;
+				expect(sessionId).toBeTruthy();
+				await database.query(
+					`UPDATE "${schema}"."session" SET "expiresAt"=statement_timestamp()+interval '1 hour' WHERE id=$1`,
+					[sessionId],
+				);
+				const dispatch = writer === "native" ? legacyRead : engine.readSession;
+				const observed = await dispatch(read(cookie, true), true);
+				const before = (await observed.json()) as {
+					session: { id: string; expiresAt: string };
+				};
+				expect(before).toMatchObject({ session: { id: sessionId } });
+				expect(observed.headers.getSetCookie()).toEqual([]);
+				const refreshed = await dispatch(read(cookie));
+				expect(refreshed.status).toBe(200);
+				const content = await refreshed.json();
+				if (trusted) {
+					expect(content).toMatchObject({
+						session: { id: sessionId },
+						user: { id: user.id },
+					});
+					const renewed = content as { session: { expiresAt: string } };
+					expect(Date.parse(renewed.session.expiresAt)).toBeGreaterThan(
+						Date.parse(before.session.expiresAt),
+					);
+					expect(cookies(refreshed)).toContain(cookie.split("; ")[0]);
+					expect(trust(cookies(refreshed))).toBeTruthy();
+					expect(trust(cookies(refreshed))).not.toBe(trust(cookie));
+				} else {
+					expect(content, writer).toEqual({
+						twoFactorRedirect: true,
+						twoFactorMethods: ["totp"],
+					});
+					expect(cookies(refreshed)).not.toContain(`${sessionCookie}=`);
+					expect(cookies(refreshed)).toContain(`${prefix}two_factor=`);
+					expect(
+						await legacy.api.getSession({
+							headers: new Headers({ cookie }),
+							query: { disableRefresh: true },
+						}),
+					).toBeNull();
+					const complete =
+						writer === "native" ? engine.dispatch : legacy.handler;
+					const factor = await complete(
+						postFactor(
+							"/two-factor/verify-backup-code",
+							{ code: backupCodes[0] },
+							cookies(refreshed),
+						),
+					);
+					expect(factor.status).toBe(200);
+					expect(await factor.json()).toMatchObject({ user: { id: user.id } });
+				}
+				const { rows } = await database.query(
+					`SELECT type, "actorId", "userId", "targetId" FROM "${schema}"."allauthEvent"
+					WHERE "userId"=$1 AND metadata->>'path'='/get-session' AND type IN ('session.created','session.deleted')`,
+					[user.id],
+				);
+				expect(rows).toEqual(
+					trusted
+						? []
+						: [
+								{
+									type: "session.deleted",
+									actorId: user.id,
+									userId: user.id,
+									targetId: sessionId,
+								},
+							],
+				);
+			}
 		});
 
 		it("preserves the native session event pair when sign-in is waiting for MFA", async () => {

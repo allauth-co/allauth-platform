@@ -1421,7 +1421,7 @@ export function createOwnedProjectEngine(
 
 	async function readSession(request: Request) {
 		if (!trustedRequest(request.headers, false)) return forbidden();
-		const headers = new Headers();
+		let headers = new Headers();
 		const token = tokenFrom(request.headers);
 		const observed = token ? await store.session(token, refreshWindow) : null;
 		if (observed?.session.impersonatedBy) {
@@ -1449,26 +1449,31 @@ export function createOwnedProjectEngine(
 			query.get("disableRefresh") !== "true" &&
 			!tokenFrom(request.headers, rememberCookie)
 		) {
-			const renewed = await store.refresh(
-				current.token,
-				policy.sessionExpiresInSeconds,
-				updateAge,
-			);
-			if (renewed) {
-				current = { ...current, session: { ...current.session, ...renewed } };
-				writeCookie(
-					headers,
-					sessionCookie,
-					current.token,
-					policy.sessionExpiresInSeconds,
+			const { token, user } = current;
+			const refreshed = await store.transaction(async (client) => {
+				if (!(await store.lockUser(client, user.id))) return null;
+				const selected = await lockExistingSession(client, token, user.id);
+				if (!selected) return null;
+				if (!selected.refreshDue) return { current: selected };
+				const result = await reissueExistingSession(
+					client,
+					request,
+					selected,
+					"/get-session",
 				);
-			} else {
-				current = await currentSession(request.headers);
-				if (!current) {
-					clearSessionCookies(headers);
-					return json(null, 200, headers);
-				}
+				if (result instanceof Response) return result;
+				return {
+					current: { ...selected, session: result.session },
+					headers: result.headers,
+				};
+			});
+			if (refreshed instanceof Response) return refreshed;
+			if (!refreshed) {
+				clearSessionCookies(headers);
+				return json(null, 200, headers);
 			}
+			current = refreshed.current;
+			if (refreshed.headers) headers = refreshed.headers;
 		}
 		if (
 			analytics &&
@@ -2039,17 +2044,23 @@ export function createOwnedProjectEngine(
 			},
 		});
 
-	async function continueEmailVerificationSession(
+	async function lockExistingSession(
+		client: PoolClient,
+		token: string,
+		userId: string,
+	) {
+		if (!(await store.lockSession(client, token, userId, false))) return null;
+		return eligibleSession(token, client);
+	}
+
+	async function reissueExistingSession(
 		client: PoolClient,
 		request: Request,
-		user: ProjectUser,
-		token: string,
+		current: NonNullable<Awaited<ReturnType<typeof eligibleSession>>>,
+		path: "/verify-email" | "/get-session",
 		callback?: string,
-	): Promise<Headers | Response> {
-		if (!(await store.lockSession(client, token, user.id, false)))
-			return forbidden();
-		const current = await eligibleSession(token, client);
-		if (!current) return forbidden();
+	) {
+		const { token, user } = current;
 		const remember = !tokenFrom(request.headers, rememberCookie);
 		const device = user.twoFactorEnabled
 			? await mfa.rotateTrustedDevice(client, user.id, request.headers)
@@ -2062,15 +2073,14 @@ export function createOwnedProjectEngine(
 			if (!challenge) return unsupported();
 			const removed = await store.revoke(
 				{ tokens: [token] },
-				"/verify-email",
+				path,
 				Boolean(backchannel),
 				client,
 				user.id,
 			);
 			if (!removed || removed.ids.length !== 1) throw unavailableLogout;
 			deliverLogoutAfterCommit(client, request, removed.targets);
-			// The verification handler reuses the original session. Starting MFA
-			// removes that row and emits no new session creation event.
+			// Reissuing an existing cookie creates no new session before MFA.
 			headers.append("Set-Cookie", challenge.setCookie);
 			writeCookie(headers, sessionCookie, "", 0);
 			writeCookie(headers, `${prefix}session_data`, "", 0);
@@ -2085,20 +2095,42 @@ export function createOwnedProjectEngine(
 						headers,
 					);
 		}
-		if (current.refreshDue && remember)
-			await store.refresh(
+		let session = current.session;
+		if (current.refreshDue && remember) {
+			const renewed = await store.refresh(
 				token,
 				policy.sessionExpiresInSeconds,
 				updateAge,
 				client,
 			);
+			if (renewed) session = { ...session, ...renewed };
+		}
 		writeCookie(
 			headers,
 			sessionCookie,
 			token,
 			remember ? policy.sessionExpiresInSeconds : undefined,
 		);
-		return headers;
+		return { headers, session };
+	}
+
+	async function continueEmailVerificationSession(
+		client: PoolClient,
+		request: Request,
+		user: ProjectUser,
+		token: string,
+		callback?: string,
+	): Promise<Headers | Response> {
+		const current = await lockExistingSession(client, token, user.id);
+		if (!current) return forbidden();
+		const result = await reissueExistingSession(
+			client,
+			request,
+			current,
+			"/verify-email",
+			callback,
+		);
+		return result instanceof Response ? result : result.headers;
 	}
 
 	const recoveryOptions = options.recovery;
