@@ -18,7 +18,8 @@ const grantRank = new Map([
 	["revoked", 3],
 ]);
 
-function parseConstraints(value: string) {
+/** Decode the native constraint text, preserving older non-JSON values. */
+export function parseOwnedAgentConstraints(value: string) {
 	try {
 		return JSON.parse(value) as unknown;
 	} catch {
@@ -42,7 +43,7 @@ function formatGrants(grants: Grant[]) {
 	}
 	return [...selected.values()].map((grant) => {
 		const constraints = grant.constraints
-			? parseConstraints(grant.constraints)
+			? parseOwnedAgentConstraints(grant.constraints)
 			: null;
 		return {
 			capability: grant.capability,

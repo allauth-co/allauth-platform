@@ -37,6 +37,10 @@ import {
 	verifyAgentMachineJWT,
 } from "./owned-project-agent-machine";
 import { registerOwnedProjectAgent } from "./owned-project-agent-registration";
+import {
+	agentSessionPath,
+	readOwnedAgentSession,
+} from "./owned-project-agent-session";
 import { readOwnedAgentStatus } from "./owned-project-agent-status";
 import type { createProjectEngineStore } from "./owned-project-engine-store";
 import { admitOwnedProjectNativeRoute } from "./owned-project-native-admission";
@@ -252,6 +256,7 @@ export function createOwnedProjectAgentHosts(options: BrowserHosts) {
 			request.method === "POST" && path === "/agent/approve-capability";
 		const pending = request.method === "GET" && path === "/agent/ciba/pending";
 		const status = request.method === "GET" && path === "/agent/status";
+		const session = request.method === "GET" && path === agentSessionPath;
 		const register = request.method === "POST" && path === "/agent/register";
 		const catalog =
 			request.method === "GET" &&
@@ -280,6 +285,7 @@ export function createOwnedProjectAgentHosts(options: BrowserHosts) {
 			!enroll &&
 			!pending &&
 			!status &&
+			!session &&
 			!register &&
 			!catalog &&
 			!introspect &&
@@ -294,13 +300,17 @@ export function createOwnedProjectAgentHosts(options: BrowserHosts) {
 						? 5
 						: pending || status
 							? 300
-							: agentRead || agentRevoke || catalog || introspect
+							: agentRead || agentRevoke || catalog || introspect || session
 								? 60
 								: 100,
 				windowMs: 60_000,
 			}),
 		);
 		if (limited) return limited;
+		if (session)
+			return options.store.transaction((client) =>
+				readOwnedAgentSession(client, request),
+			);
 		if (introspect) {
 			const body = await options.readBody(request);
 			return options.store.transaction((client) =>

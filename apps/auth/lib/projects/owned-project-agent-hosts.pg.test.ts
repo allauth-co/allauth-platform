@@ -37,6 +37,10 @@ const registrationOwner = {
 	id: "agent-host-fixture-registration-owner",
 	email: "registration-owner@agent-hosts.fixture.example",
 };
+const sessionOwner = {
+	id: "agent-host-fixture-session-owner",
+	email: "session-owner@agent-hosts.fixture.example",
+};
 
 function realm(slug: string) {
 	const id = randomUUID();
@@ -85,6 +89,12 @@ async function native(pool: Pool) {
 			logger: { disabled: true },
 			advanced: { cookiePrefix: `allauth_project_${alpha.slug}` },
 			emailAndPassword: { enabled: true, password: clerkCompatiblePasswords },
+			user: {
+				additionalFields: {
+					publicMetadata: { type: "json", required: false, input: false },
+					twoFactorEnabled: { type: "boolean", required: false, input: false },
+				},
+			},
 			plugins: [
 				admin(),
 				jwt({ disableSettingJwtHeader: true }),
@@ -115,6 +125,7 @@ describe.skipIf(!existsSync(fixture))(
 		let peerCookie: string;
 		let machineCookie: string;
 		let registrationCookie: string;
+		let sessionCookie: string;
 		let dependentKey: string;
 		let created = false;
 
@@ -191,7 +202,13 @@ describe.skipIf(!existsSync(fixture))(
 				pg.release();
 			}
 			const hash = await clerkCompatiblePasswords.hash(password);
-			for (const user of [owner, peer, machineOwner, registrationOwner]) {
+			for (const user of [
+				owner,
+				peer,
+				machineOwner,
+				registrationOwner,
+				sessionOwner,
+			]) {
 				await database.query(
 					`INSERT INTO "${alpha.schemaName}"."user" (id,name,email,"emailVerified",role) VALUES ($1,$1,$2,true,'user')`,
 					[user.id, user.email],
@@ -214,6 +231,7 @@ describe.skipIf(!existsSync(fixture))(
 			peerCookie = await signIn(peer.email);
 			machineCookie = await signIn(machineOwner.email);
 			registrationCookie = await signIn(registrationOwner.email);
+			sessionCookie = await signIn(sessionOwner.email);
 			dependentKey = JSON.stringify(
 				await exportJWK(
 					(await generateKeyPair("EdDSA", { extractable: true })).publicKey,
@@ -1292,8 +1310,8 @@ describe.skipIf(!existsSync(fixture))(
 				.sign(host.hostKey.privateKey);
 		}
 
-		async function nativeMachine(label: string) {
-			const host = await nativeMachineHost(label);
+		async function nativeMachine(label: string, cookie = machineCookie) {
+			const host = await nativeMachineHost(label, cookie);
 			const agentKey = await generateKeyPair("EdDSA", { extractable: true });
 			const registration = await registerProof(host, agentKey);
 			const agent = await legacy.handler(
@@ -2002,6 +2020,179 @@ describe.skipIf(!existsSync(fixture))(
 			);
 			expect(await expectSame(path, "", 200, optionalClaims)).toEqual({
 				active: false,
+			});
+		});
+
+		it("reads the signed agent's own native session with an explicit public user projection", async () => {
+			const path = "/agent/session";
+			const machine = await nativeMachine(
+				"Redacted agent session",
+				sessionCookie,
+			);
+			const schema = `"${alpha.schemaName}"`;
+			await database.query(
+				`UPDATE ${schema}."user" SET "publicMetadata"='{"color":"blue"}',"twoFactorEnabled"=true,username='session-fixture',"displayUsername"='Session Fixture' WHERE id=$1`,
+				[sessionOwner.id],
+			);
+			await database.query(
+				`UPDATE ${schema}."agent" SET metadata='{"device":"fixture"}',"activatedAt"=now()-interval '59 minutes',"createdAt"=now()-interval '59 minutes',"expiresAt"=now()+interval '30 seconds' WHERE id=$1`,
+				[machine.agentId],
+			);
+			await database.query(
+				`INSERT INTO ${schema}."agentCapabilityGrant" (id,"agentId",capability,status,constraints,"grantedBy","expiresAt","createdAt","updatedAt") VALUES
+				($1,$4,'fixture.read','active','{"scope":"fixture"}',$5,NULL,now(),now()),
+				($2,$4,'fixture.other','active',NULL,$5,NULL,now(),now()),
+				($3,$4,'fixture.expired','active',NULL,$5,now()-interval '1 minute',now(),now())`,
+				[
+					randomUUID(),
+					randomUUID(),
+					randomUUID(),
+					machine.agentId,
+					sessionOwner.id,
+				],
+			);
+			const proof = async (capabilities: string[]) =>
+				`Bearer ${await new SignJWT({
+					htm: "GET",
+					htu: `${agentAudience}${path}`,
+					capabilities,
+				})
+					.setProtectedHeader({ alg: "EdDSA", typ: "agent+jwt" })
+					.setIssuer(machine.hostId)
+					.setSubject(machine.agentId)
+					.setAudience(agentAudience)
+					.setIssuedAt()
+					.setExpirationTime("45s")
+					.setJti(randomUUID())
+					.sign(machine.agentKey.privateKey)}`;
+			const requestSession = (authorization?: string, cookie = "") =>
+				request(alpha, path, cookie, undefined, authorization);
+			const hostProof = `Bearer ${await nativeClientHostProof(machine)}`;
+			expect(await expectSame(path, "", 200)).toBeNull();
+			expect(await expectSame(path, sessionCookie, 200)).toBeNull();
+			expect(await expectSame(path, "", 200, undefined, hostProof)).toBeNull();
+			const legacyProof = await proof(["fixture.read", "fixture.expired"]);
+			const legacyResponse = await legacy.handler(requestSession(legacyProof));
+			expect(legacyResponse.status).toBe(200);
+			const { user: legacyUser, ...legacySession } =
+				(await legacyResponse.json()) as { user: Record<string, unknown> };
+			const heartbeat = async () =>
+				(
+					await database.query<{
+						activatedAt: Date;
+						expiresAt: Date;
+						lastUsedAt: Date | null;
+					}>(
+						`SELECT "activatedAt","expiresAt","lastUsedAt" FROM ${schema}."agent" WHERE id=$1`,
+						[machine.agentId],
+					)
+				).rows[0];
+			await expect
+				.poll(async () => (await heartbeat()).lastUsedAt)
+				.toBeTruthy();
+			await database.query(
+				`UPDATE ${schema}."agent" SET "lastUsedAt"=NULL,"expiresAt"=now()+interval '30 seconds' WHERE id=$1`,
+				[machine.agentId],
+			);
+			await database.query(
+				`UPDATE ${schema}."user" SET "privateMetadata"='{"fixture":"private"}',"directoryManaged"=true,"banReason"='fixture moderation detail' WHERE id=$1`,
+				[sessionOwner.id],
+			);
+			const ownedProof = await proof(["fixture.read", "fixture.expired"]);
+			const ownedResponse = await owned.dispatch(requestSession(ownedProof));
+			expect(ownedResponse.status).toBe(200);
+			const { user, ...agentSession } = (await ownedResponse.json()) as {
+				user: Record<string, unknown>;
+			};
+			expect(agentSession).toEqual(legacySession);
+			expect(agentSession).toMatchObject({
+				type: "delegated",
+				agentId: machine.agentId,
+				userId: sessionOwner.id,
+				host: { id: machine.hostId, userId: sessionOwner.id, status: "active" },
+				agent: {
+					id: machine.agentId,
+					hostId: machine.hostId,
+					metadata: { device: "fixture" },
+					capabilityGrants: [
+						{
+							capability: "fixture.read",
+							constraints: { scope: "fixture" },
+							grantedBy: sessionOwner.id,
+							status: "active",
+						},
+					],
+				},
+			});
+			const fields = [
+				"id",
+				"name",
+				"email",
+				"emailVerified",
+				"image",
+				"createdAt",
+				"updatedAt",
+				"role",
+				"banned",
+				"twoFactorEnabled",
+				"isAnonymous",
+				"publicMetadata",
+				"username",
+				"displayUsername",
+			];
+			expect(Object.keys(user).sort()).toEqual(fields.sort());
+			expect(user).toEqual(
+				Object.fromEntries(fields.map((key) => [key, legacyUser[key]])),
+			);
+			expect(user).toMatchObject({
+				id: sessionOwner.id,
+				publicMetadata: { color: "blue" },
+				twoFactorEnabled: true,
+			});
+			const renewed = await heartbeat();
+			expect(renewed.lastUsedAt).toBeTruthy();
+			expect(renewed.expiresAt.getTime() - renewed.activatedAt.getTime()).toBe(
+				3_600_000,
+			);
+			const replay = await candidate(alpha, true).dispatch(
+				requestSession(ownedProof),
+			);
+			expect(replay.status).toBe(401);
+			expect(await replay.json()).toMatchObject({ error: "jti_replay" });
+			const foreign = await outside.dispatch(
+				request(beta, path, "", undefined, await proof([])),
+			);
+			expect(foreign.status).toBe(401);
+			expect(
+				(await disabled.dispatch(requestSession(await proof([])))).status,
+			).toBe(501);
+			const noGrants = await owned.dispatch(requestSession(await proof([])));
+			expect(await noGrants.json()).toMatchObject({
+				agent: { capabilityGrants: [] },
+			});
+			await database.query(
+				`UPDATE ${schema}."user" SET "directoryDisabled"=true WHERE id=$1`,
+				[sessionOwner.id],
+			);
+			const disabledSession = await owned.dispatch(
+				requestSession(await proof([])),
+			);
+			expect(disabledSession.status).toBe(401);
+			expect(await disabledSession.json()).toMatchObject({
+				error: "autonomous_owner_required",
+			});
+			await database.query(
+				`UPDATE ${schema}."user" SET "privateMetadata"=NULL,"directoryManaged"=false,"directoryDisabled"=false,"banReason"=NULL WHERE id=$1`,
+				[sessionOwner.id],
+			);
+			legacy = await native(nativePool);
+			const resumed = await legacy.handler(
+				requestSession(await proof(["fixture.read"])),
+			);
+			expect(resumed.status).toBe(200);
+			expect(await resumed.json()).toMatchObject({
+				agentId: machine.agentId,
+				userId: sessionOwner.id,
 			});
 		});
 

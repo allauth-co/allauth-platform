@@ -11,7 +11,8 @@ The platform installs `@better-auth/agent-auth` 0.6.2. The endpoint inventory be
 | Host update | `POST /host/update` | Fresh verified browser owner can edit the host and replace its inline key under the existing ID. |
 | Other host maintenance | `POST /host/rotate-key`, `POST /host/switch-account` | Pending |
 | Delegated registration | `POST /agent/register` | Existing active owned host with a verified inline Ed25519 JWT and one-time JWT ID. The agent starts active with an empty capability budget. |
-| Agent identity and transfer | `POST /agent/claim`, `GET /agent/session` | Pending. Session compatibility requires a redacted public user projection. |
+| Agent identity transfer | `POST /agent/claim` | Pending. |
+| Agent session | `GET /agent/session` | Verified active inline delegated agent, live grants, and an explicit public user projection. |
 | Agent introspection | `POST /agent/introspect` | Inline delegated agent JWT in the `token` body field, with the native compact public claims and replay checks. |
 | Signed agent status | `GET /agent/status` | Known inline Ed25519 host or active delegated agent. Keeps native status and grant fields and the normal active-agent heartbeat. |
 | Agent listing and detail | `GET /agent/list`, `GET /agent/get` | Current owner’s signed browser session. |
@@ -53,4 +54,4 @@ Capability catalog reads preserve the native empty list and unknown-capability r
 
 Introspection validates the body token against the active agent’s stored inline key and returns the native identity, stored expiry and currently active grants. It preserves legacy body tokens with optional audience and JTI claims. A supplied audience must match a native audience for the selected realm, and a supplied JTI shares the persisted replay check with status and catalog reads. The fixture accepts a single credential in the request body.
 
-The installed session endpoint returns its adapter user object inside the Agent Auth session. AllAuth marks private metadata and directory management fields as `returned: false` for public output. A replacement session endpoint must explicitly select the public user fields and verify that projection against supported callers before enablement.
+The installed session endpoint returns its adapter user object inside the Agent Auth session. The owned fixture selects AllAuth’s public project-user fields for the verified agent’s active owner. The projection excludes private metadata, directory management fields and moderation details. The endpoint retains the native public agent, host and grant shape, including JWT grant filtering, and renews the bounded agent heartbeat. A browser cookie or valid host proof alone returns the native empty session.

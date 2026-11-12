@@ -4,10 +4,8 @@ import { agentHostJSON as json } from "./owned-project-agent-enrollment";
 import {
 	agentMachineAudience,
 	agentMachineProblem as problem,
+	authorizeOwnedAgentHostRead,
 	decodeAgentMachineJWT,
-	readAgentMachineHost,
-	validAgentIdentifier,
-	verifyAgentMachineJWT,
 } from "./owned-project-agent-machine";
 import {
 	authorizeOwnedAgentRead,
@@ -65,32 +63,28 @@ export async function readOwnedAgentCatalog(
 	if (!decoded) return authenticationRequired(url.origin);
 	const audience = agentMachineAudience(url, path);
 	if (decoded.typ === "host+jwt") {
-		if (!validAgentIdentifier(decoded.claims.iss))
-			return authenticationRequired(url.origin);
-		const host = await readAgentMachineHost(
+		const host = await authorizeOwnedAgentHostRead(
 			client,
-			decoded.claims.iss,
-			"share",
-		);
-		if (!host?.userId || host.status !== "active")
-			return authenticationRequired(url.origin);
-		const proof = await verifyAgentMachineJWT(
-			decoded.token,
-			host,
+			decoded,
 			audience,
 			url.origin,
 		);
-		if (proof instanceof Response) return authenticationRequired(url.origin);
+		if (host instanceof Response) return authenticationRequired(url.origin);
 	} else {
-		const agent = await authorizeOwnedAgentRead(
+		const principal = await authorizeOwnedAgentRead(
 			client,
 			request,
 			url,
 			audience,
 			decoded,
 		);
-		if (agent instanceof Response) return authenticationRequired(url.origin);
-		const refreshed = await refreshOwnedAgentRead(client, agent, url.origin);
+		if (principal instanceof Response)
+			return authenticationRequired(url.origin);
+		const refreshed = await refreshOwnedAgentRead(
+			client,
+			principal.agent,
+			url.origin,
+		);
 		if (refreshed instanceof Response)
 			return authenticationRequired(url.origin);
 	}

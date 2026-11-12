@@ -98,6 +98,33 @@ export function validAgentIdentifier(value: unknown): value is string {
 	);
 }
 
+/** Authorize a known inline host for a machine read in the selected realm. */
+export async function authorizeOwnedAgentHostRead(
+	client: PoolClient,
+	{
+		token,
+		claims,
+	}: Exclude<ReturnType<typeof decodeAgentMachineToken>, false | null>,
+	audience: string[],
+	origin: string,
+	allowPending = false,
+) {
+	if (!validAgentIdentifier(claims.iss)) return invalidAgentJWT(origin);
+	const host = await readAgentMachineHost(client, claims.iss, "share");
+	if (
+		!host?.userId ||
+		(host.status !== "active" && (!allowPending || host.status !== "pending"))
+	)
+		return agentMachineProblem(
+			401,
+			"agent_not_found",
+			"Agent not found",
+			origin,
+		);
+	const proof = await verifyAgentMachineJWT(token, host, audience, origin);
+	return proof instanceof Response ? proof : host;
+}
+
 export async function verifyAgentMachineJWT(
 	token: string,
 	row: Pick<AgentMachineHost, "publicKey" | "jwksUrl">,

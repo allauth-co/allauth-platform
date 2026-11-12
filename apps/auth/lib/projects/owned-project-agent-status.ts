@@ -5,10 +5,10 @@ import { readOwnedAgentGrants } from "./owned-project-agent-grants";
 import {
 	agentMachineAudience,
 	agentMachineProblem as problem,
+	authorizeOwnedAgentHostRead,
 	consumeAgentMachineReplay,
 	decodeAgentMachineJWT,
 	invalidAgentJWT as invalidJWT,
-	readAgentMachineHost,
 	validAgentIdentifier as validIdentifier,
 	verifyAgentMachineJWT as verifyInline,
 } from "./owned-project-agent-machine";
@@ -27,12 +27,13 @@ type Agent = {
 	jwksUrl: string | null;
 	status: string;
 	mode: string;
+	metadata: string | null;
 	createdAt: Date;
 	activatedAt: Date | null;
 	expiresAt: Date | null;
 	lastUsedAt: Date | null;
 };
-const agentFields = `id,name,"hostId","userId","publicKey","jwksUrl",status,mode,"createdAt","activatedAt","expiresAt","lastUsedAt"`;
+const agentFields = `id,name,"hostId","userId","publicKey","jwksUrl",status,mode,metadata,"createdAt","activatedAt","expiresAt","lastUsedAt"`;
 function agentNotFound(status: 401 | 404, origin?: string) {
 	return problem(status, "agent_not_found", "Agent not found", origin);
 }
@@ -175,7 +176,11 @@ export async function authorizeOwnedAgentRead(
 			"Request binding does not match the JWT",
 			url.origin,
 		);
-	return agent;
+	return {
+		agent,
+		hostUserId: host.userId,
+		capabilities: verified.capabilities,
+	};
 }
 
 /** Persist the native heartbeat without extending the configured hard lifetime. */
@@ -213,14 +218,15 @@ export async function readOwnedAgentStatus(
 	if (decoded === null)
 		return problem(401, "unauthorized", "Authentication required");
 	if (decoded === false) return invalidJWT(url.origin);
-	const { token, typ, claims } = decoded;
-	if (typ === "host+jwt") {
-		if (!validIdentifier(claims.iss)) return invalidJWT(url.origin);
-		const host = await readAgentMachineHost(client, claims.iss, "share");
-		if (!host?.userId || !["active", "pending"].includes(host.status))
-			return agentNotFound(401, url.origin);
-		const verified = await verifyInline(token, host, audience, url.origin);
-		if (verified instanceof Response) return verified;
+	if (decoded.typ === "host+jwt") {
+		const host = await authorizeOwnedAgentHostRead(
+			client,
+			decoded,
+			audience,
+			url.origin,
+			true,
+		);
+		if (host instanceof Response) return host;
 		if (ids.length > 1) return invalidStatusQuery();
 		if (!ids[0])
 			return problem(
@@ -248,16 +254,20 @@ export async function readOwnedAgentStatus(
 			);
 		return publicAgent(client, agent);
 	}
-	const agent = await authorizeOwnedAgentRead(
+	const principal = await authorizeOwnedAgentRead(
 		client,
 		request,
 		url,
 		audience,
 		decoded,
 	);
-	if (agent instanceof Response) return agent;
+	if (principal instanceof Response) return principal;
 	if (ids.length > 1) return invalidStatusQuery();
-	const refreshed = await refreshOwnedAgentRead(client, agent, url.origin);
+	const refreshed = await refreshOwnedAgentRead(
+		client,
+		principal.agent,
+		url.origin,
+	);
 	return refreshed instanceof Response
 		? refreshed
 		: publicAgent(client, refreshed);
