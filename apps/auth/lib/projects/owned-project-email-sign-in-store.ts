@@ -119,54 +119,53 @@ export function createProjectEmailSignInStore(options: {
 		]);
 	}
 
-	async function insertVerification(
-		client: PoolClient,
-		identifier: string,
-		value: string,
-	) {
-		await client.query(
-			`INSERT INTO "verification" (id, identifier, value, "expiresAt")
-			VALUES ($1, $2, $3, statement_timestamp() + interval '5 minutes')`,
-			[randomUUID(), identifier, value],
-		);
-	}
-
-	async function eligibleRecipient(client: PoolClient, email: string) {
-		const result = await client.query<{ blocked: boolean }>(
-			`SELECT (banned IS TRUE OR "directoryManaged" IS TRUE OR "directoryDisabled" IS TRUE
-				OR "isAnonymous" IS TRUE) AS blocked FROM "user" WHERE email = $1`,
-			[email],
-		);
-		const row = result.rows[0];
-		return row ? !row.blocked : options.policy.signUpEnabled;
-	}
+	const recipient = `SELECT COALESCE((
+		SELECT NOT (banned IS TRUE OR "directoryManaged" IS TRUE OR "directoryDisabled" IS TRUE
+			OR "isAnonymous" IS TRUE) FROM "user" WHERE email = $1
+	), $2::boolean) AS eligible`;
+	const insertProof = `INSERT INTO "verification" (id, identifier, value, "expiresAt")
+		SELECT $3, $4, $5, statement_timestamp() + interval '5 minutes' FROM recipient WHERE eligible`;
 
 	async function issueMagic(proof: EmailProof) {
+		const token = randomText(magicAlphabet);
 		return store.transaction(async (client) => {
-			if (!(await eligibleRecipient(client, proof.email))) return null;
-			const token = randomText(magicAlphabet);
-			await insertVerification(
-				client,
-				`magic-link:${hash(token)}`,
-				JSON.stringify({
-					type: "magic-link",
-					email: proof.email,
-					name: proof.name,
-				}),
+			const result = await client.query(
+				`WITH recipient AS (${recipient}) ${insertProof}`,
+				[
+					proof.email,
+					options.policy.signUpEnabled,
+					randomUUID(),
+					`magic-link:${hash(token)}`,
+					JSON.stringify({
+						type: "magic-link",
+						email: proof.email,
+						name: proof.name,
+					}),
+				],
 			);
-			return token;
+			return result.rowCount ? token : null;
 		});
 	}
 
 	async function issueOtp(email: string) {
+		const identifier = otpIdentifier(email);
+		const otp = String(randomInt(1_000_000)).padStart(6, "0");
 		return store.transaction(async (client) => {
-			const identifier = otpIdentifier(email);
 			await lockOtp(client, identifier);
-			if (!(await eligibleRecipient(client, email))) return null;
-			const otp = String(randomInt(1_000_000)).padStart(6, "0");
-			await clearVerification(client, identifier);
-			await insertVerification(client, identifier, `${hash(otp)}:0`);
-			return otp;
+			const result = await client.query(
+				`WITH recipient AS (${recipient}), replaced AS (
+					DELETE FROM "verification" WHERE identifier = $4 AND (SELECT eligible FROM recipient)
+				)
+				${insertProof}`,
+				[
+					email,
+					options.policy.signUpEnabled,
+					randomUUID(),
+					identifier,
+					`${hash(otp)}:0`,
+				],
+			);
+			return result.rowCount ? otp : null;
 		});
 	}
 

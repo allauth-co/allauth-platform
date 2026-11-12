@@ -16,6 +16,7 @@ import {
 	isLegacyPasswordResetToken,
 } from "./owned-password-reset";
 import type { OwnedEmailCallbackPolicy } from "./owned-project-email-callback";
+import { scheduleOwnedEmailDelivery } from "./owned-project-email-delivery";
 import { createProjectEngineStore } from "./owned-project-engine-store";
 import type { Project } from "./registry";
 import type { SessionCheckAdmission } from "./session-introspection-admission";
@@ -238,19 +239,6 @@ export function createOwnedRecoveryHttp(options: RecoveryHttpOptions) {
 		}
 	}
 
-	function schedule(
-		operation: "request-password-reset" | "send-verification-email",
-		work: () => Promise<void>,
-	) {
-		options.defer(async () => {
-			try {
-				await work();
-			} catch {
-				options.onDeliveryFailure?.(operation);
-			}
-		});
-	}
-
 	function emailURL(path: string, callbackURL: URL, token?: string) {
 		const link = new URL(`${linkBase.pathname}${path}`, linkBase.origin);
 		link.searchParams.set("callbackURL", callbackURL.href);
@@ -258,52 +246,64 @@ export function createOwnedRecoveryHttp(options: RecoveryHttpOptions) {
 		return link.href;
 	}
 
-	async function deliver(
-		operation: "request-password-reset" | "send-verification-email",
+	type Recipient = { id: string; name: string; email: string };
+	const recipientQuery = `SELECT id, name, email FROM "user" WHERE email = $1
+		AND banned IS DISTINCT FROM true AND "directoryDisabled" IS DISTINCT FROM true
+		AND "directoryManaged" IS DISTINCT FROM true AND "isAnonymous" IS DISTINCT FROM true`;
+
+	async function prepareReset(
+		request: Request,
 		address: string,
 		destination: URL,
 	) {
-		const message = await store.transaction(async (client) => {
-			const result = await client.query<{
-				id: string;
-				name: string;
-				email: string;
-				emailVerified: boolean;
-			}>(
-				`SELECT id, name, email, "emailVerified" FROM "user" WHERE email = $1
-					AND banned IS DISTINCT FROM true AND "directoryDisabled" IS DISTINCT FROM true
-					AND "directoryManaged" IS DISTINCT FROM true AND "isAnonymous" IS DISTINCT FROM true
-				FOR UPDATE`,
+		const token = Array.from(
+			{ length: 24 },
+			() => alphabet[randomInt(alphabet.length)],
+		).join("");
+		const user = await store.transaction(async (client) => {
+			const result = await client.query<Recipient>(
+				`WITH recipient AS (${recipientQuery} FOR UPDATE),
+				issued AS (
+					INSERT INTO "verification" (id, identifier, value, "expiresAt")
+					SELECT $2, $3, id, statement_timestamp() + interval '1 hour' FROM recipient
+					RETURNING value
+				)
+				SELECT recipient.* FROM recipient JOIN issued ON issued.value = recipient.id`,
+				[address, randomUUID(), `reset-password:${token}`],
+			);
+			await store.recordEvent(client, {
+				type: "user.password-reset-requested",
+				outcome: "success",
+				...options.auditContext?.(request),
+				metadata: { path: "/request-password-reset" },
+			});
+			return result.rows[0];
+		});
+		return user
+			? { user, link: emailURL(`/reset-password/${token}`, destination) }
+			: null;
+	}
+
+	async function deliverVerification(address: string, destination: URL) {
+		const user = await store.transaction(async (client) => {
+			const result = await client.query<Recipient>(
+				`${recipientQuery} AND "emailVerified" = false`,
 				[address],
 			);
-			const user = result.rows[0];
-			if (
-				!user ||
-				(operation === "send-verification-email" && user.emailVerified)
-			)
-				return null;
-			if (operation === "send-verification-email")
-				return {
-					user,
-					link: emailURL(
-						"/verify-email",
-						destination,
-						await verification.issue(user),
-					),
-				};
-
-			const token = Array.from(
-				{ length: 24 },
-				() => alphabet[randomInt(alphabet.length)],
-			).join("");
-			await client.query(
-				`INSERT INTO "verification" (id, identifier, value, "expiresAt")
-				VALUES ($1, $2, $3, statement_timestamp() + interval '1 hour')`,
-				[randomUUID(), `reset-password:${token}`, user.id],
-			);
-			return { user, link: emailURL(`/reset-password/${token}`, destination) };
+			return result.rows[0];
 		});
-		if (!message) return;
+		if (!user) return;
+		const token = await verification.issue(user);
+		await deliver("send-verification-email", {
+			user,
+			link: emailURL("/verify-email", destination, token),
+		});
+	}
+
+	async function deliver(
+		operation: "request-password-reset" | "send-verification-email",
+		message: { user: Recipient; link: string },
+	) {
 		const isReset = operation === "request-password-reset";
 		const title = isReset ? "Reset your password" : "Verify your email";
 		await sendAuthEmail(options.email.environment, {
@@ -380,25 +380,22 @@ export function createOwnedRecoveryHttp(options: RecoveryHttpOptions) {
 				"EMAIL_DELIVERY_UNAVAILABLE",
 				"Authentication email is unavailable.",
 			);
-		try {
-			schedule(operation, () => deliver(operation, address, destination.url));
-		} catch {
+		const scheduled = await scheduleOwnedEmailDelivery(
+			(work) => options.defer(work),
+			async () => {
+				if (!isReset)
+					return () => deliverVerification(address, destination.url);
+				const message = await prepareReset(request, address, destination.url);
+				return message ? () => deliver(operation, message) : null;
+			},
+			() => options.onDeliveryFailure?.(operation),
+		);
+		if (!scheduled)
 			return failure(
 				503,
 				"EMAIL_DELIVERY_UNAVAILABLE",
 				"Authentication email is unavailable.",
 			);
-		}
-		if (isReset) {
-			await store.transaction((client) =>
-				store.recordEvent(client, {
-					type: "user.password-reset-requested",
-					outcome: "success",
-					...options.auditContext?.(request),
-					metadata: { path: "/request-password-reset" },
-				}),
-			);
-		}
 		return json(
 			isReset
 				? {

@@ -7,8 +7,8 @@ import { SignJWT } from "jose";
 import { Kysely, PostgresDialect } from "kysely";
 import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { defaultAuthPolicy } from "../auth-policy/policy";
 import { localNavigation } from "../auth-navigation";
+import { defaultAuthPolicy } from "../auth-policy/policy";
 import { clerkCompatiblePasswords } from "../clerk-password";
 import { allauthControl } from "../control";
 import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
@@ -99,6 +99,7 @@ describe.skipIf(!existsSync(fixturePath))(
 		const schema = `allauth_project_${randomUUID().replaceAll("-", "")}`;
 		let administrator: Pool | undefined;
 		let database: Pool;
+		let databaseURL: string;
 		let nativeDatabase:
 			| Kysely<Record<string, Record<string, unknown>>>
 			| undefined;
@@ -127,7 +128,8 @@ describe.skipIf(!existsSync(fixturePath))(
 			await administrator.query(`CREATE DATABASE "${databaseName}"`);
 			created = true;
 			url.pathname = `/${databaseName}`;
-			database = new Pool({ connectionString: url.toString(), max: 4 });
+			databaseURL = url.toString();
+			database = new Pool({ connectionString: databaseURL, max: 4 });
 			await database.query(`CREATE SCHEMA "${schema}"`);
 			const pool = new Pool({
 				connectionString: url.toString(),
@@ -166,6 +168,7 @@ describe.skipIf(!existsSync(fixturePath))(
 
 		function fixture(
 			options: {
+				database?: Pool;
 				limited?: boolean;
 				emailUnavailable?: boolean;
 				preserveBrowserContinuation?: boolean;
@@ -175,7 +178,7 @@ describe.skipIf(!existsSync(fixturePath))(
 			const deliveries: { to: string; html: string }[] = [];
 			const queued: (() => Promise<void>)[] = [];
 			const handler = createOwnedRecoveryHttp({
-				database,
+				database: options.database ?? database,
 				project: { slug: project, schemaName: schema },
 				policy: defaultAuthPolicy,
 				signingSecret,
@@ -269,6 +272,12 @@ describe.skipIf(!existsSync(fixturePath))(
 			expect(await known?.json()).toEqual(await unknown?.json());
 			expect(recovery.queued).toHaveLength(2);
 			expect(recovery.deliveries).toHaveLength(0);
+			const persisted = await database.query(
+				`SELECT id FROM "${schema}"."verification"
+				WHERE value = $1 AND starts_with(identifier, 'reset-password:')`,
+				[user.id],
+			);
+			expect(persisted.rowCount).toBe(1);
 			await recovery.flush();
 			expect(recovery.deliveries.map((item) => item.to)).toEqual([email]);
 			const link = mailedLink(recovery.deliveries[0].html);
@@ -322,18 +331,24 @@ describe.skipIf(!existsSync(fixturePath))(
 			);
 			expect(nativeDelivery.status).toBe(200);
 			const nativeLink = new URL(legacyResetLinks.at(-1)!);
-			const ownedDelivery = fixture();
-			expect(
-				(
-					await ownedDelivery.handler(
-						post("/request-password-reset", {
-							email: ownedIssued.email,
-							redirectTo: resetCallback,
-						}),
-					)
-				)?.status,
-			).toBe(200);
+			const writer = new Pool({ connectionString: databaseURL, max: 1 });
+			const ownedDelivery = fixture({ database: writer });
+			try {
+				const response = await ownedDelivery.handler(
+					post("/request-password-reset", {
+						email: ownedIssued.email,
+						redirectTo: resetCallback,
+					}),
+				);
+				expect(response?.status).toBe(200);
+				expect(ownedDelivery.deliveries).toHaveLength(0);
+			} finally {
+				await writer.end();
+			}
 			await ownedDelivery.flush();
+			expect(ownedDelivery.deliveries.map((item) => item.to)).toEqual([
+				ownedIssued.email,
+			]);
 			const ownedLink = mailedLink(ownedDelivery.deliveries[0].html);
 
 			const ownedWithoutMail = fixture({ emailUnavailable: true });

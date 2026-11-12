@@ -7,6 +7,7 @@ import type { ApplicationBranding } from "../branding/types";
 import { authenticationEmail } from "../email/authentication";
 import type { EmailEnvironment } from "../email/send";
 import { emailConfigured, sendAuthEmail } from "../email/send";
+import { scheduleOwnedEmailDelivery } from "./owned-project-email-delivery";
 import type { CompleteProjectEmailSignIn } from "./owned-project-email-sign-in-store";
 import { createProjectEmailSignInStore } from "./owned-project-email-sign-in-store";
 import type { Project } from "./registry";
@@ -61,7 +62,7 @@ export interface OwnedProjectEmailSignInOptions {
 		operation: ProjectEmailSignInOperation,
 		normalizedEmail?: string,
 	): Promise<SessionCheckAdmission | Response>;
-	/** Schedule delivery after the HTTP response and keep the selected realm available to it. */
+	/** Schedule email delivery after the HTTP response. */
 	defer(delivery: () => Promise<void>): void;
 	onDeliveryFailure?(
 		operation: "sign-in/magic-link" | "email-otp/send-verification-otp",
@@ -228,32 +229,24 @@ export function createOwnedProjectEmailSignIn(
 		return url && approved.includes(url.href) ? url : null;
 	}
 
-	function schedule(
+	async function schedule(
 		operation: "sign-in/magic-link" | "email-otp/send-verification-otp",
-		delivery: () => Promise<void>,
+		prepare: () => Promise<(() => Promise<void>) | null>,
 	) {
-		if (!emailConfigured(options.email.environment))
-			return failure(
-				503,
-				"EMAIL_DELIVERY_UNAVAILABLE",
-				"Authentication email is unavailable.",
-			);
-		try {
-			options.defer(async () => {
-				try {
-					await delivery();
-				} catch {
-					options.onDeliveryFailure?.(operation);
-				}
-			});
-		} catch {
-			return failure(
-				503,
-				"EMAIL_DELIVERY_UNAVAILABLE",
-				"Authentication email is unavailable.",
-			);
-		}
-		return null;
+		if (
+			emailConfigured(options.email.environment) &&
+			(await scheduleOwnedEmailDelivery(
+				(work) => options.defer(work),
+				prepare,
+				() => options.onDeliveryFailure?.(operation),
+			))
+		)
+			return null;
+		return failure(
+			503,
+			"EMAIL_DELIVERY_UNAVAILABLE",
+			"Authentication email is unavailable.",
+		);
 	}
 
 	async function admission(
@@ -299,9 +292,9 @@ export function createOwnedProjectEmailSignIn(
 		const address = body.email.toLowerCase();
 		const limited = await admission(request, "sign-in/magic-link", address);
 		if (limited) return limited;
-		const scheduled = schedule("sign-in/magic-link", async () => {
+		const scheduled = await schedule("sign-in/magic-link", async () => {
 			const token = await store.issueMagic({ email: address, name: body.name });
-			if (!token) return;
+			if (!token) return null;
 			const url = new URL(`${linkPath}/magic-link/verify`, linkOrigin);
 			url.searchParams.set("token", token);
 			url.searchParams.set("callbackURL", destination.href);
@@ -309,18 +302,20 @@ export function createOwnedProjectEmailSignIn(
 				url.searchParams.set("newUserCallbackURL", created.href);
 			if (body.errorCallbackURL)
 				url.searchParams.set("errorCallbackURL", error.href);
-			await sendAuthEmail(options.email.environment, {
-				to: address,
-				fromName: appName,
-				subject: `Sign in to ${appName}`,
-				react: authenticationEmail({
-					branding,
-					title: `Sign in to ${appName}`,
-					description: "Use this link to sign in. It expires in five minutes.",
-					url: url.href,
-					actionLabel: "Sign in",
-				}),
-			});
+			return () =>
+				sendAuthEmail(options.email.environment, {
+					to: address,
+					fromName: appName,
+					subject: `Sign in to ${appName}`,
+					react: authenticationEmail({
+						branding,
+						title: `Sign in to ${appName}`,
+						description:
+							"Use this link to sign in. It expires in five minutes.",
+						url: url.href,
+						actionLabel: "Sign in",
+					}),
+				});
 		});
 		return scheduled ?? json({ status: true });
 	}
@@ -341,22 +336,26 @@ export function createOwnedProjectEmailSignIn(
 			address,
 		);
 		if (limited) return limited;
-		const scheduled = schedule("email-otp/send-verification-otp", async () => {
-			const code = await store.issueOtp(address);
-			if (!code) return;
-			await sendAuthEmail(options.email.environment, {
-				to: address,
-				fromName: appName,
-				subject: `Your ${appName} verification code`,
-				react: authenticationEmail({
-					branding,
-					title: "Your verification code",
-					description:
-						"Use this code to complete sign in. It expires in five minutes.",
-					code,
-				}),
-			});
-		});
+		const scheduled = await schedule(
+			"email-otp/send-verification-otp",
+			async () => {
+				const code = await store.issueOtp(address);
+				if (!code) return null;
+				return () =>
+					sendAuthEmail(options.email.environment, {
+						to: address,
+						fromName: appName,
+						subject: `Your ${appName} verification code`,
+						react: authenticationEmail({
+							branding,
+							title: "Your verification code",
+							description:
+								"Use this code to complete sign in. It expires in five minutes.",
+							code,
+						}),
+					});
+			},
+		);
 		return scheduled ?? json({ success: true });
 	}
 

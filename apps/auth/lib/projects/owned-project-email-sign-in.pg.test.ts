@@ -107,6 +107,7 @@ describe.skipIf(!existsSync(fixturePath))(
 		const nativeCodes: string[] = [];
 		let administrator: Pool | undefined;
 		let database: Pool;
+		let databaseURL: string;
 		let nativeDatabase:
 			| Kysely<Record<string, Record<string, unknown>>>
 			| undefined;
@@ -133,7 +134,8 @@ describe.skipIf(!existsSync(fixturePath))(
 			await administrator.query(`CREATE DATABASE "${databaseName}"`);
 			created = true;
 			url.pathname = `/${databaseName}`;
-			database = new Pool({ connectionString: url.toString(), max: 4 });
+			databaseURL = url.toString();
+			database = new Pool({ connectionString: databaseURL, max: 4 });
 			await database.query(`CREATE SCHEMA "${schema}"`);
 			const pool = new Pool({
 				connectionString: url.toString(),
@@ -277,13 +279,25 @@ describe.skipIf(!existsSync(fixturePath))(
 		it("defers owned delivery, stores the native magic hash, and lets the legacy engine verify", async () => {
 			const email = "owned-link@email-proof-fixture.example";
 			const user = await seed(email);
-			const owner = fixture();
-			const response = await owner.handler(
-				post("sign-in/magic-link", { email, callbackURL: "/account" }),
+			const writer = new Pool({ connectionString: databaseURL, max: 1 });
+			const owner = fixture({ database: writer });
+			try {
+				const response = await owner.handler(
+					post("sign-in/magic-link", { email, callbackURL: "/account" }),
+				);
+				expect(await response?.json()).toEqual({ status: true });
+				expect(owner.deliveries).toHaveLength(0);
+			} finally {
+				await writer.end();
+			}
+			const persisted = await database.query(
+				`SELECT id FROM "${schema}"."verification"
+				WHERE starts_with(identifier, 'magic-link:') AND value::jsonb->>'email' = $1`,
+				[email],
 			);
-			expect(await response?.json()).toEqual({ status: true });
-			expect(owner.deliveries).toHaveLength(0);
+			expect(persisted.rowCount).toBe(1);
 			await owner.flush();
+			expect(owner.deliveries.map((item) => item.to)).toEqual([email]);
 			const url = new URL(magicLinkFromEmail(owner.deliveries[0].html));
 			expect(url.origin + url.pathname).toBe(
 				`${appOrigin}/api/allauth/magic-link/verify`,
@@ -348,29 +362,62 @@ describe.skipIf(!existsSync(fixturePath))(
 		it("uses native OTP hashes and isolates sign-in from other OTP purposes", async () => {
 			const email = "owned-otp@email-proof-fixture.example";
 			const user = await seed(email);
-			const owner = fixture();
-			const unsupported = await owner.handler(
-				post("email-otp/send-verification-otp", {
-					email,
-					type: "email-verification",
-				}),
+			await native.auth.api.sendVerificationOTP({
+				body: { email, type: "sign-in" },
+			});
+			await native.auth.api.sendVerificationOTP({
+				body: { email, type: "email-verification" },
+			});
+			const otpRows = () =>
+				database.query<{ id: string; identifier: string; value: string }>(
+					`SELECT id, identifier, value FROM "${schema}"."verification"
+					WHERE identifier IN ($1, $2) ORDER BY identifier`,
+					[`email-verification-otp-${email}`, `sign-in-otp-${email}`],
+				);
+			const existing = (await otpRows()).rows;
+			expect(existing).toHaveLength(2);
+
+			const unavailable = fixture({
+				defer() {
+					throw new Error("Fixture cannot queue mail.");
+				},
+			});
+			const rejected = await unavailable.handler(
+				post("email-otp/send-verification-otp", { email, type: "sign-in" }),
 			);
-			expect(unsupported?.status).toBe(501);
-			expect(owner.queued).toHaveLength(0);
-			expect(
-				await (
-					await owner.handler(
-						post("email-otp/send-verification-otp", { email, type: "sign-in" }),
-					)
-				)?.json(),
-			).toEqual({ success: true });
+			expect(rejected?.status).toBe(503);
+			expect(await rejected?.json()).toMatchObject({
+				code: "EMAIL_DELIVERY_UNAVAILABLE",
+			});
+			expect((await otpRows()).rows).toEqual(existing);
+
+			const writer = new Pool({ connectionString: databaseURL, max: 1 });
+			const owner = fixture({ database: writer });
+			try {
+				const unsupported = await owner.handler(
+					post("email-otp/send-verification-otp", {
+						email,
+						type: "email-verification",
+					}),
+				);
+				expect(unsupported?.status).toBe(501);
+				expect(owner.queued).toHaveLength(0);
+				const response = await owner.handler(
+					post("email-otp/send-verification-otp", { email, type: "sign-in" }),
+				);
+				expect(await response?.json()).toEqual({ success: true });
+				expect(owner.deliveries).toHaveLength(0);
+			} finally {
+				await writer.end();
+			}
+			const persisted = (await otpRows()).rows;
+			expect(persisted).toHaveLength(2);
+			expect(persisted[0]).toEqual(existing[0]);
+			expect(persisted[1].id).not.toBe(existing[1].id);
 			await owner.flush();
+			expect(owner.deliveries.map((item) => item.to)).toEqual([email]);
 			const code = otpFromEmail(owner.deliveries[0].html);
-			const state = await database.query<{ value: string }>(
-				`SELECT value FROM "${schema}"."verification" WHERE identifier = $1`,
-				[`sign-in-otp-${email}`],
-			);
-			expect(state.rows[0].value).toBe(
+			expect(persisted[1].value).toBe(
 				`${createHash("sha256").update(code).digest("base64url")}:0`,
 			);
 			await expect(
@@ -436,18 +483,37 @@ describe.skipIf(!existsSync(fixturePath))(
 				policy: { ...defaultAuthPolicy, signUpEnabled: false },
 			});
 			const unknown = "disabled@email-proof-fixture.example";
-			expect(
-				await (
-					await disabled.handler(
-						post("email-otp/send-verification-otp", {
-							email: unknown,
-							type: "sign-in",
-						}),
-					)
-				)?.json(),
-			).toEqual({ success: true });
+			const known = "existing@email-proof-fixture.example";
+			await seed(known);
+			for (const address of [known, unknown]) {
+				const magicResponse = await disabled.handler(
+					post("sign-in/magic-link", {
+						email: address,
+						callbackURL: "/account",
+					}),
+				);
+				expect(await magicResponse?.json()).toEqual({ status: true });
+				const otpResponse = await disabled.handler(
+					post("email-otp/send-verification-otp", {
+						email: address,
+						type: "sign-in",
+					}),
+				);
+				expect(await otpResponse?.json()).toEqual({ success: true });
+			}
+			expect(disabled.queued).toHaveLength(4);
 			await disabled.flush();
-			expect(disabled.deliveries).toHaveLength(0);
+			expect(disabled.deliveries.map((item) => item.to)).toEqual([
+				known,
+				known,
+			]);
+			const proofs = await database.query(
+				`SELECT id FROM "${schema}"."verification"
+				WHERE identifier = $1 OR
+					(starts_with(identifier, 'magic-link:') AND value LIKE $2)`,
+				[`sign-in-otp-${unknown}`, `%"email":"${unknown}"%`],
+			);
+			expect(proofs.rowCount).toBe(0);
 		});
 
 		it("rejects unapproved callbacks and rolls back when continuation denies", async () => {
