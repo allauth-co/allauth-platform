@@ -241,7 +241,7 @@ async function readSupportedProviders(
 	if (admission)
 		verifyLocalRuntimeFixture(options, admission);
 	if (
-		(project.environment !== "development" && !projectEngineSelected(env, project)) ||
+		((project.environment !== "development" || project.projectEngineFenced === true) && !projectEngineSelected(env, project)) ||
 		!/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(project.id) ||
 		project.schemaName !== `allauth_project_${project.id.replaceAll("-", "")}`
 	)
@@ -254,7 +254,8 @@ async function readSupportedProviders(
 		registered.schemaName !== project.schemaName ||
 		registered.workspaceId !== project.workspaceId ||
 		registered.environment !== project.environment ||
-		(project.environment === "production" && !projectEngineSelected(env, registered))
+		(registered.projectEngineFenced === true && !projectEngineSelected(env, registered)) ||
+		Boolean(registered.projectEngineFenced) !== Boolean(project.projectEngineFenced)
 	)
 		throw new Error(
 			"The selected project does not match its registry binding.",
@@ -426,7 +427,7 @@ function projectSupport(options: Options, platformOrigin: string) {
 	} satisfies NonNullable<EngineOptions["support"]>;
 }
 
-/** Assemble an explicitly selected internal development realm. This function does not select a runtime. */
+/** Assemble the runtime for an explicitly selected project realm. */
 export async function createOwnedProjectRuntimeCandidate(options: Options) {
 	const { database, project, env, policy, defer } = options;
 	const emailAliases = parseProjectEmailAliases(

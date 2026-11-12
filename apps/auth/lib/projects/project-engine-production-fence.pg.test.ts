@@ -50,6 +50,10 @@ describe.skipIf(!existsSync(fixturePath))(
 		const production = realm(workspace, "production");
 		const sibling = realm(workspace, "production");
 		const development = realm(platformWorkspaceId, "development");
+		const customerDevelopment = realm(workspace, "development");
+		const otherDevelopment = realm(otherWorkspace, "development");
+		const pairedProduction = realm(workspace, "production");
+		const pairedApplication = randomUUID();
 		const pools: Pool[] = [];
 		let administrator: Pool | undefined;
 		let database: Pool;
@@ -61,6 +65,10 @@ describe.skipIf(!existsSync(fixturePath))(
 			pools.push(pool);
 			return pool;
 		}
+		const tag = (writer: string, id: string, revision: number) =>
+			connect(
+				`-c allauth.project_engine_writer=${writer} -c allauth.project_engine_project_id=${id} -c allauth.project_engine_writer_revision=${revision}`,
+			);
 
 		async function migrate(cwd: string | URL) {
 			await execute(process.execPath, [migrationScript, "migrate"], {
@@ -147,15 +155,24 @@ describe.skipIf(!existsSync(fixturePath))(
 					production,
 					sibling,
 					development,
+					customerDevelopment,
+					otherDevelopment,
+					pairedProduction,
 				].entries()) {
 					await database.query(`CREATE SCHEMA "${project.schemaName}"`);
 					await database.query(
 						`INSERT INTO public."allauthProject" (id,name,slug,"schemaName","primaryOrigin","brokerClientId","brokerSecret","proxyVersion","createdBy","applicationId",environment,"workspaceId")
-					 VALUES ($1,'Production fence fixture',$2,$3,'https://writer.fixture.example','fixture','fixture','fixture','fixture',$1,$4,$5)`,
+					 VALUES ($1,'Writer fence fixture',$2,$3,$4,'fixture','fixture','fixture','fixture',$5,$6,$7)`,
 						[
 							project.id,
 							`production-fence-${index}`,
 							project.schemaName,
+							project === customerDevelopment
+								? "http://localhost:3210"
+								: "https://writer.fixture.example",
+							project === customerDevelopment || project === pairedProduction
+								? pairedApplication
+								: project.id,
 							project.environment,
 							project.workspaceId,
 						],
@@ -167,6 +184,16 @@ describe.skipIf(!existsSync(fixturePath))(
 				).rejects.toMatchObject(invalidBinding);
 				await expect(
 					transition(development.id, "legacy", 0, "allauth"),
+				).resolves.toEqual({ writer: "allauth", revision: 1 });
+				const productionMigration = "021-project-engine-production.sql";
+				copyFileSync(
+					new URL(productionMigration, migrations),
+					join(priorMigrations, productionMigration),
+				);
+				await migrate(prior);
+				await register(pairedProduction.id, pairedProduction.workspaceId);
+				await expect(
+					transition(pairedProduction.id, "legacy", 0, "allauth"),
 				).resolves.toEqual({ writer: "allauth", revision: 1 });
 				await migrate(authRoot);
 			} finally {
@@ -323,10 +350,6 @@ describe.skipIf(!existsSync(fixturePath))(
 				{ table: "allauthWebhookEndpoint" },
 				{ table: "session" },
 			]);
-			const tag = (writer: string, id: string, revision: number) =>
-				connect(
-					`-c allauth.project_engine_writer=${writer} -c allauth.project_engine_project_id=${id} -c allauth.project_engine_writer_revision=${revision}`,
-				);
 			const old = tag("legacy", production.id, 0);
 			const active = tag("allauth", production.id, 1);
 			const foreign = tag("allauth", sibling.id, 1);
@@ -378,6 +401,235 @@ describe.skipIf(!existsSync(fixturePath))(
 			await expect(
 				transition(development.id, "allauth", 1, "legacy"),
 			).resolves.toEqual({ writer: "legacy", revision: 2 });
+		});
+
+		describe("ordinary development project enrollment", () => {
+			const registerDevelopment = (id: string, workspaceId: string) =>
+				database.query(
+					"SELECT public.allauth_register_project_engine_development($1,$2)",
+					[id, workspaceId],
+				);
+
+			async function developmentBinding(project: ReturnType<typeof realm>) {
+				const {
+					rows: [row],
+				} = await database.query(
+					`SELECT p."projectEngineFenced", e."workspaceId", e."schemaName", e."registeredAt",
+					 COALESCE(f.writer,'legacy') AS writer, COALESCE(f.revision,0) AS revision,
+					 public.allauth_project_engine_development_allowed(p.id,p."workspaceId",p."schemaName") AS allowed
+					 FROM public."allauthProject" p
+					 LEFT JOIN public."allauthProjectEngineDevelopment" e ON e."projectId"=p.id
+					 LEFT JOIN public."allauthProjectEngineWriter" f ON f."projectId"=p.id WHERE p.id=$1`,
+					[project.id],
+				);
+				return row;
+			}
+
+			it("registers one immutable development project at legacy revision zero", async () => {
+				const target = customerDevelopment;
+				for (const [id, workspaceId] of [
+					[target.id, otherWorkspace],
+					[pairedApplication, workspace],
+					[pairedProduction.id, workspace],
+					[development.id, platformWorkspaceId],
+				] as const) {
+					await expect(
+						registerDevelopment(id, workspaceId),
+					).rejects.toMatchObject(invalidBinding);
+				}
+				await expect(
+					registerDevelopment(target.id, "workspace-slug"),
+				).rejects.toMatchObject({ code: "22023" });
+				await expect(register(target.id, workspace)).rejects.toMatchObject(
+					invalidBinding,
+				);
+				await expect(
+					transition(target.id, "legacy", 0, "allauth"),
+				).rejects.toMatchObject(invalidBinding);
+				await expect(
+					database.query(
+						'UPDATE public."allauthProject" SET "projectEngineFenced"=TRUE WHERE id=$1',
+						[target.id],
+					),
+				).rejects.toMatchObject(invalidBinding);
+
+				await registerDevelopment(target.id, workspace);
+				const pinned = await developmentBinding(target);
+				expect(pinned).toMatchObject({
+					projectEngineFenced: true,
+					workspaceId: workspace,
+					schemaName: target.schemaName,
+					registeredAt: expect.any(Date),
+					writer: "legacy",
+					revision: 0,
+					allowed: true,
+				});
+				await registerDevelopment(target.id, workspace);
+				await expect(developmentBinding(target)).resolves.toEqual(pinned);
+				const { rows } = await database.query(
+					`SELECT public.allauth_project_engine_development_allowed($1,$2,$3) AS "wrongWorkspace",
+					 public.allauth_project_engine_development_allowed($1,$4,$5) AS "wrongSchema",
+					 public.allauth_project_engine_development_allowed($6,$4,$5) AS "productionInDevelopment",
+					 public.allauth_project_engine_production_allowed($1,$4,$3) AS "developmentInProduction",
+					 EXISTS (SELECT 1 FROM pg_proc p
+					   CROSS JOIN LATERAL aclexplode(COALESCE(p.proacl, acldefault('f',p.proowner))) a
+					   WHERE p.oid='public.allauth_register_project_engine_development(text,text)'::regprocedure
+					   AND a.grantee=0 AND a.privilege_type='EXECUTE') AS "publicCanRegister"`,
+					[
+						target.id,
+						otherWorkspace,
+						target.schemaName,
+						workspace,
+						pairedProduction.schemaName,
+						pairedProduction.id,
+					],
+				);
+				expect(rows).toEqual([
+					{
+						wrongWorkspace: false,
+						wrongSchema: false,
+						productionInDevelopment: false,
+						developmentInProduction: false,
+						publicCanRegister: false,
+					},
+				]);
+				await expect(binding(pairedProduction)).resolves.toMatchObject({
+					projectEngineFenced: true,
+					allowed: true,
+					writer: "allauth",
+					revision: 1,
+				});
+			});
+
+			it("serializes enrollment and refuses an unregistered preexisting writer", async () => {
+				const holder = await database.connect();
+				const registrar = await database.connect();
+				try {
+					await holder.query("BEGIN");
+					await holder.query(
+						"SELECT pg_advisory_xact_lock_shared(public.allauth_project_engine_admission_key($1))",
+						[otherDevelopment.id],
+					);
+					await registrar.query("BEGIN");
+					await registrar.query("SET LOCAL lock_timeout='100ms'");
+					await expect(
+						registrar.query(
+							"SELECT public.allauth_register_project_engine_development($1,$2)",
+							[otherDevelopment.id, otherWorkspace],
+						),
+					).rejects.toMatchObject({ code: "55P03" });
+					await registrar.query("ROLLBACK");
+
+					// A former protected pilot can have a persisted writer even though it has no enrollment marker.
+					await registrar.query("BEGIN");
+					await registrar.query(
+						'UPDATE public."allauthProject" SET "workspaceId"=$1 WHERE id=$2',
+						[workspace, development.id],
+					);
+					await expect(
+						registrar.query(
+							"SELECT public.allauth_register_project_engine_development($1,$2)",
+							[development.id, workspace],
+						),
+					).rejects.toMatchObject({
+						...invalidBinding,
+						message: expect.stringContaining("already has a writer revision"),
+					});
+				} finally {
+					await Promise.all([
+						holder.query("ROLLBACK"),
+						registrar.query("ROLLBACK"),
+					]);
+					holder.release();
+					registrar.release();
+				}
+				await expect(
+					developmentBinding(otherDevelopment),
+				).resolves.toMatchObject({
+					projectEngineFenced: false,
+					allowed: false,
+					writer: "legacy",
+					revision: 0,
+				});
+			});
+
+			it("preserves the binding and realm-specific write guards through rollback", async () => {
+				const target = customerDevelopment;
+				await registerDevelopment(target.id, workspace);
+				for (const [assignment, value] of [
+					["id=$1", randomUUID()],
+					['"projectEngineFenced"=$1', false],
+					['"workspaceId"=$1', otherWorkspace],
+					['"schemaName"=$1', otherDevelopment.schemaName],
+					["environment=$1", "production"],
+				] as const) {
+					await expect(
+						database.query(
+							`UPDATE public."allauthProject" SET ${assignment} WHERE id=$2`,
+							[value, target.id],
+						),
+					).rejects.toMatchObject(invalidBinding);
+				}
+
+				await expect(
+					transition(otherDevelopment.id, "legacy", 0, "allauth"),
+				).rejects.toMatchObject(invalidBinding);
+				await expect(
+					transition(target.id, "legacy", 0, "allauth"),
+				).resolves.toEqual({ writer: "allauth", revision: 1 });
+				await expect(
+					transition(target.id, "legacy", 0, "allauth"),
+				).rejects.toMatchObject({ code: "AU002" });
+				const active = tag("allauth", target.id, 1);
+				const paired = tag("allauth", pairedProduction.id, 1);
+				const sessionWrite = (pool: Pool, project: ReturnType<typeof realm>) =>
+					pool.query(
+						`UPDATE "${project.schemaName}"."session" SET token=token WHERE id='unused-fixture-session'`,
+					);
+				const createWebhook = (pool: Pool, project: ReturnType<typeof realm>) =>
+					pool.query(
+						`INSERT INTO "${project.schemaName}"."allauthWebhookEndpoint"(id,url,"eventTypes","encryptedSecret") VALUES ('dev-endpoint','https://webhook.fixture.example/events','["mfa.*"]','fixture')`,
+					);
+				for (const stale of [database, tag("legacy", target.id, 0), paired]) {
+					await expect(sessionWrite(stale, target)).rejects.toMatchObject(
+						staleWriter,
+					);
+					await expect(createWebhook(stale, target)).rejects.toMatchObject(
+						staleWriter,
+					);
+				}
+				await expect(sessionWrite(active, target)).resolves.toMatchObject({
+					rowCount: 0,
+				});
+				await expect(createWebhook(active, target)).resolves.toMatchObject({
+					rowCount: 1,
+				});
+				await expect(
+					sessionWrite(active, pairedProduction),
+				).rejects.toMatchObject(staleWriter);
+				await expect(
+					sessionWrite(paired, pairedProduction),
+				).resolves.toMatchObject({ rowCount: 0 });
+				await expect(
+					sessionWrite(database, otherDevelopment),
+				).resolves.toMatchObject({ rowCount: 0 });
+				await expect(
+					transition(target.id, "allauth", 1, "legacy"),
+				).resolves.toEqual({ writer: "legacy", revision: 2 });
+				await expect(sessionWrite(active, target)).rejects.toMatchObject(
+					staleWriter,
+				);
+				await expect(
+					sessionWrite(tag("legacy", target.id, 2), target),
+				).resolves.toMatchObject({ rowCount: 0 });
+				await registerDevelopment(target.id, workspace);
+				await expect(developmentBinding(target)).resolves.toMatchObject({
+					projectEngineFenced: true,
+					allowed: true,
+					writer: "legacy",
+					revision: 2,
+				});
+			});
 		});
 	},
 );

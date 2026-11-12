@@ -3,6 +3,10 @@ import { loadEnvFile } from "node:process";
 import { Pool } from "pg";
 import { setting } from "../../lib/configuration";
 import { verifyProjectEncryptedSamlEvidence } from "../../lib/projects/owned-project-sso-saml-evidence";
+import {
+	projectEngineEnrollment,
+	protectedInternalProject,
+} from "../../lib/projects/project-engine-internal-selection";
 import { getProject, projectRegistryPool } from "../../lib/projects/registry";
 import { projectEngineIdPattern } from "../project-engine-rollout-selection.mjs";
 
@@ -21,17 +25,22 @@ async function sampleFromStdin(): Promise<unknown> {
 
 async function run() {
 	const args = process.argv.slice(2);
-	const production = args[0] === "--project";
-	const projectId = production ? args[1] : undefined;
-	const [slug, providerId, ...rest] = production ? args.slice(2) : args;
+	const enrollment =
+		args[0] === "--project"
+			? "production"
+			: args[0] === "--development"
+				? "development"
+				: undefined;
+	const projectId = enrollment ? args[1] : undefined;
+	const [slug, providerId, ...rest] = enrollment ? args.slice(2) : args;
 	if (
 		!slug ||
 		!providerId ||
 		rest.length ||
-		(production && !projectEngineIdPattern.test(projectId ?? ""))
+		(enrollment && !projectEngineIdPattern.test(projectId ?? ""))
 	) {
 		process.stderr.write(
-			"Pass a project slug and SAML provider ID, with the sample JSON on stdin. For production, prefix the arguments with --project PROJECT_ID.\n",
+			"Pass a project slug and SAML provider ID, with the sample JSON on stdin. For enrolled projects, prefix the arguments with --project PROJECT_ID for production or --development PROJECT_ID for development.\n",
 		);
 		process.exitCode = 1;
 		return;
@@ -50,8 +59,10 @@ async function run() {
 	try {
 		const project = await getProject(slug, env);
 		if (
-			production !== (project.environment === "production") ||
-			(production && project.id !== projectId)
+			enrollment
+				? projectEngineEnrollment(project) !== enrollment ||
+					project.id !== projectId
+				: !protectedInternalProject(project)
 		)
 			throw new Error();
 		const evidence = await verifyProjectEncryptedSamlEvidence({

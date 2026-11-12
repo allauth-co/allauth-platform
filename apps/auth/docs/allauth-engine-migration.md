@@ -150,6 +150,36 @@ pnpm --dir apps/auth exec tsx scripts/rehearsal/check-compiled-project-engine.ts
   --production-cohort allauth-auth:internal-rehearsal
 ```
 
+## Customer development projects
+
+Migration `022` lets an ordinary workspace enroll a development realm independently of its production sibling. Deploy a development-capable release to every replica before registration. A release from before development enrollment support cannot serve an enrolled development realm, even after rollback to the legacy writer.
+
+Confirm the immutable development project and workspace IDs and register the exact realm with the release operator. Registration pins its environment, workspace and schema and keeps the legacy writer active.
+
+```sh
+node scripts/project-engine-writer.mjs register-development "$PROJECT_ID" "$WORKSPACE_ID"
+node scripts/project-engine-writer.mjs --development "$PROJECT_ID" status
+```
+
+Configure `ALLAUTH_PROJECT_ENGINE_DEVELOPMENT_REVISIONS` as a JSON object of development project IDs to prepared legacy revisions. Verify readiness and drain all requests and database connections admitted before registration or the prepared deployment before switching. Verify the signed proxy at the project's configured origin, including loopback for local applications. Check each verified accounts hostname when managed hosting is configured. A self-hosted development realm with no active accounts hostnames can prepare on its direct transport.
+
+Use `ALLAUTH_PROJECT_ENGINE_DEVELOPMENT_AGENT_BRIDGE_IDS` and `ALLAUTH_PROJECT_ENGINE_DEVELOPMENT_AGENT_REPLAY_APPROVALS` for configured Agent Auth state. Run the same legacy-only bridge deployment, observed drain, and evidence steps as production, using `--development "$PROJECT_ID" agent-replay-evidence`. Keep the exact development bridge configured through rollback. For configured encrypted SAML, run the same source verifier with `--development "$PROJECT_ID"` and use `ALLAUTH_PROJECT_ENGINE_DEVELOPMENT_SAML_APPROVALS`. Both approval settings use JSON objects keyed by immutable development project ID.
+
+```sh
+node scripts/project-engine-writer.mjs --development "$PROJECT_ID" switch legacy "$LEGACY_REVISION" allauth
+node scripts/project-engine-writer.mjs --development "$PROJECT_ID" status
+node scripts/project-engine-writer.mjs --development "$PROJECT_ID" switch allauth "$ALLAUTH_REVISION" legacy
+```
+
+Verify existing sessions, connected-app grants, configured integrations and paired production isolation before promoting another project. Rollback retains enrollment and requires a development-capable release. A later activation needs the new prepared legacy revision and fresh applicable approvals.
+
+Rehearse an enrolled development project using the normal runtime image and isolated PostgreSQL.
+
+```sh
+pnpm --dir apps/auth exec tsx scripts/rehearsal/check-compiled-project-engine.ts \
+  --development-cohort allauth-auth:internal-rehearsal
+```
+
 ## Compiled project rehearsal
 
 From the repository root, build both standalone images and run the fixture:

@@ -1,9 +1,4 @@
 import {
-	productionEncryptedSamlApprovalsSetting,
-	readProjectEngineApprovalValue,
-} from "../../scripts/project-engine-rollout-selection.mjs";
-import {
-	encryptedSamlApprovalSetting,
 	encryptedSamlConfigurationFingerprint,
 	parseProjectEncryptedSamlApproval,
 	samlApprovalIsCurrent,
@@ -13,6 +8,7 @@ import { setting } from "../configuration";
 import type { ProjectCustomSamlTransport } from "./owned-project-sso-saml-eligibility";
 import { configureProjectSamlTransport } from "./owned-project-sso-saml-eligibility";
 import type { SsoProvider } from "./owned-project-sso-store";
+import { projectSamlApprovalValue } from "./project-engine-internal-selection";
 import type { Project } from "./registry";
 
 export { encryptedSamlConfigurationFingerprint };
@@ -23,17 +19,14 @@ function invalidApproval(): never {
 /** Parse deployment authority for exactly one pending or already active fenced revision. */
 export function readProjectEncryptedSamlApproval(
 	env: AuthEnvironment,
-	binding: Pick<Project, "id" | "schemaName" | "environment">,
+	binding: Pick<
+		Project,
+		"id" | "schemaName" | "workspaceId" | "environment" | "projectEngineFenced"
+	>,
 	writer: { revision: number; preparing: boolean },
 	now = Date.now,
 ) {
-	const raw =
-		binding.environment === "production"
-			? readProjectEngineApprovalValue(
-					setting(env, productionEncryptedSamlApprovalsSetting),
-					binding.id,
-				)
-			: setting(env, encryptedSamlApprovalSetting).trim();
+	const raw = projectSamlApprovalValue(binding, env);
 	if (!raw) return undefined;
 	const parsed = parseProjectEncryptedSamlApproval(raw, binding, writer, now());
 	const secret = setting(env, "ALLAUTH_AUTH_SECRET");

@@ -4,19 +4,22 @@ import { Pool } from "pg";
 import {
 	agentReplayApprovalSetting,
 	agentReplayBridgeIdSetting,
+	developmentAgentReplayApprovalsSetting,
+	developmentAgentReplayBridgeIdsSetting,
 	issueAgentReplayDrainEvidence,
 	productionAgentReplayApprovalsSetting,
 	productionAgentReplayApprovalValue,
 	productionAgentReplayBridgeIdsSetting,
-	productionAgentReplayBridgeSelected,
+	projectAgentReplayBridgeIdSelected,
 	verifyAgentReplayDrainEvidence,
 } from "./project-agent-replay-evidence.mjs";
 import { assertStoredProjectAgentAdmission } from "./project-agent-stored-admission.mjs";
 import { assertProjectOAuthGrantAdmission } from "./project-engine-oauth-grant-admission.mjs";
 import {
+	developmentProjectEngineRevisionsSetting,
 	productionProjectEngineRevisionsSetting,
 	projectEngineIdPattern,
-	readProductionProjectEngineRevisions,
+	readProjectEngineRevisions,
 } from "./project-engine-rollout-selection.mjs";
 import { verifyEncryptedSamlActivation } from "./project-engine-saml-approval.mjs";
 import { verifyProjectWebhookActivation } from "./project-engine-webhook-admission.mjs";
@@ -26,19 +29,32 @@ if (!process.env.DATABASE_URL) throw new Error("DATABASE_URL is required.");
 await projectEngine(process.argv.slice(2));
 
 async function projectEngine(args) {
-	const production = args[0] === "--project";
-	const [operation, previous, revision, next, ...rest] = production
+	const scope =
+		args[0] === "--project"
+			? "production"
+			: args[0] === "--development"
+				? "development"
+				: "protected";
+	const enrolled = scope !== "protected";
+	const [operation, previous, revision, next, ...rest] = enrolled
 		? args.slice(2)
 		: args;
-	const registering = operation === "register-production";
+	const registering =
+		operation === "register-production"
+			? "production"
+			: operation === "register-development"
+				? "development"
+				: undefined;
 	if (
 		registering &&
-		(production ||
+		(enrolled ||
 			args.length !== 3 ||
 			!projectEngineIdPattern.test(previous) ||
 			!projectEngineIdPattern.test(revision))
 	)
-		throw new Error("Supply the exact production project ID and workspace ID.");
+		throw new Error(
+			`Supply the exact ${registering} project ID and workspace ID.`,
+		);
 
 	const selectedId =
 		process.env.ALLAUTH_PROJECT_ENGINE_INTERNAL_ID?.trim() ?? "";
@@ -51,11 +67,10 @@ async function projectEngine(args) {
 		next === undefined;
 	let id = selectedId;
 	if (registering) id = previous;
-	else if (production) id = args[1];
+	else if (enrolled) id = args[1];
 	else if (issuingAgentEvidence) id = bridgeId;
 	if (!projectEngineIdPattern.test(id)) {
-		if (production)
-			throw new Error("The exact production project ID is required.");
+		if (enrolled) throw new Error(`The exact ${scope} project ID is required.`);
 		if (issuingAgentEvidence)
 			throw new Error(
 				"The exact protected Agent replay bridge ID is required.",
@@ -63,7 +78,7 @@ async function projectEngine(args) {
 		throw new Error("The exact protected internal project ID is required.");
 	}
 	if (
-		!production &&
+		!enrolled &&
 		issuingAgentEvidence &&
 		selectedId &&
 		selectedId !== bridgeId
@@ -85,9 +100,14 @@ async function projectEngine(args) {
 	)
 		throw new Error("Supply the expected writer, revision and next writer.");
 	if (operation === "switch" && previous === "legacy" && next === "allauth") {
-		const prepared = production
-			? readProductionProjectEngineRevisions(
-					process.env[productionProjectEngineRevisionsSetting],
+		const prepared = enrolled
+			? readProjectEngineRevisions(
+					process.env[
+						scope === "production"
+							? productionProjectEngineRevisionsSetting
+							: developmentProjectEngineRevisionsSetting
+					],
+					scope,
 				)
 					.get(id)
 					?.toString()
@@ -107,7 +127,7 @@ async function projectEngine(args) {
 	try {
 		if (registering) {
 			await pool.query(
-				"SELECT public.allauth_register_project_engine_production($1,$2)",
+				`SELECT public.allauth_register_project_engine_${registering}($1,$2)`,
 				[id, revision],
 			);
 			console.log(JSON.stringify({ projectId: id, workspaceId: revision }));
@@ -117,27 +137,27 @@ async function projectEngine(args) {
 			console.log(
 				await issueAgentEvidence(pool, {
 					id,
-					production,
+					scope,
 					deployment: previous,
-					drainedAt: agentDrainTime(revision, production),
+					drainedAt: agentDrainTime(revision, enrolled),
 				}),
 			);
 			return;
 		}
 		const current = reading
-			? await readWriter(pool, id, production)
+			? await readWriter(pool, id, scope)
 			: await switchProject(pool, {
 					id,
 					previous,
 					revision: Number(revision),
 					next,
-					production,
+					scope,
 					bridgeId,
 				});
 		if (!current)
 			throw new Error(
-				production
-					? "The registered production project is unavailable."
+				enrolled
+					? `The registered ${scope} project is unavailable.`
 					: "The protected internal project is unavailable.",
 			);
 		console.log(JSON.stringify(current));
@@ -146,11 +166,12 @@ async function projectEngine(args) {
 	}
 }
 
-async function readWriter(database, id, production) {
-	const binding = production
-		? `p.environment='production'
-		   AND public.allauth_project_engine_production_allowed(p.id,p."workspaceId",p."schemaName")`
-		: `p.environment='development' AND w.protected AND w.id='00000000-0000-4000-8000-000000000001'`;
+async function readWriter(database, id, scope) {
+	const binding =
+		scope !== "protected"
+			? `p.environment=$2 AND p."projectEngineFenced"
+		   AND public.allauth_project_engine_binding_allowed(p.id,p."schemaName")`
+			: `p.environment=$2 AND NOT p."projectEngineFenced" AND w.protected AND w.id='00000000-0000-4000-8000-000000000001'`;
 	const {
 		rows: [current],
 	} = await database.query(
@@ -158,15 +179,15 @@ async function readWriter(database, id, production) {
 		 FROM public."allauthProject" p JOIN public."allauthWorkspace" w ON w.id=p."workspaceId"
 		 LEFT JOIN public."allauthProjectEngineWriter" f ON f."projectId"=p.id
 		 WHERE p.id=$1 AND p."schemaName"='allauth_project_' || replace(p.id,'-','') AND ${binding}`,
-		[id],
+		[id, scope === "protected" ? "development" : scope],
 	);
 	return current;
 }
 
-function agentDrainTime(value, production) {
+function agentDrainTime(value, enrolled) {
 	const timestamp = Date.parse(value);
 	if (
-		production &&
+		enrolled &&
 		(!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/.test(value) ||
 			!Number.isFinite(timestamp) ||
 			new Date(timestamp).toISOString().slice(0, 19) !== value.slice(0, 19))
@@ -185,13 +206,11 @@ function agentReplaySecret() {
 	return current ?? legacy ?? "";
 }
 
-async function issueAgentEvidence(
-	pool,
-	{ id, production, deployment, drainedAt },
-) {
-	if (production && !productionAgentBridgeConfigured(id))
+async function issueAgentEvidence(pool, { id, scope, deployment, drainedAt }) {
+	const enrolled = scope !== "protected";
+	if (enrolled && !enrolledAgentBridgeConfigured(id, scope))
 		throw new Error(
-			"The registered production project Agent replay bridge is unavailable.",
+			`The registered ${scope} project Agent replay bridge is unavailable.`,
 		);
 	const client = await pool.connect();
 	try {
@@ -200,14 +219,14 @@ async function issueAgentEvidence(
 			"SELECT pg_advisory_xact_lock(public.allauth_project_engine_admission_key($1))",
 			[id],
 		);
-		const current = await readWriter(client, id, production);
+		const current = await readWriter(client, id, scope);
 		if (current?.writer !== "legacy")
 			throw new Error(
-				production
-					? "Agent drain evidence requires the registered production legacy writer."
+				enrolled
+					? `Agent drain evidence requires the registered ${scope} legacy writer.`
 					: "Agent drain evidence requires the protected legacy writer.",
 			);
-		if (production)
+		if (enrolled)
 			await assertStoredProjectAgentAdmission(
 				client,
 				`allauth_project_${id.replaceAll("-", "")}`,
@@ -230,7 +249,7 @@ async function issueAgentEvidence(
 }
 
 async function switchProject(pool, options) {
-	const { id, previous, revision, next, production } = options;
+	const { id, previous, revision, next, scope } = options;
 	const client = await pool.connect();
 	try {
 		await client.query("BEGIN");
@@ -238,11 +257,11 @@ async function switchProject(pool, options) {
 			"SELECT pg_advisory_xact_lock(public.allauth_project_engine_admission_key($1))",
 			[id],
 		);
-		const current = await readWriter(client, id, production);
+		const current = await readWriter(client, id, scope);
 		if (current?.writer !== previous || current.revision !== revision)
 			throw new Error(
-				production
-					? "The registered production project or writer revision changed."
+				scope !== "protected"
+					? `The registered ${scope} project or writer revision changed.`
 					: "The protected project writer revision changed.",
 			);
 		const schema = `allauth_project_${id.replaceAll("-", "")}`;
@@ -256,7 +275,7 @@ async function switchProject(pool, options) {
 				schema,
 				revision,
 				process.env,
-				production,
+				scope,
 			);
 		}
 		const {
@@ -278,8 +297,9 @@ async function switchProject(pool, options) {
 async function verifyAgentSwitch(
 	client,
 	schema,
-	{ id, revision, next, production, bridgeId },
+	{ id, revision, next, scope, bridgeId },
 ) {
+	const enrolled = scope !== "protected";
 	const {
 		rows: [stored],
 	} = await client.query(
@@ -289,21 +309,25 @@ async function verifyAgentSwitch(
 		  WHERE "expiresAt" > statement_timestamp() AND identifier LIKE ANY
 		   (ARRAY['agent-status-jti:%','host-registration-jti:%','host-agent-key-rotation-jti:%'])) AS agent`,
 	);
-	const raw = production
+	const raw = enrolled
 		? productionAgentReplayApprovalValue(
-				process.env[productionAgentReplayApprovalsSetting],
+				process.env[
+					scope === "production"
+						? productionAgentReplayApprovalsSetting
+						: developmentAgentReplayApprovalsSetting
+				],
 				id,
 			)
 		: process.env[agentReplayApprovalSetting]?.trim() || "";
 	if (!stored.agent && !raw) return;
-	if (production && next === "allauth" && !raw)
+	if (enrolled && next === "allauth" && !raw)
 		throw new Error(
-			"Stored Agent state requires production replay approval before activation.",
+			`Stored Agent state requires ${scope} replay approval before activation.`,
 		);
-	if (production ? !productionAgentBridgeConfigured(id) : bridgeId !== id)
+	if (enrolled ? !enrolledAgentBridgeConfigured(id, scope) : bridgeId !== id)
 		throw new Error(
-			production
-				? "The registered production project Agent replay bridge is unavailable."
+			enrolled
+				? `The registered ${scope} project Agent replay bridge is unavailable.`
 				: "The protected project Agent replay bridge is unavailable.",
 		);
 	if (next === "allauth") {
@@ -312,9 +336,14 @@ async function verifyAgentSwitch(
 	}
 }
 
-function productionAgentBridgeConfigured(id) {
-	return productionAgentReplayBridgeSelected(
-		process.env[productionAgentReplayBridgeIdsSetting],
+function enrolledAgentBridgeConfigured(id, scope) {
+	return projectAgentReplayBridgeIdSelected(
+		process.env[
+			scope === "production"
+				? productionAgentReplayBridgeIdsSetting
+				: developmentAgentReplayBridgeIdsSetting
+		],
 		id,
+		scope,
 	);
 }

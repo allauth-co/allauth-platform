@@ -311,6 +311,16 @@ export function createOwnedProjectRealmImpersonation(options: {
 		});
 	}
 
+	async function readBoundAuthority(request: Request, client: PoolClient) {
+		const proof = await administratorProof(client, request);
+		return proof &&
+			isPlatformAdmin(proof.actor.user, proof.actor.session) &&
+			!proof.target.user.banned &&
+			!proof.target.user.directoryDisabled
+			? proof.target
+			: null;
+	}
+
 	return {
 		async dispatch(path: string, request: Request) {
 			if (
@@ -324,14 +334,15 @@ export function createOwnedProjectRealmImpersonation(options: {
 		async read(request: Request) {
 			if (!options.readCookie(request.headers, "admin")) return;
 			return store.transaction(async (client) => {
-				const proof = await administratorProof(client, request);
-				return proof &&
-					isPlatformAdmin(proof.actor.user, proof.actor.session) &&
-					!proof.target.user.banned &&
-					!proof.target.user.directoryDisabled
-					? responseSession(proof.target.session, proof.target.user)
+				const current = await readBoundAuthority(request, client);
+				return current
+					? responseSession(current.session, current.user)
 					: accountLinkJson(null);
 			});
+		},
+		readAuthority(request: Request, client: PoolClient) {
+			if (options.readCookie(request.headers, "admin"))
+				return readBoundAuthority(request, client);
 		},
 	};
 }

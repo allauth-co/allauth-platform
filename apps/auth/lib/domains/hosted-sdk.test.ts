@@ -76,7 +76,14 @@ function verifiedFixture(
 				{ [envKey]: configured },
 				new Request(url, incoming),
 				{
-					project: { id: projectId, slug, environment, projectEngineFenced },
+					project: {
+						id: projectId,
+						slug,
+						environment,
+						projectEngineFenced,
+						workspaceId: otherId,
+						schemaName: `allauth_project_${projectId.replaceAll("-", "")}`,
+					},
 					kind,
 					hostname: url.hostname,
 				},
@@ -161,14 +168,14 @@ describe("first-party hosted SDK selection", () => {
 });
 
 describe("hosted SDK transport", () => {
-	it("keeps an open production form connected to the restored legacy writer", async () => {
-		verifiedFixture("", "accounts", id, "production", true);
+	it.each(["development", "production"])("keeps an open %s form connected to the restored legacy writer", async (environment) => {
+		verifiedFixture("", "accounts", id, environment, true);
 		gateway.dispatch.mockResolvedValue(Response.json({ emailPassword: true }));
 		const response = await GET(request("sdk/config"));
 		expect(response.status).toBe(200);
 		expect(await response.json()).toEqual({ emailPassword: true });
 		expect(gateway.dispatch).toHaveBeenCalledOnce();
-		verifiedFixture("", "accounts", otherId, "production");
+		verifiedFixture("", "accounts", otherId, environment);
 		expect((await GET(request("sdk/config"))).status).toBe(404);
 		expect(gateway.dispatch).toHaveBeenCalledOnce();
 	});

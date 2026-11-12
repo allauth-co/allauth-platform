@@ -1,15 +1,27 @@
 import { describe, expect, it } from "vitest";
 import {
-	readProductionProjectEngineRevisions,
+	developmentAgentReplayApprovalsSetting,
+	developmentAgentReplayBridgeIdsSetting,
+	productionAgentReplayApprovalsSetting,
+	productionAgentReplayBridgeIdsSetting,
+} from "../../scripts/project-agent-replay-evidence.mjs";
+import {
+	developmentEncryptedSamlApprovalsSetting,
+	developmentProjectEngineRevisionsSetting,
+	productionEncryptedSamlApprovalsSetting,
+	readProjectEngineRevisions,
 	readProjectEngineApprovalValue,
 } from "../../scripts/project-engine-rollout-selection.mjs";
 import { platformWorkspaceId } from "../workspaces/types";
 import {
 	internalProjectEngineIdSetting,
 	productionProjectEngineRevisionsSetting,
+	projectAgentReplayApprovalValue,
+	projectAgentReplayBridgeSelected,
 	projectEnginePreparationRevision,
 	projectEnginePreparedForWriter,
 	projectEngineSelected,
+	projectSamlApprovalValue,
 } from "./project-engine-internal-selection";
 
 const firstId = "2462e18a-4970-4e12-821a-780814a5a0cf";
@@ -48,8 +60,58 @@ describe("project writer rollout selection", () => {
 			JSON.stringify({ [firstId]: [] }),
 		])
 			expect(() => readProjectEngineApprovalValue(invalid, firstId)).toThrow(
-				"production project approvals are invalid",
+				"project approvals are invalid",
 			);
+	});
+
+	it("separates an enrolled development realm from the production and protected settings", () => {
+		const development = {
+			...binding(firstId),
+			environment: "development" as const,
+		};
+		const production = binding(secondId);
+		const approval = JSON.stringify({ projectId: firstId });
+		const map = JSON.stringify({ [firstId]: JSON.parse(approval) });
+		const wrong = {
+			[internalProjectEngineIdSetting]: firstId,
+			[productionProjectEngineRevisionsSetting]: JSON.stringify({
+				[firstId]: 1,
+				[secondId]: 2,
+			}),
+			[productionAgentReplayBridgeIdsSetting]: firstId,
+			[productionAgentReplayApprovalsSetting]: map,
+			[productionEncryptedSamlApprovalsSetting]: map,
+		};
+		const env = {
+			...wrong,
+			[developmentProjectEngineRevisionsSetting]: JSON.stringify({
+				[firstId]: 3,
+			}),
+			[developmentAgentReplayBridgeIdsSetting]: firstId,
+			[developmentAgentReplayApprovalsSetting]: map,
+			[developmentEncryptedSamlApprovalsSetting]: map,
+		};
+		expect(projectEngineSelected(wrong, development)).toBe(false);
+		expect(projectAgentReplayBridgeSelected(development, wrong)).toBe(false);
+		expect(projectAgentReplayApprovalValue(development, wrong)).toBe("");
+		expect(projectSamlApprovalValue(development, wrong)).toBe("");
+		expect(projectEnginePreparationRevision(env, development)).toBe(3);
+		expect(projectEnginePreparationRevision(env, production)).toBe(2);
+		expect(projectAgentReplayBridgeSelected(development, env)).toBe(true);
+		expect(projectAgentReplayApprovalValue(development, env)).toBe(approval);
+		expect(projectSamlApprovalValue(development, env)).toBe(approval);
+		expect(
+			projectEngineSelected(env, {
+				...development,
+				projectEngineFenced: false,
+			}),
+		).toBe(false);
+		expect(
+			projectEngineSelected(env, {
+				...development,
+				workspaceId: platformWorkspaceId,
+			}),
+		).toBe(false);
 	});
 
 	it("prepares each enrolled production project at its exact configured revision", () => {
@@ -140,7 +202,7 @@ describe("project writer rollout selection", () => {
 	});
 
 	it("rejects noncanonical project identifiers and invalid revisions as a whole", () => {
-		expect(readProductionProjectEngineRevisions(undefined)).toEqual(new Map());
+		expect(readProjectEngineRevisions(undefined)).toEqual(new Map());
 		for (const raw of [
 			"[0]",
 			"null",
@@ -152,7 +214,7 @@ describe("project writer rollout selection", () => {
 			JSON.stringify({ [firstId]: "0" }),
 			JSON.stringify({ [firstId]: 2147483648 }),
 		])
-			expect(() => readProductionProjectEngineRevisions(raw)).toThrow(
+			expect(() => readProjectEngineRevisions(raw)).toThrow(
 				"production project preparation revisions",
 			);
 	});

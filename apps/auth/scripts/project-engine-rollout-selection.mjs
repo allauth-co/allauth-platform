@@ -1,16 +1,25 @@
 export const productionProjectEngineRevisionsSetting =
 	"ALLAUTH_PROJECT_ENGINE_PRODUCTION_REVISIONS";
+export const developmentProjectEngineRevisionsSetting =
+	"ALLAUTH_PROJECT_ENGINE_DEVELOPMENT_REVISIONS";
+export const encryptedSamlApprovalSetting =
+	"ALLAUTH_PROJECT_ENGINE_ENCRYPTED_SAML_APPROVAL";
 export const productionEncryptedSamlApprovalsSetting =
 	"ALLAUTH_PROJECT_ENGINE_PRODUCTION_SAML_APPROVALS";
+export const developmentEncryptedSamlApprovalsSetting =
+	"ALLAUTH_PROJECT_ENGINE_DEVELOPMENT_SAML_APPROVALS";
 export const projectEngineIdPattern =
 	/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/;
 
-/** @param {string | undefined} raw @returns {Map<string, number>} */
-export function readProductionProjectEngineRevisions(raw) {
+/** @param {string | undefined} raw @param {"development" | "production"} scope @returns {Map<string, number>} */
+export function readProjectEngineRevisions(
+	raw,
+	scope = "production",
+) {
 	const configured = raw?.trim();
 	if (!configured) return new Map();
 	const invalid = () =>
-		new Error("The production project preparation revisions are invalid.");
+		new Error(`The ${scope} project preparation revisions are invalid.`);
 	let revisions;
 	try {
 		revisions = JSON.parse(configured);
@@ -37,8 +46,7 @@ export function readProductionProjectEngineRevisions(raw) {
 export function readProjectEngineApprovalValue(raw, projectId) {
 	const configured = raw?.trim();
 	if (!configured) return "";
-	const invalid = () =>
-		new Error("The production project approvals are invalid.");
+	const invalid = () => new Error("The project approvals are invalid.");
 	let approvals;
 	try {
 		approvals = JSON.parse(configured);

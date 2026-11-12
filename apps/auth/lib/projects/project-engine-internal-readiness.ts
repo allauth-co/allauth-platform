@@ -1,11 +1,16 @@
 import type { Pool } from "pg";
 import type { AuthEnvironment } from "../configuration";
+import { setting } from "../configuration";
 import { resolveHostedBinding } from "../domains/hosting";
 import { listStoredActiveProjectAccountsHostnames } from "../domains/repository";
 import { domainDefaults } from "../domains/validation";
-import { projectEngineSelected } from "./project-engine-internal-selection";
+import {
+	projectEngineEnrollment,
+	projectEngineSelected,
+} from "./project-engine-internal-selection";
 import { projectWriterLease } from "./project-engine-internal-writer";
-import { getProject, type Project } from "./registry";
+import type { Project } from "./registry";
+import { getProject } from "./registry";
 import { confirmProjectEngine } from "./runtime";
 
 function sameProject(expected: Project, current: Project) {
@@ -49,8 +54,13 @@ async function verifyProjectTransports(
 			project.id,
 			database,
 		);
+		const directOnly =
+			projectEngineEnrollment(project) === "development" &&
+			setting(env, "ALLAUTH_DEPLOYMENT_MODE") === "self-hosted" &&
+			setting(env, "CLOUDFLARE_SAAS_READY") !== "true" &&
+			custom.length === 0;
 		const bindings = await Promise.all(
-			[managed, ...custom].map(async (hostname) => {
+			(directOnly ? [] : [managed, ...custom]).map(async (hostname) => {
 				const binding = await resolveHostedBinding(hostname, env);
 				if (
 					binding?.kind !== "accounts" ||

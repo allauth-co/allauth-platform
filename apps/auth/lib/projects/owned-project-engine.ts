@@ -146,6 +146,7 @@ const usernameInput = z
 	})
 	.strict();
 const sessionIdInput = z.object({ id: z.string().min(1).max(160) }).strict();
+const sessionTokenInput = z.object({ token: z.string() });
 const deviceSessionInput = z.object({
 	sessionToken: z.string().regex(/^[a-z0-9_-]{1,64}$/i),
 });
@@ -1699,7 +1700,7 @@ export function createOwnedProjectEngine(
 
 	async function revokeBrowserSessions(
 		request: Request,
-		path: "/revoke-other-sessions" | "/revoke-sessions",
+		path: "/revoke-other-sessions" | "/revoke-sessions" | "/revoke-session",
 	) {
 		const limited = await store.transaction((client) =>
 			admitOwnedProjectNativeRoute(client, options.trustedIP(request), path, {
@@ -1710,15 +1711,23 @@ export function createOwnedProjectEngine(
 		if (limited) return limited;
 		const originFailure = sessionMutationOrigin(request);
 		if (originFailure) return originFailure;
+		const target =
+			path === "/revoke-session"
+				? sessionTokenInput.safeParse(await requestBody(request))
+				: null;
+		if (target && !target.success)
+			return failure(400, "VALIDATION_ERROR", "A session token is required.");
 
 		const token =
 			serverSessionBearer(request.headers) ?? tokenFrom(request.headers);
 		const headers = new Headers();
 		const event = {
 			type:
-				path === "/revoke-other-sessions"
-					? "session.revoked-others"
-					: "session.revoked-all",
+				path === "/revoke-session"
+					? "session.revoked"
+					: path === "/revoke-other-sessions"
+						? "session.revoked-others"
+						: "session.revoked-all",
 			...browserEventContext(request),
 		};
 		const unauthorized = async (client: PoolClient) => {
@@ -1747,12 +1756,14 @@ export function createOwnedProjectEngine(
 
 			await renewAuthorizedSession(request, current, client, headers);
 			const removed = await store.revoke(
-				{
-					userId: user.id,
-					...(path === "/revoke-other-sessions"
-						? { exceptActiveToken: token }
-						: {}),
-				},
+				target
+					? { userId: user.id, tokens: [target.data.token] }
+					: {
+							userId: user.id,
+							...(path === "/revoke-other-sessions"
+								? { exceptActiveToken: token }
+								: {}),
+						},
 				path,
 				Boolean(backchannel),
 				client,
@@ -1767,6 +1778,140 @@ export function createOwnedProjectEngine(
 			});
 			deliverLogoutAfterCommit(client, request, removed.targets);
 			return json({ status: true }, 200, headers);
+		});
+	}
+
+	async function revokeSdkSession(request: Request) {
+		const path = "/sdk/sessions/revoke";
+		const originFailure = sessionMutationOrigin(request);
+		if (originFailure) return originFailure;
+		if (request.headers.has("authorization"))
+			return json(
+				{ message: "Use your signed-in browser session for this action." },
+				403,
+			);
+		if (!trustedRequest(request.headers, true))
+			return json(
+				{ message: "Use a trusted application origin for account changes." },
+				403,
+			);
+		const body = sessionIdInput.safeParse(await requestBody(request));
+		if (!body.success)
+			return failure(400, "VALIDATION_ERROR", "A session ID is required.");
+		const headers = new Headers({
+			"cache-control": "no-store",
+			pragma: "no-cache",
+		});
+		return store.transaction(async (client) => {
+			const observed = await currentSession(request.headers, client);
+			if (
+				!observed ||
+				!(await store.lockUser(client, observed.user.id)) ||
+				!(await store.lockSession(client, observed.token, observed.user.id, false))
+			)
+				return new Response(null, { status: 401, headers });
+			const current = await currentSession(request.headers, client);
+			if (!current) return new Response(null, { status: 401, headers });
+			if (!current.user.emailVerified)
+				return json(
+					{ message: "A verified, active project account is required." },
+					403,
+					headers,
+				);
+			const { user, session, token } = current;
+			await renewAuthorizedSession(request, current, client, headers, false);
+			const removed = await store.revoke(
+				{ id: body.data.id, userId: user.id, currentToken: token },
+				path,
+				Boolean(backchannel),
+				client,
+			);
+			if (!removed) throw unavailableLogout;
+			if (!removed.ids.length)
+				return json(
+					{ message: "This session does not belong to your project account." },
+					404,
+					headers,
+				);
+			// The legacy SDK route also invalidates this account's other grants and challenges.
+			await clearUserAuthentication(client, user.id);
+			await store.recordEvent(client, {
+				type: "session.revoked",
+				outcome: "success",
+				actorId: user.id,
+				userId: user.id,
+				targetId: body.data.id,
+				userAgent: request.headers.get("user-agent") ?? undefined,
+			});
+			if (body.data.id === session.id) clearSessionCookies(headers);
+			deliverLogoutAfterCommit(client, request, removed.targets);
+			return json({ success: true }, 200, headers);
+		});
+	}
+
+	async function listSdkSessions(request: Request) {
+		if (request.headers.has("authorization"))
+			return json(
+				{ message: "Use your signed-in browser session for this action." },
+				403,
+			);
+		if (!trustedRequest(request.headers, false)) return forbidden();
+		const headers = new Headers({
+			"cache-control": "no-store",
+			pragma: "no-cache",
+		});
+		const unauthorized = () => new Response(null, { status: 401, headers });
+		const token = tokenFrom(request.headers);
+		if (!token) return unauthorized();
+		return store.transaction(async (client) => {
+			let current = await store.session(token, refreshWindow, client);
+			if (!current || current.user.directoryDisabled)
+				return unauthorized();
+			if (current.session.impersonatedBy) {
+				const administrator = await realmImpersonation.readAuthority(request, client);
+				const proof = administrator === undefined
+					? await support?.readBrowserAuthority(request, client)
+					: administrator;
+				if (proof === "clear") clearSessionCookies(headers);
+				if (!proof || typeof proof === "string" ||
+					proof.session.id !== current.session.id || proof.user.id !== current.user.id)
+					return unauthorized();
+				current = proof;
+			}
+			const { session, user } = current;
+			if (
+				policy.mfaMode === "required" &&
+				!session.impersonatedBy &&
+				(!user.emailVerified || !user.twoFactorEnabled)
+			)
+				return json(
+					{ message: "This application requires an already verified account enrolled in MFA." },
+					403,
+					headers,
+				);
+			if (!user.emailVerified || user.banned)
+				return json(
+					{ message: "A verified, active project account is required." },
+					403,
+					headers,
+				);
+			if (!session.impersonatedBy)
+				await renewAuthorizedSession(request, { ...current, token }, client, headers, false);
+			const sessions = await store.list(user.id, client);
+			return json(
+				{
+					sessions: sessions.map(({ id, createdAt, expiresAt, ipAddress, userAgent }) => ({
+						id,
+						createdAt,
+						expiresAt,
+						...(ipAddress ? { ipAddress } : {}),
+						...(userAgent ? { userAgent } : {}),
+					})),
+					currentSessionId: session.id,
+				},
+				200,
+				headers,
+			);
 		});
 	}
 
@@ -2306,7 +2451,7 @@ export function createOwnedProjectEngine(
 				return headers;
 			},
 		});
-	async function clearAdminAuthentication(client: PoolClient, userId: string) {
+	async function clearUserAuthentication(client: PoolClient, userId: string) {
 		await client.query('DELETE FROM "oauthAccessToken" WHERE "userId"=$1', [
 			userId,
 		]);
@@ -2336,7 +2481,7 @@ export function createOwnedProjectEngine(
 		);
 		if (!removed) throw unavailableLogout;
 		if (authentication === "all" && "userId" in selector)
-			await clearAdminAuthentication(client, selector.userId);
+			await clearUserAuthentication(client, selector.userId);
 		deliverLogoutAfterCommit(client, request, removed.targets);
 	}
 	const adminProject = options.adminDeletion && {
@@ -2908,7 +3053,7 @@ export function createOwnedProjectEngine(
 		checkPasswordSafety: passwordSafety,
 		primaryOrigin: origin,
 		blockAdminCreation: security.denyProvisioning,
-		clearUserAuthentication: clearAdminAuthentication,
+		clearUserAuthentication,
 		revoke: revokeAdminSessions,
 	});
 	const realmImpersonation = createOwnedProjectRealmImpersonation({
@@ -3176,6 +3321,8 @@ export function createOwnedProjectEngine(
 			if (!trustedRequest(request.headers, false)) return forbidden();
 			return publicSDKConfiguration();
 		}
+		if (path === "/sdk/sessions" && request.method === "GET")
+			return listSdkSessions(request);
 		if (path === "/sdk/avatar" && request.method === "POST") {
 			if (!trustedRequest(request.headers, true)) return forbidden();
 			const current = await currentSession(request.headers);
@@ -3450,9 +3597,13 @@ export function createOwnedProjectEngine(
 			);
 		if (request.method === "POST" && path === "/sign-out")
 			return signOut(request);
+		if (request.method === "POST" && path === "/sdk/sessions/revoke")
+			return revokeSdkSession(request);
 		if (
 			request.method === "POST" &&
-			(path === "/revoke-sessions" || path === "/revoke-other-sessions")
+			(path === "/revoke-sessions" ||
+				path === "/revoke-other-sessions" ||
+				path === "/revoke-session")
 		)
 			return revokeBrowserSessions(request, path);
 		if (

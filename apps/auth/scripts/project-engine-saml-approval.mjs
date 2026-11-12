@@ -2,12 +2,13 @@ import { createHmac, X509Certificate } from "node:crypto";
 import { DOMParser } from "@xmldom/xmldom";
 import * as z from "zod";
 import {
+	developmentEncryptedSamlApprovalsSetting,
+	encryptedSamlApprovalSetting,
 	productionEncryptedSamlApprovalsSetting,
 	readProjectEngineApprovalValue,
 } from "./project-engine-rollout-selection.mjs";
 
-export const encryptedSamlApprovalSetting =
-	"ALLAUTH_PROJECT_ENGINE_ENCRYPTED_SAML_APPROVAL";
+export { encryptedSamlApprovalSetting };
 export const encryptedSamlApprovalKind =
 	"operator-verified-encrypted-saml-policy-v1";
 export const maximumSamlApprovalAge = 7 * 24 * 60 * 60 * 1000;
@@ -449,14 +450,16 @@ async function verifyActivationReceiver(client, projectId, approval, env) {
 		throw new Error("The approved encrypted SAML receiver is unavailable.");
 }
 
-/** Recheck the approved SAML row under the selected writer's exclusive admission lock. */
+/** Recheck the approved SAML row under the selected writer's exclusive admission lock.
+ * @param {"protected" | "development" | "production"} scope
+ */
 export async function verifyEncryptedSamlActivation(
 	client,
 	projectId,
 	schemaName,
 	revision,
 	env,
-	production = false,
+	scope = "protected",
 ) {
 	if (
 		!/^allauth_project_[a-f0-9]{32}$/.test(schemaName) ||
@@ -473,12 +476,17 @@ export async function verifyEncryptedSamlActivation(
 	} catch {
 		throw new Error("The stored project SAML configuration is unavailable.");
 	}
-	const raw = production
-		? readProjectEngineApprovalValue(
-				env[productionEncryptedSamlApprovalsSetting],
-				projectId,
-			)
-		: env[encryptedSamlApprovalSetting]?.trim();
+	const raw =
+		scope === "protected"
+			? env[encryptedSamlApprovalSetting]?.trim()
+			: readProjectEngineApprovalValue(
+					env[
+						scope === "production"
+							? productionEncryptedSamlApprovalsSetting
+							: developmentEncryptedSamlApprovalsSetting
+					],
+					projectId,
+				);
 	if (!raw && !encrypted.length) return;
 	if (!raw)
 		throw new Error(

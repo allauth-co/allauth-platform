@@ -2,16 +2,23 @@ import { after } from "next/server";
 import {
 	agentReplayApprovalSetting,
 	agentReplayBridgeIdSetting,
+	developmentAgentReplayApprovalsSetting,
+	developmentAgentReplayBridgeIdsSetting,
 	productionAgentReplayApprovalValue,
 	productionAgentReplayApprovalsSetting,
 	productionAgentReplayBridgeIdsSetting,
-	productionAgentReplayBridgeSelected,
+	projectAgentReplayBridgeIdSelected,
 	verifyAgentReplayDrainEvidence,
 } from "../../scripts/project-agent-replay-evidence.mjs";
 import {
+	developmentEncryptedSamlApprovalsSetting,
+	developmentProjectEngineRevisionsSetting,
+	encryptedSamlApprovalSetting,
+	productionEncryptedSamlApprovalsSetting,
 	productionProjectEngineRevisionsSetting,
 	projectEngineIdPattern,
-	readProductionProjectEngineRevisions,
+	readProjectEngineApprovalValue,
+	readProjectEngineRevisions,
 } from "../../scripts/project-engine-rollout-selection.mjs";
 import type { AuthEnvironment } from "../configuration";
 import { setting } from "../configuration";
@@ -49,6 +56,7 @@ export function protectedInternalProject(project: ProjectBinding) {
 	return (
 		project.environment === "development" &&
 		project.workspaceId === platformWorkspaceId &&
+		project.projectEngineFenced !== true &&
 		exactProjectSchema(project)
 	);
 }
@@ -64,18 +72,31 @@ export function internalProjectEngineSelected(
 	);
 }
 
-function registeredProductionProject(project: ProjectBinding) {
-	return (
-		project.projectEngineFenced === true &&
-		project.environment === "production" &&
-		projectEngineIdPattern.test(project.workspaceId) &&
-		exactProjectSchema(project)
-	);
+export function projectEngineEnrollment(project: ProjectBinding) {
+	if (
+		project.projectEngineFenced !== true ||
+		!projectEngineIdPattern.test(project.workspaceId) ||
+		!exactProjectSchema(project)
+	)
+		return;
+	if (project.environment === "production") return "production";
+	if (
+		project.environment === "development" &&
+		project.workspaceId !== platformWorkspaceId
+	)
+		return "development";
 }
 
 export function productionProjectEngineRevisions(env: AuthEnvironment) {
-	return readProductionProjectEngineRevisions(
+	return readProjectEngineRevisions(
 		setting(env, productionProjectEngineRevisionsSetting),
+	);
+}
+
+export function developmentProjectEngineRevisions(env: AuthEnvironment) {
+	return readProjectEngineRevisions(
+		setting(env, developmentProjectEngineRevisionsSetting),
+		"development",
 	);
 }
 
@@ -83,11 +104,13 @@ export function projectEngineSelected(
 	env: AuthEnvironment,
 	project: ProjectBinding,
 ) {
-	return (
-		internalProjectEngineSelected(env, project) ||
-		(registeredProductionProject(project) &&
-			productionProjectEngineRevisions(env).has(project.id))
-	);
+	if (internalProjectEngineSelected(env, project)) return true;
+	const enrollment = projectEngineEnrollment(project);
+	if (enrollment === "production")
+		return productionProjectEngineRevisions(env).has(project.id);
+	if (enrollment === "development")
+		return developmentProjectEngineRevisions(env).has(project.id);
+	return false;
 }
 
 export function projectEnginePreparationRevision(
@@ -96,8 +119,11 @@ export function projectEnginePreparationRevision(
 ) {
 	if (internalProjectEngineSelected(env, project))
 		return internalProjectPreparationRevision(env);
-	if (registeredProductionProject(project))
+	const enrollment = projectEngineEnrollment(project);
+	if (enrollment === "production")
 		return productionProjectEngineRevisions(env).get(project.id);
+	if (enrollment === "development")
+		return developmentProjectEngineRevisions(env).get(project.id);
 }
 
 export function projectEnginePreparedForWriter(
@@ -118,12 +144,17 @@ export function projectAgentReplayBridgeSelected(
 ) {
 	if (protectedInternalProject(project))
 		return setting(env, agentReplayBridgeIdSetting).trim() === project.id;
-	return (
-		registeredProductionProject(project) &&
-		productionAgentReplayBridgeSelected(
-			setting(env, productionAgentReplayBridgeIdsSetting),
-			project.id,
-		)
+	const enrollment = projectEngineEnrollment(project);
+	if (!enrollment) return false;
+	return projectAgentReplayBridgeIdSelected(
+		setting(
+			env,
+			enrollment === "production"
+				? productionAgentReplayBridgeIdsSetting
+				: developmentAgentReplayBridgeIdsSetting,
+		),
+		project.id,
+		enrollment,
 	);
 }
 
@@ -133,14 +164,37 @@ export function projectAgentReplayApprovalValue(
 ) {
 	if (protectedInternalProject(project))
 		return setting(env, agentReplayApprovalSetting).trim();
-	return registeredProductionProject(project)
-		? productionAgentReplayApprovalValue(
-				setting(env, productionAgentReplayApprovalsSetting),
-				project.id,
-			)
-		: "";
+	const enrollment = projectEngineEnrollment(project);
+	if (!enrollment) return "";
+	return productionAgentReplayApprovalValue(
+		setting(
+			env,
+			enrollment === "production"
+				? productionAgentReplayApprovalsSetting
+				: developmentAgentReplayApprovalsSetting,
+		),
+		project.id,
+	);
 }
 
+export function projectSamlApprovalValue(
+	project: ProjectBinding,
+	env: AuthEnvironment,
+) {
+	if (protectedInternalProject(project))
+		return setting(env, encryptedSamlApprovalSetting).trim();
+	const enrollment = projectEngineEnrollment(project);
+	if (!enrollment) return "";
+	return readProjectEngineApprovalValue(
+		setting(
+			env,
+			enrollment === "production"
+				? productionEncryptedSamlApprovalsSetting
+				: developmentEncryptedSamlApprovalsSetting,
+		),
+		project.id,
+	);
+}
 /** Check the operator's exact revision and drain window, including cached preparation. */
 export function projectAgentReplayApproved(
 	project: ProjectBinding,

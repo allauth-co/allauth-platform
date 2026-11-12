@@ -4,10 +4,6 @@ import { runWithAdapter } from "@better-auth/core/context";
 import { APIError } from "better-auth";
 import { Pool } from "pg";
 import {
-	productionEncryptedSamlApprovalsSetting,
-	readProjectEngineApprovalValue,
-} from "../../scripts/project-engine-rollout-selection.mjs";
-import {
 	auth,
 	createAuth,
 	getAuthEnvironment,
@@ -78,6 +74,7 @@ import {
 	projectAgentReplayBridgeSelected,
 	projectEnginePreparationRevision,
 	projectEngineSelected,
+	projectSamlApprovalValue,
 	selectProjectEngine,
 } from "./project-engine-internal-selection";
 import { projectWriterLease } from "./project-engine-internal-writer";
@@ -584,15 +581,7 @@ async function withConfiguredProjectEntry<T>(
 				.update(aliasConfiguration)
 				.digest("hex")
 		: "";
-	const samlApproval =
-		owned &&
-		writer &&
-		(project.environment === "production"
-			? readProjectEngineApprovalValue(
-					setting(env, productionEncryptedSamlApprovalsSetting),
-					project.id,
-				)
-			: setting(env, "ALLAUTH_PROJECT_ENGINE_ENCRYPTED_SAML_APPROVAL").trim());
+	const samlApproval = owned && writer && projectSamlApprovalValue(project, env);
 	const samlApprovalVersion = samlApproval
 		? createHmac("sha256", setting(env, "ALLAUTH_AUTH_SECRET")).update(samlApproval).digest("hex")
 		: "";

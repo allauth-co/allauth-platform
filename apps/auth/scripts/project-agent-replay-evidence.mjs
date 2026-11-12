@@ -12,28 +12,36 @@ export const productionAgentReplayBridgeIdsSetting =
 	"ALLAUTH_PROJECT_ENGINE_PRODUCTION_AGENT_BRIDGE_IDS";
 export const productionAgentReplayApprovalsSetting =
 	"ALLAUTH_PROJECT_ENGINE_PRODUCTION_AGENT_REPLAY_APPROVALS";
+export const developmentAgentReplayBridgeIdsSetting =
+	"ALLAUTH_PROJECT_ENGINE_DEVELOPMENT_AGENT_BRIDGE_IDS";
+export const developmentAgentReplayApprovalsSetting =
+	"ALLAUTH_PROJECT_ENGINE_DEVELOPMENT_AGENT_REPLAY_APPROVALS";
 const kind = "operator-verified-agent-replay-drain-v1";
 const drainWindowMs = 90_000;
 const preparationWindowMs = 15 * 60_000;
 const encoder = new TextEncoder();
 
-/** @param {string | undefined} raw @returns {Set<string>} */
-export function readProductionAgentReplayBridgeIds(raw) {
+/** @param {string | undefined} raw @param {"development" | "production"} scope @returns {Set<string>} */
+export function readProjectAgentReplayBridgeIds(raw, scope = "production") {
 	const configured = raw?.trim();
 	if (!configured) return new Set();
 	const ids = new Set();
 	for (const entry of configured.split(",")) {
 		const id = entry.trim();
 		if (!projectEngineIdPattern.test(id) || ids.has(id))
-			throw new Error("The production project Agent bridge IDs are invalid.");
+			throw new Error(`The ${scope} project Agent bridge IDs are invalid.`);
 		ids.add(id);
 	}
 	return ids;
 }
 
-/** @param {string | undefined} raw @param {string} projectId */
-export function productionAgentReplayBridgeSelected(raw, projectId) {
-	return readProductionAgentReplayBridgeIds(raw).has(projectId);
+/** @param {string | undefined} raw @param {string} projectId @param {"development" | "production"} scope */
+export function projectAgentReplayBridgeIdSelected(
+	raw,
+	projectId,
+	scope = "production",
+) {
+	return readProjectAgentReplayBridgeIds(raw, scope).has(projectId);
 }
 
 export const productionAgentReplayApprovalValue =

@@ -56,7 +56,7 @@ function retainPendingWork<Result>(
 	return work;
 }
 
-/** Drain native Agent work before releasing its exact protected legacy writer lease. */
+/** Drain native Agent work before releasing its exact project writer lease. */
 export function retainLegacyProjectBackgroundWork(
 	id: string,
 	work: Promise<unknown>,
@@ -140,9 +140,11 @@ export function projectEngineWriterConnectionOptions(
 export function createProjectEngineWriterLease(options: Options) {
 	const { database, selectedProjectId } = options;
 	const project = Object.freeze({ ...options.project });
-	const production =
-		project.environment === "production" &&
-		project.projectEngineFenced === true;
+	const enrolled =
+		project.projectEngineFenced === true &&
+		(project.environment === "production" ||
+			(project.environment === "development" &&
+				project.workspaceId !== platformWorkspaceId));
 	const internal =
 		project.environment === "development" &&
 		project.workspaceId === platformWorkspaceId &&
@@ -151,7 +153,7 @@ export function createProjectEngineWriterLease(options: Options) {
 		!projectId.test(selectedProjectId) ||
 		project.id !== selectedProjectId ||
 		!projectId.test(project.workspaceId) ||
-		(!production && !internal) ||
+		(!enrolled && !internal) ||
 		project.schemaName !==
 			`allauth_project_${selectedProjectId.replaceAll("-", "")}`
 	)
@@ -179,7 +181,7 @@ export function createProjectEngineWriterLease(options: Options) {
 			 FROM public."allauthProject" p
 			 JOIN public."allauthWorkspace" w ON w.id=p."workspaceId"
 			 LEFT JOIN public."allauthProjectEngineWriter" f ON f."projectId"=p.id
-			 WHERE p.id=$1 ${production ? 'AND public.allauth_project_engine_production_allowed(p.id,p."workspaceId",p."schemaName")' : ""}`,
+			 WHERE p.id=$1 ${enrolled ? 'AND public.allauth_project_engine_binding_allowed(p.id,p."schemaName") AND p."projectEngineFenced"' : ""}`,
 			[project.id],
 		);
 		const binding = rows[0];

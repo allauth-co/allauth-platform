@@ -42,6 +42,7 @@ import {
 } from "../enterprise";
 import { featureBoundaries } from "../features/server";
 import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
+import { projectManagement } from "./management-plugin";
 import { createOwnedProjectEngine } from "./owned-project-engine";
 import { createOwnedProjectPasswordSafety } from "./owned-project-password-safety";
 import { projectSecret } from "./runtime";
@@ -154,6 +155,7 @@ async function native(
 			logger: { disabled: true },
 			advanced: {
 				cookiePrefix: realm ? `allauth_project_${realm.slug}` : "better-auth",
+				disableOriginCheck: false,
 			},
 			emailAndPassword: { enabled: true, password: clerkCompatiblePasswords },
 			plugins: [
@@ -165,6 +167,19 @@ async function native(
 							authPolicyPlugin(defaultAuthPolicy),
 							multiSession({ maximumSessions: 5 }),
 							organization(),
+							projectManagement({
+								projectId: realm.id,
+								baseURL: origin,
+								async requirePlatformAdmin(ctx) {
+									const actor = await readRoot?.(ctx.headers ?? new Headers());
+									if (!actor) throw new APIError("FORBIDDEN");
+									return actor;
+								},
+								async onRevokeUser(adapter, id) {
+									await revokeUserGrants(adapter, id);
+									await revokeAuthenticationChallenges(adapter, id);
+								},
+							}),
 							jwt({ disableSettingJwtHeader: true }),
 							oauthProvider({
 								loginPage: "/sign-in",
@@ -262,7 +277,10 @@ describe.skipIf(!existsSync(fixture))(
 				for (const project of [alpha, beta]) {
 					await client.query(`CREATE SCHEMA "${project.schemaName}"`);
 					await client.query(`SET search_path TO "${project.schemaName}"`);
-					for (const migration of migrations)
+					for (const migration of [
+						...migrations,
+						"016-invitation-import-provenance",
+					])
 						await client.query(migrate(migration));
 				}
 				await client.query("SET search_path TO public");
@@ -1684,6 +1702,200 @@ describe.skipIf(!existsSync(fixture))(
 					},
 				},
 			]);
+			expect(await exercise("owned")).toEqual(native);
+		});
+
+		it.each([
+			"/revoke-session",
+			"/sdk/sessions/revoke",
+		] as const)("preserves %s authority, grants and signed session revocation events", async (path) => {
+			const sdk = path === "/sdk/sessions/revoke";
+			const realm = `"${alpha.schemaName}"`;
+			async function exercise(writer: "legacy" | "owned") {
+				const active = await browserSession(eventEmail);
+				const target = await browserSession(eventEmail);
+				const foreign = await browserSession(userEmail);
+				const clientId = randomUUID();
+				const challengeId = randomUUID();
+				const grants = [
+					"access",
+					"online",
+					"offline",
+					"sibling",
+					"foreign",
+				].map((kind) => ({ kind, id: randomUUID() }));
+				await database.query(
+					`INSERT INTO ${realm}."oauthClient" (id,"clientId","redirectUris") VALUES ($1,$1,'[]')`,
+					[clientId],
+				);
+				for (const { kind, id } of grants) {
+					const session =
+						kind === "foreign" ? foreign : kind === "sibling" ? active : target;
+					const owner = kind === "foreign" ? userId : eventUserId;
+					const table =
+						kind === "access" ? "oauthAccessToken" : "oauthRefreshToken";
+					const scopes =
+						kind === "offline" ? ["openid", "offline_access"] : ["openid"];
+					await database.query(
+						`INSERT INTO ${realm}."${table}" (id,token,"sessionId","userId","clientId","expiresAt","createdAt",scopes)
+							 VALUES ($1,$1,$2,$3,$4,now()+interval '1 day',now(),$5)`,
+						[id, session.id, owner, clientId, JSON.stringify(scopes)],
+					);
+				}
+				await database.query(
+					`INSERT INTO ${realm}.verification (id,identifier,value,"expiresAt") VALUES ($1,$2,$3,now()+interval '1 day')`,
+					[challengeId, `trust-device-${challengeId}`, eventUserId],
+				);
+				const subscription = await endpoint(
+					"legacy",
+					`revoke-${sdk ? "sdk" : "token"}-${writer}`,
+					["session.*"],
+				);
+				const body = (session: typeof active) =>
+					sdk ? { id: session.id } : { token: session.token };
+				try {
+					const denied = await send(writer, path, body(target), "");
+					expect(denied.status).toBe(401);
+					if (sdk) expect(await denied.text()).toBe("");
+					else
+						expect(await denied.json()).toEqual({
+							code: "UNAUTHORIZED",
+							message: "Unauthorized",
+						});
+					const crossOrigin = await send(
+						writer,
+						path,
+						body(target),
+						active.cookie,
+						"https://foreign.fixture.example",
+					);
+					expect(crossOrigin.status).toBe(403);
+					const wrong = await send(writer, path, body(foreign), active.cookie);
+					expect(wrong.status).toBe(sdk ? 404 : 200);
+					expect(await wrong.json()).toEqual(
+						sdk
+							? {
+									message:
+										"This session does not belong to your project account.",
+								}
+							: { status: true },
+					);
+					expect(
+						(
+							await database.query(
+								`SELECT 1 FROM ${realm}.session WHERE id=$1`,
+								[target.id],
+							)
+						).rowCount,
+					).toBe(1);
+					const revoked = await send(writer, path, body(target), active.cookie);
+					expect(revoked.status).toBe(200);
+					expect(await revoked.json()).toEqual(
+						sdk ? { success: true } : { status: true },
+					);
+					expect(revoked.headers.getSetCookie()).toEqual([]);
+					const sessions = await database.query<{ id: string }>(
+						`SELECT id FROM ${realm}.session WHERE id=ANY($1::text[])`,
+						[[active.id, foreign.id, target.id]],
+					);
+					expect(sessions.rows.map(({ id }) => id).sort()).toEqual(
+						[active.id, foreign.id].sort(),
+					);
+					const grantState = await database.query<{
+						id: string;
+						revoked: boolean;
+						sessionId: string | null;
+					}>(
+						`SELECT id, revoked IS NOT NULL AS revoked, "sessionId" FROM ${realm}."oauthAccessToken" WHERE "clientId"=$1
+							 UNION ALL SELECT id, revoked IS NOT NULL AS revoked, "sessionId" FROM ${realm}."oauthRefreshToken" WHERE "clientId"=$1`,
+						[clientId],
+					);
+					expect(grantState.rows).toHaveLength(sdk ? 1 : 5);
+					for (const { kind, id } of grants) {
+						const grant = grantState.rows.find((row) => row.id === id);
+						if (sdk && kind !== "foreign") expect(grant).toBeUndefined();
+						else
+							expect(grant).toEqual({
+								id,
+								revoked: kind === "access" || kind === "online",
+								sessionId:
+									kind === "foreign"
+										? foreign.id
+										: kind === "sibling"
+											? active.id
+											: null,
+							});
+					}
+					expect(
+						(
+							await database.query(
+								`SELECT 1 FROM ${realm}.verification WHERE id=$1`,
+								[challengeId],
+							)
+						).rowCount,
+					).toBe(sdk ? 0 : 1);
+					const events = await signedEvents(
+						subscription,
+						[
+							password,
+							eventEmail,
+							userEmail,
+							active.token,
+							target.token,
+							foreign.token,
+						],
+						new Map([[target.id, "revoked"]]),
+					);
+					expect(
+						events.filter(({ event }) => event.type === "session.deleted"),
+					).toEqual([
+						{
+							event: {
+								type: "session.deleted",
+								outcome: "success",
+								actorId: eventUserId,
+								userId: eventUserId,
+								targetId: "revoked",
+								metadata: { path },
+							},
+						},
+					]);
+					const self = await send(writer, path, body(active), active.cookie);
+					expect(self.status).toBe(200);
+					expect(await self.json()).toEqual(
+						sdk ? { success: true } : { status: true },
+					);
+					if (sdk)
+						expect(self.headers.getSetCookie()).toEqual(
+							expect.arrayContaining([
+								expect.stringMatching(/\.session_token=;.*Max-Age=0/),
+							]),
+						);
+					else expect(self.headers.getSetCookie()).toEqual([]);
+					return events;
+				} finally {
+					await database.query(
+						`DELETE FROM ${realm}."oauthClient" WHERE id=$1`,
+						[clientId],
+					);
+					await database.query(
+						`DELETE FROM ${realm}.session WHERE id=ANY($1::text[])`,
+						[[active.id, target.id, foreign.id]],
+					);
+					await database.query(
+						`DELETE FROM ${realm}.verification WHERE id=$1`,
+						[challengeId],
+					);
+					expect(
+						(
+							await send("legacy", `${base}/delete`, {
+								id: subscription.endpoint.id,
+							})
+						).status,
+					).toBe(200);
+				}
+			}
+			const native = await exercise("legacy");
 			expect(await exercise("owned")).toEqual(native);
 		});
 

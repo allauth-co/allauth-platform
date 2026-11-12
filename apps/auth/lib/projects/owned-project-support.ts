@@ -1335,6 +1335,10 @@ export function createOwnedProjectSupportHttp(
 		}
 	}
 	return Object.assign(dispatch, {
+		readBrowserAuthority(request: Request, client: PoolClient) {
+			if (supportBrowserTransport(request))
+				return admittedBrowserSession(request, client);
+		},
 		readBrowserSession,
 		readConsoleOAuthSession,
 	});

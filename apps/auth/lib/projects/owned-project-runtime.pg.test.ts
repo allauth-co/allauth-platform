@@ -1696,6 +1696,152 @@ describe.skipIf(!existsSync(fixture))(
 			}
 		}, 60_000);
 
+		it("preserves the signed SDK browser-session list across project writers", async () => {
+			const local: { container: string; DATABASE_URL: string } = JSON.parse(
+				readFileSync(fixture, "utf8"),
+			);
+			const base = new URL(local.DATABASE_URL);
+			if (
+				local.container !== "allauth-production-test-20261007" ||
+				base.hostname !== "127.0.0.1" ||
+				base.port !== "55445"
+			)
+				throw new Error("SDK session parity requires the isolated PostgreSQL fixture.");
+			const admin = new Pool({ connectionString: base.href, max: 1 });
+			const name = `allauth_hosted_${randomUUID().replaceAll("-", "")}`;
+			const databaseURL = new URL(`/${name}`, base).href;
+			let created = false;
+			let database: Pool | undefined;
+			let service: Awaited<ReturnType<typeof openProcess>> | undefined;
+			try {
+				await admin.query(`CREATE DATABASE "${name}"`);
+				created = true;
+				const { alpha, beta } = await seed(databaseURL);
+				database = new Pool({ connectionString: databaseURL, max: 1 });
+				const basePath = `/api/projects/${alpha.slug}/auth`;
+				const listPath = `${basePath}/sdk/sessions`;
+				const proxy = { proxy: alpha, origin: alpha.primaryOrigin };
+				service = await openProcess(databaseURL, alpha, false);
+				const login = await service.request(`${basePath}/sign-in/email`, {
+					...proxy,
+					body: { email: credentials.project.email, password: credentials.password },
+				});
+				expect(login.status).toBe(200);
+				const browser = { ...proxy, cookie: cookie(login) };
+				const userId = credentials.project.id;
+				const { rows: [current] } = await database.query<{ id: string }>(
+					`UPDATE "${alpha.schemaName}"."session" SET "ipAddress"='', "userAgent"=NULL
+					 WHERE "userId"=$1 RETURNING id`,
+					[userId],
+				);
+				expect(current?.id).toBeTruthy();
+				await database.query(
+					`WITH generated AS (INSERT INTO "${alpha.schemaName}"."session"
+					 (id,token,"userId","createdAt","updatedAt","expiresAt","ipAddress","userAgent")
+					 SELECT 'sdk-list-' || i, 'fixture-hidden-token-' || i, $1,
+					  now()-i*interval '1 minute',now(),now()+interval '1 hour','192.0.2.40','Fixture browser'
+					 FROM generate_series(1,100) AS i)
+					 INSERT INTO "${alpha.schemaName}"."session" (id,token,"userId","createdAt","updatedAt","expiresAt")
+					 VALUES ('sdk-expired','fixture-expired-token',$1,now(),now(),now()-interval '1 minute'),
+					        ('sdk-foreign-user','fixture-foreign-token',$2,now(),now(),now()+interval '1 hour')`,
+					[userId, credentials.realmAdmin.id],
+				);
+				await database.query(
+					`INSERT INTO "${beta.schemaName}"."session" (id,token,"userId","updatedAt","expiresAt")
+					 VALUES ('sdk-other-realm','fixture-other-realm-token',$1,now(),now()+interval '1 hour')`,
+					[userId],
+				);
+				async function expectList(writer: NonNullable<typeof service>) {
+					const unauthorized = await writer.request(listPath, proxy);
+					expect(unauthorized.status).toBe(401);
+					expect(unauthorized.headers.get("cache-control")).toBe("no-store");
+					expect(unauthorized.headers.get("pragma")).toBe("no-cache");
+					expect(await unauthorized.text()).toBe("");
+					const response = await writer.request(listPath, browser);
+					expect(response.status).toBe(200);
+					expect(response.headers.get("cache-control")).toBe("no-store");
+					expect(response.headers.get("pragma")).toBe("no-cache");
+					expect(response.headers.get("set-auth-token")).toBeNull();
+					const data = (await response.json()) as {
+						currentSessionId: string;
+						sessions: { id: string; createdAt: string; expiresAt: string }[];
+					};
+					expect(data.currentSessionId).toBe(current!.id);
+					expect(data.sessions.map(({ id }) => id)).toEqual([
+						current!.id,
+						...Array.from({ length: 99 }, (_, index) => `sdk-list-${index + 1}`),
+					]);
+					expect(data.sessions[0]).toEqual({
+						id: current!.id,
+						createdAt: expect.any(String),
+						expiresAt: expect.any(String),
+					});
+					expect(data.sessions[1]).toEqual({
+						id: "sdk-list-1",
+						createdAt: expect.any(String),
+						expiresAt: expect.any(String),
+						ipAddress: "192.0.2.40",
+						userAgent: "Fixture browser",
+					});
+					const bearer = await writer.request(listPath, {
+						...browser,
+						authorization: "Bearer fixture-not-a-browser-session",
+					});
+					expect(bearer.status).toBe(403);
+					expect(await bearer.json()).toEqual({
+						message: "Use your signed-in browser session for this action.",
+					});
+					for (const [emailVerified, banned] of [[false, false], [true, true]]) {
+						await database!.query(
+							`UPDATE "${alpha.schemaName}"."user" SET "emailVerified"=$2,banned=$3 WHERE id=$1`,
+							[userId, emailVerified, banned],
+						);
+						const ineligible = await writer.request(listPath, browser);
+						expect(ineligible.status).toBe(403);
+						expect(await ineligible.json()).toEqual({
+							message: "A verified, active project account is required.",
+						});
+					}
+					await database!.query(
+						`UPDATE "${alpha.schemaName}"."user" SET "emailVerified"=true,banned=false WHERE id=$1`,
+						[userId],
+					);
+					await database!.query(
+						`UPDATE "${alpha.schemaName}"."session" SET "expiresAt"=now()+interval '1 minute' WHERE id=$1`,
+						[current!.id],
+					);
+					const renewed = await writer.request(listPath, browser);
+					expect(renewed.status).toBe(200);
+					expect(renewed.headers.get("set-auth-token")).toBeNull();
+					expect(renewed.headers.getSetCookie().some((value) => value.includes(".session_token="))).toBe(true);
+					const renewedList = await renewed.json() as typeof data;
+					expect(renewedList.currentSessionId).toBe(data.currentSessionId);
+					expect(Date.parse(renewedList.sessions[0]!.expiresAt)).toBeGreaterThan(Date.now() + 60_000);
+					await database!.query(
+						`UPDATE "${alpha.schemaName}"."session" SET "expiresAt"=$2 WHERE id=$1`,
+						[current!.id, data.sessions[0]!.expiresAt],
+					);
+					return data;
+				}
+				const native = await expectList(service);
+				await service.stop();
+				service = undefined;
+				service = await openProcess(databaseURL, alpha, true);
+				expect(await expectList(service)).toEqual(native);
+			} finally {
+				try {
+					await service?.stop();
+				} finally {
+					try {
+						await database?.end();
+						if (created) await dropClosedFixtureDatabase(admin, name);
+					} finally {
+						await admin.end();
+					}
+				}
+			}
+		}, 60_000);
+
 		it("starts old, owned and old writers in sequence while preserving a live project session", async () => {
 			const local: { container: string; DATABASE_URL: string } = JSON.parse(
 				readFileSync(fixture, "utf8"),
@@ -2066,6 +2212,17 @@ describe.skipIf(!existsSync(fixture))(
 					(await impersonation.json()) as { session: { id: string } }
 				).session.id;
 				const supportCookies = `${rootCookie}; ${cookie(impersonation)}`;
+				const legacySupportList = await service.request(`${alphaPath}/sdk/sessions`, {
+					cookie: supportCookies,
+				});
+				expect(legacySupportList.status).toBe(200);
+				const legacySupportSessions = (await legacySupportList.json()) as {
+					currentSessionId: string;
+					sessions: { id: string }[];
+				};
+				expect(legacySupportSessions.currentSessionId).toBe(impersonationId);
+				const legacySupportSession = legacySupportSessions.sessions.find(({ id }) => id === impersonationId);
+				expect(legacySupportSession).toBeDefined();
 				const nativeLaunch = await service.request(
 					`${alphaPath}/project-admin/support/launch`,
 					{
@@ -2891,7 +3048,11 @@ describe.skipIf(!existsSync(fixture))(
 					host: alphaHost,
 					cookie: realmSupportCookie,
 				});
-				expect(await realmSupport.json()).toMatchObject({
+				const realmIdentity = (await realmSupport.json()) as {
+					session: { id: string; impersonatedBy: string };
+					user: { id: string };
+				};
+				expect(realmIdentity).toMatchObject({
 					session: { impersonatedBy: credentials.realmAdmin.id },
 					user: { id: supportTarget },
 				});
@@ -2899,6 +3060,19 @@ describe.skipIf(!existsSync(fixture))(
 					.split("; ")
 					.filter((part) => !part.includes(".admin_session="))
 					.join("; ");
+				const realmSupportList = await service.request(`${alphaPath}/sdk/sessions`, {
+					cookie: realmSupportCookie,
+				});
+				expect(realmSupportList.status).toBe(200);
+				expect(await realmSupportList.json()).toMatchObject({
+					currentSessionId: realmIdentity.session.id,
+					sessions: expect.arrayContaining([expect.objectContaining({ id: realmIdentity.session.id })]),
+				});
+				const missingRealmProof = await service.request(`${alphaPath}/sdk/sessions`, {
+					cookie: stripped,
+				});
+				expect(missingRealmProof.status).toBe(401);
+				expect(await missingRealmProof.text()).toBe("");
 				expect(
 					await (
 						await service.request("/api/auth/get-session", {
@@ -3250,6 +3424,21 @@ describe.skipIf(!existsSync(fixture))(
 					},
 					user: { id: supportTarget },
 				});
+				const consoleSupportList = await service.request(`${alphaPath}/sdk/sessions`, {
+					cookie: supportCookies,
+				});
+				expect(consoleSupportList.status).toBe(200);
+				expect(consoleSupportList.headers.get("cache-control")).toBe("no-store");
+				expect(consoleSupportList.headers.getSetCookie()).toEqual([]);
+				const consoleSupportSessions = (await consoleSupportList.json()) as typeof legacySupportSessions;
+				expect(consoleSupportSessions.currentSessionId).toBe(impersonationId);
+				expect(consoleSupportSessions.sessions.find(({ id }) => id === impersonationId)).toEqual(legacySupportSession);
+				const unboundSupportList = await service.request(`${alphaPath}/sdk/sessions`, {
+					cookie: cookie(impersonation),
+				});
+				expect(unboundSupportList.status).toBe(401);
+				expect(unboundSupportList.headers.get("cache-control")).toBe("no-store");
+				expect(await unboundSupportList.text()).toBe("");
 				expect(
 					await (
 						await service.request(`${alphaPath}/get-session`, {
@@ -3302,6 +3491,17 @@ describe.skipIf(!existsSync(fixture))(
 					...signedSupport,
 					cookie: cookie(exchangedSupport),
 				};
+				const wrongSupportList = await service.request(`${alphaPath}/sdk/sessions`, {
+					...connectedSupport,
+					origin: alpha.primaryOrigin,
+				});
+				expect(wrongSupportList.status).toBe(401);
+				expect(wrongSupportList.headers.get("cache-control")).toBe("no-store");
+				expect(await wrongSupportList.text()).toBe("");
+				const boundSupportList = await service.request(`${alphaPath}/sdk/sessions`, connectedSupport);
+				expect(boundSupportList.status).toBe(200);
+				expect(boundSupportList.headers.getSetCookie()).toEqual([]);
+				expect(await boundSupportList.json()).toEqual(consoleSupportSessions);
 				const switchedApple = await finishFixtureApple(service, nativeApple);
 				expect(switchedApple.headers.get("location")).toBe(
 					hostedProvider.destination,
