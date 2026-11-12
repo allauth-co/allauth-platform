@@ -18,8 +18,46 @@ export type {
 	SdkRelease,
 } from "./catalog-types";
 
-/** Only additive fixes belong in this compatible release feed. Never silently upgrade customer packages. */
+/** Active and retained SDK releases. Customers control the package version they install. */
 export const sdkReleases: readonly [AnnouncedSdkRelease, ...SdkRelease[]] = [
+	{
+		"kind": "sdk",
+		"id": "sdk-2.0.0",
+		"slug": "sdk-2-0-0",
+		"version": "2.0.0",
+		"title": "AllAuth React SDK 2.0.0",
+		"summary": "AllAuth’s React SDK now uses a first-party client and UI with no Better Auth package dependencies. It continues to use the existing signed proxy and authentication service.",
+		"notes": [
+			"Existing portable components keep their import paths and same-origin proxy configuration.",
+			"Replace the v1 registry provider with the first-party AllAuthProvider and components. Custom forms should use the documented AllAuth client methods.",
+			"The optional passkey sign-in button uses existing credentials and keeps the native MFA continuation.",
+			"Upgrade when your application is ready. The v1 archives remain available and this SDK release requires no platform database migration."
+		],
+		"sourceUrl": "https://github.com/allauth-co/allauth-sdk/tree/v2.0.0/packages/react",
+		"provenance": [
+			{
+				"kind": "release",
+				"details": "GitHub published the immutable SDK v2.0.0 release on 2026-11-12T03:18:10Z from source 6bb0264f6c239270704b4ec828a6285325e6b0e8. The published archive and checksum match the reviewed package and tagged source.",
+				"files": [
+					"client.ts",
+					"client-passkeys.ts",
+					"client-query.ts",
+					"next.ts",
+					"react.tsx",
+					"ui.tsx",
+					"UI_UPGRADE.md"
+				]
+			}
+		],
+		"sha256": "53618c4834c622ec489435ae80f0dc113f415600894edd86db38660075f2a4da",
+		"upgradeUrl": "https://allauth.co/sdk/quickstart#upgrade",
+		"changelogUrl": "https://allauth.co/releases/sdk-2-0-0",
+		"downloadUrl": "https://allauth.co/sdk/allauth-react-2.0.0.tgz",
+		"announce": true,
+		"dateConfidence": "known",
+		"compatibility": "migration-required",
+		"publishedAt": "2026-11-12T03:18:10Z"
+	},
 	{
 		kind: "sdk",
 		id: "sdk-1.4.7",
@@ -46,7 +84,7 @@ export const sdkReleases: readonly [AnnouncedSdkRelease, ...SdkRelease[]] = [
 		upgradeUrl: "https://allauth.co/sdk/quickstart",
 		changelogUrl: "https://allauth.co/releases/sdk-1-4-7",
 		downloadUrl: "https://allauth.co/sdk/allauth-react-1.4.7.tgz",
-		announce: true,
+		announce: false,
 		dateConfidence: "known",
 		compatibility: "backward-compatible",
 		publishedAt: "2026-11-12T01:29:11Z",

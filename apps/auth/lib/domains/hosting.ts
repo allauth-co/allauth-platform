@@ -1,11 +1,12 @@
 import { APIError } from "better-auth";
-import { getAuthEnvironment, withAuth } from "../auth";
+import { getAuthEnvironment, withAuth, withAuthEngine } from "../auth";
 import type { AuthInstance } from "../api";
+import type { AuthEngine } from "../auth-engine";
 import { setting } from "../configuration";
 import type { AuthEnvironment } from "../configuration";
 import { getProject } from "../projects/registry";
 import type { Project } from "../projects/registry";
-import { withHostedProjectAuth } from "../projects/runtime";
+import { withHostedProjectAuth, withHostedProjectAuthEngine } from "../projects/runtime";
 import { lookupActiveHostname } from "./repository";
 import { hostingBaseDomain } from "./validation";
 import { edgeHeaders, portalHeader, verifyEdgeRequest, verifyPortalBinding } from "./edge";
@@ -38,12 +39,50 @@ export async function requestHostedBinding(request: Request, env: AuthEnvironmen
 	const binding=await resolveHostedBinding(edge.hostname,env); if(!binding) throw new APIError("NOT_FOUND",{message:"Authentication hostname is not active."});
 	return {binding,headers:hostedHeaders(request.headers,binding,edge.ip)};
 }
+async function bindPortalRequest(request: Request) {
+	const env = await getAuthEnvironment();
+	const hosted = await requestHostedBinding(request, env);
+	if (!hosted) return { env, request, binding: null };
+	const url = new URL(request.url);
+	url.protocol = "https:";
+	url.host = hosted.binding.hostname;
+	const bound = new Request(url, {
+		method: request.method,
+		headers: hosted.headers,
+		body: request.body,
+		duplex: "half",
+	} as RequestInit);
+	return { env, request: bound, binding: hosted.binding };
+}
+
 export async function withPortalRequest<T>(request: Request, callback:(instance:AuthInstance,env:AuthEnvironment,request:Request,binding:HostedBinding|null)=>Promise<T>):Promise<T> {
-	const env=await getAuthEnvironment();const hosted=await requestHostedBinding(request,env);
-	if(!hosted) return withAuth((instance,environment)=>callback(instance,environment,request,null));
-	const url=new URL(request.url);url.protocol="https:";url.host=hosted.binding.hostname;
-	const bound=new Request(url,{method:request.method,headers:hosted.headers,body:request.body,duplex:"half"} as RequestInit);
-	return withHostedProjectAuth(hosted.binding.project,hosted.binding.hostname,(instance,environment)=>callback(instance,environment,bound,hosted.binding),env);
+	const { env, request: bound, binding } = await bindPortalRequest(request);
+	if (!binding) return withAuth((instance, environment) => callback(instance, environment, bound, null));
+	return withHostedProjectAuth(binding.project, binding.hostname, (instance, environment) => callback(instance, environment, bound, binding), env);
+}
+
+/** The engine is selected only after verifying the gateway envelope and hostname. */
+export async function withPortalAuthEngine<T>(
+	request: Request,
+	callback: (
+		engine: AuthEngine,
+		env: AuthEnvironment,
+		request: Request,
+		binding: HostedBinding | null,
+	) => Promise<T>,
+): Promise<T> {
+	const { env, request: bound, binding } = await bindPortalRequest(request);
+	if (!binding) {
+		return withAuthEngine((engine, environment) =>
+			callback(engine, environment, bound, null),
+		);
+	}
+	return withHostedProjectAuthEngine(
+		binding.project,
+		binding.hostname,
+		(engine, environment) => callback(engine, environment, bound, binding),
+		env,
+	);
 }
 /** Server-rendered pages receive only proxy-minted proofs and re-resolve the active mapping on each read. */
 export async function withPortalHeaders<T>(headers:Headers,callback:(instance:AuthInstance,headers:Headers,binding:HostedBinding|null)=>Promise<T>):Promise<T> {

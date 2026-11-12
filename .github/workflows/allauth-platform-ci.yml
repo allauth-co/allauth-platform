@@ -59,6 +59,13 @@ jobs:
           // Historical marker used by the tests' isolated-fixture allowlist.
           writeFileSync('.secrets/local-postgres.json', JSON.stringify({ container: 'allauth-production-test-20261007', DATABASE_URL: 'postgresql://allauth:allauth-ci-only@127.0.0.1:55445/allauth' }), { mode: 0o600 });
           JS
+      - name: Test authentication and existing SDK compatibility
+        run: >-
+          pnpm exec vitest run --root apps/auth --config vitest.config.ts
+          lib/configuration-aliases.test.ts lib/clerk-password.test.ts lib/mfa.test.ts sdk/next.test.ts
+          lib/domains/hosting.pg.test.ts lib/projects/runtime.test.ts
+          lib/projects/session-introspection.test.ts lib/projects/session-introspection.legacy.test.ts
+          lib/projects/service-directory-transport.test.ts lib/projects/sdk-version-observation.test.ts
       - name: Test billing, platform administration, self-hosting and public pages
         run: >-
           pnpm exec vitest run --root apps/auth --config vitest.config.ts

@@ -27,7 +27,8 @@ import { GET as projectGET, POST as projectPOST } from "../app/api/projects/[slu
 import { GET as discoveryGET } from "../app/.well-known/openid-configuration/route";
 
 /** This verification script intentionally refuses production databases and all external HTTP. */
-const fixture = JSON.parse(readFileSync(new URL("../../../.secrets/local-postgres.json", import.meta.url), "utf8")) as { container: string; DATABASE_URL: string };
+const fixturePath = process.env.ALLAUTH_TEST_POSTGRES_FIXTURE || new URL("../../../.secrets/local-postgres.json", import.meta.url);
+const fixture = JSON.parse(readFileSync(fixturePath, "utf8")) as { container: string; DATABASE_URL: string };
 const fixtureURL = new URL(fixture.DATABASE_URL);
 assert.ok(fixture.container === "allauth-production-test-20261007" && fixtureURL.hostname === "127.0.0.1" && fixtureURL.port === "55445", "Project checks require the isolated local PostgreSQL fixture.");
 if (existsSync(".env.local")) loadEnvFile(".env.local");
@@ -35,13 +36,16 @@ assert.ok(!process.env.DATABASE_URL || process.env.DATABASE_URL === fixture.DATA
 process.env.DATABASE_URL = fixture.DATABASE_URL;
 process.env.AUTH_RUNTIME = "node";
 process.env.DATABASE_POOL_MAX = "3";
-process.env.BETTER_AUTH_URL = "http://localhost:3002";
-process.env.BETTER_AUTH_SECRET ||= randomBytes(32).toString("hex");
+const origin = "http://localhost:3002";
+const authSecret = process.env.ALLAUTH_AUTH_SECRET || process.env.BETTER_AUTH_SECRET || randomBytes(32).toString("hex");
+process.env.ALLAUTH_AUTH_URL = origin;
+process.env.BETTER_AUTH_URL = origin;
+process.env.ALLAUTH_AUTH_SECRET = authSecret;
+process.env.BETTER_AUTH_SECRET = authSecret;
 process.env.SCIM_CREDENTIAL_HASH_SECRET ||= randomBytes(32).toString("hex");
 process.env.TRUSTED_ORIGINS = "";
 Reflect.set(process.env, "NODE_ENV", "test");
 for (const key of ["GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "GITHUB_CLIENT_ID", "GITHUB_CLIENT_SECRET", "MICROSOFT_CLIENT_ID", "MICROSOFT_CLIENT_SECRET", "CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_EMAIL_API_TOKEN", "EMAIL_FROM"]) process.env[key] = "";
-const origin = process.env.BETTER_AUTH_URL;
 const runId = randomBytes(8).toString("hex");
 const retainSDKFixture = process.argv.includes("--retain-sdk-fixture");
 const qaFixturePath = new URL("../../../.secrets/sdk-browser-qa.json", import.meta.url);
@@ -300,7 +304,7 @@ try {
 	writeFileSync(new URL("project-local-test-proof.json", proofDirectory), JSON.stringify({ checkedAt: new Date().toISOString(), fixture: fixture.container, passed: checks, checks: passedChecks, email: "local in-memory sink", network: "external HTTP refused; deterministic HIBP range fixture only", migrations: ["001-initial-auth.sql", "002-control-plane.sql", "003-projects.sql", "004-webhooks.sql", "005-free-plugins.sql", "006-analytics.sql", "007-auth-configuration.sql", "008-application-environments.sql"] }, null, 2));
 	if (retainSDKFixture) {
 		await withProjectAuth(first.slug, async (instance) => { await (await instance.$context).adapter.update({ model: "user", where: [{ field: "id", value: users[0].id }], update: { role: "user", banned: false, emailVerified: true } }); }, environment);
-		const counterKeys = await Promise.all(["fail-ip", "request-ip", "signup-ip"].map((scope) => securitySubject(String(process.env.BETTER_AUTH_SECRET), scope, ip)));
+		const counterKeys = await Promise.all(["fail-ip", "request-ip", "signup-ip"].map((scope) => securitySubject(authSecret, scope, ip)));
 		writeFileSync(qaFixturePath, JSON.stringify({ version: 1, databaseFixtureContainer: fixture.container, databaseFixtureHost: "127.0.0.1:55445", projectSlug: first.slug, proxySecret: projectProxySecret(freshProject, environment), appOrigin: first.primaryOrigin, allauthURL: origin, email: sameEmail, password, rootEmail, rootPassword: password, cleanup: { project: { id: first.id, slug: first.slug, schemaName: first.schemaName }, brokerClientId: first.brokerClientId, rootUserId: rootUser.id, rootEmail, ip, counterKeys }, cleanupCommand: "pnpm --dir apps/auth exec tsx scripts/cleanup-sdk-fixture.ts" }, null, 2), { mode: 0o600, flag: "wx" });
 		chmodSync(qaFixturePath, 0o600);
 		retainedProjectId = first.id; retainedOwnerId = rootUser.id;
@@ -331,7 +335,7 @@ try {
 	await pool.query('DELETE FROM public."allauthEvent" WHERE "actorId"=ANY($1::text[]) OR "userId"=ANY($1::text[]) OR "targetId"=ANY($1::text[]) OR "clientId"=ANY($1::text[]) OR "ipAddress"=$2', [targets, retainedProjectId ? "" : ip]);
 	for (const userId of createdRootUsers.filter((id) => id !== retainedOwnerId)) await pool.query('DELETE FROM public."user" WHERE id=$1', [userId]);
 	if (!retainedProjectId) await pool.query('DELETE FROM public."rateLimit" WHERE "key" LIKE $1', [`%${ip}%`]);
-	const rootCounterKeys = await Promise.all(["fail-ip", "request-ip", "signup-ip"].map((scope) => securitySubject(String(process.env.BETTER_AUTH_SECRET), scope, ip)));
+	const rootCounterKeys = await Promise.all(["fail-ip", "request-ip", "signup-ip"].map((scope) => securitySubject(authSecret, scope, ip)));
 	if (!retainedProjectId) await pool.query('DELETE FROM public."allauthSecurityCounter" WHERE "key"=ANY($1::text[])', [rootCounterKeys]);
 	await projectRegistryPool(environment).end();
 	await pool.end();

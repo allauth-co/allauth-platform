@@ -1,15 +1,21 @@
 <!-- cspell:words organisation organisations -->
 
-# AllAuth React SDK 1.4.7
+# AllAuth React SDK 2.0.0 candidate
 
-SDK 1.4.7 centers the chevron in the compact `OrganizationSwitcher` with a
-fixed-size SVG. Update your pinned SDK archive and rebuild your application to
-pick up this backward-compatible visual fix. No configuration changes are
-required.
+The first-party React client uses the application's same-origin AllAuth proxy.
+Install the versioned archive and use compatible React and React DOM versions
+and the declared `lucide-react` peer. The Next.js peer is required for the
+`@allauth/react/next` adapter. Import `@allauth/react/styles.css` in your app.
+See [Upgrade from SDK v1](UI_UPGRADE.md) for changes to the optional UI entry.
+
+The v2 source is a release candidate. For published versions, use the
+[AllAuth SDK downloads](https://allauth.co/sdk).
+
+## Existing integrations
 
 SDK 1.4.6 adds opt-in in-app verification for the shared AllAuth broker's authenticator and backup-code challenge. Use the matching portable `SignIn` component and standard `/api/allauth` proxy, then add `brokerTwoFactor: { signInUrl: "/sign-in" }` to the server's `createAllAuthProxy` options. Keep the sign-in page public. The option is disabled by default; older SDKs, services and unsupported integrations retain hosted MFA. Direct providers and application-account MFA keep their existing behaviour.
 
-The application receives an expiring browser-bound handoff in HttpOnly cookies, submits the code through its signed proxy and follows a one-use completion redirect. Central session cookies remain on AllAuth; native attempt limits, lockout, single-use verification, OAuth state, PKCE and consent remain authoritative. A brief redirect restores the platform session after verification; required consent may still display its hosted screen. This option is not yet supported by the optional Better Auth UI registry wrapper or custom proxy base paths. See the repository guide `docs/content/docs/integrations/allauth-in-app-two-factor.mdx` for the full flow and rollout requirements.
+The application receives an expiring browser-bound handoff in HttpOnly cookies, submits the code through its signed proxy and follows a one-use completion redirect. Central session cookies remain on AllAuth; native attempt limits, lockout, single-use verification, OAuth state, PKCE and consent remain authoritative. A brief redirect restores the platform session after verification; required consent may still display its hosted screen. Use the default proxy base path for this option. See the repository guide `docs/content/docs/integrations/allauth-in-app-two-factor.mdx` for the full flow and rollout requirements.
 
 SDK 1.4.5 adds opt-in isolated application support: set the server proxy support option `applicationReturnUrl` to the exact main-app administrator URL configured in the environment policy. The native support binding (actor kind/session, application audit ID and context) is preserved without exposing credentials; support end returns that checked application destination. Existing console support and ordinary sessions remain compatible. Browser native endpoints retain their existing allowlist; the host application must enforce its support-origin permissions and restrict native writes.
 
@@ -19,11 +25,6 @@ AllAuth's service-side session-check resilience fix works with existing SDK vers
 
 SDK 1.4.2 refines the native account dialog and preserves profile editing after a successful save. Account actions continue to use native AllAuth sessions and the selected environment's policy.
 `UserButton variant="avatar" managementMode="modal"` accepts an optional async `onProfileUpdated` callback after the native profile has been saved and the session refreshed. Use this callback to synchronize the application's own member profile. The SDK owns the dialog, forms, security actions and responsive layout.
-
-A portable React SDK backed by the app's same-origin AllAuth proxy. Install the
-versioned tarball plus its declared peers, and import `@allauth/react/styles.css`.
-React and React DOM must have compatible versions. No Next.js dependency is
-required for the React components.
 
 The working 1.4.0 candidate aligns signup with the selected environment's registration and email
 verification policy. The optional `signUpEnabled` and
@@ -142,8 +143,8 @@ same-origin proxy along with the SDK to allow native permission and role routes.
 
 The 1.4.0 candidate supports an explicit handoff from an existing console support
 session. Enable `supportAccess: { enabled: true, basePath: "/api/allauth" }` in
-`createAllAuthProxy`, and add `supportAccess` to your shared `AllAuthProvider` or
-`AllAuthUIProvider`. The server option accepts an optional fixed local
+`createAllAuthProxy`, and add `supportAccess` to your shared `AllAuthProvider`.
+The server option accepts an optional fixed local
 `afterStartUrl` (default `/`). Keep the provider mounted across app navigation.
 
 Register the exact `https://your-app.example/api/allauth/support/callback` URL

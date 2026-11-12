@@ -8,7 +8,7 @@
     "dev": "next dev",
     "dev:secure": "next dev --experimental-https",
     "typecheck": "node scripts/verify-native-links.mjs && next typegen && tsc --noEmit --incremental false",
-    "build": "pnpm run check:sdk && pnpm run verify:sdk-artifact && node scripts/verify-native-links.mjs && next build --webpack",
+    "build": "pnpm run check:sdk && pnpm run verify:sdk-artifact --served && node scripts/verify-native-links.mjs && next build --webpack",
     "start": "next start",
     "build:cloudflare": "opennextjs-cloudflare build",
     "preview": "opennextjs-cloudflare build && opennextjs-cloudflare preview",
@@ -29,7 +29,7 @@
     "verify:sdk-artifact": "node scripts/verify-sdk-artifact.mjs",
     "verify:public-sdk-releases": "node --test scripts/verify-public-sdk-releases.test.mjs && node scripts/verify-public-sdk-releases.mjs",
     "sdk:pack": "pnpm run check:sdk-runtime && node scripts/package-sdk.mjs",
-    "check:sdk-runtime": "tsx --test scripts/sdk-request-budget.test.ts scripts/sdk-backward-compatibility.test.ts"
+    "check:sdk-runtime": "tsx --experimental-test-module-mocks --test scripts/sdk-request-budget.test.ts scripts/sdk-backward-compatibility.test.ts"
   },
   "dependencies": {
     "@allauth/stripe-client": "npm:stripe@23.1.0",
@@ -54,6 +54,7 @@
     "@creem_io/better-auth": "2.0.4",
     "@dub/better-auth": "0.0.6",
     "@hookform/resolvers": "^5.2.2",
+    "@noble/hashes": "2.4.0",
     "@number-flow/react": "^0.6.0",
     "@opennextjs/cloudflare": "1.20.9",
     "@polar-sh/better-auth": "2.1.0",
@@ -87,6 +88,7 @@
     "@radix-ui/react-toggle-group": "^1.1.11",
     "@radix-ui/react-tooltip": "^1.2.8",
     "@react-email/components": "^1.0.8",
+    "@simplewebauthn/browser": "13.3.0",
     "@tanstack/query-core": "5.104.1",
     "@tanstack/react-form": "1.33.5",
     "@tanstack/react-pacer": "0.24.1",

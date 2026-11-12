@@ -23,7 +23,7 @@ export interface AnnouncedSdkRelease extends SdkReleaseBase {
 	announce: true;
 	publishedAt: string;
 	dateConfidence: "known";
-	compatibility: "backward-compatible";
+	compatibility: "backward-compatible" | "migration-required";
 }
 export interface RetainedSdkRelease extends Omit<AnnouncedSdkRelease, "announce"> {
 	announce: false;

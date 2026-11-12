@@ -3,11 +3,19 @@
 import { useEffect, useId, useRef, useState } from "react";
 import type { CSSProperties, FormEvent } from "react";
 import { Building2, Users, UsersRound, Shield } from "lucide-react";
-import { defaultStatements } from "better-auth/plugins/organization/access";
 import { useAllAuth } from "./react";
 import { Dialog } from "./dialog";
 import { authError, proxyBasePath } from "./helpers";
 import type { AllAuthClient } from "./client";
+
+/** Actions shown in the organization editor. The server remains authoritative. */
+const organizationPermissions = {
+	organization: ["update", "delete"],
+	member: ["create", "update", "delete"],
+	invitation: ["create", "cancel"],
+	team: ["create", "update", "delete"],
+	ac: ["create", "read", "update", "delete"],
+} as const;
 
 const permissionChecks = {
 	updateOrganization: { organization: ["update"] }, deleteOrganization: { organization: ["delete"] },
@@ -212,7 +220,7 @@ function OrganizationRoles({ model, busy, run }: { model: ProfileData; busy: boo
 			<label className="allauth-field" htmlFor={`${id}-role-name`}>Role name<input id={`${id}-role-name`} value={name} required maxLength={100} pattern="[a-z][a-z0-9_-]*" disabled={busy || editing !== "new"} onChange={(event) => setName(event.target.value)}/></label>
 			{editing === "new" && <p className="allauth-muted">Start with a lowercase letter; use letters, numbers, hyphens or underscores.</p>}
 			{editing !== "new" && <p className="allauth-muted">The role name is fixed to preserve existing memberships and invitations.</p>}
-			{Object.entries(defaultStatements).map(([resource, actions]) => <fieldset key={resource} disabled={busy}><legend>{resourceLabel(resource)}</legend>{actions.map((action) => <label className="allauth-row" style={{ justifyContent: "flex-start", padding: ".375rem 0" }} key={action}><input type="checkbox" style={{ width: "1rem", minHeight: "1rem", padding: 0, flex: "none" }} aria-label={`${resource}: ${action}`} checked={permission[resource]?.includes(action) ?? false} onChange={(event) => setPermission((previous) => { const next = { ...previous, [resource]: event.target.checked ? [...previous[resource] ?? [], action] : (previous[resource] ?? []).filter((value) => value !== action) }; if (!next[resource].length) delete next[resource]; return next; })}/>{roleLabel(action)}</label>)}</fieldset>)}
+			{Object.entries(organizationPermissions).map(([resource, actions]) => <fieldset key={resource} disabled={busy}><legend>{resourceLabel(resource)}</legend>{actions.map((action) => <label className="allauth-row" style={{ justifyContent: "flex-start", padding: ".375rem 0" }} key={action}><input type="checkbox" style={{ width: "1rem", minHeight: "1rem", padding: 0, flex: "none" }} aria-label={`${resource}: ${action}`} checked={permission[resource]?.includes(action) ?? false} onChange={(event) => setPermission((previous) => { const next = { ...previous, [resource]: event.target.checked ? [...previous[resource] ?? [], action] : (previous[resource] ?? []).filter((value) => value !== action) }; if (!next[resource].length) delete next[resource]; return next; })}/>{roleLabel(action)}</label>)}</fieldset>)}
 			<div className="allauth-row"><button type="submit" disabled={busy || !name.trim()}>Save role</button><button type="button" className="allauth-secondary" disabled={busy} onClick={() => setEditing(null)}>Cancel</button></div>
 		</form>}
 		{model.permissions.readRoles && <label className="allauth-field" htmlFor={`${id}-role-search`}>Search roles<input id={`${id}-role-search`} type="search" value={search} onChange={(event) => setSearch(event.target.value)}/></label>}

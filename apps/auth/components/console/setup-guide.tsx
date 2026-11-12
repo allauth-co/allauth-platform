@@ -15,7 +15,7 @@ import type { ReactNode } from "react";
 import { useEffect, useState } from "react";
 import { managementHref } from "@/components/control/helpers";
 import { Button } from "@/components/ui/button";
-import sdkPackage from "@/sdk/package.json";
+import { publishedSdkInstallPeers, publishedSdkVersion } from "@/lib/published-sdk";
 import {
 	Badge,
 	CopyValue,
@@ -41,7 +41,8 @@ export function ConsoleSetupGuide({
 }) {
 	const [downloadOrigin, setDownloadOrigin] = useState("https://allauth.co");
 	useEffect(() => setDownloadOrigin(window.location.origin), []);
-	const downloadPath = `/sdk/allauth-react-${sdkPackage.version}.tgz`;
+	const archiveName = `allauth-react-${publishedSdkVersion}.tgz`;
+	const downloadPath = `/sdk/${archiveName}`;
 	const workspaces = useConsoleWorkspaces();
 	const selectedWorkspace = workspaces.data?.workspaces.find(
 		(item) => item.id === workspace,
@@ -168,11 +169,11 @@ export function ConsoleSetupGuide({
 								installation.
 							</p>
 							<div className="guide-sdk-download">
-								<Badge>Direct download · {sdkPackage.version}</Badge>
+								<Badge>Direct download · {publishedSdkVersion}</Badge>
 								<Button asChild variant="outline" size="sm">
 									<a
 										href={downloadPath}
-										download={`allauth-react-${sdkPackage.version}.tgz`}
+										download={archiveName}
 									>
 										Download SDK
 										<Package size={14} className="ml-2" />
@@ -181,7 +182,7 @@ export function ConsoleSetupGuide({
 							</div>
 							<CodeBlock
 								label="Install in your application"
-								value={`pnpm add ${downloadOrigin}${downloadPath} better-auth@${sdkPackage.peerDependencies["better-auth"]} @better-auth/passkey@${sdkPackage.peerDependencies["@better-auth/passkey"]}`}
+								value={["pnpm add", downloadOrigin + downloadPath, ...publishedSdkInstallPeers].join(" ")}
 							/>
 							<p className="guide-note">
 								Direct download, not published to npm. The package exports
@@ -191,11 +192,11 @@ export function ConsoleSetupGuide({
 								<summary>Package from source instead</summary>
 								<CodeBlock
 									label="Package from the AllAuth repository"
-									value="pnpm --dir apps/auth/sdk pack"
+									value={`git clone --branch v${publishedSdkVersion} --depth 1 https://github.com/allauth-co/allauth-sdk.git\ncd allauth-sdk\npnpm --dir packages/react pack`}
 								/>
 								<CodeBlock
 									label="Install your local tarball"
-									value={`pnpm add /path/to/allauth-react-${sdkPackage.version}.tgz better-auth@${sdkPackage.peerDependencies["better-auth"]} @better-auth/passkey@${sdkPackage.peerDependencies["@better-auth/passkey"]}`}
+									value={["pnpm add", `/path/to/${archiveName}`, ...publishedSdkInstallPeers].join(" ")}
 								/>
 							</details>
 							<CodeBlock

@@ -33,6 +33,126 @@ afterEach(() => {
 });
 
 describe("Next.js AllAuth app proxy boundaries", () => {
+	/** @see https://github.com/allauth-co/allauth-sdk/blob/v1.4.7/packages/react/README.md */
+	it("keeps an app-origin native MFA challenge inside an SDK JSON sign-in and scopes pending cookies", async () => {
+		const upstream = new Response(null, {
+			status: 302,
+			headers: {
+				location: `${origin}/sign-in?challenge=two-factor&callbackUrl=%2Faccount`,
+				"set-cookie":
+					"__Secure-allauth_project_fixture-app.two_factor=pending; Domain=allauth.co; Path=/api/auth; Secure; HttpOnly",
+			},
+		});
+		fetcher.mockResolvedValue(upstream);
+		const handler = createAllAuthProxy({
+			project,
+			proxySecret: secret,
+			appOrigin: origin,
+		});
+		const response = await handler(
+			incoming(
+				"sign-in/email",
+				"POST",
+				JSON.stringify({ callbackURL: `${origin}/account` }),
+				{
+					accept: "application/json",
+					"content-type": "application/json",
+				},
+			),
+			context("sign-in/email"),
+		);
+		expect(response.status).toBe(200);
+		expect(response.headers.get("location")).toBeNull();
+		expect(response.headers.getSetCookie()).toEqual([
+			"__Secure-allauth_project_fixture-app.two_factor=pending; Path=/; Secure; HttpOnly",
+		]);
+		expect(await response.json()).toEqual({ twoFactorRedirect: true });
+	});
+
+	it.each([
+		undefined,
+		"INVALID_TOKEN",
+	])("returns the native verification callback to a JSON SDK caller (%s)", async (code) => {
+		const callback = `${origin}/account?from=verification`;
+		const destination = code ? `${callback}&error=${code}` : callback;
+		fetcher.mockResolvedValue(
+			new Response(null, { status: 302, headers: { location: destination } }),
+		);
+		const handler = createAllAuthProxy({
+			project,
+			proxySecret: secret,
+			appOrigin: origin,
+		});
+		const query = new URLSearchParams({
+			token: "fixture",
+			callbackURL: callback,
+		});
+		const response = await handler(
+			incoming(`verify-email?${query}`, "GET", undefined, {
+				accept: "application/json",
+			}),
+			context("verify-email"),
+		);
+		expect(response.status).toBe(200);
+		expect(response.headers.get("location")).toBeNull();
+		expect(await response.json()).toEqual({
+			redirect: true,
+			url: destination,
+			status: !code,
+			user: null,
+		});
+	});
+
+	it("retains native redirects for link navigation, unrelated locations and other origins", async () => {
+		const handler = createAllAuthProxy({
+			project,
+			proxySecret: secret,
+			appOrigin: origin,
+		});
+		const query = new URLSearchParams({
+			token: "fixture",
+			callbackURL: `${origin}/account`,
+		});
+		const fixtures = [
+			{
+				endpoint: "verify-email",
+				url: `verify-email?${query}`,
+				method: "GET",
+				accept: "text/html",
+				location: `${origin}/account`,
+			},
+			{
+				endpoint: "verify-email",
+				url: `verify-email?${query}`,
+				method: "GET",
+				accept: "application/json",
+				location: `${origin}/elsewhere`,
+			},
+			{
+				endpoint: "sign-in/email",
+				url: "sign-in/email",
+				method: "POST",
+				accept: "application/json",
+				location: "https://other.example/sign-in?challenge=two-factor",
+			},
+		];
+		for (const fixture of fixtures) {
+			fetcher.mockResolvedValueOnce(
+				new Response(null, {
+					status: 302,
+					headers: { location: fixture.location },
+				}),
+			);
+			const response = await handler(
+				incoming(fixture.url, fixture.method, undefined, {
+					accept: fixture.accept,
+				}),
+				context(fixture.endpoint),
+			);
+			expect(response.status).toBe(302);
+			expect(response.headers.get("location")).toBe(fixture.location);
+		}
+	});
 	/** @see docs/content/docs/integrations/allauth-signed-session-introspection.mdx */
 	it.each([
 		"17",

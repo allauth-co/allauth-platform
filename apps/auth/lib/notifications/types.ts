@@ -1,3 +1,5 @@
+import type { AnnouncedSdkRelease } from "./catalog-types";
+
 /** Safe dashboard data. SDK observations are advisory application reports, never authentication evidence. */
 export interface SdkObservation {
 	projectId: string;
@@ -19,7 +21,7 @@ export interface SdkReleaseNotification extends ReleaseNotificationBase {
 	kind: "sdk-release";
 	release: {
 		version: string;
-		compatibility: "backward-compatible";
+		compatibility: AnnouncedSdkRelease["compatibility"];
 		summary: string;
 		upgradeUrl: string;
 		changelogUrl: string;
