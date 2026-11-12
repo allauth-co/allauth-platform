@@ -2038,6 +2038,69 @@ export function createOwnedProjectEngine(
 				});
 			},
 		});
+
+	async function continueEmailVerificationSession(
+		client: PoolClient,
+		request: Request,
+		user: ProjectUser,
+		token: string,
+		callback?: string,
+	): Promise<Headers | Response> {
+		if (!(await store.lockSession(client, token, user.id, false)))
+			return forbidden();
+		const current = await eligibleSession(token, client);
+		if (!current) return forbidden();
+		const remember = !tokenFrom(request.headers, rememberCookie);
+		const device = user.twoFactorEnabled
+			? await mfa.rotateTrustedDevice(client, user.id, request.headers)
+			: null;
+		const headers = new Headers();
+		if (device?.setCookie) headers.append("Set-Cookie", device.setCookie);
+		if (!remember) rememberPreference(headers, false);
+		if (user.twoFactorEnabled && !device?.trusted) {
+			const challenge = await mfa.issue(client, user.id);
+			if (!challenge) return unsupported();
+			const removed = await store.revoke(
+				{ tokens: [token] },
+				"/verify-email",
+				Boolean(backchannel),
+				client,
+				user.id,
+			);
+			if (!removed || removed.ids.length !== 1) throw unavailableLogout;
+			deliverLogoutAfterCommit(client, request, removed.targets);
+			// The verification handler reuses the original session. Starting MFA
+			// removes that row and emits no new session creation event.
+			headers.append("Set-Cookie", challenge.setCookie);
+			writeCookie(headers, sessionCookie, "", 0);
+			writeCookie(headers, `${prefix}session_data`, "", 0);
+			return callback
+				? redirect(headers, mfaContinuation(callback))
+				: json(
+						{
+							twoFactorRedirect: true,
+							twoFactorMethods: challenge.twoFactorMethods,
+						},
+						200,
+						headers,
+					);
+		}
+		if (current.refreshDue && remember)
+			await store.refresh(
+				token,
+				policy.sessionExpiresInSeconds,
+				updateAge,
+				client,
+			);
+		writeCookie(
+			headers,
+			sessionCookie,
+			token,
+			remember ? policy.sessionExpiresInSeconds : undefined,
+		);
+		return headers;
+	}
+
 	const recoveryOptions = options.recovery;
 	const recoveryHttp =
 		recoveryOptions &&
@@ -2073,7 +2136,19 @@ export function createOwnedProjectEngine(
 				callbackURL: callback,
 			}) {
 				const active = await currentSession(request.headers, client);
-				if (active?.user.id === user.id) return undefined;
+				if (active?.user.id === user.id) {
+					const result = await continueEmailVerificationSession(
+						client,
+						request,
+						active.user,
+						active.token,
+						callback,
+					);
+					if (result instanceof Response) return result;
+					return callback
+						? redirect(result, callback)
+						: json({ status: true, user: null }, 200, result);
+				}
 				return primaryResult(
 					client,
 					await store.lockUser(client, user.id),
@@ -2118,18 +2193,14 @@ export function createOwnedProjectEngine(
 			admitVerification: (request) =>
 				factorAdmission(request, "change-email-verification"),
 			async complete(client, { request, user, current, callbackURL }) {
-				if (current) {
-					const headers = new Headers();
-					writeCookie(
-						headers,
-						sessionCookie,
+				if (current)
+					return continueEmailVerificationSession(
+						client,
+						request,
+						user,
 						current.token,
-						tokenFrom(request.headers, rememberCookie)
-							? undefined
-							: policy.sessionExpiresInSeconds,
+						callbackURL,
 					);
-					return headers;
-				}
 				const response = await primaryResult(
 					client,
 					user,

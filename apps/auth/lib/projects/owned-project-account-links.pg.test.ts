@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
-import { symmetricEncrypt } from "better-auth/crypto";
+import { symmetricDecrypt, symmetricEncrypt } from "better-auth/crypto";
 import { getTestInstance } from "better-auth/test";
 import {
 	exportJWK,
@@ -15,9 +15,11 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { defaultAuthPolicy } from "../auth-policy/policy";
 import { clerkCompatiblePasswords } from "../clerk-password";
 import { allauthControl } from "../control";
+import { productionTwoFactor } from "../mfa";
 import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
 import type { OwnedProjectAccountDeletionOptions } from "./owned-project-account-deletion";
 import type { ProjectAccountLinkOptions } from "./owned-project-account-links";
+import { createOwnedEmailVerification } from "./owned-email-verification";
 import { createOwnedProjectAppleDeletion } from "./owned-project-apple-deletion";
 import { createOwnedProjectEngine } from "./owned-project-engine";
 
@@ -45,7 +47,10 @@ async function nativeFixture(database: LegacyDatabase, messages: Message[]) {
 				logger: { disabled: true },
 				database: { db: database, type: "postgres", transaction: true },
 				advanced: { cookiePrefix },
-				plugins: [allauthControl({ ipHeader: "x-real-ip" })],
+				plugins: [
+					productionTwoFactor(origin),
+					allauthControl({ ipHeader: "x-real-ip" }),
+				],
 				emailAndPassword: {
 					enabled: true,
 					autoSignIn: false,
@@ -53,6 +58,7 @@ async function nativeFixture(database: LegacyDatabase, messages: Message[]) {
 					async sendResetPassword() {},
 				},
 				emailVerification: {
+					autoSignInAfterVerification: true,
 					async sendVerificationEmail({ user, url }) {
 						messages.push({ user, url, kind: "change-email-verification" });
 					},
@@ -160,6 +166,7 @@ describe.skipIf(!existsSync(fixturePath))(
 			for (const migration of [
 				"001-initial-auth.sql",
 				"002-control-plane.sql",
+				"004-webhooks.sql",
 				"005-free-plugins.sql",
 			])
 				await nativePool.query(
@@ -198,7 +205,10 @@ describe.skipIf(!existsSync(fixturePath))(
 			return message!.url;
 		}
 
-		function owned(ip: string | null = "203.0.113.117") {
+		function owned(
+			ip: string | null = "203.0.113.117",
+			requireEmailVerification = defaultAuthPolicy.requireEmailVerification,
+		) {
 			return createOwnedProjectEngine({
 				database,
 				project: { slug, schemaName: schema },
@@ -206,7 +216,7 @@ describe.skipIf(!existsSync(fixturePath))(
 				basePath: "/api/auth",
 				trustedOrigins: [],
 				signingSecret: secret,
-				policy: defaultAuthPolicy,
+				policy: { ...defaultAuthPolicy, requireEmailVerification },
 				trustedIP: () => ip,
 				recovery: {
 					publicLinkBaseURL: base,
@@ -588,6 +598,259 @@ describe.skipIf(!existsSync(fixturePath))(
 				email: account.email,
 				emailVerified: true,
 			});
+		});
+
+		it.each([
+			"ordinary",
+			"change-email",
+		] as const)("preserves the existing session and MFA boundary for %s verification", async (flow) => {
+			const legacy = (request: Request) => native.handler(request);
+			function cookieFrom(response: Response, kind: string) {
+				return response.headers
+					.getSetCookie()
+					.find(
+						(cookie) =>
+							cookie.startsWith(`__Secure-${cookiePrefix}.${kind}=`) &&
+							!cookie.includes("Max-Age=0"),
+					)
+					?.split(";", 1)[0];
+			}
+			for (const [index, [writer, trusted]] of (
+				[
+					["native", false],
+					["owned", false],
+					["native", true],
+					["owned", true],
+				] as const
+			).entries()) {
+				const engine = owned(
+					`203.0.113.${120 + (flow === "ordinary" ? 0 : 4) + index}`,
+					false,
+				);
+				const account = await user(
+					`${flow}-${writer}-${trusted}`,
+					flow === "change-email",
+				);
+				const enabled = await legacy(
+					post("/two-factor/enable", { password }, account.cookie),
+				);
+				expect(enabled.status).toBe(200);
+				const { backupCodes } = (await enabled.json()) as {
+					backupCodes: string[];
+				};
+				const {
+					rows: [factor],
+				} = await database.query<{ secret: string }>(
+					`SELECT secret FROM "${schema}"."twoFactor" WHERE "userId"=$1`,
+					[account.id],
+				);
+				const key = await symmetricDecrypt({
+					key: secret,
+					data: factor!.secret,
+				});
+				const { code } = await native.api.generateTOTP({
+					body: { secret: key },
+				});
+				const enrolled = await legacy(
+					post("/two-factor/verify-totp", { code }, account.cookie),
+				);
+				expect(enrolled.status).toBe(200);
+				let currentCookie = activeCookie(enrolled)!;
+				let trustedCookie: string | undefined;
+				let rememberCookie: string | undefined;
+				if (trusted) {
+					const rememberMe = flow !== "ordinary";
+					const pending = await legacy(
+						post("/sign-in/email", {
+							email: account.email,
+							password,
+							rememberMe,
+						}),
+					);
+					const proof = cookieFrom(pending, "two_factor");
+					expect(proof).toBeTruthy();
+					rememberCookie = cookieFrom(pending, "dont_remember");
+					expect(Boolean(rememberCookie)).toBe(!rememberMe);
+					const factorCookies = [proof, rememberCookie]
+						.filter(Boolean)
+						.join("; ");
+					const signedIn = await legacy(
+						post(
+							"/two-factor/verify-backup-code",
+							{ code: backupCodes[0], trustDevice: true },
+							factorCookies,
+						),
+					);
+					expect(signedIn.status).toBe(200);
+					currentCookie = activeCookie(signedIn)!;
+					trustedCookie = cookieFrom(signedIn, "trust_device");
+					expect(trustedCookie).toBeTruthy();
+				}
+				const existing = await session(currentCookie);
+				expect(existing).toMatchObject({
+					user: { id: account.id },
+					session: { id: expect.any(String) },
+				});
+				const cookies = [currentCookie, trustedCookie, rememberCookie]
+					.filter(Boolean)
+					.join("; ");
+				const source = writer === "native" ? "owned" : "native";
+				const dispatch = writer === "native" ? legacy : engine.dispatch;
+				const opposite = writer === "native" ? engine.dispatch : legacy;
+				let link: string;
+				const email =
+					flow === "ordinary" ? account.email : `updated-${account.email}`;
+				if (flow === "ordinary") {
+					if (source === "native") {
+						await native.api.sendVerificationEmail({
+							body: { email, callbackURL: destination },
+						});
+						link = await mailbox("change-email-verification", email, source);
+					} else {
+						const verification = createOwnedEmailVerification({
+							database,
+							schemaName: schema,
+							signingSecret: secret,
+						});
+						const url = new URL(`${base}/verify-email`);
+						url.searchParams.set("token", await verification.issue(account));
+						url.searchParams.set("callbackURL", destination);
+						link = url.href;
+					}
+				} else {
+					const started = await opposite(
+						post(
+							"/change-email",
+							{ newEmail: email, callbackURL: destination },
+							cookies,
+						),
+					);
+					expect(started.status).toBe(200);
+					const confirm = await mailbox(
+						"change-email-confirmation",
+						account.email,
+						source,
+					);
+					expect(
+						(await opposite(follow(confirm, cookies))).headers.get("location"),
+					).toBe(destination);
+					link = await mailbox("change-email-verification", email, source);
+				}
+				const endpointId = randomUUID();
+				await database.query(
+					`INSERT INTO "${schema}"."allauthWebhookEndpoint" (id,url,"eventTypes","encryptedSecret") VALUES ($1,'https://verify-mfa.fixture.example/receive','["session.created","session.deleted"]','fixture')`,
+					[endpointId],
+				);
+				try {
+					if (writer === "owned" && !trusted) {
+						const pendingProofs = async () =>
+							(
+								await database.query(
+									`SELECT id FROM "${schema}"."verification" WHERE starts_with(identifier,'2fa-') ORDER BY id`,
+								)
+							).rows;
+						const before = await pendingProofs();
+						await database.query(`
+							CREATE FUNCTION "${schema}"."fixtureRejectVerifySessionEvent"() RETURNS trigger LANGUAGE plpgsql AS $$
+							BEGIN
+								IF NEW.type = 'session.deleted' AND NEW.metadata->>'path' = '/verify-email' THEN
+									RAISE EXCEPTION 'Synthetic verification session event failure';
+								END IF;
+								RETURN NEW;
+							END $$;
+							CREATE TRIGGER "fixtureRejectVerifySessionEvent" BEFORE INSERT ON "${schema}"."allauthEvent"
+							FOR EACH ROW EXECUTE FUNCTION "${schema}"."fixtureRejectVerifySessionEvent"();
+						`);
+						try {
+							await expect(dispatch(follow(link, cookies))).rejects.toThrow(
+								"Synthetic verification session event failure",
+							);
+							expect(await pendingProofs()).toEqual(before);
+							expect(await session(currentCookie)).toMatchObject({
+								session: { id: existing!.session.id },
+							});
+							expect(await identity(account.id)).toEqual({
+								email: account.email,
+								emailVerified: flow === "change-email",
+							});
+						} finally {
+							await database.query(
+								`DROP TRIGGER "fixtureRejectVerifySessionEvent" ON "${schema}"."allauthEvent"; DROP FUNCTION "${schema}"."fixtureRejectVerifySessionEvent"()`,
+							);
+						}
+					}
+					const response = await dispatch(follow(link, cookies));
+					expect(response.status).toBe(302);
+					expect(await identity(account.id)).toEqual({
+						email,
+						emailVerified: true,
+					});
+					if (trusted) {
+						expect(response.headers.get("location")).toBe(destination);
+						expect(activeCookie(response)).toBe(currentCookie);
+						expect(cookieFrom(response, "dont_remember")).toBe(rememberCookie);
+						const sessionHeader = response.headers
+							.getSetCookie()
+							.find((value) => value.startsWith(`${cookieName}=`));
+						expect(sessionHeader?.includes("Max-Age=")).toBe(!rememberCookie);
+						expect(cookieFrom(response, "two_factor")).toBeUndefined();
+						expect(cookieFrom(response, "trust_device")).toBeTruthy();
+						expect(cookieFrom(response, "trust_device")).not.toBe(
+							trustedCookie,
+						);
+						expect(await session(currentCookie)).toMatchObject({
+							user: { id: account.id, email },
+							session: { id: existing!.session.id },
+						});
+					} else {
+						const callback = new URL(response.headers.get("location")!, origin);
+						expect(callback.pathname, `${writer} ${flow}`).toBe("/two-factor");
+						expect(callback.searchParams.get("callbackUrl")).toBe(
+							"/account?confirmed=true",
+						);
+						expect(activeCookie(response)).toBeUndefined();
+						expect(await session(currentCookie)).toBeNull();
+						const proof = cookieFrom(response, "two_factor");
+						expect(proof).toBeTruthy();
+						const completed = await opposite(
+							post(
+								"/two-factor/verify-backup-code",
+								{ code: backupCodes[0] },
+								proof,
+							),
+						);
+						expect(completed.status).toBe(200);
+						const replacement = await session(activeCookie(completed));
+						expect(replacement).toMatchObject({
+							user: { id: account.id, email },
+						});
+						expect(replacement?.session.id).not.toBe(existing?.session.id);
+					}
+					const events = await database.query(
+						`SELECT (payload#>'{data,event}') - ARRAY['id','createdAt'] AS event FROM "${schema}"."allauthWebhookDelivery" WHERE "endpointId"=$1 AND payload#>>'{data,event,metadata,path}'='/verify-email'`,
+						[endpointId],
+					);
+					expect(events.rows.map(({ event }) => event)).toEqual(
+						trusted
+							? []
+							: [
+									{
+										type: "session.deleted",
+										outcome: "success",
+										actorId: account.id,
+										userId: account.id,
+										targetId: existing?.session.id,
+										metadata: { path: "/verify-email" },
+									},
+								],
+					);
+				} finally {
+					await database.query(
+						`DELETE FROM "${schema}"."allauthWebhookEndpoint" WHERE id=$1`,
+						[endpointId],
+					);
+				}
+			}
 		});
 
 		it("consumes a native deletion link once after live owner checks and runs cleanup outside the user lock", async () => {
