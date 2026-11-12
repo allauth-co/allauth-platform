@@ -626,6 +626,25 @@ try {
 	const configuredWebhook = fencedSelection
 		? await startConfiguredWebhook(owned, rootCookie)
 		: undefined;
+	const googleClient = "allauth-engine-rehearsal.apps.googleusercontent.com";
+	if (fencedSelection && !railway) {
+		expectStatus(
+			await request(`/api/admin/projects/${owned.slug}/providers/google`, {
+				cookie: rootCookie,
+				method: "PATCH",
+				body: {
+					version: 0,
+					google: {
+						enabled: true,
+						clientId: googleClient,
+						clientSecret: "synthetic-google-credential",
+					},
+				},
+			}),
+			200,
+			"Configure the isolated Google sign-in fixture.",
+		);
+	}
 	const direct = `/api/projects/${owned.slug}/auth`;
 	const controlPath = `/api/projects/${control.slug}/auth`;
 	const selected = {
@@ -920,6 +939,36 @@ try {
 			assert.equal(
 				await query(restored, `SELECT count(*) FROM "${schema}"."verification" WHERE identifier LIKE 'magic-link:%'`),
 				"0",
+			);
+			const callbackURL = new URL(destination, `https://${host}`).href;
+			const socialBody = {
+				provider: "google",
+				callbackURL,
+				newUserCallbackURL: callbackURL,
+				disableRedirect: true,
+			};
+			assert.ok(Buffer.byteLength(JSON.stringify(socialBody)) > 8192);
+			const social = await request("/api/auth/hosted-ui/sign-in/social", {
+				host,
+				body: socialBody,
+				accept: "application/json",
+			});
+			expectStatus(
+				social,
+				200,
+				"The compiled hosted route starts Google with the long signed continuation.",
+			);
+			const provider = new URL((JSON.parse(social.body) as { url: string }).url);
+			assert.equal(provider.origin, "https://accounts.google.com");
+			assert.equal(provider.searchParams.get("client_id"), googleClient);
+			assert.equal(
+				provider.searchParams.get("redirect_uri"),
+				`https://${host}/api/auth/callback/google`,
+			);
+			expectStatus(
+				await request("/api/auth/sign-in/social", { host, body: socialBody }),
+				400,
+				"The standard social route retains the existing request limit.",
 			);
 		}
 	} else {
