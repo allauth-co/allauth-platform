@@ -1,11 +1,15 @@
 import { createHmac, randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
-import { symmetricDecrypt } from "better-auth/crypto";
+import { symmetricDecrypt, symmetricEncrypt } from "better-auth/crypto";
 import { getTestInstance } from "better-auth/test";
 import { Kysely, PostgresDialect } from "kysely";
 import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { clerkCompatiblePasswords } from "../clerk-password";
+import { allauthControl } from "../control";
+import { newWebhookSigningSecret } from "../control/webhook-contract";
+import type { ControlWebhookEnvelope } from "../control/webhooks";
+import { deliverPendingWebhooks, webhookSignature } from "../control/webhooks";
 import { productionTwoFactor } from "../mfa";
 import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
 import { readLegacySessionCookie } from "./legacy-session-cookie";
@@ -24,10 +28,14 @@ const password = "synthetic-enrollment-fixture-password";
 const prefix = `__Secure-allauth_project_${slug}.`;
 const sessionCookie = `${prefix}session_token`;
 const keys = { secret };
+const auditContext = {
+	ipAddress: "192.0.2.18",
+	userAgent: "Synthetic MFA browser",
+};
 
 type LegacyDatabase = Kysely<Record<string, Record<string, unknown>>>;
 
-async function nativeInstance(database: LegacyDatabase) {
+async function nativeInstance(database: LegacyDatabase, audit = false) {
 	return (
 		await getTestInstance(
 			{
@@ -38,7 +46,20 @@ async function nativeInstance(database: LegacyDatabase) {
 				secret,
 				emailAndPassword: { enabled: true, password: clerkCompatiblePasswords },
 				advanced: { cookiePrefix: `allauth_project_${slug}` },
-				plugins: [productionTwoFactor(origin, "/two-factor", issuer)],
+				plugins: [
+					productionTwoFactor(origin, "/two-factor", issuer),
+					...(audit
+						? [
+								allauthControl({
+									database,
+									secret,
+									baseURL: origin,
+									ipHeader: "x-real-ip",
+									requireTrustedIP: true,
+								}),
+							]
+						: []),
+				],
 			},
 			{ disableTestUser: true },
 		)
@@ -102,7 +123,9 @@ describe.skipIf(!existsSync(fixturePath))(
 					for (const migration of [
 						"001-initial-auth.sql",
 						"002-control-plane.sql",
+						"004-webhooks.sql",
 						"005-free-plugins.sql",
+						"006-analytics.sql",
 					]) {
 						await client.query(
 							readFileSync(
@@ -154,6 +177,12 @@ describe.skipIf(!existsSync(fixturePath))(
 				issuer,
 				secureCookies: true,
 				mfaRequired: options.mfaRequired ?? false,
+				auditContext(request) {
+					return {
+						ipAddress: request.headers.get("x-real-ip") ?? undefined,
+						userAgent: request.headers.get("user-agent") ?? undefined,
+					};
+				},
 				async lockAuthority(client, request, { fresh }) {
 					const token = readLegacySessionCookie(
 						request.headers,
@@ -456,6 +485,220 @@ describe.skipIf(!existsSync(fixturePath))(
 				{ method: "totp", code: await verifyCode(user.id) },
 			);
 			expect(checked).toMatchObject({ status: "rotated" });
+		});
+
+		it("delivers the same signed MFA enrollment and mutation events from both writers", async () => {
+			if (!nativeDatabase) throw new Error("Missing fixture database.");
+			const webhookDatabase = nativeDatabase;
+			const legacy = await nativeInstance(webhookDatabase, true);
+			const endpointId = randomUUID();
+			const endpoint = "https://webhooks.fixture.example/mfa";
+			const webhookSecret = newWebhookSigningSecret();
+			await database.query(
+				`INSERT INTO "${schema}"."allauthWebhookEndpoint" (id, url, "eventTypes", "encryptedSecret") VALUES ($1, $2, '["mfa.*"]', $3)`,
+				[
+					endpointId,
+					endpoint,
+					await symmetricEncrypt({ key: secret, data: webhookSecret }),
+				],
+			);
+			const wrongPassword = "synthetic-wrong-mfa-password";
+			const request = (path: string, body: unknown, cookie: string) => {
+				const result = post(path, body, cookie);
+				result.headers.set("x-real-ip", auditContext.ipAddress);
+				result.headers.set("user-agent", auditContext.userAgent);
+				return result;
+			};
+			async function signedEvents(userId: string, privateValues: string[]) {
+				const deliveries: Array<{
+					body: string;
+					headers: Record<string, string>;
+				}> = [];
+				const events: Array<
+					Omit<ControlWebhookEnvelope["data"]["event"], "id" | "createdAt">
+				> = [];
+				const ids = new Set<string>();
+				const result = await deliverPendingWebhooks({
+					database: webhookDatabase,
+					secret,
+					resolver: async () => [{ address: "93.184.216.34", family: 4 }],
+					now: () => new Date(Date.now() + 1_000),
+					maxDeliveries: 20,
+					transport: async ({ destination, body, headers }) => {
+						if (destination.url.href === endpoint)
+							deliveries.push({ body, headers });
+						return 204;
+					},
+				});
+				expect(result).toEqual({
+					delivered: deliveries.length,
+					claimed: deliveries.length,
+					failed: 0,
+					retried: 0,
+				});
+				for (const { body, headers } of deliveries) {
+					expect(headers["webhook-signature"]).toBe(
+						await webhookSignature(
+							webhookSecret,
+							headers["webhook-id"],
+							headers["webhook-timestamp"],
+							body,
+						),
+					);
+					const { id, type, timestamp, data } = JSON.parse(
+						body,
+					) as ControlWebhookEnvelope;
+					expect(data.event).toMatchObject({ id, type, createdAt: timestamp });
+					expect(data).not.toHaveProperty("user");
+					for (const value of [
+						password,
+						wrongPassword,
+						webhookSecret,
+						...privateValues,
+					])
+						expect(body).not.toContain(JSON.stringify(value));
+					const { id: _id, createdAt: _time, ...event } = data.event;
+					if (event.actorId) expect(event.actorId).toBe(userId);
+					if (event.userId) expect(event.userId).toBe(userId);
+					events.push({
+						...event,
+						actorId: event.actorId && "owner",
+						userId: event.userId && "owner",
+					});
+					ids.add(id);
+				}
+				expect(ids.size).toBe(deliveries.length);
+				return events.sort((a, b) =>
+					JSON.stringify(a).localeCompare(JSON.stringify(b)),
+				);
+			}
+
+			const oldUser = await signedIn();
+			const nativeSend = (
+				path: string,
+				body: unknown,
+				cookie = oldUser.cookie,
+			) => legacy.handler(request(`/two-factor/${path}`, body, cookie));
+			expect(
+				(await nativeSend("enable", { password: wrongPassword })).status,
+			).toBe(400);
+			const nativeSetup = await nativeSend("enable", { password });
+			expect(nativeSetup.status).toBe(200);
+			const { backupCodes: oldCodes } = (await nativeSetup.json()) as {
+				backupCodes: string[];
+			};
+			const oldCode = await verifyCode(oldUser.id);
+			const confirmation = await nativeSend("verify-totp", { code: oldCode });
+			expect(confirmation.status).toBe(200);
+			const oldCookie = cookies(confirmation);
+			expect(oldCookie).toBeTruthy();
+			expect(
+				(
+					await nativeSend(
+						"verify-totp",
+						{ code: await verifyCode(oldUser.id) },
+						oldCookie,
+					)
+				).status,
+			).toBe(200);
+			expect(
+				(
+					await nativeSend(
+						"verify-backup-code",
+						{ code: oldCodes[0] },
+						oldCookie,
+					)
+				).status,
+			).toBe(200);
+			expect(
+				(
+					await nativeSend(
+						"generate-backup-codes",
+						{ password: wrongPassword },
+						oldCookie,
+					)
+				).status,
+			).toBe(400);
+			expect(
+				(await nativeSend("generate-backup-codes", { password }, oldCookie))
+					.status,
+			).toBe(200);
+			expect(
+				(await nativeSend("disable", { password: wrongPassword }, oldCookie))
+					.status,
+			).toBe(400);
+			expect(
+				(await nativeSend("disable", { password }, oldCookie)).status,
+			).toBe(200);
+			const expected = await signedEvents(oldUser.id, [
+				oldCode,
+				oldCookie,
+				...oldCodes,
+			]);
+			expect(
+				expected.map(({ type, outcome }) => `${type}:${outcome}`).sort(),
+			).toEqual([
+				"mfa.disabled:failure",
+				"mfa.disabled:success",
+				"mfa.enrollment-started:failure",
+				"mfa.enrollment-started:success",
+				"mfa.recovery-codes-rotated:failure",
+				"mfa.recovery-codes-rotated:success",
+				"mfa.verified:success",
+			]);
+
+			const user = await signedIn();
+			const enrollment = owned();
+			const enable = request("/two-factor/enable", {}, user.cookie);
+			expect(
+				await enrollment.enable(enable, { password: wrongPassword }),
+			).toMatchObject({ code: "INVALID_PASSWORD" });
+			const setup = await enrollment.enable(enable, { password });
+			if (setup.status !== "setup")
+				throw new Error("Could not set up owned MFA.");
+			const code = await verifyCode(user.id);
+			const confirm = request("/two-factor/verify-totp", {}, user.cookie);
+			await expect(
+				owned({ failRotation: true }).verify(confirm, { method: "totp", code }),
+			).rejects.toThrow("Synthetic rotation failure.");
+			const verified = await enrollment.verify(confirm, {
+				method: "totp",
+				code,
+			});
+			if (verified.status !== "rotated")
+				throw new Error("Could not confirm owned MFA.");
+			const cookie = verified.value.cookie;
+			expect(
+				await enrollment.verify(
+					request("/two-factor/verify-totp", {}, cookie),
+					{ method: "totp", code: await verifyCode(user.id) },
+				),
+			).toMatchObject({ status: "verified" });
+			expect(
+				await enrollment.verify(
+					request("/two-factor/verify-backup-code", {}, cookie),
+					{ method: "backup", code: setup.backupCodes[0]! },
+				),
+			).toMatchObject({ status: "verified" });
+			const recover = request("/two-factor/generate-backup-codes", {}, cookie);
+			expect(
+				await enrollment.rotateBackupCodes(recover, {
+					password: wrongPassword,
+				}),
+			).toMatchObject({ code: "INVALID_PASSWORD" });
+			expect(
+				await enrollment.rotateBackupCodes(recover, { password }),
+			).toMatchObject({ status: "codes" });
+			const disable = request("/two-factor/disable", {}, cookie);
+			expect(
+				await enrollment.disable(disable, { password: wrongPassword }),
+			).toMatchObject({ code: "INVALID_PASSWORD" });
+			expect(await enrollment.disable(disable, { password })).toMatchObject({
+				status: "rotated",
+			});
+			expect(
+				await signedEvents(user.id, [code, cookie, ...setup.backupCodes]),
+			).toEqual(expected);
 		});
 
 		it("rolls back failed rotation and revokes only the selected realm on disable", async () => {

@@ -7,6 +7,7 @@ import {
 import type { Pool, PoolClient } from "pg";
 import { defaultPasswordPolicy } from "../auth-policy/password";
 import { clerkCompatiblePasswords } from "../clerk-password";
+import type { ControlEventInput } from "../control/types";
 import type { LegacyMfaKeys } from "./legacy-mfa-record";
 import { openLegacyMfaRecord, sealLegacyMfaRecord } from "./legacy-mfa-record";
 import {
@@ -29,6 +30,12 @@ type Factor = {
 type MutationPath = "/two-factor/verify-totp" | "/two-factor/disable";
 type PasswordInput = { password?: string };
 
+const mutationEvents = {
+	"/two-factor/enable": "mfa.enrollment-started",
+	"/two-factor/disable": "mfa.disabled",
+	"/two-factor/generate-backup-codes": "mfa.recovery-codes-rotated",
+} as const;
+
 interface Options<User extends MfaUser, Session extends MfaSession, Rotation> {
 	database: Pool;
 	project: Pick<Project, "schemaName" | "slug">;
@@ -36,6 +43,10 @@ interface Options<User extends MfaUser, Session extends MfaSession, Rotation> {
 	issuer: string;
 	secureCookies: boolean;
 	mfaRequired: boolean;
+	/** Project-resolved browser event provenance. */
+	auditContext(
+		request: Request,
+	): Pick<ControlEventInput, "ipAddress" | "userAgent">;
 	/** Resolve and lock a current, authorized database session. Lock its user before the session. */
 	lockAuthority(
 		client: PoolClient,
@@ -134,6 +145,47 @@ export function createOwnedMfaEnrollment<
 	const expired = (name: string) =>
 		`${prefix}${name}=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax${secureCookies ? "; Secure" : ""}`;
 
+	function recordMfaEvent(
+		client: PoolClient,
+		request: Request,
+		userId: string,
+		type: string,
+		path: string,
+		errorCode?: string,
+	) {
+		return store.recordEvent(client, {
+			...options.auditContext(request),
+			type,
+			outcome: errorCode ? "failure" : "success",
+			actorId: userId,
+			userId,
+			metadata: { path, ...(errorCode ? { errorCode } : {}) },
+		});
+	}
+
+	function auditedMutation<T extends { status: string; code?: string }>(
+		request: Request,
+		path: keyof typeof mutationEvents,
+		work: (client: PoolClient, auth: Authority<User, Session>) => Promise<T>,
+	) {
+		return store.transaction(async (client) => {
+			const auth = await options.lockAuthority(client, request, {
+				fresh: false,
+			});
+			if (!auth) return reject("unauthorized");
+			const result = await work(client, auth);
+			await recordMfaEvent(
+				client,
+				request,
+				auth.user.id,
+				mutationEvents[path],
+				path,
+				result.status === "rejected" ? result.code : undefined,
+			);
+			return result;
+		});
+	}
+
 	async function lockFactor(client: PoolClient, userId: string) {
 		return (
 			await client.query<Factor>(
@@ -173,49 +225,42 @@ export function createOwnedMfaEnrollment<
 		request: Request,
 		input: PasswordInput & { issuer?: string; method?: "totp" | "otp" },
 	) {
-		return store.transaction(async (client) => {
-			const auth = await options.lockAuthority(client, request, {
-				fresh: false,
-			});
-			if (!auth) return reject("unauthorized");
-			const { id, email } = auth.user;
-			const denied = await authorizePassword(client, id, input.password);
-			if (denied) return denied;
-			if (input.method === "otp") return reject("otpUnsupported");
-			const factors = await lockFactor(client, id);
-			if (factors.length > 1) return reject("duplicateFactor");
-			const existing = factors[0];
-			if (existing && existing.verified !== false)
-				return reject("alreadyEnrolled");
-			const secret = randomBytes(24).toString("base64url");
-			const codes = newBackupCodes();
-			const encrypted = sealLegacyMfaRecord(secret, keys);
-			const encryptedCodes = sealLegacyMfaRecord(JSON.stringify(codes), keys);
-			if (existing) {
-				await client.query(
-					`UPDATE "${schema}"."twoFactor" SET secret = $1, "backupCodes" = $2, verified = FALSE WHERE id = $3`,
-					[encrypted, encryptedCodes, existing.id],
-				);
-			} else {
-				await client.query(
-					`INSERT INTO "${schema}"."twoFactor" (id, secret, "backupCodes", "userId", verified) VALUES ($1, $2, $3, $4, FALSE)`,
-					[randomUUID(), encrypted, encryptedCodes, id],
-				);
-			}
-			await store.record(
-				client,
-				"mfa.enrollment-started",
-				"success",
-				"/two-factor/enable",
-				id,
-			);
-			return {
-				status: "setup" as const,
-				method: "totp" as const,
-				totpURI: ownedMfaTotpUri(secret, input.issuer || issuer, email),
-				backupCodes: codes,
-			};
-		});
+		return auditedMutation(
+			request,
+			"/two-factor/enable",
+			async (client, auth) => {
+				const { id, email } = auth.user;
+				const denied = await authorizePassword(client, id, input.password);
+				if (denied) return denied;
+				if (input.method === "otp") return reject("otpUnsupported");
+				const factors = await lockFactor(client, id);
+				if (factors.length > 1) return reject("duplicateFactor");
+				const existing = factors[0];
+				if (existing && existing.verified !== false)
+					return reject("alreadyEnrolled");
+				const secret = randomBytes(24).toString("base64url");
+				const codes = newBackupCodes();
+				const encrypted = sealLegacyMfaRecord(secret, keys);
+				const encryptedCodes = sealLegacyMfaRecord(JSON.stringify(codes), keys);
+				if (existing) {
+					await client.query(
+						`UPDATE "${schema}"."twoFactor" SET secret = $1, "backupCodes" = $2, verified = FALSE WHERE id = $3`,
+						[encrypted, encryptedCodes, existing.id],
+					);
+				} else {
+					await client.query(
+						`INSERT INTO "${schema}"."twoFactor" (id, secret, "backupCodes", "userId", verified) VALUES ($1, $2, $3, $4, FALSE)`,
+						[randomUUID(), encrypted, encryptedCodes, id],
+					);
+				}
+				return {
+					status: "setup" as const,
+					method: "totp" as const,
+					totpURI: ownedMfaTotpUri(secret, input.issuer || issuer, email),
+					backupCodes: codes,
+				};
+			},
+		);
 	}
 
 	async function rotate(
@@ -285,8 +330,6 @@ export function createOwnedMfaEnrollment<
 			);
 			await store.record(client, action, "success", path, userId, userId);
 		}
-		if (!enabled)
-			await store.record(client, "mfa.disabled", "success", path, userId);
 		return {
 			status: "rotated" as const,
 			value: replacement.value,
@@ -333,8 +376,18 @@ export function createOwnedMfaEnrollment<
 					`UPDATE "${schema}"."twoFactor" SET verified = TRUE WHERE id = $1`,
 					[factor.id],
 				);
-				if (!auth.user.twoFactorEnabled)
-					return rotate(client, request, auth, true, "/two-factor/verify-totp");
+				if (!auth.user.twoFactorEnabled) {
+					const path = "/two-factor/verify-totp";
+					const result = await rotate(client, request, auth, true, path);
+					await recordMfaEvent(
+						client,
+						request,
+						auth.user.id,
+						"mfa.verified",
+						path,
+					);
+					return result;
+				}
 			}
 			return { status: "verified" as const, authority: auth };
 		});
@@ -342,23 +395,23 @@ export function createOwnedMfaEnrollment<
 
 	async function disable(request: Request, input: PasswordInput) {
 		if (options.mfaRequired) return reject("required");
-		return store.transaction(async (client) => {
-			const auth = await options.lockAuthority(client, request, {
-				fresh: false,
-			});
-			if (!auth) return reject("unauthorized");
-			const denied = await authorizePassword(
-				client,
-				auth.user.id,
-				input.password,
-			);
-			if (denied) return denied;
-			await client.query(
-				`DELETE FROM "${schema}"."twoFactor" WHERE "userId" = $1`,
-				[auth.user.id],
-			);
-			return rotate(client, request, auth, false, "/two-factor/disable");
-		});
+		return auditedMutation(
+			request,
+			"/two-factor/disable",
+			async (client, auth) => {
+				const denied = await authorizePassword(
+					client,
+					auth.user.id,
+					input.password,
+				);
+				if (denied) return denied;
+				await client.query(
+					`DELETE FROM "${schema}"."twoFactor" WHERE "userId" = $1`,
+					[auth.user.id],
+				);
+				return rotate(client, request, auth, false, "/two-factor/disable");
+			},
+		);
 	}
 
 	async function readTotp(request: Request, input: PasswordInput) {
@@ -386,36 +439,29 @@ export function createOwnedMfaEnrollment<
 	}
 
 	async function rotateBackupCodes(request: Request, input: PasswordInput) {
-		return store.transaction(async (client) => {
-			const auth = await options.lockAuthority(client, request, {
-				fresh: false,
-			});
-			if (!auth) return reject("unauthorized");
-			if (!auth.user.twoFactorEnabled) return reject("mfaNotEnabled");
-			const denied = await authorizePassword(
-				client,
-				auth.user.id,
-				input.password,
-			);
-			if (denied) return denied;
-			const factors = await lockFactor(client, auth.user.id);
-			if (factors.length > 1) return reject("duplicateFactor");
-			const factor = factors[0];
-			if (!factor) return reject("mfaNotEnabled");
-			const codes = newBackupCodes();
-			await client.query(
-				`UPDATE "${schema}"."twoFactor" SET "backupCodes" = $1 WHERE id = $2`,
-				[sealLegacyMfaRecord(JSON.stringify(codes), keys), factor.id],
-			);
-			await store.record(
-				client,
-				"mfa.recovery-codes-rotated",
-				"success",
-				"/two-factor/generate-backup-codes",
-				auth.user.id,
-			);
-			return { status: "codes" as const, backupCodes: codes };
-		});
+		return auditedMutation(
+			request,
+			"/two-factor/generate-backup-codes",
+			async (client, auth) => {
+				if (!auth.user.twoFactorEnabled) return reject("mfaNotEnabled");
+				const denied = await authorizePassword(
+					client,
+					auth.user.id,
+					input.password,
+				);
+				if (denied) return denied;
+				const factors = await lockFactor(client, auth.user.id);
+				if (factors.length > 1) return reject("duplicateFactor");
+				const factor = factors[0];
+				if (!factor) return reject("mfaNotEnabled");
+				const codes = newBackupCodes();
+				await client.query(
+					`UPDATE "${schema}"."twoFactor" SET "backupCodes" = $1 WHERE id = $2`,
+					[sealLegacyMfaRecord(JSON.stringify(codes), keys), factor.id],
+				);
+				return { status: "codes" as const, backupCodes: codes };
+			},
+		);
 	}
 
 	return { enable, verify, disable, readTotp, rotateBackupCodes };

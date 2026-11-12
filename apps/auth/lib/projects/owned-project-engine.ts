@@ -997,6 +997,7 @@ export function createOwnedProjectEngine(
 		issuer: options.appName ?? options.passkeys?.name ?? "AllAuth",
 		secureCookies: secure,
 		mfaRequired: policy.mfaMode === "required",
+		auditContext: browserEventContext,
 		async lockAuthority(client, request, { fresh }) {
 			const current = await currentSession(request.headers, client);
 			if (!current) return null;
