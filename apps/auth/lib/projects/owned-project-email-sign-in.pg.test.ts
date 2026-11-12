@@ -1,12 +1,18 @@
 import { createHash, createHmac, randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
+import { betterAuth } from "better-auth";
+import { symmetricEncrypt } from "better-auth/crypto";
 import { emailOTP, magicLink } from "better-auth/plugins";
 import { getTestInstance } from "better-auth/test";
 import { Kysely, PostgresDialect } from "kysely";
 import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { createAuthOptions } from "../auth";
 import { defaultAuthPolicy } from "../auth-policy/policy";
 import { clerkCompatiblePasswords } from "../clerk-password";
+import { newWebhookSigningSecret } from "../control/webhook-contract";
+import type { ControlWebhookEnvelope } from "../control/webhooks";
+import { deliverPendingWebhooks, webhookSignature } from "../control/webhooks";
 import { productionTwoFactor } from "../mfa";
 import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
 import { sealLegacyMfaRecord } from "./legacy-mfa-record";
@@ -110,6 +116,7 @@ describe.skipIf(!existsSync(fixturePath))(
 	() => {
 		const databaseName = `allauth_hosted_${randomUUID().replaceAll("-", "")}`;
 		const schema = `allauth_project_${randomUUID().replaceAll("-", "")}`;
+		const foreignSchema = `allauth_project_${randomUUID().replaceAll("-", "")}`;
 		const nativeMagic: { url: string; token: string }[] = [];
 		const nativeCodes: string[] = [];
 		let administrator: Pool | undefined;
@@ -153,7 +160,9 @@ describe.skipIf(!existsSync(fixturePath))(
 			for (const migration of [
 				"001-initial-auth.sql",
 				"002-control-plane.sql",
+				"004-webhooks.sql",
 				"005-free-plugins.sql",
+				"006-analytics.sql",
 			])
 				await pool.query(
 					readFileSync(
@@ -161,6 +170,11 @@ describe.skipIf(!existsSync(fixturePath))(
 						"utf8",
 					),
 				);
+			await database.query(`BEGIN;
+				CREATE SCHEMA "${foreignSchema}";
+				SET LOCAL search_path TO "${foreignSchema}";
+				${readFileSync(new URL("../../migrations/001-initial-auth.sql", import.meta.url), "utf8")}
+				COMMIT;`);
 			native = await legacyFixture(nativeDatabase, nativeMagic, nativeCodes);
 		});
 
@@ -672,6 +686,355 @@ describe.skipIf(!existsSync(fixturePath))(
 			).resolves.toMatchObject({
 				user: { id: user.id, emailVerified: true },
 			});
+		});
+
+		it.each([
+			["magic-link", true, "192.0.2.130"],
+			["magic-link", false, "192.0.2.131"],
+			["email-otp", true, "192.0.2.132"],
+			["email-otp", false, "192.0.2.133"],
+		] as const)("delivers native %s device replacement with active browser cookie %s", async (method, activeCookie, ip) => {
+			if (!nativeDatabase) throw new Error("Missing fixture database.");
+			const webhookDatabase = nativeDatabase;
+			const realm = `"${schema}"`;
+			const foreignRealm = `"${foreignSchema}"`;
+			const path =
+				method === "magic-link" ? "/magic-link/verify" : "/sign-in/email-otp";
+			const mail: { to: string; html: string }[] = [];
+			const environment = {
+				EMAIL_PROVIDER: "cloudflare" as const,
+				EMAIL_FROM: "no-reply@email-proof-fixture.example",
+				EMAIL: {
+					async send(value: { to: string; html: string }) {
+						mail.push(value);
+					},
+				},
+			};
+			const options = createAuthOptions(
+				{ db: webhookDatabase, type: "postgres", transaction: true },
+				{
+					...environment,
+					ALLAUTH_AUTH_URL: origin,
+					ALLAUTH_AUTH_SECRET: signingSecret,
+					AUTH_RUNTIME: "node",
+					SCIM_CREDENTIAL_HASH_SECRET:
+						"synthetic-email-replacement-scim-fixture-key",
+				},
+				{
+					name: "Email replacement fixture",
+					basePath,
+					cookiePrefix: `allauth_project_${slug}`,
+					primaryOrigin: appOrigin,
+					origins: [appOrigin],
+					broker: {
+						clientId: "fixture-broker",
+						clientSecret: "synthetic-broker-secret",
+					},
+					authorizeAdmin: async () => null,
+					management: { id: "email-replacement-fixture" },
+				},
+			);
+			const installed = betterAuth({ ...options, logger: { disabled: true } });
+			const candidate = createOwnedProjectEngine({
+				database,
+				project: { schemaName: schema, slug },
+				baseURL: origin,
+				basePath,
+				signingSecret,
+				policy: defaultAuthPolicy,
+				trustedOrigins: [appOrigin],
+				trustedIP: (input) => input.headers.get("x-real-ip"),
+				emailSignIn: {
+					publicLinkBaseURL: `${appOrigin}/api/allauth`,
+					callbackURLs: [destination],
+					email: { environment },
+					async admit() {
+						return { allowed: true, retryAfter: 0 };
+					},
+					defer: () => {},
+				},
+			});
+			function withBrowser(input: Request, clientIP: string, cookie?: string) {
+				input.headers.set("x-real-ip", clientIP);
+				if (cookie) input.headers.set("cookie", cookie);
+				return input;
+			}
+			const sessionName = `__Secure-allauth_project_${slug}.session_token`;
+			const setCookie = (response: Response, name: string) =>
+				response.headers
+					.getSetCookie()
+					.find((cookie) => cookie.startsWith(`${name}=`))
+					?.split(";", 1)[0] ?? "";
+			async function savedSession(email: string, clientIP: string) {
+				const signedIn = await installed.handler(
+					withBrowser(post("sign-in/email", { email, password }), clientIP),
+				);
+				expect(signedIn.status).toBe(200);
+				const primary = setCookie(signedIn, sessionName);
+				const active = await installed.api.getSession({
+					headers: new Headers({ cookie: primary }),
+				});
+				if (!active) throw new Error("Expected an installed native session.");
+				const deviceName = `${sessionName}_multi-${active.session.token.toLowerCase()}`;
+				const device = setCookie(signedIn, deviceName);
+				expect(device).toBeTruthy();
+				return { primary, device, deviceName, ...active.session };
+			}
+			async function exercise(writer: "legacy" | "owned", clientIP: string) {
+				const owner = await seed(`${randomUUID()}@fixture.example`);
+				const browser = await seed(`${randomUUID()}@fixture.example`);
+				const active = await savedSession(browser.email, clientIP);
+				const previous = await savedSession(owner.email, clientIP);
+				const sibling = await savedSession(owner.email, clientIP);
+				const endpoint = `https://email-replacement-${writer}.fixture.example/receive`;
+				const endpointId = randomUUID();
+				const webhookSecret = newWebhookSigningSecret();
+				const clientId = randomUUID();
+				const grants = ["access", "online", "offline", "sibling"].map(
+					(kind) => ({ kind, id: randomUUID() }),
+				);
+				try {
+					await database.query(
+						`INSERT INTO ${realm}."allauthWebhookEndpoint" (id,url,"eventTypes","encryptedSecret") VALUES ($1,$2,'["session.deleted"]',$3)`,
+						[
+							endpointId,
+							endpoint,
+							await symmetricEncrypt({
+								key: signingSecret,
+								data: webhookSecret,
+							}),
+						],
+					);
+					await database.query(
+						`INSERT INTO ${realm}."oauthClient" (id,"clientId","redirectUris") VALUES ($1,$1,'[]')`,
+						[clientId],
+					);
+					for (const { kind, id } of grants) {
+						const table =
+							kind === "access" ? "oauthAccessToken" : "oauthRefreshToken";
+						await database.query(
+							`INSERT INTO ${realm}."${table}" (id,token,"sessionId","userId","clientId","expiresAt","createdAt",scopes) VALUES ($1,$1,$2,$3,$4,now()+interval '1 day',now(),$5)`,
+							[
+								id,
+								kind === "sibling" ? sibling.id : previous.id,
+								owner.id,
+								clientId,
+								JSON.stringify(
+									kind === "offline"
+										? ["openid", "offline_access"]
+										: ["openid"],
+								),
+							],
+						);
+					}
+					await database.query(
+						`INSERT INTO ${foreignRealm}."user" (id,name,email,"emailVerified") VALUES ($1,'Fixture',$2,true)`,
+						[owner.id, owner.email],
+					);
+					await database.query(
+						`INSERT INTO ${foreignRealm}.session (id,token,"userId","expiresAt","updatedAt") VALUES ($1,$2,$3,now()+interval '1 day',now())`,
+						[previous.id, previous.token, owner.id],
+					);
+					await database.query(
+						`INSERT INTO ${foreignRealm}."oauthClient" (id,"clientId","redirectUris") VALUES ($1,$1,'[]')`,
+						[clientId],
+					);
+					const foreignGrant = grants.find(
+						({ kind }) => kind === "offline",
+					)!.id;
+					await database.query(
+						`INSERT INTO ${foreignRealm}."oauthRefreshToken" (id,token,"sessionId","userId","clientId","expiresAt","createdAt",scopes) VALUES ($1,$1,$2,$3,$4,now()+interval '1 day',now(),'["offline_access"]')`,
+						[foreignGrant, previous.id, owner.id, clientId],
+					);
+					const before = mail.length;
+					const issue =
+						method === "magic-link"
+							? post("sign-in/magic-link", {
+									email: owner.email,
+									callbackURL: destination,
+								})
+							: post("email-otp/send-verification-otp", {
+									email: owner.email,
+									type: "sign-in",
+								});
+					expect(
+						(await installed.handler(withBrowser(issue, clientIP))).status,
+					).toBe(200);
+					const message = mail
+						.slice(before)
+						.find(({ to }) => to === owner.email);
+					if (!message)
+						throw new Error("Expected an in-process native sign-in email.");
+					const proof =
+						method === "magic-link"
+							? magicLinkFromEmail(message.html)
+							: otpFromEmail(message.html);
+					const proofToken =
+						method === "magic-link"
+							? new URL(proof).searchParams.get("token")
+							: proof;
+					if (!proofToken) throw new Error("Expected a native email proof.");
+					const completion =
+						method === "magic-link"
+							? browserLink(proof)
+							: post("sign-in/email-otp", { email: owner.email, otp: proof });
+					const incoming = withBrowser(
+						completion,
+						clientIP,
+						[activeCookie ? active.primary : "", active.device, previous.device]
+							.filter(Boolean)
+							.join("; "),
+					);
+					const completed = await (writer === "legacy"
+						? installed.handler(incoming)
+						: candidate.dispatch(incoming));
+					expect(completed.status).toBe(method === "magic-link" ? 302 : 200);
+					if (method === "magic-link")
+						expect(location(completed).href).toBe(destination);
+					const replacement = await installed.api.getSession({
+						headers: new Headers({ cookie: setCookie(completed, sessionName) }),
+					});
+					if (!replacement)
+						throw new Error("Expected a native-readable session.");
+					expect(replacement.user.id).toBe(owner.id);
+					expect(
+						completed.headers
+							.getSetCookie()
+							.some(
+								(cookie) =>
+									cookie.startsWith(`${previous.deviceName}=;`) &&
+									cookie.includes("Max-Age=0"),
+							),
+					).toBe(true);
+					expect(
+						completed.headers
+							.getSetCookie()
+							.some((cookie) => cookie.startsWith(`${active.deviceName}=`)),
+					).toBe(false);
+					const sessions = await database.query<{ id: string }>(
+						`SELECT id FROM ${realm}.session WHERE "userId"=ANY($1::text[]) ORDER BY id`,
+						[[owner.id, browser.id]],
+					);
+					expect(sessions.rows.map(({ id }) => id)).toEqual(
+						[active.id, sibling.id, replacement.session.id].sort(),
+					);
+					const remaining = await database.query<{
+						id: string;
+						revoked: boolean;
+						sessionId: string | null;
+					}>(
+						`SELECT id,revoked IS NOT NULL AS revoked,"sessionId" FROM ${realm}."oauthAccessToken" WHERE "clientId"=$1 UNION ALL SELECT id,revoked IS NOT NULL AS revoked,"sessionId" FROM ${realm}."oauthRefreshToken" WHERE "clientId"=$1`,
+						[clientId],
+					);
+					expect(remaining.rows).toHaveLength(grants.length);
+					for (const { kind, id } of grants)
+						expect(remaining.rows.find((row) => row.id === id)).toEqual({
+							id,
+							revoked: kind === "access" || kind === "online",
+							sessionId: kind === "sibling" ? sibling.id : null,
+						});
+					expect(
+						(
+							await database.query(
+								`SELECT s.id,r.revoked FROM ${foreignRealm}.session s JOIN ${foreignRealm}."oauthRefreshToken" r ON r."sessionId"=s.id WHERE s.token=$1 AND r.id=$2`,
+								[previous.token, foreignGrant],
+							)
+						).rows,
+					).toEqual([{ id: previous.id, revoked: null }]);
+					const delivered: ControlWebhookEnvelope["data"]["event"][] = [];
+					const state = await deliverPendingWebhooks({
+						database: webhookDatabase,
+						secret: signingSecret,
+						resolver: async () => [{ address: "93.184.216.34", family: 4 }],
+						now: () => new Date(Date.now() + 1_000),
+						transport: async ({ destination, body, headers }) => {
+							expect(destination.url.href).toBe(endpoint);
+							expect(headers["webhook-signature"]).toBe(
+								await webhookSignature(
+									webhookSecret,
+									headers["webhook-id"],
+									headers["webhook-timestamp"],
+									body,
+								),
+							);
+							const { data, id, type, timestamp } = JSON.parse(
+								body,
+							) as ControlWebhookEnvelope;
+							expect(data.event).toMatchObject({
+								id,
+								type,
+								createdAt: timestamp,
+							});
+							expect(data.user).toBeUndefined();
+							for (const privateValue of [
+								owner.email,
+								browser.email,
+								active.token,
+								previous.token,
+								sibling.token,
+								replacement.session.token,
+								proofToken,
+								...grants.map(({ id }) => id),
+							])
+								expect(body).not.toContain(JSON.stringify(privateValue));
+							delivered.push(data.event);
+							return 204;
+						},
+					});
+					expect(state).toMatchObject({ claimed: 1, delivered: 1 });
+					expect(delivered).toHaveLength(1);
+					const {
+						id: _id,
+						createdAt: _time,
+						actorId,
+						userId,
+						targetId,
+						...event
+					} = delivered[0]!;
+					expect(userId).toBe(owner.id);
+					expect(targetId).toBe(previous.id);
+					return {
+						...event,
+						actor:
+							actorId === undefined
+								? undefined
+								: actorId === browser.id
+									? "browser"
+									: "other",
+					};
+				} finally {
+					await database.query(
+						`DELETE FROM ${realm}."allauthWebhookEndpoint" WHERE id=$1`,
+						[endpointId],
+					);
+					await database.query(
+						`DELETE FROM ${realm}."oauthClient" WHERE id=$1`,
+						[clientId],
+					);
+					await database.query(
+						`DELETE FROM ${realm}."user" WHERE id=ANY($1::text[])`,
+						[[owner.id, browser.id]],
+					);
+					await database.query(
+						`DELETE FROM ${foreignRealm}."user" WHERE id=$1`,
+						[owner.id],
+					);
+					await database.query(
+						`DELETE FROM ${foreignRealm}."oauthClient" WHERE id=$1`,
+						[clientId],
+					);
+				}
+			}
+			const expected = await exercise("legacy", ip);
+			expect(expected).toEqual({
+				type: "session.deleted",
+				outcome: "success",
+				actor: activeCookie ? "browser" : undefined,
+				metadata: { path },
+			});
+			expect(
+				await exercise("owned", ip.replace("192.0.2.", "198.51.100.")),
+			).toEqual(expected);
 		});
 
 		it("consumes an existing native magic link once and leaves a native-readable session", async () => {

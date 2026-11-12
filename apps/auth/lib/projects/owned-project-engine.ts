@@ -755,7 +755,12 @@ export function createOwnedProjectEngine(
 		}
 		if (owned.length) {
 			let actorId: string | null | undefined;
-			if (path === "/sign-in/email" || path === "/sign-in/username") {
+			if (
+				path === "/sign-in/email" ||
+				path === "/sign-in/username" ||
+				path === "/magic-link/verify" ||
+				path === "/sign-in/email-otp"
+			) {
 				// The legacy anonymous-session hook reads the incoming browser session before multi-session cleanup.
 				const browserToken = tokenFrom(request.headers);
 				const browser = browserToken
