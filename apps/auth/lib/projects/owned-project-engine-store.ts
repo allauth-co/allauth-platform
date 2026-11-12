@@ -246,14 +246,38 @@ export function createProjectEngineStore(database: Pool, schemaName: string) {
 						);
 			const ids = selected.rows.map((row) => row.id);
 			if (ids.length === 0) return ids;
-			const linked = await client.query<{ present: boolean }>(
-				`SELECT (EXISTS (SELECT 1 FROM "oauthRefreshToken" WHERE "sessionId" = ANY($1::text[]))
-					OR EXISTS (SELECT 1 FROM "oauthAccessToken" WHERE "sessionId" = ANY($1::text[]))
-					OR ($2 AND EXISTS (SELECT 1 FROM "account" WHERE "providerId" <> 'credential'
-						AND "userId" = ANY($3::text[])))) AS present`,
+			const deferredLogout = await client.query<{ required: boolean }>(
+				`SELECT (
+					EXISTS (
+						SELECT 1 FROM "oauthClient" c
+						WHERE c.disabled IS DISTINCT FROM true AND NULLIF(c."backchannelLogoutUri", '') IS NOT NULL
+							AND (
+								EXISTS (SELECT 1 FROM "oauthRefreshToken" r WHERE r."clientId" = c."clientId" AND r."sessionId" = ANY($1::text[]))
+								OR EXISTS (SELECT 1 FROM "oauthAccessToken" a WHERE a."clientId" = c."clientId" AND a."sessionId" = ANY($1::text[]))
+							)
+					)
+					OR ($2 AND EXISTS (
+						SELECT 1 FROM "account" WHERE "providerId" NOT IN ('credential', 'allauth', 'google')
+							AND "userId" = ANY($3::text[])
+					))
+				) AS required`,
 				[ids, path === "/sign-out", selected.rows.map((row) => row.userId)],
 			);
-			if (linked.rows[0]?.present) return null;
+			if (deferredLogout.rows[0]?.required) return null;
+
+			// The session foreign key clears on deletion. Revoke the linked grants first,
+			// retaining offline refresh authority as the native issuer does.
+			await client.query(
+				`UPDATE "oauthAccessToken" SET revoked = statement_timestamp()
+				 WHERE "sessionId" = ANY($1::text[]) AND revoked IS NULL`,
+				[ids],
+			);
+			await client.query(
+				`UPDATE "oauthRefreshToken" SET revoked = statement_timestamp()
+				 WHERE "sessionId" = ANY($1::text[]) AND revoked IS NULL
+				   AND NOT (scopes ? 'offline_access')`,
+				[ids],
+			);
 			await client.query('DELETE FROM "session" WHERE id = ANY($1::text[])', [
 				ids,
 			]);

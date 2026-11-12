@@ -397,11 +397,12 @@ describe.skipIf(!existsSync(fixturePath))("isolated PostgreSQL owned project eng
 		expect(await (await owner.dispatch(request("/get-session", undefined, headers))).json()).toBeNull();
 	});
 
-	it("refuses to mutate an OAuth-linked session or unsupported authentication flow", async () => {
+	it("rejects candidate logout when the session has configured back-channel delivery", async () => {
 		const userId = await seed("oauth-session-owner@fixture.example");
 		const active = await legacySession(userId, 1200);
 		const clientId = "isolated-test-client";
-		await database.query(`INSERT INTO "${schema}"."oauthClient"(id,"clientId","redirectUris") VALUES ($1,$2,'[]')`, [randomUUID(), clientId]);
+		await database.query(`INSERT INTO "${schema}"."oauthClient"(id,"clientId","redirectUris","backchannelLogoutUri") VALUES ($1,$2,'[]',$3)`,
+			[randomUUID(), clientId, "https://client.fixture.example/logout"]);
 		await database.query(
 			`INSERT INTO "${schema}"."oauthRefreshToken"(id,token,"clientId","userId","sessionId","expiresAt","createdAt",scopes)
 			VALUES ($1,$2,$3,$4,$5,statement_timestamp() + interval '1 hour',statement_timestamp(),'[]')`,
@@ -413,6 +414,52 @@ describe.skipIf(!existsSync(fixturePath))("isolated PostgreSQL owned project eng
 		expect(await (await owner.dispatch(request("/get-session?disableRefresh=true", undefined, { cookie: active.cookie }))).json()).toMatchObject({ session: { id: active.id } });
 		expect((await owner.dispatch(request("/two-factor/verify-totp", { code: "123456" }))).status).toBe(401);
 		expect((await owner.dispatch(request("/sso/sign-in", { email: "person@example.test" }))).status).toBe(501);
+	});
+
+	it("revokes the browser grants on sign-out and retains offline refresh authority", async () => {
+		const userId = await seed("offline-grant-owner@fixture.example");
+		const active = await legacySession(userId, 1200);
+		const other = await legacySession(userId, 2400);
+		const clientId = "fixture-session-revocation-client";
+		await database.query(
+			`INSERT INTO "${schema}"."account"(id,"accountId","providerId","userId","updatedAt") VALUES ($1,$2,'allauth',$3,statement_timestamp())`,
+			[randomUUID(), randomUUID(), userId],
+		);
+		await database.query(`INSERT INTO "${schema}"."oauthClient"(id,"clientId","redirectUris") VALUES ($1,$2,'[]')`, [randomUUID(), clientId]);
+		const offline = randomUUID();
+		const online = randomUUID();
+		const unaffected = randomUUID();
+		for (const grant of [
+			{ id: offline, session: active, scopes: ["openid", "offline_access"] },
+			{ id: online, session: active, scopes: ["openid"] },
+			{ id: unaffected, session: other, scopes: ["openid"] },
+		]) {
+			await database.query(
+				`INSERT INTO "${schema}"."oauthRefreshToken"(id,token,"clientId","userId","sessionId","expiresAt","createdAt",scopes)
+				 VALUES ($1,$2,$3,$4,$5,statement_timestamp() + interval '1 hour',statement_timestamp(),$6)`,
+				[grant.id, randomUUID(), clientId, userId, grant.session.id, JSON.stringify(grant.scopes)],
+			);
+		}
+		const access = randomUUID();
+		await database.query(
+			`INSERT INTO "${schema}"."oauthAccessToken"(id,token,"clientId","userId","sessionId","refreshId","expiresAt","createdAt",scopes)
+			 VALUES ($1,$2,$3,$4,$5,$6,statement_timestamp() + interval '5 minutes',statement_timestamp(),'["openid"]')`,
+			[access, randomUUID(), clientId, userId, active.id, offline],
+		);
+		const owner = engine();
+		const signedOut = await owner.dispatch(request("/sign-out", {}, { cookie: active.cookie }));
+		expect(await signedOut.json()).toEqual({ success: true });
+		expect(await nativeGetSession(new Headers({ cookie: active.cookie }))).toBeNull();
+		expect(await nativeGetSession(new Headers({ cookie: other.cookie }))).toMatchObject({ user: { id: userId } });
+		const refresh = await database.query(`SELECT id, revoked, "sessionId" FROM "${schema}"."oauthRefreshToken" WHERE id = ANY($1::text[])`,
+			[[offline, online, unaffected]]);
+		expect(refresh.rows).toEqual(expect.arrayContaining([
+			{ id: offline, revoked: null, sessionId: null },
+			{ id: online, revoked: expect.any(Date), sessionId: null },
+			{ id: unaffected, revoked: null, sessionId: other.id },
+		]));
+		const accessToken = await database.query(`SELECT revoked, "sessionId" FROM "${schema}"."oauthAccessToken" WHERE id = $1`, [access]);
+		expect(accessToken.rows).toEqual([{ revoked: expect.any(Date), sessionId: null }]);
 	});
 
 	it("keeps failure counters readable when switching in either direction", async () => {
