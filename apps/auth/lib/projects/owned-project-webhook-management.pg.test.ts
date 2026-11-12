@@ -19,16 +19,17 @@ import type {
 	ControlWebhookDelivery,
 	ControlWebhookEndpoint,
 } from "../control/webhook-contract";
+import type { ControlWebhookEnvelope } from "../control/webhooks";
 import {
 	webhookDeliveryInput,
 	webhookEndpointInput,
+	webhookEventTypes,
 	webhookSignature,
 } from "../control/webhook-contract";
 import {
 	createControlWebhooks,
 	deliverPendingWebhooks,
 } from "../control/webhooks";
-import type { ControlWebhookEnvelope } from "../control/webhooks";
 import {
 	revokeAuthenticationChallenges,
 	revokeUserGrants,
@@ -344,7 +345,11 @@ describe.skipIf(!existsSync(fixture))(
 						platformOrigin: origin,
 						readWorkspacePrincipal: readRoot,
 					},
-					webhookManagement: { resolver, encryptionSecret: project.secret },
+					webhookManagement: {
+						resolver,
+						encryptionSecret: project.secret,
+						supportedEventTypes: webhookEventTypes,
+					},
 					passwordChange: {
 						checkPasswordSafety: createOwnedProjectPasswordSafety(),
 					},
@@ -736,6 +741,7 @@ describe.skipIf(!existsSync(fixture))(
 			});
 			expect(await listed("owned")).toEqual({
 				endpoints: [old.endpoint],
+				supportedEventTypes: webhookEventTypes,
 				deliveryRetentionDays: 30,
 				maxAttempts: 8,
 			});

@@ -75,6 +75,11 @@ import { projectSamlAcs } from "./owned-project-sso-saml-management";
 import { createProjectCustomSamlTransport } from "./owned-project-sso-saml-transport";
 import { ssoProviderId } from "./owned-project-sso-store";
 import { createOwnedProjectUserConsole } from "./owned-project-user-console";
+import {
+	assertOwnedProjectWebhookAdmission,
+	ownedMfaWebhookPolicy,
+	ownedMfaWebhookSubscription,
+} from "./owned-project-webhook-admission";
 import type { ProjectAvatarStorage } from "./project-avatar-upload";
 import { verifiedProjectRequest } from "./proxy";
 import type { Project } from "./registry";
@@ -100,6 +105,7 @@ type Options = {
 	defer(work: () => Promise<void>): void;
 	/** Only the isolated fixture supplies alternate egress. */
 	fetchPasswordRange?: Parameters<typeof createOwnedProjectPasswordSafety>[0];
+	webhookResolver?: NonNullable<EngineOptions["webhookManagement"]>["resolver"];
 	encryptedSamlFixture?: ProjectEncryptedSamlFixtureAdmission;
 	postBackchannelLogout?: NonNullable<
 		EngineOptions["backchannelLogout"]
@@ -273,7 +279,6 @@ async function readSupportedProviders(
 		   k."rateLimitMax" IS DISTINCT FROM 100
 		 ) OR
 		 EXISTS (SELECT 1 FROM "${schema}"."agentHost") OR
-		 EXISTS (SELECT 1 FROM "${schema}"."allauthWebhookEndpoint") OR
 		 (NOT $2::boolean AND EXISTS (SELECT 1 FROM "${schema}"."allauthAvatarAsset" WHERE state <> 'deleted')) OR
 		 EXISTS (
 		  SELECT 1 FROM "${schema}"."account" a JOIN "${schema}"."user" u ON u.id=a."userId"
@@ -306,6 +311,7 @@ async function readSupportedProviders(
 		throw new Error(
 			"This development project has stored features outside the candidate scope.",
 		);
+	await assertOwnedProjectWebhookAdmission(database, schema, options.policy);
 	return { google, microsoft, apple };
 }
 
@@ -583,6 +589,13 @@ export async function createOwnedProjectRuntimeCandidate(options: Options) {
 		appName: project.name,
 		openApi: true,
 		analytics: true,
+		webhookManagement: {
+			encryptionSecret: options.signingSecret,
+			resolver: options.webhookResolver,
+			supportedEventTypes: ownedMfaWebhookPolicy(policy)
+				? [ownedMfaWebhookSubscription]
+				: [],
+		},
 		sdk: {
 			avatar: avatarStorage,
 			personalApiKeys: true,

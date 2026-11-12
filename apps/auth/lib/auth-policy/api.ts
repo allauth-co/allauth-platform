@@ -88,20 +88,15 @@ async function boundedBody(request: Request) {
 	}
 }
 async function configurationResponse(
-	request: Request,
+	method: string,
 	scope: ConfigurationScope,
 	owner: ControlPrincipal,
 	dependencies: ConfigurationDependencies,
+	input?: ReturnType<typeof authPolicyUpdateSchema.parse>,
 ): Promise<Response> {
 	const providers = await dependencies.providers(scope);
 	let stored: StoredAuthPolicy;
-	if (request.method === "PATCH") {
-		if (
-			request.headers.get("origin") !== dependencies.origin ||
-			request.headers.get("sec-fetch-site") === "cross-site"
-		)
-			throw new APIError("FORBIDDEN");
-		const input = authPolicyUpdateSchema.parse(await boundedBody(request));
+	if (input) {
 		if (
 			input.policy.supportAccess &&
 			(scope.type !== "project" ||
@@ -165,7 +160,7 @@ async function configurationResponse(
 			owner.user.id,
 			scope,
 		);
-	} else if (request.method === "GET")
+	} else if (method === "GET")
 		stored = await dependencies.read(scope.id);
 	else throw new APIError("METHOD_NOT_ALLOWED");
 	const { schemaName: _schemaName, origins: _origins, ...publicScope } = scope;
@@ -208,10 +203,19 @@ export function configurationHandler(dependencies: ConfigurationDependencies) {
 			(scope.type === "platform" && !isPlatformAdmin(owner.user, owner.session))
 		)
 			throw new APIError("FORBIDDEN");
-		if (request.method === "PATCH" && dependencies.serializeWrite)
-			return dependencies.serializeWrite(scope, owner, (locked) =>
-				configurationResponse(request, scope, owner, locked),
-			);
-		return configurationResponse(request, scope, owner, dependencies);
+		if (request.method !== "PATCH")
+			return configurationResponse(request.method, scope, owner, dependencies);
+		if (
+			request.headers.get("origin") !== dependencies.origin ||
+			request.headers.get("sec-fetch-site") === "cross-site"
+		)
+			throw new APIError("FORBIDDEN");
+		// Finish parsing before taking either the project writer lease or the settings lock.
+		const input = authPolicyUpdateSchema.parse(await boundedBody(request));
+		return dependencies.serializeWrite
+			? dependencies.serializeWrite(scope, owner, (locked) =>
+					configurationResponse(request.method, scope, owner, locked, input),
+				)
+			: configurationResponse(request.method, scope, owner, dependencies, input);
 	};
 }

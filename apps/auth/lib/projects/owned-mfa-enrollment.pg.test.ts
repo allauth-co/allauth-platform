@@ -622,17 +622,19 @@ describe.skipIf(!existsSync(fixturePath))(
 							)
 						).status,
 					).toBe(401);
-					expect(
-						(
-							await send(
-								request(
-									`/two-factor/${path}`,
-									{ password: 123, userId: claimedUser },
-									oldUser.cookie,
-								),
-							)
-						).status,
-					).toBe(400);
+					const malformed = await send(
+						request(
+							`/two-factor/${path}`,
+							{ password: 123, userId: claimedUser },
+							oldUser.cookie,
+						),
+					);
+					expect(malformed.status).toBe(400);
+					expect(await malformed.json()).toEqual({
+						code: "VALIDATION_ERROR",
+						message:
+							"[body.password] Invalid input: expected string, received number",
+					});
 				}
 				const longPassword = password.repeat(8);
 				expect(
@@ -875,6 +877,56 @@ describe.skipIf(!existsSync(fixturePath))(
 					userAgent: auditContext.userAgent,
 				})),
 			);
+
+			const pending = await signedIn();
+			expect(
+				(
+					await legacy.handler(
+						request("/two-factor/enable", { password }, pending.cookie),
+					)
+				).status,
+			).toBe(200);
+			expect(await signedEvents(pending.id, [])).toHaveLength(1);
+			function pendingVerification(code: string, ip = "192.0.2.21") {
+				const input = request(
+					"/two-factor/verify-totp",
+					{ code },
+					pending.cookie,
+				);
+				input.headers.set("x-real-ip", ip);
+				return input;
+			}
+			for (let attempt = 0; attempt < 3; attempt++)
+				expect(
+					(
+						await rateLimitedNative.handler(
+							pendingVerification("invalid-test-code"),
+						)
+					).status,
+				).toBe(401);
+			const pendingCode = await verifyCode(pending.id);
+			expect(
+				(await ownedRuntime.dispatch(pendingVerification(pendingCode))).status,
+			).toBe(429);
+			expect(await signedEvents(pending.id, [pendingCode])).toEqual([]);
+			expect(
+				(
+					await ownedRuntime.dispatch(
+						pendingVerification(pendingCode, "192.0.2.22"),
+					)
+				).status,
+			).toBe(200);
+			expect(await signedEvents(pending.id, [pendingCode])).toEqual([
+				{
+					type: "mfa.verified",
+					outcome: "success",
+					actorId: "owner",
+					userId: "owner",
+					metadata: { path: "/two-factor/verify-totp" },
+					ipAddress: "192.0.2.22",
+					userAgent: auditContext.userAgent,
+				},
+			]);
 		});
 
 		it("rolls back failed rotation and revokes only the selected realm on disable", async () => {

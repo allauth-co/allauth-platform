@@ -288,7 +288,7 @@ interface OwnedProjectEngineOptions {
 	analytics?: boolean;
 	webhookManagement?: Pick<
 		Parameters<typeof createOwnedProjectWebhookManagement>[0],
-		"resolver" | "encryptionSecret"
+		"resolver" | "encryptionSecret" | "supportedEventTypes"
 	>;
 	recovery?: Omit<
 		Parameters<typeof createOwnedRecoveryHttp>[0],
@@ -644,6 +644,16 @@ export function createOwnedProjectEngine(
 		return (
 			user.emailVerified ||
 			(!policy.requireEmailVerification && policy.mfaMode !== "required")
+		);
+	}
+
+	function mfaEligibleUser(user: ProjectUser | null): user is ProjectUser {
+		if (!user || user.banned || user.directoryDisabled) return false;
+		if (!user.isAnonymous) return verifiedUser(user);
+		return (
+			policy.mfaMode === "optional" &&
+			!policy.requireEmailVerification &&
+			!user.directoryManaged
 		);
 	}
 
@@ -1009,8 +1019,7 @@ export function createOwnedProjectEngine(
 			if (!current) return null;
 			const user = await store.lockUser(client, current.user.id);
 			if (
-				!activeUser(user) ||
-				!verifiedUser(user) ||
+				!mfaEligibleUser(user) ||
 				!(await store.lockSession(client, current.token, user.id, fresh))
 			)
 				return null;
@@ -1020,7 +1029,7 @@ export function createOwnedProjectEngine(
 		},
 		async rotateSession(client, request, authority, path) {
 			const user = await store.lockUser(client, authority.user.id);
-			if (!activeUser(user)) throw changedMfaOwner;
+			if (!mfaEligibleUser(user)) throw changedMfaOwner;
 			const value = await createSession(
 				client,
 				user,
@@ -1041,19 +1050,23 @@ export function createOwnedProjectEngine(
 		},
 	});
 
+	function admitTwoFactorRoute(request: Request, path: string) {
+		const ip = options.trustedIP(request);
+		if (!ip || !isIP(ip)) return forbidden();
+		return store.transaction((client) =>
+			admitOwnedProjectNativeRoute(client, ip, path, {
+				max: 3,
+				windowMs: 10_000,
+			}),
+		);
+	}
+
 	async function manageMfa(
 		request: Request,
 		operation: "enable" | "disable" | "get-totp-uri" | "generate-backup-codes",
 	) {
 		if (!trustedRequest(request.headers, true)) return forbidden();
-		const ip = options.trustedIP(request);
-		if (!ip || !isIP(ip)) return forbidden();
-		const refused = await store.transaction((client) =>
-			admitOwnedProjectNativeRoute(client, ip, `/two-factor/${operation}`, {
-				max: 3,
-				windowMs: 10_000,
-			}),
-		);
+		const refused = await admitTwoFactorRoute(request, `/two-factor/${operation}`);
 		if (refused) return refused;
 		const token = tokenFrom(request.headers);
 		const session = token ? await store.session(token, refreshWindow) : null;
@@ -1068,12 +1081,17 @@ export function createOwnedProjectEngine(
 			operation === "enable" ? mfaEnableInput : mfaPasswordInput
 		).safeParse(body);
 		if (!input.success) {
-			if (body !== undefined && operation !== "get-totp-uri")
+			if (body === undefined)
+				return failure(400, "INVALID_BODY", "Invalid two-factor request.");
+			if (operation !== "get-totp-uri")
 				await mfaEnrollment.recordMalformedMutation(
 					request,
 					`/two-factor/${operation}`,
 				);
-			return failure(400, "INVALID_BODY", "Invalid two-factor request.");
+			const message = input.error.issues
+				.map((issue) => `[${["body", ...issue.path].join(".")}] ${issue.message}`)
+				.join("; ");
+			return failure(400, "VALIDATION_ERROR", message);
 		}
 		const result = await {
 			enable: mfaEnrollment.enable,
@@ -1099,6 +1117,12 @@ export function createOwnedProjectEngine(
 
 	async function completeMfa(request: Request, method: "totp" | "backup") {
 		if (!trustedRequest(request.headers, true)) return forbidden();
+		const path =
+			method === "totp"
+				? "/two-factor/verify-totp"
+				: "/two-factor/verify-backup-code";
+		const refused = await admitTwoFactorRoute(request, path);
+		if (refused) return refused;
 		const body = z
 			.object({
 				code: z.string().min(1).max(128),
@@ -1108,14 +1132,8 @@ export function createOwnedProjectEngine(
 			.safeParse(await requestBody(request));
 		if (!body.success)
 			return failure(400, "INVALID_BODY", "Supply a verification code.");
-		const path =
-			method === "totp"
-				? "/two-factor/verify-totp"
-				: "/two-factor/verify-backup-code";
 		if (await store.transaction((client) => security.admit(client, request)))
 			return securityBlocked();
-		const refused = await factorAdmission(request, method);
-		if (refused) return refused;
 		if (await currentSession(request.headers)) {
 			const result = await mfaEnrollment.verify(request, {
 				method,

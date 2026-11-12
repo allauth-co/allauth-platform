@@ -288,6 +288,11 @@ async function boot(selection: ProjectRuntimeFixtureBoot) {
 							outboundDisabled();
 						return new Response(`${"F".repeat(35)}:0\r\n`);
 					},
+					async webhookResolver(hostname) {
+						if (hostname !== "webhook.runtime.fixture.example")
+							outboundDisabled();
+						return [{ address: "93.184.216.34", family: 4 }];
+					},
 					async postBackchannelLogout(destination, payload) {
 						if (
 							destination.href !== "https://rp.runtime.fixture.example/logout"

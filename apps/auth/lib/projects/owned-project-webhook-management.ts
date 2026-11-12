@@ -1,8 +1,10 @@
 import { randomUUID } from "node:crypto";
 import type { PoolClient } from "pg";
+import { lockProjectSettings } from "../auth-policy/serialization";
+import { authPolicyRepository } from "../auth-policy/storage";
 import { canonicalIP } from "../control/security-policy";
 import type { ControlPrincipal } from "../control/types";
-import type { Resolver } from "../control/webhook-contract";
+import type { Resolver, webhookEventTypes } from "../control/webhook-contract";
 import {
 	newWebhookSigningSecret,
 	publicDelivery,
@@ -21,6 +23,11 @@ import {
 import { lockOwnedProjectWorkspaceAdministrator } from "./owned-project-admin-authority";
 import type { createProjectEngineStore } from "./owned-project-engine-store";
 import { admitOwnedProjectNativeRoute } from "./owned-project-native-admission";
+import {
+	ownedMfaWebhookAccountsSupported,
+	ownedMfaWebhookPolicy,
+	ownedMfaWebhookSubscription,
+} from "./owned-project-webhook-admission";
 import type { Project } from "./registry";
 
 type Store = ReturnType<typeof createProjectEngineStore>;
@@ -39,6 +46,10 @@ const invalid = () =>
 	accountLinkError(400, "INVALID_BODY", "The request contains invalid fields.");
 const badRequest = (message: string) =>
 	accountLinkError(400, "BAD_REQUEST", message);
+const unavailableSubscriptions = () =>
+	badRequest(
+		"These webhook subscriptions are unavailable for this project configuration.",
+	);
 
 const endpointProjection =
 	'id,url,description,"eventTypes",enabled,"createdAt","updatedAt"';
@@ -76,6 +87,8 @@ export function createOwnedProjectWebhookManagement(options: {
 	readBody(request: Request): Promise<unknown>;
 	trustedIP(request: Request): string | null;
 	resolver?: Resolver;
+	/** The runtime supplies only selectors with proven compatibility. */
+	supportedEventTypes: readonly (typeof webhookEventTypes)[number][];
 }) {
 	const { store, project } = options;
 	const direct = `/api/projects/${project.slug}/auth`;
@@ -114,8 +127,10 @@ export function createOwnedProjectWebhookManagement(options: {
 		const actorId = actor.user.id;
 		const authorized = async (
 			work: (client: PoolClient) => Promise<Response>,
+			serializePolicy = false,
 		) =>
 			store.transaction(async (client) => {
+				if (serializePolicy) await lockProjectSettings(client, project.id);
 				if (
 					!(await lockOwnedProjectWorkspaceAdministrator(
 						client,
@@ -145,6 +160,7 @@ export function createOwnedProjectWebhookManagement(options: {
 				);
 				return accountLinkJson({
 					endpoints: rows.map(publicEndpoint),
+					supportedEventTypes: options.supportedEventTypes,
 					deliveryRetentionDays: 30,
 					maxAttempts: 8,
 				});
@@ -182,6 +198,11 @@ export function createOwnedProjectWebhookManagement(options: {
 		if (path === "/control/webhooks/create") {
 			const parsed = webhookCreateInput.safeParse(body);
 			if (!parsed.success) return invalid();
+			const { description, eventTypes } = parsed.data;
+			const supported = options.supportedEventTypes;
+			if (eventTypes.some((type) => !supported.includes(type)))
+				return authorized(async () => unavailableSubscriptions());
+			const usesMfa = eventTypes.includes(ownedMfaWebhookSubscription);
 			let destination: Awaited<ReturnType<typeof validateWebhookDestination>>;
 			try {
 				destination = await validateWebhookDestination(
@@ -193,8 +214,20 @@ export function createOwnedProjectWebhookManagement(options: {
 					"Webhook destinations require public HTTPS on port 443.",
 				);
 			}
-			const { description, eventTypes } = parsed.data;
 			return authorized(async (client) => {
+				if (usesMfa) {
+					const { policy } = await authPolicyRepository(client).read(
+						project.id,
+					);
+					if (
+						!ownedMfaWebhookPolicy(policy) ||
+						!(await ownedMfaWebhookAccountsSupported(
+							client,
+							project.schemaName,
+						))
+					)
+						return unavailableSubscriptions();
+				}
 				// Coordinate with the legacy writer's endpoint limit during rollback.
 				await client.query(
 					"SELECT pg_advisory_xact_lock(hashtext('allauth-webhook-endpoint-limit'))",
@@ -221,7 +254,7 @@ export function createOwnedProjectWebhookManagement(options: {
 				);
 				await audit(client, "webhook.created", actorId, id, ip, request);
 				return accountLinkJson({ endpoint: publicEndpoint(rows[0]), secret });
-			});
+			}, usesMfa);
 		}
 		const parsed = (
 			path === "/control/webhooks/retry"

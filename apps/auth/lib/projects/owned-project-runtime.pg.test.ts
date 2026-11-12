@@ -10,6 +10,7 @@ import { once } from "node:events";
 import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import { symmetricEncrypt } from "better-auth/crypto";
 import type { JSONWebKeySet } from "jose";
 import {
 	createLocalJWKSet,
@@ -18,19 +19,25 @@ import {
 	jwtVerify,
 	SignJWT,
 } from "jose";
+import { Kysely, PostgresDialect } from "kysely";
 import { Pool } from "pg";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { createSiweMessage } from "viem/siwe";
 import { describe, expect, it, vi } from "vitest";
 import { defaultAuthPolicy } from "../auth-policy/policy";
+import { lockProjectSettings } from "../auth-policy/serialization";
 import { authPolicyRepository } from "../auth-policy/storage";
 import { clerkCompatiblePasswords } from "../clerk-password";
 import { defaultSecurityPolicy } from "../control/security-policy";
 import type { SecurityRule } from "../control/security-management";
 import type { ControlPrincipal } from "../control/types";
+import { newWebhookSigningSecret, webhookSignature } from "../control/webhook-contract";
+import { deliverPendingWebhooks } from "../control/webhooks";
 import { signEdgeRequest } from "../domains/edge";
 import { googleProviderRepository } from "../project-providers/repository";
 import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
+import { openLegacyMfaRecord } from "./legacy-mfa-record";
+import { readLegacyProjectKeyring } from "./legacy-project-keyring";
 import { signProjectIssuerQuery } from "./owned-project-issuer-authorization-query";
 import { projectOpenApiPath } from "./owned-project-openapi";
 import type { ProjectRuntimeFixtureBoot } from "./owned-project-runtime-fixture";
@@ -58,6 +65,7 @@ import type { ProjectEncryptedSamlFixtureAdmission } from "./owned-project-sso-s
 import { encryptedSamlFixtureConfigurationDigest } from "./owned-project-sso-saml-fixture-admission";
 import { projectProxySecret } from "./proxy";
 import type { Project } from "./registry";
+import { projectSecret } from "./runtime";
 
 const fixture = new URL(
 	"../../../../.secrets/local-postgres.json",
@@ -1079,6 +1087,411 @@ async function seed(databaseURL: string) {
 describe.skipIf(!existsSync(fixture))(
 	"isolated project service process cutover and rollback",
 	() => {
+		it("restarts with an approved MFA webhook and existing unverified and guest sessions", async () => {
+			const local: { container: string; DATABASE_URL: string } = JSON.parse(
+				readFileSync(fixture, "utf8"),
+			);
+			const base = new URL(local.DATABASE_URL);
+			if (
+				local.container !== "allauth-production-test-20261007" ||
+				base.hostname !== "127.0.0.1" ||
+				base.port !== "55445"
+			)
+				throw new Error(
+					"Project webhook cutover requires the isolated local PostgreSQL fixture.",
+				);
+			const admin = new Pool({ connectionString: base.href, max: 1 });
+			const name = `allauth_hosted_${randomUUID().replaceAll("-", "")}`;
+			const databaseURL = new URL(`/${name}`, base).href;
+			let created = false;
+			let service: Awaited<ReturnType<typeof openProcess>> | undefined;
+			let database: Pool | undefined;
+			let workerDatabase:
+				| Kysely<Record<string, Record<string, unknown>>>
+				| undefined;
+			try {
+				await admin.query(`CREATE DATABASE "${name}"`);
+				created = true;
+				const { alpha } = await seed(databaseURL);
+				const schema = `"${alpha.schemaName}"`;
+				const settingsDatabase = new Pool({
+					connectionString: databaseURL,
+					max: 2,
+				});
+				database = settingsDatabase;
+				workerDatabase = new Kysely({
+					dialect: new PostgresDialect({
+						pool: new Pool({
+							connectionString: databaseURL,
+							max: 1,
+							options: `-c search_path=${alpha.schemaName}`,
+						}),
+					}),
+				});
+				const repository = authPolicyRepository(database);
+				const current = await repository.read(alpha.id);
+				const eligiblePolicy = {
+					...current.policy,
+					requireEmailVerification: false,
+				};
+				await repository.update(
+					alpha.id,
+					current.version,
+					eligiblePolicy,
+					credentials.platform.id,
+				);
+				await database.query(
+					`UPDATE ${schema}."user" SET "emailVerified"=FALSE WHERE id=$1`,
+					[credentials.project.id],
+				);
+				const projectKey = projectSecret(childEnvironment(), alpha.id);
+				const endpointId = randomUUID();
+				const destination = "https://webhook.runtime.fixture.example/mfa";
+				const oldSigningKey = newWebhookSigningSecret();
+				await database.query(
+					`INSERT INTO ${schema}."allauthWebhookEndpoint" (id,url,"eventTypes","encryptedSecret") VALUES ($1,$2,'["mfa.*"]',$3)`,
+					[
+						endpointId,
+						destination,
+						await symmetricEncrypt({ key: projectKey, data: oldSigningKey }),
+					],
+				);
+				const direct = `/api/projects/${alpha.slug}/auth`;
+				const webhooks = `${direct}/control/webhooks`;
+				const host = `${alpha.slug}-accounts.allauth.co`;
+				const hosted = "/api/auth";
+				service = await openProcess(databaseURL, alpha, false);
+				const platformSignIn = await service.request(
+					"/api/auth/sign-in/email",
+					{
+						body: {
+							email: credentials.platform.email,
+							password: credentials.password,
+						},
+					},
+				);
+				expect(platformSignIn.status).toBe(200);
+				const adminCookie = cookie(platformSignIn);
+				const existing = await service.request(`${hosted}/sign-in/email`, {
+					host,
+					body: {
+						email: credentials.project.email,
+						password: credentials.password,
+					},
+				});
+				expect(existing.status).toBe(200);
+				expect(await existing.json()).toMatchObject({
+					user: { id: credentials.project.id, emailVerified: false },
+				});
+				const guest = await service.request(`${hosted}/sign-in/anonymous`, {
+					host,
+					body: {},
+				});
+				expect(guest.status).toBe(200);
+				const { user: guestUser } = (await guest.json()) as {
+					user: { id: string };
+				};
+				const users = [
+					{
+						id: credentials.project.id,
+						cookie: cookie(existing),
+						password: credentials.password,
+						role: "user",
+						ip: "192.0.2.81",
+					},
+					{
+						id: guestUser.id,
+						cookie: cookie(guest),
+						password: undefined,
+						role: "guest",
+						ip: "192.0.2.82",
+					},
+				];
+				for (const user of users) {
+					const setup = await service.request(`${hosted}/two-factor/enable`, {
+						host,
+						clientIP: user.ip,
+						cookie: user.cookie,
+						body: { password: user.password },
+					});
+					expect(setup.status, await setup.clone().text()).toBe(200);
+				}
+				await service.stop();
+				service = undefined;
+
+				service = await openProcess(databaseURL, alpha, true);
+				const list = await service.request(webhooks, { cookie: adminCookie });
+				expect(list.status).toBe(200);
+				expect(await list.json()).toMatchObject({
+					endpoints: [{ id: endpointId, eventTypes: ["mfa.*"] }],
+					supportedEventTypes: ["mfa.*"],
+				});
+				const hostedManagement = await service.request(
+					`${hosted}/control/webhooks`,
+					{ host, cookie: adminCookie },
+				);
+				expect(hostedManagement.status).toBe(403);
+				const unproved = await service.request(`${webhooks}/create`, {
+					cookie: adminCookie,
+					body: { url: destination, eventTypes: ["mfa.*", "*"] },
+				});
+				expect(unproved.status).toBe(400);
+				expect(await unproved.json()).toMatchObject({
+					message: expect.stringMatching(/subscription|event/i),
+				});
+				const rotate = await service.request(`${webhooks}/rotate`, {
+					cookie: adminCookie,
+					body: { id: endpointId },
+				});
+				expect(rotate.status).toBe(200);
+				const { secret: newSigningKey } = (await rotate.json()) as {
+					secret: string;
+				};
+				expect(newSigningKey).not.toBe(oldSigningKey);
+				const { encryptionKeys } = readLegacyProjectKeyring(
+					projectKey,
+					versionedEncryption,
+				);
+				for (const user of users) {
+					const stored = await database.query<{ secret: string }>(
+						`SELECT secret FROM ${schema}."twoFactor" WHERE "userId"=$1`,
+						[user.id],
+					);
+					const factor = openLegacyMfaRecord(
+						stored.rows[0]!.secret,
+						encryptionKeys,
+					);
+					const counter = new Uint8Array(8);
+					new DataView(counter.buffer).setBigUint64(
+						0,
+						BigInt(Math.floor(Date.now() / 30_000)),
+					);
+					const digest = createHmac("sha1", factor).update(counter).digest();
+					const code = String(
+						(digest.readUInt32BE(digest[digest.length - 1]! & 15) &
+							0x7fff_ffff) %
+							1_000_000,
+					).padStart(6, "0");
+					const verified = await service.request(
+						`${hosted}/two-factor/verify-totp`,
+						{ host, clientIP: user.ip, cookie: user.cookie, body: { code } },
+					);
+					expect(verified.status, await verified.clone().text()).toBe(200);
+					user.cookie = cookie(verified);
+					expect(user.cookie).toBeTruthy();
+				}
+				const createInput = {
+					cookie: adminCookie,
+					body: {
+						url: "https://webhook.runtime.fixture.example/new-mfa",
+						eventTypes: ["mfa.*"],
+					},
+				};
+				const settings = await database.connect();
+				let settingsCommitted = false;
+				try {
+					await settings.query("BEGIN");
+					await lockProjectSettings(settings, alpha.id);
+					const inFlight = service.request(`${webhooks}/create`, createInput);
+					await expect
+						.poll(
+							async () => {
+								const { rows } = await settingsDatabase.query<{
+									waiting: boolean;
+								}>(
+									`SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype='advisory' AND NOT granted
+								AND database=(SELECT oid FROM pg_database WHERE datname=current_database())
+								AND objsubid=1 AND objid=(hashtext($1)::bigint & 4294967295)::oid) AS waiting`,
+									[`allauth:project-auth-configuration:${alpha.id}`],
+								);
+								return rows[0]?.waiting;
+							},
+							{ timeout: 4_000 },
+						)
+						.toBe(true);
+					const lockedPolicy = authPolicyRepository(settings);
+					const revision = await lockedPolicy.read(alpha.id);
+					const changed = await lockedPolicy.update(
+						alpha.id,
+						revision.version,
+						{ ...eligiblePolicy, requireEmailVerification: true },
+						credentials.platform.id,
+					);
+					await settings.query("COMMIT");
+					settingsCommitted = true;
+					const refused = await inFlight;
+					expect(refused.status).toBe(400);
+					expect(await refused.json()).toMatchObject({
+						message: expect.stringMatching(/subscription/i),
+					});
+					await repository.update(
+						alpha.id,
+						changed.version,
+						eligiblePolicy,
+						credentials.platform.id,
+					);
+				} finally {
+					if (!settingsCommitted) await settings.query("ROLLBACK");
+					settings.release();
+				}
+				const subscribed = await service.request(
+					`${webhooks}/create`,
+					createInput,
+				);
+				expect(subscribed.status, await subscribed.clone().text()).toBe(200);
+				const { endpoint: newEndpoint } = (await subscribed.json()) as {
+					endpoint: { id: string };
+				};
+				await service.stop();
+				service = undefined;
+
+				await database.query(
+					`UPDATE ${schema}."allauthWebhookEndpoint" SET "eventTypes"='["mfa.*","*"]' WHERE id=$1`,
+					[endpointId],
+				);
+				await expect(openProcess(databaseURL, alpha, true)).rejects.toThrow(
+					/webhook/i,
+				);
+				await database.query(
+					`UPDATE ${schema}."allauthWebhookEndpoint" SET "eventTypes"='["mfa.*"]' WHERE id=$1`,
+					[endpointId],
+				);
+				const revision = await repository.read(alpha.id);
+				const required = await repository.update(
+					alpha.id,
+					revision.version,
+					{
+						...eligiblePolicy,
+						mfaMode: "required",
+						requireEmailVerification: true,
+						signUpEnabled: false,
+					},
+					credentials.platform.id,
+				);
+				await expect(openProcess(databaseURL, alpha, true)).rejects.toThrow(
+					/webhook/i,
+				);
+				await repository.update(
+					alpha.id,
+					required.version,
+					eligiblePolicy,
+					credentials.platform.id,
+				);
+				service = await openProcess(databaseURL, alpha, false);
+				const rollbackList = await service.request(webhooks, {
+					cookie: adminCookie,
+				});
+				expect(await rollbackList.json()).toMatchObject({
+					endpoints: expect.arrayContaining([
+						{
+							id: newEndpoint.id,
+							eventTypes: ["mfa.*"],
+							url: "https://webhook.runtime.fixture.example/new-mfa",
+							enabled: true,
+							description: "",
+							createdAt: expect.any(String),
+							updatedAt: expect.any(String),
+						},
+					]),
+				});
+				expect(
+					(
+						await service.request(`${webhooks}/delete`, {
+							cookie: adminCookie,
+							body: { id: newEndpoint.id },
+						})
+					).status,
+				).toBe(200);
+				for (const user of users) {
+					const active = await service.request(`${hosted}/get-session`, {
+						host,
+						clientIP: user.ip,
+						cookie: user.cookie,
+					});
+					expect(await active.json()).toMatchObject({
+						user: {
+							id: user.id,
+							emailVerified: false,
+							role: user.role,
+							twoFactorEnabled: true,
+						},
+					});
+					const disabled = await service.request(
+						`${hosted}/two-factor/disable`,
+						{
+							host,
+							clientIP: user.ip,
+							cookie: user.cookie,
+							body: { password: user.password },
+						},
+					);
+					expect(disabled.status, await disabled.clone().text()).toBe(200);
+				}
+				const deliveries: Array<{
+					body: string;
+					headers: Record<string, string>;
+				}> = [];
+				expect(
+					await deliverPendingWebhooks({
+						database: workerDatabase,
+						secret: projectKey,
+						resolver: async () => [{ address: "93.184.216.34", family: 4 }],
+						now: () => new Date(Date.now() + 1_000),
+						maxDeliveries: 20,
+						transport: async ({ destination: target, body, headers }) => {
+							if (target.url.href === destination)
+								deliveries.push({ body, headers });
+							return 204;
+						},
+					}),
+				).toEqual({ claimed: 6, delivered: 6, failed: 0, retried: 0 });
+				const subjects = new Set(users.map((user) => user.id));
+				const types = [];
+				for (const { body, headers } of deliveries) {
+					expect(headers["webhook-signature"]).toBe(
+						await webhookSignature(
+							newSigningKey,
+							headers["webhook-id"],
+							headers["webhook-timestamp"],
+							body,
+						),
+					);
+					const event = JSON.parse(body).data.event as {
+						type: string;
+						actorId: string;
+						userId: string;
+						outcome: string;
+					};
+					expect(subjects.has(event.userId)).toBe(true);
+					expect(event).toMatchObject({
+						actorId: event.userId,
+						outcome: "success",
+					});
+					expect(body).not.toContain(credentials.password);
+					types.push(event.type);
+				}
+				expect(types.sort()).toEqual([
+					"mfa.disabled",
+					"mfa.disabled",
+					"mfa.enrollment-started",
+					"mfa.enrollment-started",
+					"mfa.verified",
+					"mfa.verified",
+				]);
+			} finally {
+				try {
+					await service?.stop();
+				} finally {
+					await Promise.all([database?.end(), workerDatabase?.destroy()]);
+					try {
+						if (created) await dropClosedFixtureDatabase(admin, name);
+					} finally {
+						await admin.end();
+					}
+				}
+			}
+		}, 60_000);
+
 		it("starts old, owned and old writers in sequence while preserving a live project session", async () => {
 			const local: { container: string; DATABASE_URL: string } = JSON.parse(
 				readFileSync(fixture, "utf8"),
