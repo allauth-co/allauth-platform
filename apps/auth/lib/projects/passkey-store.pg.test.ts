@@ -2,7 +2,7 @@ import { createHash, generateKeyPairSync, randomBytes, randomUUID, sign } from "
 import { existsSync, readFileSync } from "node:fs";
 import { passkey } from "@better-auth/passkey";
 import { isoCBOR } from "@simplewebauthn/server/helpers";
-import { symmetricEncrypt } from "better-auth/crypto";
+import { symmetricDecrypt, symmetricEncrypt } from "better-auth/crypto";
 import { admin, anonymous } from "better-auth/plugins";
 import { getTestInstance } from "better-auth/test";
 import { Pool } from "pg";
@@ -14,6 +14,7 @@ import { newWebhookSigningSecret, webhookSignature } from "../control/webhook-co
 import type { ControlWebhookEnvelope } from "../control/webhooks";
 import { deliverPendingWebhooks } from "../control/webhooks";
 import { featureBoundaries } from "../features/server";
+import { productionTwoFactor } from "../mfa";
 import { createOwnedProjectEngine } from "./owned-project-engine";
 import { readLegacySessionCookie } from "./legacy-session-cookie";
 import { projectPasskeyStore } from "./passkey-store";
@@ -98,6 +99,7 @@ function legacyFixture(database: ReturnType<typeof postgresDatabase>, audit = fa
 		logger: { disabled: true },
 		plugins: [
 			passkey({ rpID: rpId, origin, requireUserVerification: true }),
+			productionTwoFactor(origin),
 			...(audit ? [admin(), allauthControl({ database: database.db, secret: fixtureSecret, baseURL: origin, ipHeader: "x-real-ip", requireTrustedIP: true }), featureBoundaries(), anonymous()] : []),
 		],
 	}, { disableTestUser: true });
@@ -826,6 +828,240 @@ describe.skipIf(!existsSync(fixturePath))("project passkey PostgreSQL interopera
 					userId: user.id,
 				})),
 			);
+		}
+	});
+
+	it("completes a guest passkey challenge across writers after MFA is enrolled", async () => {
+		if (!pool || !nativeDatabase)
+			throw new Error("Missing PostgreSQL fixture.");
+		const database = pool;
+		const { auth } = await legacyFixture(nativeDatabase, true);
+		const candidate = ownedHttpFixture(database, {
+			...defaultAuthPolicy,
+			requireEmailVerification: false,
+		});
+		const legacyDispatch = (request: Request) => auth.handler(request);
+		const ownedDispatch = (request: Request) => candidate.dispatch(request);
+		type Dispatch = typeof legacyDispatch;
+		function send(
+			dispatch: Dispatch,
+			path: string,
+			cookie = "",
+			body?: object,
+		) {
+			return dispatch(
+				new Request(`${origin}/api/auth/${path}`, {
+					method: body ? "POST" : "GET",
+					headers: {
+						origin,
+						cookie,
+						"x-real-ip": "192.0.2.93",
+						...(body ? { "content-type": "application/json" } : {}),
+					},
+					body: body ? JSON.stringify(body) : undefined,
+				}),
+			);
+		}
+		function cookieFrom(response: Response, kind: string) {
+			return (
+				response.headers
+					.getSetCookie()
+					.find(
+						(value) =>
+							value.includes(`.${kind}=`) && !value.includes("Max-Age=0"),
+					)
+					?.split(";", 1)[0] ?? ""
+			);
+		}
+		const guest = await send(legacyDispatch, "sign-in/anonymous", "", {});
+		expect(guest.status).toBe(200);
+		const { user } = (await guest.json()) as { user: { id: string } };
+		await database.query(
+			`UPDATE "${primary}"."user" SET role='guest' WHERE id=$1`,
+			[user.id],
+		);
+		const guestCookie = cookieFrom(guest, "session_token");
+		expect(guestCookie).toBeTruthy();
+		const proof = virtualCredential();
+		const options = await send(
+			legacyDispatch,
+			"passkey/generate-register-options",
+			guestCookie,
+		);
+		expect(options.status).toBe(200);
+		const { challenge } = (await options.json()) as { challenge: string };
+		const registered = await send(
+			legacyDispatch,
+			"passkey/verify-registration",
+			`${guestCookie}; ${cookieFrom(options, "better-auth-passkey")}`,
+			{
+				response: proof.registration(challenge),
+			},
+		);
+		expect(registered.status).toBe(200);
+		const enabled = await send(
+			ownedDispatch,
+			"two-factor/enable",
+			guestCookie,
+			{},
+		);
+		expect(enabled.status).toBe(200);
+		const { backupCodes } = (await enabled.json()) as {
+			backupCodes: string[];
+		};
+		async function totp() {
+			const {
+				rows: [factor],
+			} = await database.query<{ secret: string }>(
+				`SELECT secret FROM "${primary}"."twoFactor" WHERE "userId"=$1`,
+				[user.id],
+			);
+			if (!factor) throw new Error("Missing fixture MFA secret.");
+			const secret = await symmetricDecrypt({
+				key: fixtureSecret,
+				data: factor.secret,
+			});
+			return (await auth.api.generateTOTP({ body: { secret } })).code;
+		}
+		const enrolled = await send(
+			ownedDispatch,
+			"two-factor/verify-totp",
+			guestCookie,
+			{ code: await totp() },
+		);
+		expect(enrolled.status).toBe(200);
+		const identity = {
+			id: user.id,
+			role: "guest",
+			isAnonymous: true,
+			emailVerified: false,
+			twoFactorEnabled: true,
+		};
+		const enrolledCookie = cookieFrom(enrolled, "session_token");
+		expect(
+			await auth.api.getSession({
+				headers: new Headers({ cookie: enrolledCookie }),
+			}),
+		).toMatchObject({ user: identity });
+		async function sessionIds() {
+			return (
+				await database.query<{ id: string }>(
+					`SELECT id FROM "${primary}"."session" WHERE "userId"=$1 ORDER BY id`,
+					[user.id],
+				)
+			).rows;
+		}
+		async function verifyPasskey(
+			dispatch: Dispatch,
+			counter: number,
+			trustCookie = "",
+		) {
+			const options = await send(
+				dispatch,
+				"passkey/generate-authenticate-options",
+				trustCookie,
+			);
+			expect(options.status).toBe(200);
+			const { challenge } = (await options.json()) as { challenge: string };
+			return send(
+				dispatch,
+				"passkey/verify-authentication",
+				[trustCookie, cookieFrom(options, "better-auth-passkey")]
+					.filter(Boolean)
+					.join("; "),
+				{
+					response: proof.assertion(challenge, counter),
+				},
+			);
+		}
+		async function pending(dispatch: Dispatch, counter: number) {
+			const before = await sessionIds();
+			const response = await verifyPasskey(dispatch, counter);
+			expect(response.status).toBe(200);
+			expect(await response.json()).toEqual({
+				twoFactorRedirect: true,
+				twoFactorMethods: ["totp"],
+			});
+			expect(cookieFrom(response, "session_token")).toBe("");
+			expect(await sessionIds()).toEqual(before);
+			const challenge = cookieFrom(response, "two_factor");
+			expect(challenge).toBeTruthy();
+			return challenge;
+		}
+		const legacyPending = await pending(legacyDispatch, 1);
+		const ownedFactor = await send(
+			ownedDispatch,
+			"two-factor/verify-totp",
+			legacyPending,
+			{ code: await totp(), trustDevice: true },
+		);
+		expect(ownedFactor.status).toBe(200);
+		const ownedTrust = cookieFrom(ownedFactor, "trust_device");
+		expect(ownedTrust).toBeTruthy();
+		expect(
+			await auth.api.getSession({
+				headers: new Headers({
+					cookie: cookieFrom(ownedFactor, "session_token"),
+				}),
+			}),
+		).toMatchObject({ user: identity });
+
+		const ownedPending = await pending(ownedDispatch, 2);
+		const legacyFactor = await send(
+			legacyDispatch,
+			"two-factor/verify-backup-code",
+			ownedPending,
+			{ code: backupCodes[0], trustDevice: true },
+		);
+		expect(legacyFactor.status).toBe(200);
+		const legacyTrust = cookieFrom(legacyFactor, "trust_device");
+		expect(legacyTrust).toBeTruthy();
+		const ownedRead = await send(
+			ownedDispatch,
+			"get-session",
+			cookieFrom(legacyFactor, "session_token"),
+		);
+		expect(await ownedRead.json()).toMatchObject({ user: identity });
+
+		for (const [dispatch, trustCookie, counter] of [
+			[legacyDispatch, ownedTrust, 3],
+			[ownedDispatch, legacyTrust, 4],
+		] as const) {
+			const response = await verifyPasskey(dispatch, counter, trustCookie);
+			expect(response.status).toBe(200);
+			expect(await response.json()).toMatchObject({ user: identity });
+			expect(cookieFrom(response, "two_factor")).toBe("");
+			expect(cookieFrom(response, "trust_device")).toBeTruthy();
+			expect(cookieFrom(response, "trust_device")).not.toBe(trustCookie);
+		}
+		for (const dispatch of [legacyDispatch, ownedDispatch]) {
+			const options = await send(
+				dispatch,
+				"passkey/generate-register-options",
+				enrolledCookie,
+			);
+			expect(options.status).toBe(200);
+			const { challenge } = (await options.json()) as { challenge: string };
+			const next = virtualCredential();
+			const before = await sessionIds();
+			const registered = await send(
+				dispatch,
+				"passkey/verify-registration",
+				`${enrolledCookie}; ${cookieFrom(options, "better-auth-passkey")}`,
+				{
+					response: next.registration(challenge),
+					createSession: true,
+				},
+			);
+			expect(registered.status).toBe(200);
+			expect(await registered.json()).toEqual({
+				twoFactorRedirect: true,
+				twoFactorMethods: ["totp"],
+			});
+			expect(cookieFrom(registered, "session_token")).toBe("");
+			expect(cookieFrom(registered, "two_factor")).toBeTruthy();
+			expect(await sessionIds()).toEqual(before);
+			expect((await store.findCredential(next.id))?.userId).toBe(user.id);
 		}
 	});
 

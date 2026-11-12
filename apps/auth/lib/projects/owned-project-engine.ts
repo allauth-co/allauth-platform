@@ -868,7 +868,13 @@ export function createOwnedProjectEngine(
 			wallet?: { address: string; chainId: number };
 		},
 	): Promise<Response> {
-		if (!activeUser(user) || (user.directoryManaged && !providerProof?.managed))
+		const passkeyPath =
+			path === "/passkey/verify-registration" ||
+			path === "/passkey/verify-authentication";
+		if (
+			(!activeUser(user) && !(passkeyPath && passkeyGuestUser(user))) ||
+			(user.directoryManaged && !providerProof?.managed)
+		)
 			return forbidden();
 		if (
 			!verifiedUser(user) &&
@@ -920,6 +926,7 @@ export function createOwnedProjectEngine(
 		} = await createSession(client, user, request, rememberMe, path);
 		if (
 			guest &&
+			!user.isAnonymous &&
 			(path.startsWith("/sign-in/") ||
 				path.startsWith("/callback/") ||
 				path === "/verify-email" ||
@@ -1172,7 +1179,7 @@ export function createOwnedProjectEngine(
 				async (client, pending) => {
 					const user = await store.lockUser(client, pending.userId);
 					if (
-						!activeUser(user) ||
+						(!activeUser(user) && !passkeyGuestUser(user)) ||
 						(policy.mfaMode === "required" && !user.emailVerified) ||
 						!user.twoFactorEnabled ||
 						missingSupportAdapter
@@ -1782,7 +1789,6 @@ export function createOwnedProjectEngine(
 				!user.directoryManaged &&
 				!user.directoryDisabled &&
 				!user.emailVerified &&
-				!user.twoFactorEnabled &&
 				policy.mfaMode === "optional" &&
 				!policy.requireEmailVerification,
 		);
@@ -1790,29 +1796,6 @@ export function createOwnedProjectEngine(
 
 	function passkeyOwner(user: ProjectUser | null): user is ProjectUser {
 		return (activeUser(user) && verifiedUser(user)) || passkeyGuestUser(user);
-	}
-
-	async function completePasskeySession(
-		client: PoolClient,
-		user: ProjectUser | null,
-		request: Request,
-		path: "/passkey/verify-registration" | "/passkey/verify-authentication",
-	) {
-		if (!passkeyGuestUser(user))
-			return primaryResult(client, user, request, true, path);
-		if (missingSupportAdapter) return unsupported();
-		if (await security.denySession(client, request, user.email))
-			return securityBlocked();
-		// A verified passkey restores the same guest identity. It cannot convert
-		// the current or another guest into an ordinary account.
-		const { headers, session, user: value } = await createSession(
-			client,
-			user,
-			request,
-			true,
-			path,
-		);
-		return json({ session, user: value }, 200, headers);
 	}
 
 	const passkeyHttp =
@@ -1890,20 +1873,28 @@ export function createOwnedProjectEngine(
 					const user = await store.lockUser(client, userId);
 					if (!passkeyOwner(user) || user.directoryManaged)
 						return null;
+					if (
+						user.isAnonymous &&
+						user.twoFactorEnabled &&
+						!(await mfa.hasEnrolledFactor(client, user.id))
+					)
+						return null;
 					if (!(await record(client))) return null;
-					return completePasskeySession(
+					return primaryResult(
 						client,
 						user,
 						request,
+						true,
 						"/passkey/verify-authentication",
 					);
 				});
 			},
 			async completeRegistration(client, request, userId) {
-				return completePasskeySession(
+				return primaryResult(
 					client,
 					await store.lockUser(client, userId),
 					request,
+					true,
 					"/passkey/verify-registration",
 				);
 			},

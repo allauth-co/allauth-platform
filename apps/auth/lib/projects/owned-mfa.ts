@@ -126,10 +126,15 @@ export function createOwnedProjectMfa(options: {
 		return result.rows.length === 1 && row?.verified !== false ? row : null;
 	}
 
+	async function hasEnrolledFactor(client: PoolClient, userId: string) {
+		return Boolean(
+			(await activeOwner(client, userId)) && (await factor(client, userId)),
+		);
+	}
+
 	/** Call from the primary-credential transaction after authenticating the owner. */
 	async function issue(client: PoolClient, userId: string) {
-		if (!(await activeOwner(client, userId)) || !(await factor(client, userId)))
-			return null;
+		if (!(await hasEnrolledFactor(client, userId))) return null;
 		const identifier = `2fa-${randomBytes(15).toString("base64url")}`;
 		await client.query(
 			`INSERT INTO "${schema}"."verification" (id, identifier, value, "expiresAt")
@@ -360,5 +365,5 @@ export function createOwnedProjectMfa(options: {
 		}
 	}
 
-	return { issue, complete, rotateTrustedDevice };
+	return { issue, complete, rotateTrustedDevice, hasEnrolledFactor };
 }

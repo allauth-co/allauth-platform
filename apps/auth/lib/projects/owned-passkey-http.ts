@@ -533,6 +533,7 @@ export function createOwnedProjectPasskeyHttp(options: Options) {
 		const data = signIn
 			? ((await signIn.json()) as Record<string, unknown>)
 			: {};
+		if (data.twoFactorRedirect === true) return json(data, 200, headers);
 		return json({ ...result.value, ...data }, 200, headers);
 	}
 
