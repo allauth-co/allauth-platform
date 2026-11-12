@@ -40,6 +40,10 @@ import {
 	revokeOwnSignedAgent,
 } from "./owned-project-agent-grant-revocation";
 import {
+	agentHostAccountSwitchPath,
+	switchOwnedAgentHostAccount,
+} from "./owned-project-agent-host-account";
+import {
 	agentHostRotationPath,
 	rotateOwnedAgentHost,
 } from "./owned-project-agent-host-rotation";
@@ -321,12 +325,15 @@ export function createOwnedProjectAgentHosts(options: BrowserHosts) {
 		const hostRotation =
 			request.method === "POST" && path === agentHostRotationPath;
 		const hostUpdate = request.method === "POST" && path === "/host/update";
+		const hostSwitch =
+			request.method === "POST" && path === agentHostAccountSwitchPath;
 		const write =
 			decision ||
 			browserAgentWrite ||
 			grantRevoke ||
 			hostRevoke ||
 			hostUpdate ||
+			hostSwitch ||
 			(request.method === "POST" && path === "/host/create");
 		const enroll = request.method === "POST" && path === "/host/enroll";
 		const read =
@@ -533,6 +540,8 @@ export function createOwnedProjectAgentHosts(options: BrowserHosts) {
 				if (path === "/host/create")
 					return createOwnedAgentHost(client, userId, body);
 				if (hostUpdate) return updateOwnedAgentHost(client, userId, body);
+				if (hostSwitch)
+					return switchOwnedAgentHostAccount(client, userId, body);
 				// AllAuth's owner guard rejects missing IDs along with unknown and foreign hosts.
 				const target = revokeInput.safeParse(body);
 				return target.success && target.data.host_id

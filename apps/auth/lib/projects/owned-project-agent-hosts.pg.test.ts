@@ -2943,6 +2943,245 @@ describe.skipIf(!existsSync(fixture))(
 			).toBe(200);
 		});
 
+		it("switches a delegated host to its existing owner and retires linked access across writers", async () => {
+			const path = "/host/switch-account";
+			const scope = `"${alpha.schemaName}"`;
+			const host = await nativeMachineHost(
+				"Same-owner switch host",
+				ownerCookie,
+			);
+			const body = { host_id: host.hostId };
+			const actor = owner.id;
+			const states = [
+				"active",
+				"pending",
+				"expired",
+				"claimed",
+				"rejected",
+				"revoked",
+			];
+			async function seed() {
+				const ids = states.map(() => randomUUID());
+				await database.query(
+					`INSERT INTO ${scope}."agent" (id,name,"userId","hostId",status,mode,"publicKey",kid,"jwksUrl","createdAt","updatedAt")
+					SELECT a.id,a.status,CASE WHEN a.status='pending' THEN NULL ELSE $3 END,$4,a.status,'delegated',$5,'switch-agent-kid','https://unused.fixture.invalid/jwks',now(),now()-interval '1 minute'
+					FROM unnest($1::text[],$2::text[]) AS a(id,status)`,
+					[ids, states, actor, host.hostId, dependentKey],
+				);
+				for (const id of ids)
+					await database.query(
+						`INSERT INTO ${scope}."agentCapabilityGrant" (id,"agentId",capability,status,"createdAt","updatedAt") VALUES
+						 ($1,$3,'fixture.read','active',now(),now()-interval '1 minute'),($2,$3,'fixture.used','consumed',now(),now()-interval '1 minute')`,
+						[randomUUID(), randomUUID(), id],
+					);
+				return ids;
+			}
+			async function agents(ids: string[]) {
+				return (
+					await database.query<{
+						id: string;
+						status: string;
+						publicKey: string;
+						kid: string | null;
+						jwksUrl: string | null;
+						grants: string[];
+						userId: string | null;
+						touched: boolean;
+					}>(
+						`SELECT a.id,a.status,a."publicKey",a.kid,a."jwksUrl",a."userId",a."updatedAt">now()-interval '30 seconds' AS touched,
+					 ARRAY(SELECT g.status FROM ${scope}."agentCapabilityGrant" g WHERE g."agentId"=a.id ORDER BY g.capability) AS grants
+					FROM ${scope}."agent" a WHERE a.id=ANY($1::text[]) ORDER BY array_position($1::text[],a.id)`,
+						[ids],
+					)
+				).rows;
+			}
+			async function hostState() {
+				return (
+					await database.query<{ public: object; updatedAt: Date }>(
+						`SELECT to_jsonb(h)-'updatedAt' AS public,h."updatedAt" FROM ${scope}."agentHost" h WHERE id=$1`,
+						[host.hostId],
+					)
+				).rows[0];
+			}
+			function switchResult(revoked: number) {
+				return {
+					host_id: host.hostId,
+					status: "active",
+					previous_user_id: actor,
+					new_user_id: actor,
+					agents_revoked: revoked,
+				};
+			}
+			function assertAgentSwitch(rows: Awaited<ReturnType<typeof agents>>) {
+				for (const [index, state] of states.entries()) {
+					const changed = index < 3;
+					expect(rows[index]).toMatchObject({
+						status: changed ? "revoked" : state,
+						publicKey: changed ? "" : dependentKey,
+						kid: changed ? null : "switch-agent-kid",
+						jwksUrl: changed ? null : "https://unused.fixture.invalid/jwks",
+						userId: state === "pending" ? null : actor,
+						touched: changed,
+						grants: changed ? ["revoked", "revoked"] : ["active", "consumed"],
+					});
+				}
+			}
+			const first = await seed();
+			const before = await hostState();
+			const nativeSwitch = await legacy.handler(
+				request(alpha, path, ownerCookie, body),
+			);
+			expect(nativeSwitch.status).toBe(200);
+			expect(await nativeSwitch.json()).toEqual(switchResult(3));
+			assertAgentSwitch(await agents(first));
+			const nativeHost = await hostState();
+			expect(nativeHost.public).toEqual(before.public);
+			expect(nativeHost.updatedAt.getTime()).toBeGreaterThanOrEqual(
+				before.updatedAt.getTime(),
+			);
+
+			const second = await seed();
+			const pending = await agents(second);
+			const approvalId = randomUUID();
+			await database.query(
+				`INSERT INTO ${scope}."approvalRequest" (id,method,"agentId","hostId","userId",status,interval,"expiresAt","createdAt","updatedAt")
+				 VALUES ($1,'device_authorization',$2,$3,$4,'pending',5,now()+interval '5 minutes',now(),now())`,
+				[approvalId, second[1], host.hostId, actor],
+			);
+			await expectSame(path, peerCookie, 403, body);
+			await expectSame(path, "", 403, body);
+			await expectSame(path, ownerCookie, 403, { host_id: randomUUID() });
+			for (const invalid of [{}, { host_id: "" }, { host_id: 1 }])
+				await expectSame(path, ownerCookie, 403, invalid);
+			await expectSame(
+				path,
+				ownerCookie,
+				403,
+				body,
+				`Bearer ${await hostProof(host)}`,
+			);
+			expect(
+				(await outside.dispatch(request(beta, path, ownerCookie, body))).status,
+			).toBe(403);
+			expect(
+				(await disabled.dispatch(request(alpha, path, ownerCookie, body)))
+					.status,
+			).toBe(501);
+			expect(await agents(second)).toEqual(pending);
+			await database.query(
+				`ALTER TABLE ${scope}."agentCapabilityGrant" ADD CONSTRAINT fixture_reject_host_switch CHECK (status<>'revoked') NOT VALID`,
+			);
+			try {
+				await expect(
+					owned.dispatch(request(alpha, path, ownerCookie, body)),
+				).rejects.toMatchObject({ code: "23514" });
+			} finally {
+				await database.query(
+					`ALTER TABLE ${scope}."agentCapabilityGrant" DROP CONSTRAINT fixture_reject_host_switch`,
+				);
+			}
+			expect(await agents(second)).toEqual(pending);
+			expect(await hostState()).toEqual(nativeHost);
+			const ownedSwitch = await owned.dispatch(
+				request(alpha, path, ownerCookie, body),
+			);
+			expect(ownedSwitch.status).toBe(200);
+			expect(await ownedSwitch.json()).toEqual(switchResult(3));
+			assertAgentSwitch(await agents(second));
+			expect(
+				(
+					await database.query(
+						`SELECT status FROM ${scope}."approvalRequest" WHERE id=$1`,
+						[approvalId],
+					)
+				).rows,
+			).toEqual([{ status: "pending" }]);
+			expect((await hostState()).public).toEqual(before.public);
+
+			legacy = await native(nativePool);
+			const status = await legacy.handler(
+				request(
+					alpha,
+					`${statusPath}?agent_id=${second[0]}`,
+					"",
+					undefined,
+					`Bearer ${await hostProof(host)}`,
+				),
+			);
+			expect(status.status).toBe(200);
+			expect(await status.json()).toMatchObject({
+				host_id: host.hostId,
+				agent_id: second[0],
+				status: "revoked",
+			});
+			expect(await expectSame(path, ownerCookie, 200, body)).toEqual(
+				switchResult(0),
+			);
+			expect((await hostState()).public).toEqual(before.public);
+		});
+
+		it("holds the same-owner host switch boundary for stale sessions, revoked hosts and autonomous records", async () => {
+			const path = "/host/switch-account";
+			const scope = `"${alpha.schemaName}"`;
+			const revoked = await nativeMachineHost(
+				"Revoked switch host",
+				ownerCookie,
+			);
+			await database.query(
+				`UPDATE ${scope}."agentHost" SET status='revoked' WHERE id=$1`,
+				[revoked.hostId],
+			);
+			expect(
+				await expectSame(path, ownerCookie, 403, { host_id: revoked.hostId }),
+			).toEqual({ error: "host_revoked", message: "Host has been revoked" });
+
+			const host = await nativeMachineHost(
+				"Restricted switch host",
+				ownerCookie,
+			);
+			const organizationId = randomUUID();
+			await database.query(
+				`INSERT INTO ${scope}."organization" (id,name,slug,"createdAt") VALUES ($1,'Fixture host peers','fixture-host-peers',now())`,
+				[organizationId],
+			);
+			await database.query(
+				`INSERT INTO ${scope}."member" (id,"organizationId","userId",role,"createdAt") VALUES ($1,$3,$4,'owner',now()),($2,$3,$5,'member',now())`,
+				[randomUUID(), randomUUID(), organizationId, owner.id, peer.id],
+			);
+			await expectSame(path, peerCookie, 403, { host_id: host.hostId });
+			const stale = await signIn(owner.email);
+			const session = await legacy.handler(
+				request(alpha, "/get-session", stale),
+			);
+			const {
+				session: { id: sessionId },
+			} = (await session.json()) as { session: { id: string } };
+			await database.query(
+				`UPDATE ${scope}."session" SET "createdAt"=now()-interval '6 minutes' WHERE id=$1`,
+				[sessionId],
+			);
+			await expectSame(path, stale, 403, { host_id: host.hostId });
+			const [delegated, autonomous] = await seedDependents(host.hostId);
+			await database.query(
+				`UPDATE ${scope}."agent" SET mode='autonomous' WHERE id=$1`,
+				[autonomous],
+			);
+			const before = await persisted(host.hostId);
+			const denied = await owned.dispatch(
+				request(alpha, path, ownerCookie, { host_id: host.hostId }),
+			);
+			expect(denied.status).toBe(501);
+			expect(await persisted(host.hostId)).toEqual(before);
+			expect(
+				(
+					await database.query(
+						`SELECT status FROM ${scope}."agent" WHERE id=$1`,
+						[delegated],
+					)
+				).rows,
+			).toEqual([{ status: "active" }]);
+		});
+
 		it("updates the fresh browser owner's host and replaces its inline key under the stable ID across writers", async () => {
 			const path = "/host/update";
 			const host = await nativeMachineHost("Browser key update", ownerCookie);

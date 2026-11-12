@@ -10,7 +10,7 @@ The platform installs `@better-auth/agent-auth` 0.6.2. The endpoint inventory be
 | Host provisioning and enrollment | `POST /host/create`, `POST /host/enroll` | Fresh verified browser provisioning, inline Ed25519, and one-time enrollment across writers. |
 | Host update | `POST /host/update` | Fresh verified browser owner can edit the host and replace its inline key under the existing ID. |
 | Signed host key rotation | `POST /host/rotate-key` | Active owned inline host with an exact host-ID issuer and unused JTI. Host-ID changes require a host without linked agents or approvals. |
-| Host account switch | `POST /host/switch-account` | Pending |
+| Host account switch | `POST /host/switch-account` | Fresh verified browser session of the current owner resets access for a delegated host under its existing ID and key. |
 | Delegated registration | `POST /agent/register` | Existing active owned host with a verified inline Ed25519 JWT and one-time JWT ID. Supports an active agent or a pending registration with device approval under the same host owner. |
 | Agent identity transfer | `POST /agent/claim` | Pending. |
 | Agent session | `GET /agent/session` | Verified active inline delegated agent, live grants, and an explicit public user projection. |
@@ -43,6 +43,8 @@ The existing project schema in `migrations/005-free-plugins.sql` carries all fou
 | `approvalRequest` | Approval ID, `device_authorization` or `ciba` method, nullable agent, host and user references, capabilities text, hashed user code, polling and expiry state, and CIBA delivery fields. Statuses are `pending`, `approved`, `denied` and `expired`. Keep these records separate from OAuth `deviceCode`. |
 
 The owned fixture reads the original host rows and preserves the legacy public response. Browser revocation updates the host, its eligible agents and their grants in one realm-scoped transaction. An already-revoked host returns zero newly revoked agents. Enrollment preserves the one-hour token deadline, the 15-minute host session lifetime and the host ID on activation. Both writers consume tokens issued by the other. Same-owner key enrollment can merge a pending host into an existing host and retire the pending record. The fixture requires a valid public Ed25519 JWK and refuses unowned or ambiguous key records.
+
+The account-switch route follows the platform’s current-owner check. It retires linked delegated agent keys and grants in one transaction and returns the native count and identical previous and new owner IDs. Claimed, rejected, and revoked agents keep their stored state. Native reads after rollback recognize the revoked agents and accept the original host key. Hosts with autonomous agent records stay outside the fixture scope.
 
 The native pending list accepts a current browser session and scopes rows by owner. The decision endpoint confirms a fresh verified browser session and matches the approval, delegated agent and existing active host to that owner. Device approval checks the existing hashed code. Decisions resolve compatible pending rows and the agent status in one transaction. The fixture leaves unowned hosts, host transfers, mixed approval methods, capability grants and push delivery outside its decision scope.
 
