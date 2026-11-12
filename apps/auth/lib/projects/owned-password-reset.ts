@@ -12,7 +12,13 @@ import { checkedProjectSchema } from "./validation";
 export type PasswordSafety = "allowed" | "breached" | "unavailable";
 type PasswordResetResult =
 	| { status: "reset" }
-	| { status: "invalid-token" | "breached-password" | "unavailable" }
+	| {
+			status:
+				| "invalid-token"
+				| "breached-password"
+				| "breach-check-unavailable"
+				| "unavailable";
+	  }
 	| {
 			status: "password-policy";
 			code:
@@ -205,7 +211,7 @@ export function createOwnedPasswordReset(options: PasswordResetOptions) {
 			.checkPasswordSafety(input.newPassword)
 			.catch(() => "unavailable" as const);
 		if (safe === "breached") return { status: "breached-password" };
-		if (safe !== "allowed") return { status: "unavailable" };
+		if (safe !== "allowed") return { status: "breach-check-unavailable" };
 		const hashed = await clerkCompatiblePasswords.hash(input.newPassword);
 
 		return store.transaction(async (client) => {

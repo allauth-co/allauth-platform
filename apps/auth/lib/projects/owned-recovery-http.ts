@@ -490,13 +490,18 @@ export function createOwnedRecoveryHttp(options: RecoveryHttpOptions) {
 		const limited = await admission(request, "reset-password");
 		if (limited) return limited;
 		const auditContext = options.auditContext?.(request);
-		const rejected = async (status: number, code: string, message: string) => {
+		const rejected = async (
+			status: number,
+			code: string,
+			message: string,
+			auditCode = code,
+		) => {
 			await store.transaction((client) =>
 				store.recordEvent(client, {
 					type: "user.password-reset",
 					outcome: "failure",
 					...auditContext,
-					metadata: { path: "/reset-password", errorCode: code },
+					metadata: { path: "/reset-password", errorCode: auditCode },
 				}),
 			);
 			return failure(status, code, message);
@@ -518,13 +523,18 @@ export function createOwnedRecoveryHttp(options: RecoveryHttpOptions) {
 				return rejected(
 					400,
 					"PASSWORD_COMPROMISED",
-					"Choose a password that has not appeared in a data breach.",
+					"The password you entered has been compromised. Please choose a different password.",
 				);
+			case "breach-check-unavailable":
 			case "unavailable":
 				return rejected(
 					503,
 					"PASSWORD_RESET_UNAVAILABLE",
 					"Password reset is unavailable.",
+					// Preserve the installed audit code without exposing provider errors in HTTP.
+					result.status === "breach-check-unavailable"
+						? "AUTHENTICATION_FAILED"
+						: undefined,
 				);
 		}
 	}

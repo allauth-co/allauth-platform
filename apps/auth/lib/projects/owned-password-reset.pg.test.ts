@@ -221,7 +221,7 @@ describe.skipIf(!existsSync(fixturePath))(
 			const sessionId = await addSession(userId);
 			await expect(
 				consume(async () => "unavailable")({ token, newPassword }),
-			).resolves.toEqual({ status: "unavailable" });
+			).resolves.toEqual({ status: "breach-check-unavailable" });
 			await database.query(
 				`ALTER TABLE "${schema}"."allauthAudit" ADD CONSTRAINT fixture_reject_audit CHECK (false) NOT VALID`,
 			);

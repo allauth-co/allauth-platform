@@ -18,11 +18,16 @@ import { allauthControl } from "../control";
 import { newWebhookSigningSecret } from "../control/webhook-contract";
 import type { ControlWebhookEnvelope } from "../control/webhooks";
 import { deliverPendingWebhooks } from "../control/webhooks";
+import type { EmailEnvironment } from "../email/send";
 import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
 import type { CompleteOwnedEmailVerification } from "./owned-email-verification";
+import { createOwnedEmailVerification } from "./owned-email-verification";
 import type { OwnedProjectEmailAliases } from "./owned-project-email-aliases";
 import { createOwnedProjectEmailAliases } from "./owned-project-email-aliases";
 import { createOwnedProjectEmailCallbackPolicy } from "./owned-project-email-callback";
+import { createOwnedProjectEngine } from "./owned-project-engine";
+import { createOwnedProjectPasswordSafety } from "./owned-project-password-safety";
+import type { RecoveryHttpOptions } from "./owned-recovery-http";
 import { createOwnedRecoveryHttp } from "./owned-recovery-http";
 
 const fixturePath = new URL(
@@ -187,6 +192,7 @@ describe.skipIf(!existsSync(fixturePath))(
 				preserveBrowserContinuation?: boolean;
 				hosted?: boolean;
 				policy?: AuthPolicy;
+				checkPasswordSafety?: RecoveryHttpOptions["checkPasswordSafety"];
 				completeVerification?: CompleteOwnedEmailVerification;
 			} = {},
 		) {
@@ -231,9 +237,8 @@ describe.skipIf(!existsSync(fixturePath))(
 								},
 							},
 				},
-				async checkPasswordSafety() {
-					return "allowed";
-				},
+				checkPasswordSafety:
+					options.checkPasswordSafety ?? (async () => "allowed"),
 				async admit() {
 					return {
 						allowed: !options.limited,
@@ -269,6 +274,41 @@ describe.skipIf(!existsSync(fixturePath))(
 				[userId],
 			);
 			return result.rows[0]?.emailVerified;
+		}
+
+		function installedFixture(
+			policy: AuthPolicy,
+			email: EmailEnvironment = {},
+		) {
+			if (!nativeDatabase)
+				throw new Error("Expected the isolated native database.");
+			const options = createAuthOptions(
+				{ db: nativeDatabase, type: "postgres", transaction: true },
+				{
+					AUTH_RUNTIME: "node",
+					ALLAUTH_AUTH_URL: origin,
+					ALLAUTH_AUTH_SECRET: signingSecret,
+					SCIM_CREDENTIAL_HASH_SECRET: "synthetic-recovery-fixture-scim-secret",
+					...email,
+				},
+				{
+					name: "Recovery event fixture",
+					slug: project,
+					basePath,
+					cookiePrefix: "allauth_project_recovery_event",
+					primaryOrigin: appOrigin,
+					publicOrigin: origin,
+					origins: [appOrigin],
+					broker: {
+						clientId: "fixture-broker-id",
+						clientSecret: "fixture-broker-secret",
+					},
+					authorizeAdmin: async () => null,
+					management: { id: "recovery-event-fixture" },
+				},
+				policy,
+			);
+			return betterAuth({ ...options, logger: { disabled: true } });
 		}
 
 		it("queues uniform password recovery and sends a legacy-format, single-use link", async () => {
@@ -810,7 +850,11 @@ describe.skipIf(!existsSync(fixturePath))(
 			);
 		});
 
-		it("preserves the installed password policy rejection and signed reset events", async () => {
+		it.each([
+			"password policy rejection",
+			"compromised password",
+			"breach-check outage",
+		] as const)("preserves signed reset events after %s", async (scenario) => {
 			if (!nativeDatabase)
 				throw new Error("Expected the isolated native database.");
 			const policy = {
@@ -820,44 +864,41 @@ describe.skipIf(!existsSync(fixturePath))(
 					requireSymbol: true,
 				},
 			};
-			const options = createAuthOptions(
-				{ db: nativeDatabase, type: "postgres", transaction: true },
-				{
-					AUTH_RUNTIME: "node",
-					ALLAUTH_AUTH_URL: origin,
-					ALLAUTH_AUTH_SECRET: signingSecret,
-					SCIM_CREDENTIAL_HASH_SECRET: "synthetic-recovery-fixture-scim-secret",
-				},
-				{
-					name: "Recovery event fixture",
-					slug: project,
-					basePath,
-					cookiePrefix: "allauth_project_recovery_event",
-					primaryOrigin: appOrigin,
-					publicOrigin: origin,
-					origins: [appOrigin],
-					broker: {
-						clientId: "fixture-broker-id",
-						clientSecret: "fixture-broker-secret",
-					},
-					authorizeAdmin: async () => null,
-					management: { id: "recovery-event-fixture" },
-				},
+			const installed = installedFixture(policy);
+			const owned = fixture({
 				policy,
+				checkPasswordSafety: createOwnedProjectPasswordSafety(),
+			});
+			const account = await seed(
+				`password-events-${randomUUID()}@fixture.example`,
 			);
-			const installed = betterAuth({ ...options, logger: { disabled: true } });
-			const owned = fixture({ policy });
-			const account = await seed("password-policy-events@fixture.example");
 			const realm = `"${schema}"`;
 			const address = "192.0.2.188";
-			const agent = "Synthetic recovery policy fixture";
+			const agent = "Synthetic recovery fixture";
+			const compromised = "Synthetic-compromised-password!";
+			const unavailable = "Synthetic-unavailable-password!";
+			const compromiseDigest = createHash("sha1")
+				.update(compromised)
+				.digest("hex")
+				.toUpperCase();
+			const unavailableDigest = createHash("sha1")
+				.update(unavailable)
+				.digest("hex")
+				.toUpperCase();
 			const network = vi
 				.spyOn(globalThis, "fetch")
 				.mockImplementation(async (input) => {
 					const url = new URL(input instanceof Request ? input.url : input);
 					if (url.origin !== "https://api.pwnedpasswords.com")
 						throw new Error("Unexpected external request.");
-					return new Response("00000000000000000000000000000000000:0", {
+					const prefix = url.pathname.split("/").at(-1);
+					if (prefix === unavailableDigest.slice(0, 5))
+						return new Response("Synthetic provider outage", { status: 503 });
+					const body =
+						prefix === compromiseDigest.slice(0, 5)
+							? `${compromiseDigest.slice(5)}:1`
+							: "00000000000000000000000000000000000:0";
+					return new Response(body, {
 						headers: { "content-type": "text/plain" },
 					});
 				});
@@ -886,6 +927,27 @@ describe.skipIf(!existsSync(fixturePath))(
 			] as const;
 			try {
 				for (const dispatch of [installed.handler, owned.handler]) {
+					const legacy = dispatch === installed.handler;
+					const policyRejected = scenario === "password policy rejection";
+					const retryable = policyRejected || !legacy;
+					const context = { ipAddress: address, userAgent: agent };
+					const resetEvent = (errorCode?: string) => ({
+						type: "user.password-reset",
+						outcome: errorCode ? "failure" : "success",
+						...context,
+						metadata: {
+							path: "/reset-password",
+							...(errorCode && { errorCode }),
+						},
+					});
+					const expected = [
+						{
+							type: "user.password-reset-requested",
+							outcome: "success",
+							...context,
+							metadata: { path: "/request-password-reset" },
+						},
+					];
 					const endpoint = randomUUID();
 					const signing = newWebhookSigningSecret();
 					const recipient = "https://recovery-hook.fixture.example/events";
@@ -924,26 +986,75 @@ describe.skipIf(!existsSync(fixturePath))(
 							}),
 						);
 						expect(requested?.status).toBe(200);
-						for (const [newPassword, code, message] of rejected) {
+						if (policyRejected) {
+							for (const [newPassword, code, message] of rejected) {
+								const response = await dispatch(
+									send("/reset-password", { token, newPassword }),
+								);
+								expect(response?.status).toBe(400);
+								expect(await response?.json()).toEqual({ code, message });
+								expect(await state()).toEqual({ proof: true, session: true });
+							}
+						} else {
+							const breach = scenario === "compromised password";
 							const response = await dispatch(
-								send("/reset-password", { token, newPassword }),
+								send("/reset-password", {
+									token,
+									newPassword: breach ? compromised : unavailable,
+								}),
 							);
-							expect(response?.status).toBe(400);
-							expect(await response?.json()).toEqual({ code, message });
-							expect(await state()).toEqual({ proof: true, session: true });
+							const body = await response?.json();
+							if (breach) {
+								expect(response?.status).toBe(400);
+								expect(body).toEqual({
+									code: "PASSWORD_COMPROMISED",
+									message:
+										"The password you entered has been compromised. Please choose a different password.",
+								});
+								expected.push(resetEvent("PASSWORD_COMPROMISED"));
+							} else {
+								expect(response?.status).toBe(legacy ? 500 : 503);
+								expect(body).toEqual(
+									legacy
+										? { message: "Failed to check password. Status: 503" }
+										: {
+												code: "PASSWORD_RESET_UNAVAILABLE",
+												message: "Password reset is unavailable.",
+											},
+								);
+								expected.push(resetEvent("AUTHENTICATION_FAILED"));
+							}
 						}
-						const success = await dispatch(
+						expect(await state()).toEqual({ proof: retryable, session: true });
+						const retry = await dispatch(
 							send("/reset-password", { token, newPassword: password }),
 						);
-						expect(success?.status, await success?.clone().text()).toBe(200);
-						expect(await state()).toEqual({ proof: false, session: false });
-						const replay = await dispatch(
-							send("/reset-password", { token, newPassword: password }),
+						expect(retry?.status, await retry?.clone().text()).toBe(
+							retryable ? 200 : 400,
 						);
-						expect(replay?.status).toBe(400);
-						expect(await replay?.json()).toMatchObject({
-							code: "INVALID_TOKEN",
+						if (retryable) {
+							expect(await retry?.json()).toEqual({ status: true });
+							expected.push(resetEvent());
+						} else {
+							expect(await retry?.json()).toMatchObject({
+								code: "INVALID_TOKEN",
+							});
+							expected.push(resetEvent("INVALID_TOKEN"));
+						}
+						expect(await state()).toEqual({
+							proof: false,
+							session: !retryable,
 						});
+						if (policyRejected) {
+							const replay = await dispatch(
+								send("/reset-password", { token, newPassword: password }),
+							);
+							expect(replay?.status).toBe(400);
+							expect(await replay?.json()).toMatchObject({
+								code: "INVALID_TOKEN",
+							});
+							expected.push(resetEvent("INVALID_TOKEN"));
+						}
 						const events: Omit<
 							ControlWebhookEnvelope["data"]["event"],
 							"id" | "createdAt"
@@ -967,6 +1078,8 @@ describe.skipIf(!existsSync(fixturePath))(
 								for (const value of [
 									token,
 									password,
+									compromised,
+									unavailable,
 									...rejected.map(([value]) => value),
 								])
 									expect(body).not.toContain(value);
@@ -982,38 +1095,13 @@ describe.skipIf(!existsSync(fixturePath))(
 								return 204;
 							},
 						});
-						const context = { ipAddress: address, userAgent: agent };
 						expect(result).toEqual({
 							claimed: 3,
 							delivered: 3,
 							retried: 0,
 							failed: 0,
 						});
-						expect(events).toEqual(
-							expect.arrayContaining([
-								{
-									type: "user.password-reset-requested",
-									outcome: "success",
-									...context,
-									metadata: { path: "/request-password-reset" },
-								},
-								{
-									type: "user.password-reset",
-									outcome: "success",
-									...context,
-									metadata: { path: "/reset-password" },
-								},
-								{
-									type: "user.password-reset",
-									outcome: "failure",
-									...context,
-									metadata: {
-										path: "/reset-password",
-										errorCode: "INVALID_TOKEN",
-									},
-								},
-							]),
-						);
+						expect(events).toEqual(expect.arrayContaining(expected));
 					} finally {
 						await database.query(
 							`DELETE FROM ${realm}."allauthWebhookEndpoint" WHERE id=$1`,
@@ -1072,6 +1160,228 @@ describe.skipIf(!existsSync(fixturePath))(
 			expect(response?.status).toBe(429);
 			expect(response?.headers.get("retry-after")).toBe("7");
 			expect(limited.queued).toHaveLength(0);
+		});
+
+		it.each([
+			true,
+			false,
+		])("signs signup and first email verification with requireEmailVerification=%s", async (requireEmailVerification) => {
+			if (!nativeDatabase)
+				throw new Error("Expected the isolated native database.");
+			const policy = { ...defaultAuthPolicy, requireEmailVerification };
+			const links: URL[] = [];
+			const queued: (() => Promise<void>)[] = [];
+			const mail: EmailEnvironment = {
+				EMAIL_FROM: "no-reply@recovery-fixture.example",
+				EMAIL: {
+					async send({ html }) {
+						links.push(mailedLink(html));
+					},
+				},
+			};
+			const verification = createOwnedEmailVerification({
+				database,
+				schemaName: schema,
+				signingSecret,
+			});
+			const defer = (work: () => Promise<void>) => {
+				queued.push(work);
+			};
+			const checkPasswordSafety = async () => "allowed" as const;
+			const admit = async () => ({ allowed: true, retryAfter: 0 });
+			const installed = installedFixture(policy, mail);
+			const owned = createOwnedProjectEngine({
+				database,
+				project: { slug: project, schemaName: schema },
+				policy,
+				signingSecret,
+				baseURL: origin,
+				basePath,
+				trustedOrigins: [appOrigin],
+				trustedIP: (request) => request.headers.get("x-real-ip"),
+				signUp: {
+					checkPasswordSafety,
+					admit,
+					verification: {
+						callbackURLs: [verifyCallback],
+						defer,
+						async send(user, callbackURL) {
+							const link = new URL(`${appOrigin}/api/allauth/verify-email`);
+							link.searchParams.set("token", await verification.issue(user));
+							link.searchParams.set("callbackURL", callbackURL);
+							links.push(link);
+						},
+					},
+				},
+				recovery: {
+					publicLinkBaseURL: `${appOrigin}/api/allauth`,
+					resetCallbackURLs: [resetCallback],
+					verificationCallbackURLs: [verifyCallback],
+					email: { environment: mail },
+					checkPasswordSafety,
+					admit,
+					defer,
+				},
+			});
+			const network = vi
+				.spyOn(globalThis, "fetch")
+				.mockImplementation(async (input) => {
+					const url = new URL(input instanceof Request ? input.url : input);
+					if (
+						url.origin !== "https://api.pwnedpasswords.com" ||
+						!url.pathname.startsWith("/range/")
+					)
+						throw new Error("Unexpected external request.");
+					return new Response("");
+				});
+			try {
+				for (const [writer, dispatch] of [
+					["native", installed.handler],
+					["owned", owned.dispatch],
+				] as const) {
+					const endpointId = randomUUID();
+					const recipient = "https://verification-hook.fixture.example/events";
+					const signing = newWebhookSigningSecret();
+					await database.query(
+						`INSERT INTO "${schema}"."allauthWebhookEndpoint" (id,url,"eventTypes","encryptedSecret") VALUES ($1,$2,'["user.created","user.email-verified"]',$3)`,
+						[
+							endpointId,
+							recipient,
+							await symmetricEncrypt({ key: signingSecret, data: signing }),
+						],
+					);
+					try {
+						const email = `${writer}-${requireEmailVerification}@verification.fixture.example`;
+						const name = "Verification fixture account";
+						const signup = post("/sign-up/email", {
+							email,
+							name,
+							password: oldPassword,
+							callbackURL: verifyCallback,
+						});
+						signup.headers.set("x-real-ip", "192.0.2.104");
+						signup.headers.set("user-agent", "Fixture signup");
+						const registered = await dispatch(signup);
+						expect(registered.status, `${writer} signup`).toBe(200);
+						expect(registered.headers.getSetCookie()).toEqual([]);
+						const { token, user } = (await registered.json()) as {
+							token: string | null;
+							user: { id: string };
+						};
+						expect(token).toBeNull();
+						expect(user).toMatchObject({ email, name, emailVerified: false });
+						if (!requireEmailVerification) {
+							expect(links).toHaveLength(0);
+							expect(queued).toHaveLength(0);
+							const issue = post("/send-verification-email", {
+								email,
+								callbackURL: verifyCallback,
+							});
+							issue.headers.set("x-real-ip", "192.0.2.104");
+							expect((await dispatch(issue)).status).toBe(200);
+						}
+						for (const work of queued.splice(0)) await work();
+						expect(links).toHaveLength(1);
+						const [link] = links.splice(0);
+						const context = {
+							ipAddress: "192.0.2.105",
+							userAgent: "Fixture verification",
+						};
+						const visit = () =>
+							new Request(`${origin}${basePath}/verify-email${link.search}`, {
+								headers: {
+									"x-real-ip": context.ipAddress,
+									"user-agent": context.userAgent,
+								},
+							});
+						const verified = await dispatch(visit());
+						expect(verified.status, `${writer} verify`).toBe(302);
+						expect(verified.headers.get("location")).toBe(verifyCallback);
+						expect(verified.headers.get("set-cookie")).toContain(
+							"session_token=",
+						);
+						expect(await isVerified(user.id)).toBe(true);
+						const replay = await dispatch(visit());
+						expect(replay.status, `${writer} replay`).toBe(302);
+						expect(replay.headers.get("location")).toBe(verifyCallback);
+						expect(replay.headers.getSetCookie()).toEqual([]);
+						const sessions = await database.query(
+							`SELECT id FROM "${schema}"."session" WHERE "userId"=$1`,
+							[user.id],
+						);
+						expect(sessions.rows).toHaveLength(1);
+						const sent: {
+							url: string;
+							body: string;
+							headers: Record<string, string>;
+						}[] = [];
+						const result = await deliverPendingWebhooks({
+							database: nativeDatabase,
+							secret: signingSecret,
+							now: () => new Date(Date.now() + 1_000),
+							resolver: async () => [{ address: "93.184.216.34", family: 4 }],
+							async transport({ destination, body, headers }) {
+								sent.push({ url: destination.url.href, body, headers });
+								return 204;
+							},
+						});
+						expect(result, writer).toEqual({
+							claimed: 2,
+							delivered: 2,
+							retried: 0,
+							failed: 0,
+						});
+						const events = sent.map(({ url, body, headers }) => {
+							expect(url).toBe(recipient);
+							const signature = createHmac(
+								"sha256",
+								Buffer.from(signing.slice(6), "base64"),
+							)
+								.update(
+									`${headers["webhook-id"]}.${headers["webhook-timestamp"]}.${body}`,
+								)
+								.digest("base64");
+							expect(headers["webhook-signature"]).toBe(`v1,${signature}`);
+							const envelope = JSON.parse(body) as ControlWebhookEnvelope;
+							const { id, type, timestamp } = envelope;
+							const created = type === "user.created";
+							expect(envelope).toEqual({
+								id,
+								type,
+								timestamp,
+								data: {
+									event: {
+										id,
+										type,
+										createdAt: timestamp,
+										outcome: "success",
+										actorId: user.id,
+										userId: user.id,
+										targetId: user.id,
+										metadata: {
+											path: created ? "/sign-up/email" : "/verify-email",
+										},
+										...(!created && context),
+									},
+									user: { id: user.id, email, name, emailVerified: !created },
+								},
+							});
+							return type;
+						});
+						expect(events.sort()).toEqual([
+							"user.created",
+							"user.email-verified",
+						]);
+					} finally {
+						await database.query(
+							`DELETE FROM "${schema}"."allauthWebhookEndpoint" WHERE id=$1`,
+							[endpointId],
+						);
+					}
+				}
+			} finally {
+				network.mockRestore();
+			}
 		});
 
 		it("uses the existing verification email and lets the legacy engine consume its signed link", async () => {
