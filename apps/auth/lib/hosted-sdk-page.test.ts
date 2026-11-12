@@ -1,10 +1,12 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { beforeEach, expect, it, vi } from "vitest";
+import OrganizationSSOPage from "@/app/organizations/[id]/sso/page";
 import { AllAuthAuth } from "@/components/better-auth-ui/allauth-auth";
 import { HostedProjectAuth } from "@/components/hosted-project-auth";
 import { HostedProjectAuthPage } from "@/components/hosted-project-auth-page";
 import { HostedProjectIssuerNavigation } from "@/components/hosted-project-auth-status";
 import { HostedProjectUnavailable } from "@/components/hosted-project-unavailable";
+import { SSOManagement } from "@/components/management/sso";
 import type { HostedProjectAuthPageProps } from "@/components/hosted-project-auth-page";
 import { portalHeader } from "./domains/edge";
 import { projectWriterUnavailable } from "./projects/project-engine-unavailable";
@@ -19,6 +21,9 @@ const runtime = vi.hoisted(() => ({
 }));
 vi.mock("next/headers", () => ({ headers: runtime.headers }));
 vi.mock("next/navigation", () => ({
+	notFound: () => {
+		throw new Error("not found");
+	},
 	redirect: (path: string) => {
 		throw new Error(`redirect:${path}`);
 	},
@@ -36,6 +41,9 @@ vi.mock("@/components/hosted-project-auth", () => ({
 }));
 vi.mock("@/components/better-auth-ui/allauth-auth", () => ({
 	AllAuthAuth: () => null,
+}));
+vi.mock("@/components/management/sso", () => ({
+	SSOManagement: () => null,
 }));
 
 function engineConfiguration(configuration: Record<string, unknown>) {
@@ -567,6 +575,58 @@ it("switches registered production sign-in by the current writer and requires it
 	expect((await read()).type).toBe(HostedProjectUnavailable);
 	runtime.readWriter.mockResolvedValue({ writer: "legacy", revision: 4 });
 	expect((await read()).type).toBe(AllAuthAuth);
+});
+
+it("selects the SSO client with the destination page's verified project writer", async () => {
+	const realm = {
+		...project,
+		workspaceId: platformWorkspaceId,
+		schemaName: `allauth_project_${project.id.replaceAll("-", "")}`,
+	};
+	const env = { ALLAUTH_PROJECT_ENGINE_INTERNAL_ID: project.id };
+	const requestHeaders = new Headers({ [portalHeader]: "fixture-proof" });
+	const bound = new Headers({ cookie: "fixture-session=opaque" });
+	const engine = {
+		dispatch: vi.fn(async (_request: Request) => Response.json({ role: "owner" })),
+	};
+	runtime.headers.mockResolvedValue(requestHeaders);
+	runtime.portalSession.mockResolvedValue({
+		user: { emailVerified: true },
+		session: {},
+	});
+	runtime.withPortalHeadersEngine.mockImplementation(async (_headers, select) =>
+		select(
+			engine,
+			bound,
+			{ kind: "accounts", project: realm, hostname: accountsHostname },
+			env,
+		),
+	);
+	const page = () =>
+		OrganizationSSOPage({ params: Promise.resolve({ id: "fixture-org" }) });
+	for (const [writer, revision] of [
+		["legacy", 0],
+		["allauth", 1],
+		["legacy", 2],
+	] as const) {
+		runtime.readWriter.mockResolvedValue({ writer, revision });
+		const result = await page();
+		expect(result.props.children[2]).toMatchObject({
+			type: SSOManagement,
+			props: {
+				organizationId: "fixture-org",
+				origin: `https://${accountsHostname}`,
+				hosted: writer === "allauth",
+			},
+		});
+	}
+	const membershipRequest = engine.dispatch.mock.calls[0][0];
+	expect(membershipRequest.url).toBe(
+		`https://${accountsHostname}/api/auth/organization/get-active-member-role?organizationId=fixture-org`,
+	);
+	expect(membershipRequest.headers.get("cookie")).toBe(bound.get("cookie"));
+	engine.dispatch.mockResolvedValueOnce(Response.json({ role: "member" }));
+	await expect(page()).rejects.toThrow("not found");
 });
 
 it("only selects alternate sign-in methods when the verified project can offer them", async () => {

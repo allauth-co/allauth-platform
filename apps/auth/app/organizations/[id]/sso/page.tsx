@@ -4,6 +4,7 @@ import { notFound, redirect } from "next/navigation";
 import { SSOManagement } from "@/components/management/sso";
 import { hasOrganizationAdminRole } from "@/components/management/sso-utils";
 import { authOrigin } from "@/lib/configuration";
+import { hostedSdkSelected } from "@/lib/domains/hosted-sdk-selection";
 import { portalSession, withPortalHeadersEngine } from "@/lib/domains/hosting";
 
 export default async function OrganizationSSOPage({
@@ -36,15 +37,23 @@ export default async function OrganizationSSOPage({
 			);
 			if (!response.ok) return null;
 			const result: unknown = await response.json();
-			return result &&
-				typeof result === "object" &&
-				"role" in result &&
-				typeof result.role === "string"
-				? { role: result.role, origin }
-				: null;
+			if (
+				!result ||
+				typeof result !== "object" ||
+				!("role" in result) ||
+				typeof result.role !== "string" ||
+				!hasOrganizationAdminRole(result.role)
+			)
+				return null;
+			return {
+				origin,
+				hosted: binding
+					? await hostedSdkSelected(env, binding.project, binding.kind)
+					: false,
+			};
 		},
 	).catch(() => null);
-	if (!access || !hasOrganizationAdminRole(access.role)) notFound();
+	if (!access) notFound();
 	return (
 		<div className="space-y-6">
 			<Link
@@ -61,7 +70,11 @@ export default async function OrganizationSSOPage({
 					Manage your organization's identity provider and verify its domains.
 				</p>
 			</div>
-			<SSOManagement organizationId={id} origin={access.origin} />
+			<SSOManagement
+				organizationId={id}
+				origin={access.origin}
+				hosted={access.hosted}
+			/>
 		</div>
 	);
 }

@@ -85,6 +85,7 @@ jobs:
         run: >-
           pnpm exec vitest run --root apps/auth --config vitest.config.ts
           lib/domains/hosted-sdk.test.ts lib/hosted-sdk-page.test.ts lib/hosted-sdk-ui-render.test.ts
+          lib/hosted-project-passkey-render.test.ts
           lib/domains/hosted-organization-preview.test.ts lib/hosted-organization-ui-render.test.ts
           lib/domains/hosted-header-render.test.ts lib/domains/hosted-account-profile-render.test.ts
           lib/domains/hosted-account-security-render.test.ts

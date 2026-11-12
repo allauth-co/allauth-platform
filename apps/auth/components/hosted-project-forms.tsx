@@ -1,12 +1,24 @@
 "use client";
 
+import { Eye, EyeOff } from "lucide-react";
+import type {
+	ComponentProps,
+	CSSProperties,
+	FormEvent,
+	ReactNode,
+} from "react";
 import { useEffect, useId, useRef, useState } from "react";
-import type { CSSProperties, FormEvent, ReactNode } from "react";
 import { hostedMagicLinkCallbacks } from "@/lib/domains/hosted-sdk-policy";
 import { brandForeground, brandLinkColor } from "@/sdk/branding";
 import { appCallback, authError, proxyBasePath } from "@/sdk/helpers";
+import {
+	defaultPasswordPolicy,
+	passwordPolicyDescription,
+	passwordPolicyError,
+} from "@/sdk/password-policy";
 import { useAllAuth, withAuthReturnTo } from "@/sdk/react";
 import { ApplicationBrandFooter } from "./application-brand";
+import { useHostedPasskeySignIn } from "./hosted-project-passkey";
 
 type FormContext = { destination: string; legacyPath: string };
 type HostedOperation =
@@ -170,11 +182,17 @@ function PasswordForm({
 	destination: string;
 }) {
 	const { run, busy, error } = useHostedAction();
+	const passkey = useHostedPasskeySignIn({
+		destination,
+		enabled: identifier === "username",
+	});
 	const [verification, setVerification] = useState(false);
 	const id = useId();
 	const label = identifier === "username" ? "Username" : "Email address";
 	function submit(event: FormEvent<HTMLFormElement>) {
 		event.preventDefault();
+		if (busy || passkey.busy) return;
+		passkey.cancelAutofill();
 		const form = new FormData(event.currentTarget);
 		const value = formValue(form, identifier).trim();
 		void run(async (request) => {
@@ -209,7 +227,7 @@ function PasswordForm({
 	}
 	return (
 		<form className="allauth-auth-form" onSubmit={submit}>
-			<FormError message={error} />
+			<FormError message={error || passkey.error} />
 			{verification && (
 				<p role="status">
 					Verify your email address to sign in.{" "}
@@ -224,12 +242,15 @@ function PasswordForm({
 				<label htmlFor={`${id}-identifier`}>{label}</label>
 				<input
 					id={`${id}-identifier`}
+					ref={passkey.identifierRef}
 					name={identifier}
 					type={identifier === "email" ? "email" : "text"}
-					autoComplete="username"
+					autoComplete={
+						identifier === "username" ? "username webauthn" : "username"
+					}
 					required
 					defaultValue={email}
-					disabled={busy}
+					disabled={busy || passkey.busy}
 				/>
 			</div>
 			<div className="allauth-field">
@@ -240,12 +261,26 @@ function PasswordForm({
 					type="password"
 					autoComplete="current-password"
 					required
-					disabled={busy}
+					disabled={busy || passkey.busy}
 				/>
 			</div>
-			<button type="submit" className="allauth-primary" disabled={busy}>
+			<button
+				type="submit"
+				className="allauth-primary"
+				disabled={busy || passkey.busy}
+			>
 				{busy ? "Signing in…" : "Sign in"}
 			</button>
+			{identifier === "username" && (
+				<button
+					type="button"
+					className="allauth-secondary"
+					disabled={busy || passkey.busy}
+					onClick={passkey.signInWithPasskey}
+				>
+					{passkey.busy ? "Waiting for passkey…" : "Sign in with a passkey"}
+				</button>
+			)}
 		</form>
 	);
 }
@@ -258,6 +293,220 @@ export function HostedProjectUsername(props: FormContext) {
 		>
 			<PasswordForm identifier="username" destination={props.destination} />
 		</HostedProjectCard>
+	);
+}
+
+function SignupField({
+	label,
+	children,
+	...input
+}: ComponentProps<"input"> & { label: string }) {
+	return (
+		<div className="allauth-field">
+			<label htmlFor={input.id}>{label}</label>
+			<input {...input} />
+			{children}
+		</div>
+	);
+}
+
+/** Keep the optional project username outside the published SDK sign-up component. */
+export function HostedProjectPasswordSignup({
+	destination,
+	showEmail,
+}: {
+	destination: string;
+	showEmail: boolean;
+}) {
+	const { capabilities, client } = useAllAuth();
+	const policy = capabilities?.passwordPolicy ?? defaultPasswordPolicy;
+	const id = useId();
+	const submitting = useRef(false);
+	const [username, setUsername] = useState("");
+	const [available, setAvailable] = useState<boolean>();
+	const [visible, setVisible] = useState(false);
+	const [busy, setBusy] = useState(false);
+	const [error, setError] = useState("");
+	const [waitingForEmail, setWaitingForEmail] = useState(false);
+	const desiredUsername = username.trim();
+	const validUsername = /^[a-zA-Z0-9_.]{3,30}$/.test(desiredUsername);
+
+	useEffect(() => {
+		if (!validUsername) return;
+		const controller = new AbortController();
+		const timer = setTimeout(() => {
+			void client
+				.isUsernameAvailable(
+					{ username: desiredUsername },
+					{ signal: controller.signal },
+				)
+				.then(({ data }) => {
+					if (!controller.signal.aborted) setAvailable(data?.available);
+				})
+				.catch(() => {});
+		}, 500);
+		return () => {
+			clearTimeout(timer);
+			controller.abort();
+		};
+	}, [client, desiredUsername, validUsername]);
+
+	async function submit(event: FormEvent<HTMLFormElement>) {
+		event.preventDefault();
+		const form = event.currentTarget;
+		if (submitting.current || !form.reportValidity()) return;
+		const fields = new FormData(form);
+		const firstName = formValue(fields, "firstName").trim();
+		const name = [firstName, formValue(fields, "lastName").trim()]
+			.filter(Boolean)
+			.join(" ");
+		const email = formValue(fields, "email").trim();
+		const password = formValue(fields, "password");
+		const invalid = !firstName
+			? "Enter your first name."
+			: name.length > 200
+				? "Your full name must be 200 characters or fewer."
+				: desiredUsername && !validUsername
+					? "Use 3–30 letters, numbers, underscores or dots for your username."
+					: passwordPolicyError(password, policy);
+		setError(invalid ?? "");
+		if (invalid) return;
+		submitting.current = true;
+		setBusy(true);
+		try {
+			const result = await client.signUp.email({
+				name,
+				email,
+				password,
+				...(desiredUsername && { username: desiredUsername }),
+				callbackURL: appCallback(destination, window.location.origin),
+			});
+			if (result.error) throw result.error;
+			const passwordField = form.elements.namedItem("password");
+			if (passwordField instanceof HTMLInputElement) passwordField.value = "";
+			const session = await client.getSession();
+			if (session.error) throw session.error;
+			const registeredUser = result.data?.user?.id;
+			if (registeredUser && session.data?.user.id === registeredUser) {
+				window.location.assign(destination);
+			} else if (capabilities?.emailVerificationRequired === false) {
+				window.location.assign(withAuthReturnTo("/sign-in", destination));
+			} else {
+				setWaitingForEmail(true);
+				if (showEmail)
+					window.location.assign(
+						withAuthReturnTo("/verify-email", destination),
+					);
+			}
+		} catch (cause) {
+			setError(authError(cause));
+		} finally {
+			submitting.current = false;
+			setBusy(false);
+		}
+	}
+
+	if (waitingForEmail)
+		return (
+			<p className="allauth-notice" role="status">
+				Check your email for a verification link. Open it to verify your address
+				and continue.
+			</p>
+		);
+
+	return (
+		<form
+			className="allauth-auth-form"
+			onSubmit={(event) => void submit(event)}
+		>
+			<FormError message={error} />
+			<fieldset className="contents" disabled={busy}>
+				<div className="allauth-name-grid">
+					<SignupField
+						id={`${id}-first-name`}
+						label="First name"
+						name="firstName"
+						autoComplete="given-name"
+						required
+						maxLength={200}
+					/>
+					<SignupField
+						id={`${id}-last-name`}
+						label="Last name (optional)"
+						name="lastName"
+						autoComplete="family-name"
+						maxLength={200}
+					/>
+				</div>
+				<SignupField
+					id={`${id}-email`}
+					label="Email address"
+					name="email"
+					type="email"
+					autoComplete="email"
+					required
+					maxLength={320}
+				/>
+				<SignupField
+					id={`${id}-username`}
+					label="Username (optional)"
+					name="username"
+					autoComplete="username"
+					minLength={3}
+					maxLength={30}
+					aria-describedby={`${id}-username-status`}
+					value={username}
+					onChange={(event) => {
+						setUsername(event.target.value);
+						setAvailable(undefined);
+					}}
+				>
+					<p
+						id={`${id}-username-status`}
+						className="allauth-muted"
+						aria-live="polite"
+					>
+						{available === true
+							? "Username is available."
+							: available === false
+								? "This username is taken."
+								: "Use 3–30 letters, numbers, underscores or dots."}
+					</p>
+				</SignupField>
+				<div className="allauth-field">
+					<label htmlFor={`${id}-password`}>Password</label>
+					<div className="allauth-password-field">
+						<input
+							id={`${id}-password`}
+							name="password"
+							type={visible ? "text" : "password"}
+							autoComplete="new-password"
+							required
+							minLength={policy.minLength}
+							maxLength={policy.maxLength}
+						/>
+						<button
+							type="button"
+							className="allauth-password-toggle"
+							aria-label={visible ? "Hide password" : "Show password"}
+							aria-controls={`${id}-password`}
+							aria-pressed={visible}
+							onClick={() => setVisible(!visible)}
+						>
+							{visible ? (
+								<EyeOff size={18} aria-hidden="true" />
+							) : (
+								<Eye size={18} aria-hidden="true" />
+							)}
+						</button>
+					</div>
+				</div>
+			</fieldset>
+			<p className="allauth-muted">{passwordPolicyDescription(policy)}</p>
+			<button type="submit" className="allauth-primary" disabled={busy}>
+				{busy ? "Creating account…" : "Continue"}
+			</button>
+		</form>
 	);
 }
 

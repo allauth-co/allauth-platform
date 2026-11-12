@@ -1,6 +1,11 @@
 "use client";
 
 import { useState } from "react";
+import type {
+	HostedAuthCallbackStatus,
+	HostedPasswordResetStatus,
+	HostedSdkForm,
+} from "@/lib/domains/hosted-sdk-policy";
 import {
 	AllAuthProvider,
 	ForgotPassword,
@@ -10,11 +15,6 @@ import {
 	useAllAuth,
 	withAuthReturnTo,
 } from "@/sdk/react";
-import type {
-	HostedAuthCallbackStatus,
-	HostedPasswordResetStatus,
-	HostedSdkForm,
-} from "@/lib/domains/hosted-sdk-policy";
 import {
 	HostedProjectAuthCallback,
 	HostedProjectResetStatus,
@@ -25,6 +25,7 @@ import {
 	HostedProjectCard,
 	HostedProjectEmail,
 	HostedProjectMfa,
+	HostedProjectPasswordSignup,
 	HostedProjectSso,
 	HostedProjectUsername,
 } from "./hosted-project-forms";
@@ -52,13 +53,14 @@ function HostedProjectChoices({
 	showPassword,
 	showEmail,
 	showSso,
+	nativeSignup = false,
 }: Pick<
 	HostedProjectAuthProps,
 	"view" | "destination" | "legacyPath" | "showBroker"
 > &
 	Partial<
 		Pick<HostedProjectAuthProps, "showPassword" | "showEmail" | "showSso">
-	>) {
+	> & { nativeSignup?: boolean }) {
 	const { capabilities, challenge, client } = useAllAuth();
 	const [busy, setBusy] = useState(false);
 	const [error, setError] = useState("");
@@ -79,14 +81,23 @@ function HostedProjectChoices({
 		);
 	}
 	const primary = view === "signIn" || view === "signUp";
+	const nativeProviders = nativeSignup
+		? (["apple", "google", "microsoft"] as const).filter(
+				(provider) => capabilities?.[provider],
+			)
+		: [];
+	const labels = { apple: "Apple", google: "Google", microsoft: "Microsoft" };
 
-	async function startBroker() {
+	async function startProvider(provider: "allauth" | keyof typeof labels) {
 		setBusy(true);
 		setError("");
 		try {
 			const callbackURL = new URL(destination, window.location.origin).href;
 			const result = await client.signIn.social({
-				provider: "allauth",
+				provider:
+					provider === "google"
+						? capabilities?.googleProvider || "allauth"
+						: provider,
 				callbackURL,
 				...(view === "signUp" ? { newUserCallbackURL: callbackURL } : {}),
 			});
@@ -112,11 +123,22 @@ function HostedProjectChoices({
 						type="button"
 						className="allauth-secondary w-full"
 						disabled={busy}
-						onClick={() => void startBroker()}
+						onClick={() => void startProvider("allauth")}
 					>
 						{busy ? "Connecting…" : "Continue with AllAuth"}
 					</button>
 				)}
+			{nativeProviders.map((provider) => (
+				<button
+					key={provider}
+					type="button"
+					className="allauth-secondary allauth-social-button w-full"
+					disabled={busy}
+					onClick={() => void startProvider(provider)}
+				>
+					Continue with {labels[provider]}
+				</button>
+			))}
 			{error && (
 				<p role="alert" className="allauth-error">
 					{error}
@@ -190,12 +212,25 @@ function HostedProjectSignUp({
 	"destination" | "legacyPath" | "showBroker" | "showEmail"
 >) {
 	const { capabilities, branding } = useAllAuth();
+	const passwordSignup =
+		capabilities?.emailPassword === true &&
+		capabilities.signUpEnabled !== false;
+	const title = branding?.name
+		? `Create your ${branding.name} account`
+		: "Create your account";
+	const footer = (
+		<p>
+			Already have an account?{" "}
+			<a href={withAuthReturnTo("/sign-in", destination)}>Sign in</a>
+		</p>
+	);
 	const choices = (
 		<HostedProjectChoices
 			view="signUp"
 			destination={destination}
 			legacyPath={legacyPath}
 			showBroker={showBroker}
+			nativeSignup={passwordSignup}
 		/>
 	);
 	if (
@@ -208,22 +243,22 @@ function HostedProjectSignUp({
 		!capabilities.microsoft
 	) {
 		return (
-			<HostedProjectCard
-				showBrandName={false}
-				title={
-					branding?.name
-						? `Create your ${branding.name} account`
-						: "Create your account"
-				}
-				footer={
-					<p>
-						Already have an account?{" "}
-						<a href={withAuthReturnTo("/sign-in", destination)}>Sign in</a>
-					</p>
-				}
-			>
+			<HostedProjectCard showBrandName={false} title={title} footer={footer}>
 				{choices}
 			</HostedProjectCard>
+		);
+	}
+	if (passwordSignup) {
+		return (
+			<>
+				<HostedProjectCard showBrandName={false} title={title} footer={footer}>
+					<HostedProjectPasswordSignup
+						destination={destination}
+						showEmail={showEmail}
+					/>
+				</HostedProjectCard>
+				{choices}
+			</>
 		);
 	}
 	return (
@@ -309,7 +344,10 @@ export function HostedProjectAuth({
 					<HostedProjectSignOut destination={destination} />
 				)}
 				{view === "authCallback" && (
-					<HostedProjectAuthCallback status={callbackStatus} destination={destination} />
+					<HostedProjectAuthCallback
+						status={callbackStatus}
+						destination={destination}
+					/>
 				)}
 				{(view === "verifyEmail" ||
 					view === "resetLinkSent" ||

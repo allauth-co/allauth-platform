@@ -14,7 +14,9 @@ import type {
 
 const native = vi.hoisted(() => ({
 	social: vi.fn(),
+	passkey: vi.fn(),
 	signUp: vi.fn(),
+	usernameAvailable: vi.fn(),
 	getSession: vi.fn(),
 	signOut: vi.fn(),
 	sendVerificationEmail: vi.fn(),
@@ -27,8 +29,9 @@ vi.mock("@/sdk/client", () => ({
 	) => {
 		native.onChallenge = onChallenge;
 		return {
-			signIn: { social: native.social },
+			signIn: { social: native.social, passkey: native.passkey },
 			signUp: { email: native.signUp },
+			isUsernameAvailable: native.usernameAvailable,
 			getSession: native.getSession,
 			signOut: native.signOut,
 			sendVerificationEmail: native.sendVerificationEmail,
@@ -50,7 +53,9 @@ afterEach(async () => {
 	vi.useRealTimers();
 	window.sessionStorage.clear();
 	native.social.mockReset();
+	native.passkey.mockReset();
 	native.signUp.mockReset();
+	native.usernameAvailable.mockReset();
 	native.getSession.mockReset();
 	native.signOut.mockReset();
 	native.sendVerificationEmail.mockReset();
@@ -310,8 +315,18 @@ async function renderHostedAuth(
 
 it("renders an email-verification callback with its vetted continuation", async () => {
 	vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
-	vi.stubGlobal("fetch", vi.fn(async () => Response.json({ emailPassword: true })));
-	const container = await renderHostedAuth("authCallback", destination, false, undefined, true, "emailVerified");
+	vi.stubGlobal(
+		"fetch",
+		vi.fn(async () => Response.json({ emailPassword: true })),
+	);
+	const container = await renderHostedAuth(
+		"authCallback",
+		destination,
+		false,
+		undefined,
+		true,
+		"emailVerified",
+	);
 	expect(container.textContent).toContain("Email verified");
 	const continuation = container.querySelector("a");
 	expect(continuation?.textContent).toBe("Continue");
@@ -496,6 +511,7 @@ it("keeps the broker registration action unavailable when the project disables s
 	const container = await renderHostedAuth("signUp");
 	expect(container.textContent).toContain("Account creation is not enabled");
 	expect(container.textContent).not.toContain("Continue with AllAuth");
+	expect(container.querySelector('input[name="username"]')).toBeNull();
 });
 
 it("hands a hosted email signup awaiting verification to the first-party verification page", async () => {
@@ -525,6 +541,13 @@ it("hands a hosted email signup awaiting verification to the first-party verific
 	expect(container.textContent).toContain(
 		"Create your Customer portal account",
 	);
+	const username = container.querySelector<HTMLInputElement>(
+		'input[name="username"]',
+	)!;
+	expect(username.required).toBe(false);
+	expect(
+		container.querySelector(`label[for="${username.id}"]`)?.textContent,
+	).toBe("Username (optional)");
 	await enter(container, "firstName", "Fixture");
 	await enter(container, "email", "signup@customer.example");
 	await enter(container, "password", "Synthetic-ready-password-123!");
@@ -538,6 +561,142 @@ it("hands a hosted email signup awaiting verification to the first-party verific
 	expect(assign).toHaveBeenCalledExactlyOnceWith(
 		`/verify-email?${new URLSearchParams({ returnTo: signed })}`,
 	);
+});
+
+it("creates a hosted password account with the exact optional username and preserves the return after sign-in", async () => {
+	vi.useFakeTimers();
+	vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+	vi.stubGlobal("fetch", async () =>
+		Response.json({
+			emailPassword: true,
+			google: true,
+			googleProvider: "google",
+			apple: true,
+			microsoft: true,
+			organizations: true,
+			twoFactor: true,
+			signUpEnabled: true,
+			emailVerificationRequired: false,
+		}),
+	);
+	native.usernameAvailable.mockResolvedValue({
+		data: { available: true },
+		error: null,
+	});
+	native.signUp.mockResolvedValue({
+		data: { user: { id: "fixture-user" } },
+		error: null,
+	});
+	native.getSession.mockResolvedValue({ data: null, error: null });
+	const assign = vi
+		.spyOn(window.location, "assign")
+		.mockImplementation(() => {});
+	const signed =
+		"/oauth2/continue?client_id=fixture&resource=one&resource=two&sig=fixture%2Bsignature";
+	const container = await renderHostedAuth("signUp", signed);
+	for (const provider of ["Apple", "Google", "Microsoft"]) {
+		expect(container.textContent).toContain(`Continue with ${provider}`);
+	}
+	await enter(container, "username", "Fixture.Person");
+	await act(async () => vi.advanceTimersByTimeAsync(500));
+	expect(native.usernameAvailable).toHaveBeenCalledExactlyOnceWith(
+		{ username: "Fixture.Person" },
+		{ signal: expect.any(AbortSignal) },
+	);
+	expect(container.textContent).toContain("Username is available.");
+	await enter(container, "firstName", "Fixture");
+	await enter(container, "lastName", "Person");
+	await enter(container, "email", "signup@customer.example");
+	await enter(container, "password", "Synthetic-ready-password-123!");
+	await submit(container);
+	expect(native.signUp).toHaveBeenCalledExactlyOnceWith({
+		name: "Fixture Person",
+		email: "signup@customer.example",
+		password: "Synthetic-ready-password-123!",
+		username: "Fixture.Person",
+		callbackURL: `https://accounts.customer.example${signed}`,
+	});
+	expect(assign).toHaveBeenCalledExactlyOnceWith(
+		`/sign-in?${new URLSearchParams({ returnTo: signed })}`,
+	);
+});
+
+it("does not submit an invalid optional username and surfaces a provider-independent signup conflict", async () => {
+	vi.useFakeTimers();
+	vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+	vi.stubGlobal("fetch", async () =>
+		Response.json({
+			emailPassword: true,
+			google: false,
+			organizations: true,
+			twoFactor: true,
+			signUpEnabled: true,
+		}),
+	);
+	native.usernameAvailable.mockResolvedValue({
+		data: { available: false },
+		error: null,
+	});
+	native.signUp.mockResolvedValue({
+		data: null,
+		error: { status: 422, message: "Username is already taken." },
+	});
+	const assign = vi
+		.spyOn(window.location, "assign")
+		.mockImplementation(() => {});
+	const container = await renderHostedAuth("signUp");
+	await enter(container, "firstName", "Fixture");
+	await enter(container, "email", "signup@customer.example");
+	await enter(container, "password", "Synthetic-ready-password-123!");
+	await enter(container, "username", "not valid");
+	await submit(container);
+	expect(native.signUp).not.toHaveBeenCalled();
+	expect(container.querySelector('[role="alert"]')?.textContent).toContain(
+		"3–30",
+	);
+	await enter(container, "username", "taken.user");
+	await act(async () => vi.advanceTimersByTimeAsync(500));
+	expect(container.textContent).toContain("This username is taken.");
+	await submit(container);
+	expect(native.signUp).toHaveBeenCalledTimes(1);
+	expect(container.querySelector('[role="alert"]')?.textContent).toBe(
+		"Username is already taken.",
+	);
+	expect(assign).not.toHaveBeenCalled();
+});
+
+it.each([
+	{ user: { id: "opaque-signup-user" } },
+	{},
+])("shows verification after an opaque signup while another browser session exists", async (data) => {
+	vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+	vi.stubGlobal("fetch", async () =>
+		Response.json({
+			emailPassword: true,
+			google: false,
+			organizations: true,
+			twoFactor: true,
+			signUpEnabled: true,
+			emailVerificationRequired: true,
+		}),
+	);
+	native.signUp.mockResolvedValue({ data, error: null });
+	native.getSession.mockResolvedValue({
+		data: { user: { id: "previous-account" } },
+		error: null,
+	});
+	const assign = vi
+		.spyOn(window.location, "assign")
+		.mockImplementation(() => {});
+	const container = await renderHostedAuth("signUp");
+	await enter(container, "firstName", "Fixture");
+	await enter(container, "email", "signup@customer.example");
+	await enter(container, "password", "Synthetic-ready-password-123!");
+	await submit(container);
+	expect(assign).toHaveBeenCalledExactlyOnceWith(
+		`/verify-email?${new URLSearchParams({ returnTo: destination })}`,
+	);
+	expect(container.querySelector('[role="alert"]')).toBeNull();
 });
 
 function hostedRequests(
@@ -603,6 +762,31 @@ it("continues username sign-in to dedicated MFA before navigating to the account
 	expect(navigate).toHaveBeenCalledExactlyOnceWith(
 		`/two-factor?${new URLSearchParams({ callbackUrl: destination })}`,
 	);
+});
+
+it("offers conditional and explicit passkey sign-in on the hosted username form", async () => {
+	hostedRequests(() => Response.json({}));
+	native.passkey.mockResolvedValue({
+		data: { user: { id: "fixture-user" } },
+		error: null,
+	});
+	const navigate = vi
+		.spyOn(window.location, "assign")
+		.mockImplementation(() => {});
+	const container = await renderHostedAuth("username");
+	expect(
+		container.querySelector('input[name="username"]')?.getAttribute("autocomplete"),
+	).toBe("username webauthn");
+	const passkey = [...container.querySelectorAll("button")].find(
+		(button) => button.textContent === "Sign in with a passkey",
+	);
+	expect(passkey).toBeDefined();
+	await act(async () => passkey?.click());
+	expect(native.passkey).toHaveBeenCalledExactlyOnceWith({
+		autoFill: false,
+		fetchOptions: { signal: expect.any(AbortSignal) },
+	});
+	expect(navigate).toHaveBeenCalledExactlyOnceWith(destination);
 });
 
 it.each([
