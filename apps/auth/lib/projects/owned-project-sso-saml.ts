@@ -33,7 +33,11 @@ const requestAge = 5 * 60 * 1000;
 const relayAge = 10 * 60 * 1000;
 const relayId = /^[A-Za-z0-9_-]{32,80}$/;
 const requestId = /^[A-Za-z_][A-Za-z0-9._:-]{0,255}$/;
-const formSize = 3 * 256 * 1024 + 4096;
+const postBodySize = 3 * 256 * 1024 + 4096;
+const jsonResponse = z.object({
+	SAMLResponse: z.string(),
+	RelayState: z.string().optional(),
+});
 const requestRecord = z.object({
 	id: z.string().regex(requestId),
 	providerId: z.string(),
@@ -65,14 +69,24 @@ function parse<T>(value: string, schema: z.ZodType<T>) {
 	}
 }
 
-async function postForm(request: Request) {
+function samlFormResponse(body: string) {
+	const data = new URLSearchParams(body);
+	const responses = data.getAll("SAMLResponse");
+	const states = data.getAll("RelayState");
+	if (responses.length !== 1 || states.length > 1) return null;
+	return { SAMLResponse: responses[0], RelayState: states[0] };
+}
+
+async function samlPostResponse(request: Request) {
+	const media = request.headers
+		.get("content-type")
+		?.split(";", 1)[0]
+		?.trim()
+		.toLowerCase();
 	if (
 		!request.body ||
-		request.headers
-			.get("content-type")
-			?.split(";", 1)[0]
-			?.trim()
-			.toLowerCase() !== "application/x-www-form-urlencoded"
+		(media !== "application/x-www-form-urlencoded" &&
+			media !== "application/json")
 	)
 		return null;
 	const reader = request.body.getReader();
@@ -84,23 +98,20 @@ async function postForm(request: Request) {
 			const item = await reader.read();
 			if (item.done) break;
 			size += item.value.byteLength;
-			if (size > formSize) {
+			if (size > postBodySize) {
 				void reader.cancel().catch(() => {});
 				return null;
 			}
 			body += decoder.decode(item.value, { stream: true });
 		}
-		const data = new URLSearchParams(body + decoder.decode());
-		const responses = data.getAll("SAMLResponse");
-		const states = data.getAll("RelayState");
-		if (
-			responses.length !== 1 ||
-			!responses[0] ||
-			states.length > 1 ||
-			(states[0] && !relayId.test(states[0]))
-		)
-			return null;
-		return { response: responses[0], relay: states[0] || undefined };
+		body += decoder.decode();
+		const payload =
+			media === "application/json"
+				? parse(body, jsonResponse)
+				: samlFormResponse(body);
+		const relay = payload?.RelayState;
+		if (!payload?.SAMLResponse || (relay && !relayId.test(relay))) return null;
+		return { response: payload.SAMLResponse, relay: relay || undefined };
 	} catch {
 		return null;
 	} finally {
@@ -445,8 +456,8 @@ export function createOwnedProjectSaml(options: {
 	}
 
 	async function callback(request: Request, providerId: string) {
-		const form = await postForm(request);
-		if (!form)
+		const payload = await samlPostResponse(request);
+		if (!payload)
 			return json(
 				{ code: "INVALID_SAML_RESPONSE", message: "Invalid SAML response." },
 				400,
@@ -462,7 +473,7 @@ export function createOwnedProjectSaml(options: {
 			});
 			if (selected.custom && request.url !== selected.acs)
 				throw new Error("This transport is not the registered SAML receiver.");
-			proof = await verifyOwnedSaml(form.response, selected.configured);
+			proof = await verifyOwnedSaml(payload.response, selected.configured);
 			const approval = options.encryptedApproval;
 			if (
 				approval?.providerId === providerId &&
@@ -498,7 +509,7 @@ export function createOwnedProjectSaml(options: {
 		const abort = Symbol("SAML sign-in refused");
 		let rejection = "account_not_linked";
 		try {
-			const consumed = await consume(provider, proof, form.relay);
+			const consumed = await consume(provider, proof, payload.relay);
 			if (typeof consumed === "string") return failure(consumed);
 			flow = consumed.flow ?? undefined;
 			let destination = saved.idpInitiatedCallbackUrl

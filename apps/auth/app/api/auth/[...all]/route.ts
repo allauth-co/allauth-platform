@@ -1,5 +1,6 @@
 import { withPortalAuthEngine } from "@/lib/domains/hosting";
 import { authOrigin } from "@/lib/configuration";
+import { hostedOAuthBrowserActionRequests } from "@/lib/domains/hosted-oauth-requests";
 import { localDevelopmentAuthRequest } from "@/lib/local-development";
 import { projectOpenApiPath } from "@/lib/projects/owned-project-openapi";
 import { isProjectWriterUnavailable } from "@/lib/projects/project-engine-unavailable";
@@ -21,12 +22,19 @@ function unavailable(request: Request, error: unknown) {
 }
 async function handle(request: Request) {
 	const response = await withPortalAuthEngine(request, async (engine, env, bound, binding) => {
+		const path = new URL(bound.url).pathname;
+		if (
+			binding?.kind === "accounts" &&
+			bound.method === "POST" &&
+			(path === "/api/auth/oauth2/continue" || path === "/api/auth/oauth2/consent")
+		)
+			hostedOAuthBrowserActionRequests.add(bound);
 		// The hosted gateway removes Authorization before the browser request reaches auth.
 		const mixedSchemaCredentials =
 			binding &&
 			request.method === "GET" &&
 			request.headers.has("authorization") &&
-			new URL(bound.url).pathname === `/api/auth${projectOpenApiPath}`;
+			path === `/api/auth${projectOpenApiPath}`;
 		const result = mixedSchemaCredentials
 			? Response.json(
 					{

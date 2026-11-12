@@ -1,9 +1,12 @@
 import { randomInt, randomUUID } from "node:crypto";
 import type { Pool, PoolClient } from "pg";
 import * as z from "zod";
+import { hostedOAuthBrowserActionRequests } from "../domains/hosted-oauth-requests";
+import { oauthBrowserQuery } from "../oauth-browser";
 import { createProjectEngineStore } from "./owned-project-engine-store";
 import {
 	filteredProjectIssuerClaims,
+	maximumProjectAuthorizationQueryLength,
 	projectAuthorizationLifetime,
 	projectIssuerAuthorizationParams,
 	projectIssuerAuthorizationQuery,
@@ -24,19 +27,23 @@ import {
 import { issuerResourcePolicy } from "./owned-project-issuer-resources";
 
 const continueBody = z.object({
-	oauth_query: z.string().min(1).max(16_384),
+	oauth_query: z.string().min(1).max(maximumProjectAuthorizationQueryLength),
 	selected: z.boolean().optional(),
 	created: z.boolean().optional(),
 	postLogin: z.boolean().optional(),
 });
 const consentBody = z.object({
-	oauth_query: z.string().min(1).max(16_384),
+	oauth_query: z.string().min(1).max(maximumProjectAuthorizationQueryLength),
 	accept: z.boolean(),
 	scope: z.string().max(512).optional(),
 	claims: z
 		.union([z.string().max(8192), z.record(z.string(), z.unknown())])
 		.optional(),
 });
+const hostedContinueBody = continueBody.strict();
+const hostedConsentBody = consentBody
+	.pick({ oauth_query: true, accept: true })
+	.strict();
 const privateHeaders = {
 	"Cache-Control": "no-store",
 	Pragma: "no-cache",
@@ -66,6 +73,7 @@ export interface OwnedProjectIssuerAuthorizationOptions {
 	signingSecret: string;
 	errorURL?: string;
 	readBody(request: Request): Promise<unknown>;
+	readHostedBrowserActionBody?(request: Request): Promise<unknown>;
 	/** Read the exact verified project browser session, without refreshing its lifetime. */
 	readSession(
 		request: Request,
@@ -298,7 +306,7 @@ export function createOwnedProjectIssuerAuthorization(
 		query: AuthorizationQuery,
 	) {
 		await client.query(
-			"SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+			"SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", // cspell:ignore xact
 			[
 				JSON.stringify([
 					options.schemaName,
@@ -770,19 +778,31 @@ export function createOwnedProjectIssuerAuthorization(
 					"A same-origin authorization request is required.",
 					403,
 				);
-			const input = await options.readBody(request);
+			const readHostedBody = hostedOAuthBrowserActionRequests.has(request)
+				? options.readHostedBrowserActionBody
+				: undefined;
+			const standard = await options.readBody(
+				readHostedBody ? (request.clone() as Request) : request,
+			);
+			const extended = Boolean(readHostedBody && standard === undefined);
+			const input =
+				standard === undefined && readHostedBody
+					? await readHostedBody(request)
+					: standard;
+			function signedQuery(query: string) {
+				if (extended && oauthBrowserQuery(query)?.toString() !== query)
+					return null;
+				return readSignedProjectIssuerQuery(query, options.signingSecret);
+			}
 			if (path === "/oauth2/consent") {
-				const body = consentBody.safeParse(input);
+				const body = (extended ? hostedConsentBody : consentBody).safeParse(input);
 				if (!body.success) throw invalid("Invalid consent request.");
-				const signed = readSignedProjectIssuerQuery(
-					body.data.oauth_query,
-					options.signingSecret,
-				);
+				const signed = signedQuery(body.data.oauth_query);
 				if (!signed)
 					throw invalid("The authorization request is invalid or expired.");
 				return await consent(request, body.data, signed);
 			}
-			const body = continueBody.safeParse(input);
+			const body = (extended ? hostedContinueBody : continueBody).safeParse(input);
 			if (
 				!body.success ||
 				[body.data.selected, body.data.created, body.data.postLogin].filter(
@@ -790,10 +810,7 @@ export function createOwnedProjectIssuerAuthorization(
 				).length !== 1
 			)
 				throw invalid("Invalid authorization continuation.");
-			const signed = readSignedProjectIssuerQuery(
-				body.data.oauth_query,
-				options.signingSecret,
-			);
+			const signed = signedQuery(body.data.oauth_query);
 			if (!signed)
 				throw invalid("The authorization request is invalid or expired.");
 			return await authorize(request, signed.params, signed);

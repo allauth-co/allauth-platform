@@ -680,6 +680,125 @@ describe.skipIf(!existsSync(fixturePath))(
 			}
 		});
 
+		it("checks a recovery code without creating a session across both writers", async () => {
+			const legacy = await nativeInstance(nativeDatabase!, true);
+			const candidate = createOwnedProjectEngine({
+				database,
+				project: { schemaName: schema, slug },
+				baseURL: origin,
+				basePath: "/api/auth",
+				trustedOrigins: [],
+				signingSecret: secret,
+				policy: { ...defaultAuthPolicy, requireEmailVerification: false },
+				trustedIP: (input) => input.headers.get("x-real-ip"),
+			});
+			for (const [start, check, ip, freshIp] of [
+				[candidate.dispatch, legacy.handler, "192.0.2.61", "192.0.2.62"],
+				[legacy.handler, candidate.dispatch, "192.0.2.63", "192.0.2.64"],
+			] as const) {
+				function request(
+					path: string,
+					body: unknown,
+					cookie = "",
+					ipAddress: string = ip,
+				) {
+					const input = post(path, body, cookie);
+					input.headers.set("x-real-ip", ipAddress);
+					return input;
+				}
+				const user = await signedIn();
+				const setup = await legacy.handler(
+					request("/two-factor/enable", { password }, user.cookie),
+				);
+				expect(setup.status).toBe(200);
+				const { backupCodes } = (await setup.json()) as {
+					backupCodes: string[];
+				};
+				const enrolled = await legacy.handler(
+					request(
+						"/two-factor/verify-totp",
+						{ code: await verifyCode(user.id) },
+						user.cookie,
+					),
+				);
+				expect(enrolled.status).toBe(200);
+				const sessionIds = async () =>
+					(
+						await database.query<{ id: string }>(
+							`SELECT id FROM "${schema}"."session" WHERE "userId"=$1 ORDER BY id`,
+							[user.id],
+						)
+					).rows.map(({ id }) => id);
+				const existing = await sessionIds();
+				expect(existing).toHaveLength(1);
+				const signIn = (ipAddress: string = ip) =>
+					request(
+						"/sign-in/email",
+						{ email: user.email, password },
+						"",
+						ipAddress,
+					);
+				const pending = await start(signIn());
+				expect(await pending.json()).toMatchObject({ twoFactorRedirect: true });
+				const cookie = cookies(pending);
+				const challenge = readLegacySessionCookie(
+					new Headers({ cookie }),
+					`${prefix}two_factor`,
+					secret,
+				);
+				expect(challenge).toBeTruthy();
+				const verification = (
+					code: string,
+					challengeCookie: string,
+					disableSession = false,
+					ipAddress: string = ip,
+				) =>
+					request(
+						"/two-factor/verify-backup-code",
+						{ code, disableSession, trustDevice: true },
+						challengeCookie,
+						ipAddress,
+					);
+				const verified = await check(
+					verification(backupCodes[0]!, cookie, true),
+				);
+				expect(verified.status).toBe(200);
+				expect(await verified.json()).toEqual({
+					user: expect.objectContaining({ id: user.id }),
+				});
+				expect(verified.headers.getSetCookie()).toEqual([]);
+				expect(await sessionIds()).toEqual(existing);
+				expect(
+					(
+						await database.query<{ identifier: string }>(
+							`SELECT identifier FROM "${schema}"."verification"
+					 WHERE identifier=ANY($1::text[]) OR (value=$2 AND starts_with(identifier,'trust-device-'))`,
+							[[challenge, `2fa-attempts-${challenge}`], user.id],
+						)
+					).rows,
+				).toEqual([{ identifier: challenge }]);
+				const spentChallenge = await start(
+					verification(backupCodes[1]!, cookie),
+				);
+				expect(await spentChallenge.json()).toMatchObject({
+					code: "INVALID_TWO_FACTOR_COOKIE",
+				});
+				const fresh = cookies(await start(signIn(freshIp)));
+				const spentCode = await start(
+					verification(backupCodes[0]!, fresh, false, freshIp),
+				);
+				expect(await spentCode.json()).toMatchObject({
+					code: "INVALID_BACKUP_CODE",
+				});
+				const completed = await check(
+					verification(backupCodes[1]!, fresh, false, freshIp),
+				);
+				expect(completed.status).toBe(200);
+				expect(await completed.json()).toMatchObject({ user: { id: user.id } });
+				expect(await sessionIds()).toHaveLength(2);
+			}
+		});
+
 		it("preserves the native session event pair when sign-in is waiting for MFA", async () => {
 			const legacy = await nativeInstance(nativeDatabase!, true);
 			const user = await signedIn();

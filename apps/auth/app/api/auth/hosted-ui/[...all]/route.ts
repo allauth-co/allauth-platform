@@ -1,7 +1,10 @@
 import { authOrigin } from "@/lib/configuration";
 import { edgeHeaders } from "@/lib/domains/edge";
 import { hostedSdkMagicLinkRequests } from "@/lib/domains/hosted-magic-link-requests";
-import { hostedSocialSignInRequests } from "@/lib/domains/hosted-oauth-requests";
+import {
+	hostedPasswordSignInRequests,
+	hostedSocialSignInRequests,
+} from "@/lib/domains/hosted-oauth-requests";
 import { hostedScimConsoleRequest } from "@/lib/domains/hosted-scim-console";
 import { hostedSdkEndpoint } from "@/lib/domains/hosted-sdk-policy";
 import {
@@ -103,6 +106,8 @@ async function handle(request: Request) {
 			hostedSdkMagicLinkRequests.add(nativeRequest);
 		if (endpoint === "sign-in/social")
 			hostedSocialSignInRequests.add(nativeRequest);
+		if (endpoint === "sign-in/email" || endpoint === "sign-in/username")
+			hostedPasswordSignInRequests.add(nativeRequest);
 		return hostedSdkResponse(
 			await engine.dispatch(nativeRequest),
 			endpoint,

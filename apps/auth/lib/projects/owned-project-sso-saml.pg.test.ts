@@ -1021,6 +1021,30 @@ describe.skipIf(!existsSync(fixturePath))(
 			);
 		});
 
+		it("rejects additional authorization parameters before either SAML writer issues state", async () => {
+			const engine = createOwnedProjectEngine({
+				database,
+				project: { schemaName: schema, slug },
+				baseURL: origin,
+				basePath: "/api/auth",
+				trustedOrigins: [],
+				signingSecret: secret,
+				policy: defaultAuthPolicy,
+				trustedIP: () => "203.0.113.83",
+				sso: { defaultErrorURL: `${origin}/auth-error`, saml: true },
+			});
+			for (const additionalParams of [{}, { prompt: "login" }]) {
+				const input = { ...body, additionalParams };
+				const legacy = await native.handler(startRequest(input));
+				const candidate = await engine.dispatch(startRequest(input));
+				expect(legacy.status).toBe(400);
+				expect(candidate.status).toBe(legacy.status);
+				expect(await candidate.json()).toEqual(await legacy.json());
+				expect(cookies(legacy)).toBe("");
+				expect(cookies(candidate)).toBe("");
+			}
+		});
+
 		it("preserves reserved SAML email errors and an existing provider subject binding", async () => {
 			if (!nativeDatabase)
 				throw new Error("Expected the scoped fixture database.");
@@ -1621,6 +1645,48 @@ describe.skipIf(!existsSync(fixturePath))(
 					providerId,
 				),
 			);
+		});
+
+		it("completes signed JSON ACS requests across both project writers", async () => {
+			const engine = managementEngine();
+			const jsonCallback = (payload: unknown) =>
+				new Request(acs, {
+					method: "POST",
+					headers: {
+						origin: idpOrigin,
+						"content-type": "application/json; charset=utf-8",
+						"sec-fetch-site": "cross-site",
+						"sec-fetch-mode": "navigate",
+					},
+					body: JSON.stringify(payload),
+				});
+
+			const ownedState = await pending(await engine.dispatch(startRequest()));
+			await assertSession(
+				await native.handler(
+					jsonCallback({
+						SAMLResponse: signedResponse(ownedState.requestId).encoded,
+						RelayState: ownedState.relay,
+					}),
+				),
+			);
+			const nativeState = await pending(await native.handler(startRequest()));
+			const assertion = {
+				SAMLResponse: signedResponse(nativeState.requestId).encoded,
+				RelayState: nativeState.relay,
+			};
+			for (const invalid of [
+				{ ...assertion, RelayState: [nativeState.relay] },
+				{ ...assertion, padding: " ".repeat(3 * 256 * 1024 + 4096) },
+			]) {
+				const denied = await engine.dispatch(jsonCallback(invalid));
+				expect(denied.status).toBe(400);
+				expect(await denied.json()).toMatchObject({
+					code: "INVALID_SAML_RESPONSE",
+				});
+				expect(cookies(denied)).toBe("");
+			}
+			await assertSession(await engine.dispatch(jsonCallback(assertion)));
 		});
 
 		it("dispatches SAML sign-in and ACS through the realm security and native-readable session hooks", async () => {

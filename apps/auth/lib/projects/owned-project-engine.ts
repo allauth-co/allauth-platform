@@ -15,7 +15,11 @@ import {
 	isPrimaryAuthenticationPath,
 } from "../control/event-contract";
 import { discoveryHeaders } from "../discovery";
-import { hostedSocialSignInRequests } from "../domains/hosted-oauth-requests";
+import { verifiedHostedOAuthContinuation } from "../domains/hosted-oauth-continuation";
+import {
+	hostedPasswordSignInRequests,
+	hostedSocialSignInRequests,
+} from "../domains/hosted-oauth-requests";
 import { emailConfigured } from "../email/send";
 import { freshFeatureSession, isServerTokenRequest } from "../features/helpers";
 import { applicationMfaCallback } from "../mfa-continuation";
@@ -68,7 +72,10 @@ import type { ProjectGuestProof } from "./owned-project-guest";
 import { createOwnedProjectGuest } from "./owned-project-guest";
 import { createOwnedProjectInvitationImport } from "./owned-project-invitation-import";
 import { createOwnedProjectIssuer } from "./owned-project-issuer";
-import { readSignedProjectIssuerQuery } from "./owned-project-issuer-authorization-query";
+import {
+	maximumProjectAuthorizationQueryLength,
+	readSignedProjectIssuerQuery,
+} from "./owned-project-issuer-authorization-query";
 import { ProjectOAuthError } from "./owned-project-issuer-http";
 import { ownedProjectIssuerMetadata } from "./owned-project-issuer-metadata";
 import { admitOwnedProjectNativeRoute } from "./owned-project-native-admission";
@@ -81,6 +88,10 @@ import {
 	ownedProjectOAuthUnlinkInput,
 	projectOAuthProvider,
 } from "./owned-project-oauth";
+import {
+	maximumProjectOAuthReturnLength,
+	standardProjectOAuthReturnLength,
+} from "./owned-project-oauth-store";
 import {
 	ownedProjectOpenApi,
 	projectOpenApiPath,
@@ -132,7 +143,7 @@ import { projectOrigin, projectSlug } from "./validation";
 
 const passwordFields = {
 	password: z.string().min(1).max(defaultPasswordPolicy.maxLength),
-	callbackURL: z.string().max(2048).optional(),
+	callbackURL: z.string().max(standardProjectOAuthReturnLength).optional(),
 	rememberMe: z.boolean().optional(),
 };
 const emailInput = z
@@ -148,6 +159,18 @@ const usernameInput = z
 			.regex(/^[A-Za-z0-9_.]+$/),
 	})
 	.strict();
+const maximumHostedPasswordCallbackLength =
+	maximumProjectOAuthReturnLength + "https://".length + 253;
+const hostedPasswordCallback = z
+	.string()
+	.min(standardProjectOAuthReturnLength + 1)
+	.max(maximumHostedPasswordCallbackLength);
+const hostedEmailInput = emailInput.extend({
+	callbackURL: hostedPasswordCallback,
+});
+const hostedUsernameInput = usernameInput.extend({
+	callbackURL: hostedPasswordCallback,
+});
 const sessionIdInput = z.object({ id: z.string().min(1).max(160) }).strict();
 const sessionTokenInput = z.object({ token: z.string() });
 const deviceSessionInput = z.object({
@@ -445,6 +468,16 @@ export function createOwnedProjectEngine(
 					? options.issuer.errorURL
 					: undefined,
 			readBody: requestBody,
+			async readHostedBrowserActionBody(request) {
+				const body = await requestBody(
+					request,
+					maximumProjectAuthorizationQueryLength + 128,
+				);
+				return body !== undefined &&
+					Buffer.byteLength(JSON.stringify(body)) > maximumBodyBytes
+					? body
+					: undefined;
+			},
 			logout: {
 				sessionCookie,
 				requireMfa: policy.mfaMode === "required",
@@ -767,7 +800,8 @@ export function createOwnedProjectEngine(
 				path === "/sign-in/email" ||
 				path === "/sign-in/username" ||
 				path === "/magic-link/verify" ||
-				path === "/sign-in/email-otp"
+				path === "/sign-in/email-otp" ||
+				path === "/passkey/verify-authentication"
 			) {
 				// The legacy anonymous-session hook reads the incoming browser session before multi-session cleanup.
 				const browserToken = tokenFrom(request.headers);
@@ -1252,7 +1286,7 @@ export function createOwnedProjectEngine(
 						user: projectUserResponse(result.authority.user),
 					});
 		}
-		if (body.data.disableSession) return unsupported();
+		const verifyOnly = method === "backup" && body.data.disableSession === true;
 		try {
 			const result = await mfa.complete(
 				request.headers,
@@ -1266,6 +1300,7 @@ export function createOwnedProjectEngine(
 						missingSupportAdapter
 					)
 						throw changedMfaOwner;
+					if (verifyOnly) return { verifiedUser: projectUserResponse(user) };
 					if (await security.denySession(client, request, user.email))
 						throw deniedMfa;
 					return createSession(
@@ -1287,6 +1322,8 @@ export function createOwnedProjectEngine(
 					headers.append("Set-Cookie", cookie);
 				return failure(result.httpStatus, result.code, result.message, headers);
 			}
+			if ("verifiedUser" in result.session)
+				return json({ user: result.session.verifiedUser });
 			const { session, user, headers } = result.session;
 			for (const cookie of result.setCookies)
 				headers.append("Set-Cookie", cookie);
@@ -1366,19 +1403,55 @@ export function createOwnedProjectEngine(
 				"Email and password is not enabled",
 			);
 		if (missingSupportAdapter) return unsupported();
-		const raw = await requestBody(request);
-		const body =
+		const hosted =
+			issuer &&
+			options.basePath === "/api/auth" &&
+			request.headers.get("origin") === origin &&
+			hostedPasswordSignInRequests.has(request);
+		const parse = (raw: unknown, extended = false) =>
 			field === "email"
-				? emailInput.safeParse(emailAliases.normalizeInput(raw))
-				: usernameInput.safeParse(raw);
-		if (!body.success)
-			return failure(
+				? (extended ? hostedEmailInput : emailInput).safeParse(
+						emailAliases.normalizeInput(raw),
+					)
+				: (extended ? hostedUsernameInput : usernameInput).safeParse(raw);
+		const raw = await requestBody(hosted ? request.clone() : request);
+		const regular = parse(raw);
+		const body =
+			hosted && !regular.success
+				? parse(
+						raw === undefined
+							? await requestBody(
+									request,
+									maximumHostedPasswordCallbackLength + 2048,
+								)
+							: raw,
+						true,
+					)
+				: regular;
+		const invalidBody = () =>
+			failure(
 				400,
 				"INVALID_BODY",
 				"Supply a valid identifier and password.",
 			);
+		if (!body.success) return invalidBody();
 		const callback = callbackURL(body.data.callbackURL, request);
 		if (callback === null) return forbidden();
+		if (!regular.success) {
+			if (!issuer || !callback) return invalidBody();
+			const target = new URL(callback);
+			const path = target.pathname + target.search;
+			if (
+				callback !== origin + path ||
+				oauthBrowserReturnPath(path) !== path ||
+				!(await verifiedHostedOAuthContinuation(
+					{ readOAuthContext: issuer.readContext },
+					target.hostname,
+					target.search.slice(1),
+				))
+			)
+				return invalidBody();
+		}
 
 		const login = (
 			"email" in body.data ? body.data.email : body.data.username

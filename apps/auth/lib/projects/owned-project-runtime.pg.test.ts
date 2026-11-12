@@ -6863,6 +6863,210 @@ describe.skipIf(!existsSync(fixture))(
 			}
 		}, 60_000);
 
+		it("preserves long signed hosted password returns across the project writer switch", async () => {
+			const local: { container: string; DATABASE_URL: string } = JSON.parse(
+				readFileSync(fixture, "utf8"),
+			);
+			const base = new URL(local.DATABASE_URL);
+			if (
+				local.container !== "allauth-production-test-20261007" ||
+				base.hostname !== "127.0.0.1" ||
+				base.port !== "55445"
+			)
+				throw new Error(
+					"Hosted password sign-in requires isolated PostgreSQL.",
+				);
+			const admin = new Pool({ connectionString: base.href, max: 1 });
+			const name = `allauth_hosted_${randomUUID().replaceAll("-", "")}`;
+			const databaseURL = new URL(`/${name}`, base).href;
+			let created = false;
+			let service: Awaited<ReturnType<typeof openProcess>> | undefined;
+			try {
+				await admin.query(`CREATE DATABASE "${name}"`);
+				created = true;
+				const { alpha } = await seed(databaseURL);
+				const username = "fixture_user";
+				const database = new Pool({ connectionString: databaseURL, max: 1 });
+				try {
+					await database.query(
+						`UPDATE "${alpha.schemaName}"."user" SET username=$2,"displayUsername"=$2 WHERE id=$1`,
+						[credentials.project.id, username],
+					);
+				} finally {
+					await database.end();
+				}
+				const host = `${alpha.slug}-accounts.allauth.co`;
+				const origin = `https://${host}`;
+				const rollout = { ALLAUTH_PROJECT_HOSTED_UI_PROJECT_IDS: alpha.id };
+				const transport = { host, accept: "application/json" };
+				const state = `${"signed-application-state".repeat(355)}+one&two`;
+				async function begin(requireConsent = false) {
+					const query = fixtureAuthorizationQuery(state);
+					if (requireConsent) query.set("prompt", "consent");
+					const started = await fixtureRedirect(
+						await service!.request(
+							`/api/auth/oauth2/authorize?${query}`,
+							transport,
+						),
+					);
+					expect(started.pathname).toBe("/sign-in");
+					expect(started.searchParams.get("state")).toBe(state);
+					expect(started.searchParams.get("sig")).toBeTruthy();
+					return `${origin}/oauth2/continue${started.search}`;
+				}
+				let nextClientIP = 151;
+				const signIn = (
+					field: "email" | "username",
+					callbackURL: string,
+					hosted = true,
+				) =>
+					service!.request(
+						`/api/auth/${hosted ? "hosted-ui/" : ""}sign-in/${field}`,
+						{
+							...transport,
+							clientIP: `192.0.2.${nextClientIP++}`,
+							body: {
+								[field]:
+									field === "email" ? credentials.project.email : username,
+								password: credentials.password,
+								callbackURL,
+							},
+						},
+					);
+				async function assertSession(value: string) {
+					expect(value).toContain(".session_token=");
+					const result = await service!.request(
+						"/api/auth/hosted-ui/get-session",
+						{
+							...transport,
+							cookie: value,
+						},
+					);
+					expect(result.status).toBe(200);
+					expect(await result.json()).toMatchObject({
+						user: { id: credentials.project.id },
+					});
+				}
+				async function complete(
+					field: "email" | "username",
+					callbackURL: string,
+				) {
+					const response = await signIn(field, callbackURL);
+					expect(response.status, await response.clone().text()).toBe(200);
+					const body = await response.json();
+					expect(body).toMatchObject({
+						redirect: true,
+						url: callbackURL,
+						user: { id: credentials.project.id },
+					});
+					expect(body).not.toHaveProperty("token");
+					const session = cookie(response);
+					await assertSession(session);
+					return session;
+				}
+				async function finish(
+					callbackURL: string,
+					session: string,
+					requireConsent = false,
+				) {
+					async function action(path: "continue" | "consent", url: URL) {
+						const body = {
+							oauth_query: url.searchParams.toString(),
+							...(path === "continue" ? { selected: true } : { accept: true }),
+						};
+						expect(Buffer.byteLength(JSON.stringify(body))).toBeGreaterThan(
+							8192,
+						);
+						const response = await service!.request(
+							`/api/auth/oauth2/${path}`,
+							{
+								...transport,
+								cookie: session,
+								body,
+							},
+						);
+						expect(response.status, await response.clone().text()).toBe(200);
+						return fixtureRedirect(response);
+					}
+					let result = await action("continue", new URL(callbackURL));
+					if (requireConsent) {
+						expect(result.pathname).toBe("/oauth/consent");
+						result = await action("consent", result);
+					}
+					expect(result.origin + result.pathname).toBe(oauthRedirectURI);
+					expect(result.searchParams.get("state")).toBe(state);
+					expect(result.searchParams.get("iss")).toBe(`${origin}/api/auth`);
+					const code = result.searchParams.get("code");
+					expect(code).toBeTruthy();
+					const tokens = await service!.request("/api/auth/oauth2/token", {
+						...transport,
+						body: new URLSearchParams({
+							grant_type: "authorization_code",
+							client_id: oauthClientId,
+							redirect_uri: oauthRedirectURI,
+							code: code!,
+							code_verifier: oauthVerifier,
+						}),
+					});
+					expect(tokens.status, await tokens.clone().text()).toBe(200);
+					expect(await tokens.json()).toMatchObject({
+						access_token: expect.any(String),
+						id_token: expect.any(String),
+					});
+				}
+				const open = (owned: boolean) =>
+					openProcess(
+						databaseURL,
+						alpha,
+						owned,
+						alpha.slug,
+						undefined,
+						undefined,
+						rollout,
+					);
+				service = await open(false);
+				const legacyReturn = await begin();
+				expect(legacyReturn.length).toBeGreaterThan(8192);
+				await finish(legacyReturn, await complete("email", legacyReturn));
+				await complete("username", legacyReturn);
+				await service.stop();
+				service = undefined;
+				service = await open(true);
+				await finish(legacyReturn, await complete("email", legacyReturn));
+				const consentReturn = await begin(true);
+				await finish(
+					consentReturn,
+					await complete("email", consentReturn),
+					true,
+				);
+				const ownedReturn = await begin();
+				const ownedSession = await complete("username", ownedReturn);
+				for (const refused of [
+					await signIn("email", ownedReturn, false),
+					await signIn("email", `${origin}/account?return=${"a".repeat(2048)}`),
+				]) {
+					expect(refused.status).toBe(400);
+					expect(await refused.json()).toMatchObject({ code: "INVALID_BODY" });
+					expect(cookie(refused)).toBe("");
+				}
+				await service.stop();
+				service = undefined;
+				service = await open(false);
+				await assertSession(ownedSession);
+				await finish(ownedReturn, ownedSession);
+			} finally {
+				try {
+					await service?.stop();
+				} finally {
+					try {
+						if (created) await dropClosedFixtureDatabase(admin, name);
+					} finally {
+						await admin.end();
+					}
+				}
+			}
+		}, 60_000);
+
 		it("carries long signed hosted social returns across the project writer switch", async () => {
 			const local: { container: string; DATABASE_URL: string } = JSON.parse(
 				readFileSync(fixture, "utf8"),

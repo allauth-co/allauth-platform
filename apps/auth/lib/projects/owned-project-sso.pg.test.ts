@@ -711,6 +711,67 @@ describe.skipIf(!existsSync(fixturePath))(
 			});
 		});
 
+		it("preserves additional OIDC authorization parameters across both project writers", async () => {
+			const engine = createOwnedProjectEngine({
+				database,
+				project: { slug, schemaName: schema },
+				baseURL: origin,
+				basePath: "/api/auth",
+				trustedOrigins: [],
+				signingSecret: secret,
+				policy: defaultAuthPolicy,
+				trustedIP: () => "203.0.113.43",
+				sso: { defaultErrorURL: `${origin}/auth-error`, fetch: network },
+			});
+			const additionalParams = {
+				prompt: "login",
+				max_age: "300",
+				acr_values: "urn:fixture:hardware urn:fixture:mfa",
+			};
+			const input = { ...body, additionalParams };
+			for (const [start, complete] of [
+				[native.handler, engine.dispatch],
+				[engine.dispatch, native.handler],
+			]) {
+				const started = await start(startRequest(input));
+				expect(started.status, await started.clone().text()).toBe(200);
+				const { url } = (await started.clone().json()) as { url: string };
+				const authorization = new URL(url);
+				for (const [name, value] of Object.entries(additionalParams))
+					expect(authorization.searchParams.getAll(name)).toEqual([value]);
+				expect(authorization.searchParams.get("state")).toBeTruthy();
+				expect(authorization.searchParams.get("code_challenge")).toBeTruthy();
+				const finished = await complete(await authorize(started));
+				expect(finished.headers.get("location")).toBe(destination);
+				const session = await native.api.getSession({
+					headers: new Headers({ cookie: cookies(finished) }),
+					query: { disableRefresh: true },
+				});
+				expect(session?.user.id).toBe(managed);
+			}
+			for (const handler of [native.handler, engine.dispatch]) {
+				for (const name of [
+					"state",
+					"client_id",
+					"redirect_uri",
+					"response_type",
+					"code_challenge",
+					"code_challenge_method",
+					"nonce",
+					"scope",
+				]) {
+					const denied = await handler(
+						startRequest({
+							...body,
+							additionalParams: { [name]: "fixture-value" },
+						}),
+					);
+					expect(denied.status, name).toBe(400);
+					expect(cookies(denied)).toBe("");
+				}
+			}
+		});
+
 		it("rejects an inactive directory subject even when its older binding and a matching local email remain", async () => {
 			const callback = await authorize(
 				await owned().start(startRequest(), body),

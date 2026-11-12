@@ -1051,6 +1051,49 @@ try {
 			200,
 			"The selected realm uses the first-party hosted API.",
 		);
+		if (connected) {
+			const authorization = new URLSearchParams(connected.queryString);
+			const state = `${"signed-application-state".repeat(355)}+one&two`;
+			authorization.set("state", state);
+			const oauthQuery = signProjectIssuerQuery(authorization, authSecret);
+			const callbackURL = `https://${host}/oauth2/continue?${oauthQuery}`;
+			const transport = {
+				host,
+				clientIP: "192.0.2.62",
+				accept: "application/json",
+			};
+			const body = { ...ownedLogin, callbackURL };
+			assert.ok(Buffer.byteLength(JSON.stringify(body)) > 8192);
+			const signedIn = await request("/api/auth/hosted-ui/sign-in/email", {
+				...transport,
+				body,
+			});
+			expectStatus(
+				signedIn,
+				200,
+				"Password sign-in accepts a long signed app return.",
+			);
+			const signInResult = JSON.parse(signedIn.body);
+			assert.equal(signInResult.url, callbackURL);
+			assert.equal(signInResult.user.id, accountId);
+			const continued = await request("/api/auth/oauth2/continue", {
+				...transport,
+				cookie: sessionCookie(signedIn),
+				body: { selected: true, oauth_query: oauthQuery },
+			});
+			expectStatus(
+				continued,
+				200,
+				"The compiled issuer finishes the same signed app return.",
+			);
+			const redirect = new URL(JSON.parse(continued.body).url);
+			assert.equal(
+				redirect.origin + redirect.pathname,
+				authorization.get("redirect_uri"),
+			);
+			assert.ok(redirect.searchParams.get("state") === state);
+			assert.ok(redirect.searchParams.has("code"));
+		}
 		if (!railway && connected) {
 			const authorization = new URLSearchParams(connected.queryString);
 			authorization.set("state", `${"signed-application-state".repeat(171)}+one&two`);

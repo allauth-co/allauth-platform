@@ -10,7 +10,7 @@ export const projectIssuerScopes = [
 	"organization:read",
 ];
 export const projectAuthorizationLifetime = 60;
-const maximumQueryLength = 16_384;
+export const maximumProjectAuthorizationQueryLength = 16_384;
 const markers = new Set(["ba_iat", "ba_param", "ba_pl", "exp", "sig"]);
 const prompts = new Set([
 	"none",
@@ -137,7 +137,7 @@ export function signProjectIssuerQuery(
 	for (const name of [...new Set([...params.keys(), "ba_param"])].sort())
 		params.append("ba_param", name);
 	params.set("sig", signature(params, signingSecret));
-	if (params.toString().length > maximumQueryLength)
+	if (params.toString().length > maximumProjectAuthorizationQueryLength)
 		throw invalidRequest("The OAuth request is too large.");
 	return params;
 }
@@ -147,7 +147,8 @@ function readSignedQueryAt(
 	signingSecret: string,
 	now: number,
 ) {
-	if (!serialized || serialized.length > maximumQueryLength) return null;
+	if (!serialized || serialized.length > maximumProjectAuthorizationQueryLength)
+		return null;
 	const params = new URLSearchParams(serialized);
 	const supplied = params.getAll("sig");
 	if (supplied.length !== 1 || !/^[A-Za-z0-9+/]{43}=$/.test(supplied[0]!))
@@ -186,7 +187,8 @@ export function isAuthenticExpiredProjectIssuerEmailContinuation(
 	serialized: string,
 	signingSecret: string,
 ) {
-	if (!serialized || serialized.length > maximumQueryLength) return false;
+	if (!serialized || serialized.length > maximumProjectAuthorizationQueryLength)
+		return false;
 	const now = Date.now();
 	const expires = Number(new URLSearchParams(serialized).get("exp")) * 1000;
 	if (
@@ -254,7 +256,7 @@ export function registeredProjectIssuerRedirect(
 }
 
 export function projectIssuerAuthorizationParams(input: URLSearchParams) {
-	if (input.toString().length > maximumQueryLength)
+	if (input.toString().length > maximumProjectAuthorizationQueryLength)
 		throw invalidRequest("The OAuth request is too large.");
 	const params = new URLSearchParams(input);
 	for (const name of markers) params.delete(name);

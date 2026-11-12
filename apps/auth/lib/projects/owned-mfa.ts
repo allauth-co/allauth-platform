@@ -41,6 +41,7 @@ type CompletionInput = {
 	method: MfaMethod;
 	code: string;
 	trustDevice?: boolean;
+	disableSession?: boolean;
 };
 
 const failures = {
@@ -220,11 +221,11 @@ export function createOwnedProjectMfa(options: {
 		};
 	}
 
-	/** The callback creates the session on the supplied client; cookies can be sent after this commits. */
+	/** Verify the factor and run the completion callback in the same transaction. */
 	async function complete<T>(
 		headers: Headers,
 		input: CompletionInput,
-		createSession: (
+		completeVerified: (
 			client: PoolClient,
 			verified: { userId: string; dontRememberMe: boolean },
 		) => Promise<T>,
@@ -334,12 +335,16 @@ export function createOwnedProjectMfa(options: {
 					);
 				}
 
+				const verifyOnly = input.method === "backup" && input.disableSession;
+				// A legacy verification without sign-in spends the attempt record but leaves the challenge cookie alone.
+				const completedIds = verifyOnly ? [counter.id] : ids;
 				const deleted = await client.query(
 					`DELETE FROM "${schema}"."verification"
 					WHERE id = ANY($1::text[]) AND "expiresAt" > statement_timestamp()`,
-					[ids],
+					[completedIds],
 				);
-				if (deleted.rowCount !== 2) throw expiredDuringAttempt;
+				if (deleted.rowCount !== completedIds.length)
+					throw expiredDuringAttempt;
 				await client.query(
 					`UPDATE "${schema}"."twoFactor" SET "failedVerificationCount" = 0, "lockedUntil" = NULL,
 						verified = CASE WHEN $2 THEN TRUE ELSE verified END WHERE id = $1`,
@@ -348,7 +353,12 @@ export function createOwnedProjectMfa(options: {
 				const dontRememberMe = Boolean(
 					readLegacySessionCookie(headers, rememberCookie, signingSecret),
 				);
-				const session = await createSession(client, { userId, dontRememberMe });
+				const session = await completeVerified(client, {
+					userId,
+					dontRememberMe,
+				});
+				if (verifyOnly)
+					return { status: "verified" as const, session, setCookies: [] };
 				const setCookies = input.trustDevice
 					? [
 							...expiredCookie,

@@ -2,14 +2,16 @@ import { createHash, generateKeyPairSync, randomBytes, randomUUID, sign } from "
 import { existsSync, readFileSync } from "node:fs";
 import { passkey } from "@better-auth/passkey";
 import { isoCBOR } from "@simplewebauthn/server/helpers";
+import { betterAuth } from "better-auth";
 import { symmetricDecrypt, symmetricEncrypt } from "better-auth/crypto";
 import { admin, anonymous } from "better-auth/plugins";
 import { getTestInstance } from "better-auth/test";
 import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { AuthInstance } from "../api";
-import { postgresDatabase } from "../auth";
+import { createAuthOptions, postgresDatabase } from "../auth";
 import { defaultAuthPolicy } from "../auth-policy/policy";
+import { clerkCompatiblePasswords } from "../clerk-password";
 import { allauthControl } from "../control";
 import { newWebhookSigningSecret, webhookSignature } from "../control/webhook-contract";
 import type { ControlWebhookEnvelope } from "../control/webhooks";
@@ -303,6 +305,344 @@ describe.skipIf(!existsSync(fixturePath))("project passkey PostgreSQL interopera
 			}
 		} finally {
 			await pool?.end();
+		}
+	});
+
+	it.each([
+		true,
+		false,
+	])("attributes signed passkey device replacement with an active browser cookie %s", async (hasBrowser) => {
+		if (!pool || !nativeDatabase)
+			throw new Error("Missing PostgreSQL fixture.");
+		const database = pool;
+		const scoped = nativeDatabase.db;
+		const realm = `"${primary}"`;
+		const sibling = `"${other}"`;
+		const options = createAuthOptions(
+			nativeDatabase,
+			{
+				ALLAUTH_AUTH_URL: origin,
+				ALLAUTH_AUTH_SECRET: fixtureSecret,
+				AUTH_RUNTIME: "node",
+				SCIM_CREDENTIAL_HASH_SECRET:
+					"synthetic-passkey-replacement-fixture-key",
+			},
+			{
+				name: "Synthetic passkey replacement",
+				slug: projectSlug,
+				basePath: "/api/auth",
+				cookiePrefix: `allauth_project_${projectSlug}`,
+				primaryOrigin: origin,
+				publicOrigin: origin,
+				origins: [],
+				broker: {
+					clientId: "fixture-broker",
+					clientSecret: "synthetic-fixture-broker-key",
+				},
+				authorizeAdmin: async () => null,
+				management: { id: "passkey-replacement-fixture" },
+			},
+		);
+		const installed = betterAuth({ ...options, logger: { disabled: true } });
+		const owned = ownedHttpFixture(database);
+		const address = hasBrowser ? "192.0.2.190" : "192.0.2.191";
+		const path = "/passkey/verify-authentication";
+		const agent = "Synthetic passkey replacement fixture";
+		const owner = {
+			id: randomUUID(),
+			email: `passkey-owner-${randomUUID()}@fixture.example`,
+		};
+		const browserActor = {
+			id: randomUUID(),
+			email: `passkey-browser-${randomUUID()}@fixture.example`,
+		};
+		const incomingHeaders = {
+			origin,
+			"x-real-ip": address,
+			"user-agent": agent,
+		};
+		const request = (route: string, cookie = "", body?: object) =>
+			new Request(`${origin}/api/auth${route}`, {
+				method: body ? "POST" : "GET",
+				headers: {
+					...incomingHeaders,
+					cookie,
+					...(body ? { "content-type": "application/json" } : {}),
+				},
+				body: body ? JSON.stringify(body) : undefined,
+			});
+		const cookies = (response: Response) =>
+			response.headers
+				.getSetCookie()
+				.filter((value) => !/;\s*Max-Age=0(?:;|$)/i.test(value))
+				.map((value) => value.split(";", 1)[0]!);
+		const cookieName = `__Secure-allauth_project_${projectSlug}.session_token`;
+		const read = (cookie: string) =>
+			installed.api.getSession({
+				headers: new Headers({ cookie }),
+				query: { disableRefresh: true },
+			});
+		async function browser(email: string) {
+			const response = await installed.api.signInEmail({
+				headers: new Headers(incomingHeaders),
+				body: { email, password: fixturePassword },
+				asResponse: true,
+			});
+			expect(response.status, await response.clone().text()).toBe(200);
+			const primary = cookies(response).find((value) =>
+				value.startsWith(`${cookieName}=`),
+			);
+			if (!primary) throw new Error("Missing native browser cookie.");
+			const current = await read(primary);
+			if (!current) throw new Error("Missing native browser session.");
+			const device = cookies(response).find((value) =>
+				value.startsWith(
+					`${cookieName}_multi-${current.session.token.toLowerCase()}=`,
+				),
+			);
+			if (!device) throw new Error("Missing native saved-device cookie.");
+			return { ...current.session, primary, device };
+		}
+		const recipient =
+			"https://passkey-replacement-hook.fixture.example/events";
+		try {
+			const passwordHash =
+				await clerkCompatiblePasswords.hash(fixturePassword);
+			for (const { id, email } of [owner, browserActor]) {
+				await database.query(
+					`INSERT INTO ${realm}."user" (id,name,email,"emailVerified") VALUES ($1,'Passkey fixture',$2,true)`,
+					[id, email],
+				);
+				await database.query(
+					`INSERT INTO ${realm}."account" (id,"userId","accountId","providerId",password,"updatedAt") VALUES ($1,$2,$2,'credential',$3,now())`,
+					[randomUUID(), id, passwordHash],
+				);
+			}
+			const original = (await browser(owner.email)).primary;
+			const credential = virtualCredential();
+			const registration = await installed.handler(
+				request("/passkey/generate-register-options", original),
+			);
+			expect(registration.status).toBe(200);
+			const { challenge: registrationChallenge } = (await registration.json()) as {
+				challenge: string;
+			};
+			const registered = await installed.handler(
+				request(
+					"/passkey/verify-registration",
+					[original, ...cookies(registration)].join("; "),
+					{
+						response: credential.registration(registrationChallenge),
+					},
+				),
+			);
+			expect(registered.status).toBe(200);
+			for (const [index, dispatch] of [
+				installed.handler,
+				owned.dispatch,
+			].entries()) {
+				const previous = await browser(owner.email);
+				const active = await browser(browserActor.email);
+				const unrelated = await browser(owner.email);
+				const endpoint = randomUUID();
+				const signingKey = newWebhookSigningSecret();
+				const shadowOwner = randomUUID();
+				const client = randomUUID();
+				const grants = ["access", "online", "offline", "unrelated"].map(
+					(kind) => ({ id: randomUUID(), kind }),
+				);
+				const sessionIds = [previous.id, active.id, unrelated.id];
+				try {
+					await database.query(
+						`INSERT INTO ${sibling}."user" (id,name,email,"emailVerified") VALUES ($1,'Shadow owner',$2,true)`,
+						[shadowOwner, `${shadowOwner}@fixture.example`],
+					);
+					await database.query(
+						`INSERT INTO ${sibling}.session (id,token,"userId","expiresAt","updatedAt") VALUES ($1,$2,$3,now()+interval '1 day',now())`,
+						[previous.id, previous.token, shadowOwner],
+					);
+					await database.query(
+						`INSERT INTO ${realm}."oauthClient" (id,"clientId","redirectUris") VALUES ($1,$1,'[]')`,
+						[client],
+					);
+					for (const { id, kind } of grants) {
+						const table =
+							kind === "access" ? "oauthAccessToken" : "oauthRefreshToken";
+						await database.query(
+							`INSERT INTO ${realm}."${table}" (id,token,"sessionId","userId","clientId","expiresAt","createdAt",scopes)
+							 VALUES ($1,$1,$2,$3,$4,now()+interval '1 day',now(),$5)`,
+							[
+								id,
+								kind === "unrelated" ? unrelated.id : previous.id,
+								owner.id,
+								client,
+								JSON.stringify(
+									kind === "offline"
+										? ["openid", "offline_access"]
+										: ["openid"],
+								),
+							],
+						);
+					}
+					const encrypted = await symmetricEncrypt({
+						key: fixtureSecret,
+						data: signingKey,
+					});
+					for (const target of [realm, sibling])
+						await database.query(
+							`INSERT INTO ${target}."allauthWebhookEndpoint" (id,url,"eventTypes","encryptedSecret") VALUES ($1,$2,'["session.deleted"]',$3)`,
+							[endpoint, recipient, encrypted],
+						);
+					const challenge = await installed.handler(
+						request("/passkey/generate-authenticate-options"),
+					);
+					expect(challenge.status).toBe(200);
+					const { challenge: assertionChallenge } = (await challenge.json()) as {
+						challenge: string;
+					};
+					const assertion = {
+						response: credential.assertion(assertionChallenge, index + 1),
+					};
+					const incoming = [
+						...(hasBrowser ? [active.primary] : []),
+						active.device,
+						previous.device,
+						...cookies(challenge),
+					].join("; ");
+					const signedIn = await dispatch(request(path, incoming, assertion));
+					expect(signedIn.status, await signedIn.clone().text()).toBe(200);
+					const replacement = await read(cookies(signedIn).join("; "));
+					if (!replacement)
+						throw new Error("Missing replacement passkey session.");
+					expect(replacement.user.id).toBe(owner.id);
+					sessionIds.push(replacement.session.id);
+					const previousCookieName = previous.device.split("=", 1)[0];
+					expect(
+						signedIn.headers
+							.getSetCookie()
+							.some(
+								(value) =>
+									value.startsWith(`${previousCookieName}=;`) &&
+									value.includes("Max-Age=0"),
+							),
+					).toBe(true);
+					const replay = await dispatch(request(path, incoming, assertion));
+					expect(replay.status).toBe(400);
+					expect(await replay.json()).toMatchObject({
+						code: "CHALLENGE_NOT_FOUND",
+					});
+					const existing = await database.query<{ id: string }>(
+						`SELECT id FROM ${realm}.session WHERE id=ANY($1::text[])`,
+						[sessionIds],
+					);
+					expect(new Set(existing.rows.map(({ id }) => id))).toEqual(
+						new Set([active.id, unrelated.id, replacement.session.id]),
+					);
+					expect(
+						(
+							await database.query(
+								`SELECT "userId" FROM ${sibling}.session WHERE token=$1`,
+								[previous.token],
+							)
+						).rows,
+					).toEqual([{ userId: shadowOwner }]);
+					expect(
+						(
+							await database.query(
+								`SELECT id FROM ${sibling}."allauthWebhookDelivery" WHERE "endpointId"=$1`,
+								[endpoint],
+							)
+						).rows,
+					).toEqual([]);
+					const grantState = await database.query(
+						`SELECT id,revoked IS NOT NULL AS revoked,"sessionId" FROM ${realm}."oauthAccessToken" WHERE "clientId"=$1
+						 UNION ALL SELECT id,revoked IS NOT NULL AS revoked,"sessionId" FROM ${realm}."oauthRefreshToken" WHERE "clientId"=$1`,
+						[client],
+					);
+					expect(grantState.rows).toHaveLength(grants.length);
+					for (const { id, kind } of grants)
+						expect(grantState.rows.find((grant) => grant.id === id)).toEqual({
+							id,
+							revoked: kind === "access" || kind === "online",
+							sessionId: kind === "unrelated" ? unrelated.id : null,
+						});
+					const envelopes: ControlWebhookEnvelope[] = [];
+					const delivery = await deliverPendingWebhooks({
+						database: scoped,
+						secret: fixtureSecret,
+						now: () => new Date(Date.now() + 2_000),
+						resolver: async () => [{ address: "93.184.216.34", family: 4 }],
+						async transport({ destination, body, headers }) {
+							expect(destination.url.href).toBe(recipient);
+							expect(headers["webhook-signature"]).toBe(
+								await webhookSignature(
+									signingKey,
+									headers["webhook-id"]!,
+									headers["webhook-timestamp"]!,
+									body,
+								),
+							);
+							for (const value of [
+								previous.token,
+								active.token,
+								replacement.session.token,
+								credential.id,
+							])
+								expect(body).not.toContain(value);
+							envelopes.push(JSON.parse(body) as ControlWebhookEnvelope);
+							return 204;
+						},
+					});
+					expect(delivery).toEqual({
+						claimed: 1,
+						delivered: 1,
+						retried: 0,
+						failed: 0,
+					});
+					const { id, createdAt } = envelopes[0]!.data.event;
+					expect(envelopes).toEqual([
+						{
+							id,
+							type: "session.deleted",
+							timestamp: createdAt,
+							data: {
+								event: {
+									id,
+									createdAt,
+									type: "session.deleted",
+									outcome: "success",
+									...(hasBrowser ? { actorId: browserActor.id } : {}),
+									userId: owner.id,
+									targetId: previous.id,
+									metadata: { path },
+								},
+							},
+						},
+					]);
+				} finally {
+					for (const target of [realm, sibling])
+						await database.query(
+							`DELETE FROM ${target}."allauthWebhookEndpoint" WHERE id=$1`,
+							[endpoint],
+						);
+					await database.query(
+						`DELETE FROM ${realm}."oauthClient" WHERE id=$1`,
+						[client],
+					);
+					await database.query(
+						`DELETE FROM ${realm}.session WHERE id=ANY($1::text[])`,
+						[sessionIds],
+					);
+					await database.query(`DELETE FROM ${sibling}."user" WHERE id=$1`, [
+						shadowOwner,
+					]);
+				}
+			}
+		} finally {
+			await database.query(
+				`DELETE FROM ${realm}."user" WHERE id=ANY($1::text[])`,
+				[[owner.id, browserActor.id]],
+			);
 		}
 	});
 

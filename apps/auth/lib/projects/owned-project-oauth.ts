@@ -20,6 +20,10 @@ import {
 	readLinkedOAuthToken,
 } from "./owned-project-account-info";
 import {
+	projectAdditionalAuthorizationParams,
+	setProjectAdditionalAuthorizationParams,
+} from "./owned-project-authorization-params";
+import {
 	markOwnedCallbackFailure,
 	ownedCallbackFailureCode,
 } from "./owned-project-callback-failure";
@@ -98,17 +102,6 @@ async function isStoredAccountPolicyDenial(response: Response) {
 	);
 }
 const originControls = /[\\\u0000-\u0020\u007f]/;
-// Match the existing social start/link URL contract while keeping protocol inputs server-owned.
-const reservedAuthorizationParams = new Set([
-	"state",
-	"client_id",
-	"redirect_uri",
-	"response_type",
-	"code_challenge",
-	"code_challenge_method",
-	"nonce",
-	"scope",
-]);
 const googleMetadata: oauth.AuthorizationServer = {
 	issuer: "https://accounts.google.com",
 	authorization_endpoint: "https://accounts.google.com/o/oauth2/v2/auth",
@@ -136,15 +129,7 @@ export const ownedProjectOAuthStartInput = z.strictObject({
 		})
 		.optional(),
 	additionalData: z.record(z.string(), z.unknown()).optional(),
-	additionalParams: z
-		.record(z.string(), z.string())
-		.refine(
-			(params) =>
-				!Object.keys(params).some((name) =>
-					reservedAuthorizationParams.has(name),
-				),
-		)
-		.optional(),
+	additionalParams: projectAdditionalAuthorizationParams,
 	scopes: z
 		.array(
 			z
@@ -645,10 +630,10 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 				authorization.searchParams.set("include_granted_scopes", "true");
 			if (body.provider === "allauth" && options.broker.hintGoogle)
 				authorization.searchParams.set("idp_hint", "google");
-			for (const [name, value] of Object.entries(body.additionalParams ?? {})) {
-				if (!reservedAuthorizationParams.has(name))
-					authorization.searchParams.set(name, value);
-			}
+			setProjectAdditionalAuthorizationParams(
+				authorization,
+				body.additionalParams,
+			);
 			const flow: ProjectOAuthState = {
 				...body.additionalData,
 				link: undefined,

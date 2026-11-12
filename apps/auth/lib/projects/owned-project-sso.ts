@@ -6,6 +6,10 @@ import * as z from "zod";
 import { validAvatarPath } from "../avatars/protocol";
 import type { LegacyMfaKeys } from "./legacy-mfa-record";
 import { readLegacySessionCookie } from "./legacy-session-cookie";
+import {
+	projectAdditionalAuthorizationParams,
+	setProjectAdditionalAuthorizationParams,
+} from "./owned-project-authorization-params";
 import { markOwnedCallbackFailure } from "./owned-project-callback-failure";
 import type { OwnedProjectEmailAliases } from "./owned-project-email-aliases";
 import type { ProjectUser } from "./owned-project-engine-store";
@@ -92,6 +96,7 @@ export const ownedProjectSsoInput = z.strictObject({
 	errorCallbackURL: z.string().max(2048).optional(),
 	loginHint: z.string().max(320).optional(),
 	scopes: z.array(ssoScope).max(24).optional(),
+	additionalParams: projectAdditionalAuthorizationParams,
 	requestSignUp: z.boolean().optional(),
 });
 export type OwnedProjectSsoInput = z.infer<typeof ownedProjectSsoInput>;
@@ -376,6 +381,14 @@ export function createOwnedProjectSso(options: OwnedProjectSsoOptions) {
 					},
 					501,
 				);
+			if (body.additionalParams)
+				return json(
+					{
+						message:
+							"additionalParams is not supported for SAML providers; the SAML AuthnRequest is signed and cannot carry caller-supplied query parameters.",
+					},
+					400,
+				);
 			if (body.callbackURL === undefined)
 				return json(
 					{ code: "BAD_REQUEST", message: "callbackURL is required" },
@@ -434,6 +447,10 @@ export function createOwnedProjectSso(options: OwnedProjectSsoOptions) {
 			}
 			const loginHint = body.loginHint || body.email;
 			if (loginHint) authorization.searchParams.set("login_hint", loginHint);
+			setProjectAdditionalAuthorizationParams(
+				authorization,
+				body.additionalParams,
+			);
 			await store.issue(state, {
 				callbackURL: destination.href,
 				newUserURL: newUser?.href,
@@ -501,7 +518,7 @@ export function createOwnedProjectSso(options: OwnedProjectSsoOptions) {
 			auth,
 			query,
 			redirectURI(provider.providerId),
-			config.pkce ? flow.codeVerifier : oauth.nopkce,
+			config.pkce ? flow.codeVerifier : oauth.nopkce, // cspell:ignore nopkce
 			requestOptions,
 		);
 		const tokens = await oauth.processAuthorizationCodeResponse(
