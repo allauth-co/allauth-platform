@@ -1,17 +1,26 @@
 import { createHash, createHmac, randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { organization } from "better-auth/plugins";
+import { createAccessControl } from "better-auth/plugins/access";
+import type { Statements } from "better-auth/plugins/access";
+import {
+	defaultRoles,
+	defaultStatements,
+} from "better-auth/plugins/organization/access";
 import { getTestInstance } from "better-auth/test";
 import { Kysely, PostgresDialect } from "kysely";
 import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { defaultAuthPolicy } from "../auth-policy/policy";
+import { defaultApplicationBranding } from "../branding/validation";
 import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
 import { readLegacySessionCookie } from "./legacy-session-cookie";
 import { createProjectEngineStore } from "./owned-project-engine-store";
 import { createOwnedProjectEngine } from "./owned-project-engine";
 import type { OwnedProjectOrganizationOptions } from "./owned-project-organization";
 import { createOwnedProjectOrganizationHttp } from "./owned-project-organization";
+import { createOwnedProjectInvitationEmail } from "./owned-project-organization-email";
+import type { InvitationRecord } from "./owned-project-organization-store";
 
 const fixturePath = new URL(
 	"../../../../.secrets/local-postgres.json",
@@ -55,6 +64,9 @@ async function nativeFixture(
 			advanced: { cookiePrefix: "allauth_project_organization-fixture" },
 			plugins: [
 				organization({
+					ac: createAccessControl<Statements>(defaultStatements),
+					roles: defaultRoles,
+					dynamicAccessControl: { enabled: true },
 					teams: { enabled: true },
 					requireEmailVerificationOnInvitation: true,
 					allowUserToCreateOrganization: (user) => user.emailVerified,
@@ -636,6 +648,8 @@ describe.skipIf(!existsSync(fixturePath))(
 
 		it("dispatches the organization routes through the owned signed-cookie engine", async () => {
 			const owner = await account();
+			const recipient = await account();
+			const delivered: string[] = [];
 			const engine = createOwnedProjectEngine({
 				database,
 				project: { schemaName: schema, slug: "organization-fixture" },
@@ -645,6 +659,13 @@ describe.skipIf(!existsSync(fixturePath))(
 				signingSecret: secret,
 				policy: defaultAuthPolicy,
 				trustedIP: () => "203.0.113.20",
+				organization: {
+					invitationEmail: {
+						async send({ invitation }) {
+							delivered.push(invitation.id);
+						},
+					},
+				},
 			});
 			const created = await engine.dispatch(
 				request("create", owner.cookie, {
@@ -659,6 +680,31 @@ describe.skipIf(!existsSync(fixturePath))(
 					await engine.dispatch(request("get-full-organization", owner.cookie))
 				).json(),
 			).toMatchObject({ id, slug: "integrated-organization" });
+			const permission = await engine.dispatch(
+				request("has-permission", owner.cookie, {
+					permissions: { invitation: ["create", "cancel"] },
+				}),
+			);
+			expect(await permission.json()).toEqual({ success: true, error: null });
+			const invited = await engine.dispatch(
+				request("invite-member", owner.cookie, {
+					email: recipient.email,
+					role: "member",
+				}),
+			);
+			expect(invited.status).toBe(200);
+			const invitation = (await invited.json()) as InvitationRecord;
+			expect(delivered).toEqual([invitation.id]);
+			const canceled = await engine.dispatch(
+				request("cancel-invitation", owner.cookie, {
+					invitationId: invitation.id,
+				}),
+			);
+			expect(await canceled.json()).toMatchObject({
+				id: invitation.id,
+				status: "canceled",
+			});
+
 			const cleared = await engine.dispatch(
 				request("set-active", owner.cookie, { organizationId: null }),
 			);
@@ -721,6 +767,359 @@ describe.skipIf(!existsSync(fixturePath))(
 				[teamId, recipient.id],
 			);
 			expect(rows.rows).toEqual([]);
+		});
+
+		async function role(
+			organizationId: string,
+			name: string,
+			permissions: Record<string, string[]>,
+		) {
+			const id = randomUUID();
+			await database.query(
+				`INSERT INTO "${schema}"."organizationRole" (id, "organizationId", role, permission) VALUES ($1, $2, $3, $4)`,
+				[id, organizationId, name, JSON.stringify(permissions)],
+			);
+			return id;
+		}
+
+		async function member(
+			organizationId: string,
+			userId: string,
+			roleName: string,
+		) {
+			await database.query(
+				`INSERT INTO "${schema}".member (id, "organizationId", "userId", role, "createdAt") VALUES ($1, $2, $3, $4, statement_timestamp())`,
+				[randomUUID(), organizationId, userId, roleName],
+			);
+		}
+
+		it("matches native static and dynamic permission composition, scoping and immediate revocation", async () => {
+			const owner = await account();
+			const subject = await account();
+			const stranger = await account();
+			const engine = owned();
+			const selected = await organizationFixture(owner, engine);
+			const foreign = await organizationFixture(owner, engine);
+			await member(selected.id, subject.id, "operator,reporter");
+			await role(selected.id, "operator", { invitation: ["create"] });
+			const editable = await role(selected.id, "operator", {
+				organization: ["update"],
+			});
+			await role(selected.id, "reporter", { team: ["delete"] });
+			await role(foreign.id, "operator", { organization: ["delete"] });
+			for (const { actor, input, allowed } of [
+				{
+					actor: subject,
+					input: {
+						permissions: { invitation: ["create"], organization: ["update"] },
+					},
+					allowed: true,
+				},
+				{
+					actor: subject,
+					input: { permissions: { invitation: ["create"], team: ["delete"] } },
+					allowed: false,
+				},
+				{
+					actor: subject,
+					input: { permissions: { organization: ["delete"] } },
+					allowed: false,
+				},
+				{
+					actor: subject,
+					input: { permissions: { organization: [] } },
+					allowed: false,
+				},
+				{
+					actor: owner,
+					input: { permissions: { organization: ["update", "delete"] } },
+					allowed: true,
+				},
+				{
+					actor: owner,
+					input: { permission: { invitation: ["create"] } },
+					allowed: false,
+				},
+			]) {
+				const body = { organizationId: selected.id, ...input };
+				const legacy = await native(
+					request("has-permission", actor.cookie, body),
+				);
+				const replacement = await engine("has-permission", actor.cookie, body);
+				expect(replacement.status).toBe(200);
+				expect(await replacement.json()).toEqual({
+					success: allowed,
+					error: null,
+				});
+				expect(await legacy.json()).toEqual({ success: allowed, error: null });
+			}
+			const foreignPermission = {
+				organizationId: foreign.id,
+				permissions: { organization: ["delete"] },
+			};
+			expect(
+				(await engine("has-permission", subject.cookie, foreignPermission))
+					.status,
+			).toBe(401);
+			expect(
+				(await engine("has-permission", stranger.cookie, { permissions: {} }))
+					.status,
+			).toBe(400);
+			await database.query(
+				`UPDATE "${schema}"."organizationRole" SET permission = '{}' WHERE id = $1`,
+				[editable],
+			);
+			expect(
+				await (
+					await engine("has-permission", subject.cookie, {
+						organizationId: selected.id,
+						permissions: { organization: ["update"] },
+					})
+				).json(),
+			).toEqual({ success: false, error: null });
+		});
+
+		it("sends the existing hosted email after commit and lets the native engine accept the new invitation", async () => {
+			const owner = await account();
+			const inviter = await account();
+			const recipient = await account();
+			const messages: { to: string; text: string; subject: string }[] = [];
+			const send = createOwnedProjectInvitationEmail({
+				env: {
+					EMAIL_PROVIDER: "cloudflare",
+					EMAIL_FROM: "security@fixture.example",
+					EMAIL: {
+						async send(message) {
+							messages.push(message);
+						},
+					},
+				},
+				project: { slug: "organization-fixture", primaryOrigin: appOrigin },
+				publicOrigin: origin,
+				async readBranding() {
+					return defaultApplicationBranding("Branded fixture");
+				},
+			});
+			const engine = owned({
+				invitationEmail: {
+					async send(notification) {
+						const committed = await database.query(
+							`SELECT status FROM "${schema}".invitation WHERE id = $1`,
+							[notification.invitation.id],
+						);
+						expect(committed.rows).toEqual([{ status: "pending" }]);
+						await send.send(notification);
+					},
+					onFailure() {
+						throw new Error("Fixture mail should succeed");
+					},
+				},
+			});
+			const selected = await organizationFixture(owner, engine);
+			const teamId = selected.teams[0]!.id;
+			await role(selected.id, "inviter", { invitation: ["create"] });
+			await role(selected.id, "editor", { organization: ["update"] });
+			await member(selected.id, inviter.id, "inviter");
+			const created = await engine("invite-member", inviter.cookie, {
+				email: recipient.email.toUpperCase(),
+				role: ["editor", "member"],
+				teamId: [teamId],
+				organizationId: selected.id,
+				inviterId: owner.id,
+			});
+			expect(created.status).toBe(200);
+			const invitation = (await created.json()) as InvitationRecord;
+			expect(invitation).toMatchObject({
+				email: recipient.email,
+				role: "editor,member",
+				teamId,
+				inviterId: inviter.id,
+				status: "pending",
+			});
+			expect(messages).toHaveLength(1);
+			expect(messages[0]).toMatchObject({
+				to: recipient.email,
+				subject: `You've been invited to ${selected.name} on Branded fixture`,
+			});
+			expect(messages[0]!.text).toContain(
+				`${origin}/accept-invitation/${invitation.id}`,
+			);
+			const accepted = await native(
+				request("accept-invitation", recipient.cookie, {
+					invitationId: invitation.id,
+				}),
+			);
+			expect(accepted.status).toBe(200);
+			expect(await accepted.json()).toMatchObject({
+				invitation: { status: "accepted" },
+				member: { role: "editor,member", userId: recipient.id },
+			});
+			expect(
+				(
+					await engine("cancel-invitation", owner.cookie, {
+						invitationId: invitation.id,
+					})
+				).status,
+			).toBe(400);
+			const committed = await database.query(
+				`SELECT status FROM "${schema}".invitation WHERE id = $1`,
+				[invitation.id],
+			);
+			expect(committed.rows).toEqual([{ status: "accepted" }]);
+		});
+
+		it("renews a native invitation without changing its grant and cancels it only with live permission", async () => {
+			const owner = await account();
+			const operator = await account();
+			const recipient = await account();
+			const deliveries: { inviter: string; id: string }[] = [];
+			let deliveryFailures = 0;
+			const engine = owned({
+				invitationEmail: {
+					async send({ inviter, invitation }) {
+						deliveries.push({ inviter: inviter.email, id: invitation.id });
+						throw new Error("Fixture transport unavailable");
+					},
+					onFailure() {
+						deliveryFailures++;
+					},
+				},
+			});
+			const selected = await organizationFixture(owner, engine);
+			const teamId = selected.teams[0]!.id;
+			const custom = await role(selected.id, "invitation-operator", {
+				invitation: ["create"],
+			});
+			await member(selected.id, operator.id, "invitation-operator");
+			const nativeInvite = await native(
+				request("invite-member", owner.cookie, {
+					email: recipient.email,
+					role: "member",
+					organizationId: selected.id,
+					teamId,
+				}),
+			);
+			expect(nativeInvite.status).toBe(200);
+			const original = (await nativeInvite.json()) as InvitationRecord;
+			await database.query(
+				`UPDATE "${schema}".invitation SET "expiresAt" = statement_timestamp() + interval '1 hour' WHERE id = $1`,
+				[original.id],
+			);
+			const payload = {
+				email: recipient.email,
+				role: "admin",
+				organizationId: selected.id,
+			};
+			const duplicate = await engine("invite-member", operator.cookie, payload);
+			expect(await duplicate.json()).toMatchObject({
+				code: "USER_IS_ALREADY_INVITED_TO_THIS_ORGANIZATION",
+			});
+			const renewed = await engine("invite-member", operator.cookie, {
+				...payload,
+				resend: true,
+			});
+			expect(renewed.status).toBe(200);
+			const persisted = (await renewed.json()) as InvitationRecord;
+			expect(persisted).toMatchObject({
+				id: original.id,
+				inviterId: owner.id,
+				role: "member",
+				teamId,
+				status: "pending",
+			});
+			expect(
+				new Date(persisted.expiresAt).getTime() - Date.now(),
+			).toBeGreaterThan(47 * 3600 * 1000);
+			expect(deliveries).toEqual([
+				{ inviter: operator.email, id: original.id },
+			]);
+			expect(deliveryFailures).toBe(1);
+			const cancel = { invitationId: original.id };
+			expect(
+				(await engine("cancel-invitation", operator.cookie, cancel)).status,
+			).toBe(403);
+			await database.query(
+				`UPDATE "${schema}"."organizationRole" SET permission = '{"invitation":["cancel"]}' WHERE id = $1`,
+				[custom],
+			);
+			const canceled = await engine(
+				"cancel-invitation",
+				operator.cookie,
+				cancel,
+			);
+			expect(canceled.status).toBe(200);
+			expect(await canceled.json()).toMatchObject({
+				id: original.id,
+				status: "canceled",
+			});
+			expect(
+				(await native(request("accept-invitation", recipient.cookie, cancel)))
+					.status,
+			).toBe(400);
+		});
+
+		it("serializes the native pending invitation quota and enforces the owner and team boundaries", async () => {
+			const owner = await account();
+			const admin = await account();
+			const first = await account();
+			const second = await account();
+			const engine = owned();
+			const selected = await organizationFixture(owner, engine);
+			const foreign = await organizationFixture(owner, engine);
+			await member(selected.id, admin.id, "admin");
+			const invalidOwner = await engine("invite-member", admin.cookie, {
+				organizationId: selected.id,
+				email: first.email,
+				role: " owner",
+			});
+			expect(invalidOwner.status).toBe(403);
+			const invalidTeam = await engine("invite-member", admin.cookie, {
+				organizationId: selected.id,
+				email: first.email,
+				role: "member",
+				teamId: foreign.teams[0]!.id,
+			});
+			expect(await invalidTeam.json()).toMatchObject({
+				code: "TEAM_NOT_FOUND",
+			});
+			const separatedTeams = await engine("invite-member", admin.cookie, {
+				organizationId: selected.id,
+				email: first.email,
+				role: "member",
+				teamId: "fixture,foreign",
+			});
+			expect(await separatedTeams.json()).toMatchObject({
+				code: "INVALID_TEAM_ID",
+			});
+			await database.query(
+				`INSERT INTO "${schema}".invitation (id,"organizationId",email,role,status,"expiresAt","inviterId")
+			 SELECT $1 || n::text,$2,n::text || '@quota.fixture.example','member','pending',statement_timestamp() + interval '1 day',$3 FROM generate_series(1,99) n`,
+				[randomUUID(), selected.id, owner.id],
+			);
+			await invite(selected.id, owner, first, { expired: true });
+			const both = await Promise.all([
+				engine("invite-member", owner.cookie, {
+					organizationId: selected.id,
+					email: first.email,
+					role: "member",
+				}),
+				engine("invite-member", admin.cookie, {
+					organizationId: selected.id,
+					email: second.email,
+					role: "member",
+				}),
+			]);
+			expect(both.map((response) => response.status).sort()).toEqual([
+				200, 403,
+			]);
+			expect(await both.find((response) => !response.ok)!.json()).toMatchObject(
+				{ code: "INVITATION_LIMIT_REACHED" },
+			);
+			const count = await database.query(
+				`SELECT count(*)::int AS total FROM "${schema}".invitation WHERE "organizationId" = $1 AND status = 'pending' AND "expiresAt" > statement_timestamp()`,
+				[selected.id],
+			);
+			expect(count.rows).toEqual([{ total: 100 }]);
 		});
 	},
 );

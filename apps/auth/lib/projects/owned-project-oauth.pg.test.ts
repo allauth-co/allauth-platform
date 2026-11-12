@@ -264,7 +264,11 @@ describe.skipIf(!existsSync(fixturePath))(
 			}
 		});
 
-		function owned(schemaName = schema, deny = false) {
+		function owned(
+			schemaName = schema,
+			deny = false,
+			authorizeLinkedAccounts?: OwnedProjectOAuthOptions["authorizeLinkedAccounts"],
+		) {
 			const store = createProjectEngineStore(database, schemaName);
 			return createOwnedProjectOAuth({
 				database,
@@ -279,6 +283,7 @@ describe.skipIf(!existsSync(fixturePath))(
 				broker: config,
 				google,
 				fetch: network,
+				authorizeLinkedAccounts,
 				async complete(client, { user, destination: target }) {
 					const token = randomUUID();
 					await store.createSession(client, {
@@ -337,12 +342,143 @@ describe.skipIf(!existsSync(fixturePath))(
 			});
 		}
 
+		function accountRequest(path: string, cookie: string, body?: unknown) {
+			const request =
+				body === undefined
+					? new Request(`${origin}/api/auth${path}`)
+					: post(origin, path, body);
+			request.headers.set("cookie", cookie);
+			return request;
+		}
+
+		async function persistedSession(
+			userId: string,
+			namespace = schema,
+			daysOld = 0,
+		) {
+			const id = randomUUID();
+			const token = randomUUID();
+			await database.query(
+				`INSERT INTO "${namespace}"."session" (id, token, "userId", "createdAt", "updatedAt", "expiresAt")
+				VALUES ($1, $2, $3, statement_timestamp() - $4::int * interval '1 day', statement_timestamp(), statement_timestamp()+interval '7 days')`,
+				[id, token, userId, daysOld],
+			);
+			const signature = createHmac("sha256", key)
+				.update(token)
+				.digest("base64");
+			return {
+				id,
+				cookie: `${sessionCookie}=${encodeURIComponent(`${token}.${signature}`)}`,
+			};
+		}
+
+		async function accountOwner(namespace = schema) {
+			const userId = randomUUID();
+			await database.query(
+				`INSERT INTO "${namespace}"."user" (id,email,name,"emailVerified") VALUES ($1,$2,'Linked account fixture',TRUE)`,
+				[userId, `${userId}@fixture.example`],
+			);
+			return { userId, ...(await persistedSession(userId, namespace)) };
+		}
+
+		async function persistedAccount(
+			userId: string,
+			providerId: string,
+			namespace = schema,
+		) {
+			const account = {
+				id: randomUUID(),
+				accountId: randomUUID(),
+				providerId,
+				userId,
+				scopes: ["openid", "profile"],
+			};
+			await database.query(
+				`INSERT INTO "${namespace}"."account" (id,"accountId","userId","providerId",scope,"accessToken","refreshToken","idToken",password,"updatedAt")
+				VALUES ($1,$2,$3,$4,'openid, profile','fixture-private-access','fixture-private-refresh','fixture-private-id','fixture-private-password',statement_timestamp())`,
+				[account.id, account.accountId, userId, providerId],
+			);
+			return account;
+		}
+
+		function callbackWithSession(request: Request, cookie: string) {
+			const headers = new Headers(request.headers);
+			headers.set("cookie", `${request.headers.get("cookie")}; ${cookie}`);
+			return new Request(request.url, { headers });
+		}
+
 		const startBody = {
 			provider: "allauth" as const,
 			callbackURL: destination,
 			newUserCallbackURL: newUserDestination,
 			disableRedirect: true,
 		};
+
+		async function googleAuthorization(
+			start: Response,
+			email: string,
+			subject: string,
+		) {
+			expect(start.status).toBe(200);
+			const { url } = (await start.json()) as { url: string };
+			const authorization = new URL(url);
+			expect(authorization.origin).toBe("https://accounts.google.com");
+			expect(authorization.searchParams.get("redirect_uri")).toBe(
+				google.redirectURI,
+			);
+			const keys = await generateKeyPair("RS256");
+			const kid = "synthetic-google-signing-key";
+			const jwk = {
+				...(await exportJWK(keys.publicKey)),
+				kid,
+				alg: "RS256",
+				use: "sig",
+			};
+			googleNetwork = async (input, init) => {
+				const request = new Request(input, init);
+				if (request.url === "https://www.googleapis.com/oauth2/v3/certs")
+					return Response.json({ keys: [jwk] });
+				if (request.url !== "https://oauth2.googleapis.com/token")
+					throw new Error("Unexpected Google fixture endpoint.");
+				const params = new URLSearchParams(await request.text());
+				expect(params.get("client_id")).toBe(google.clientId);
+				expect(params.get("client_secret")).toBe(google.clientSecret);
+				expect(params.get("redirect_uri")).toBe(google.redirectURI);
+				expect(
+					createHash("sha256")
+						.update(params.get("code_verifier")!)
+						.digest("base64url"),
+				).toBe(authorization.searchParams.get("code_challenge"));
+				const token = await new SignJWT({
+					email,
+					email_verified: true,
+					name: "Google Fixture",
+					...(authorization.searchParams.has("nonce")
+						? { nonce: authorization.searchParams.get("nonce") }
+						: {}),
+				})
+					.setProtectedHeader({ alg: "RS256", kid })
+					.setSubject(subject)
+					.setIssuer("accounts.google.com")
+					.setAudience(google.clientId)
+					.setIssuedAt()
+					.setExpirationTime("5m")
+					.sign(keys.privateKey);
+				return Response.json({
+					access_token: "synthetic-google-access",
+					token_type: "Bearer",
+					expires_in: 300,
+					id_token: token,
+				});
+			};
+			const callback = new URL(google.redirectURI);
+			callback.searchParams.set(
+				"state",
+				authorization.searchParams.get("state")!,
+			);
+			callback.searchParams.set("code", "fixture-google-code");
+			return new Request(callback, { headers: { cookie: cookiePairs(start) } });
+		}
 
 		it("consumes a native pending state, verifies the actual broker token and establishes a legacy-readable project session", async () => {
 			const started = await native.handler(
@@ -429,66 +565,13 @@ describe.skipIf(!existsSync(fixturePath))(
 			const start = await native.handler(
 				post(origin, "/sign-in/social", { ...startBody, provider: "google" }),
 			);
-			expect(start.status).toBe(200);
-			const { url } = (await start.json()) as { url: string };
-			const authorization = new URL(url);
-			expect(authorization.origin).toBe("https://accounts.google.com");
-			expect(authorization.searchParams.get("redirect_uri")).toBe(
-				google.redirectURI,
-			);
-			const keys = await generateKeyPair("RS256");
-			const kid = "synthetic-google-signing-key";
-			const jwk = {
-				...(await exportJWK(keys.publicKey)),
-				kid,
-				alg: "RS256",
-				use: "sig",
-			};
-			googleNetwork = async (input, init) => {
-				const request = new Request(input, init);
-				if (request.url === "https://www.googleapis.com/oauth2/v3/certs")
-					return Response.json({ keys: [jwk] });
-				if (request.url !== "https://oauth2.googleapis.com/token")
-					throw new Error("Unexpected Google fixture endpoint.");
-				const params = new URLSearchParams(await request.text());
-				expect(params.get("client_id")).toBe(google.clientId);
-				expect(params.get("client_secret")).toBe(google.clientSecret);
-				expect(params.get("redirect_uri")).toBe(google.redirectURI);
-				expect(
-					createHash("sha256")
-						.update(params.get("code_verifier")!)
-						.digest("base64url"),
-				).toBe(authorization.searchParams.get("code_challenge"));
-				const token = await new SignJWT({
-					email: brokerEmail,
-					email_verified: true,
-					name: "Google Fixture",
-				})
-					.setProtectedHeader({ alg: "RS256", kid })
-					.setSubject("fixture-google-subject")
-					.setIssuer("accounts.google.com")
-					.setAudience(google.clientId)
-					.setIssuedAt()
-					.setExpirationTime("5m")
-					.sign(keys.privateKey);
-				return Response.json({
-					access_token: "synthetic-google-access",
-					token_type: "Bearer",
-					expires_in: 300,
-					id_token: token,
-				});
-			};
 			try {
-				const callback = new URL(google.redirectURI);
-				callback.searchParams.set(
-					"state",
-					authorization.searchParams.get("state")!,
+				const callback = await googleAuthorization(
+					start,
+					brokerEmail,
+					"fixture-google-subject",
 				);
-				callback.searchParams.set("code", "fixture-google-code");
-				const response = await owned().callback(
-					new Request(callback, { headers: { cookie: cookiePairs(start) } }),
-					"google",
-				);
+				const response = await owned().callback(callback, "google");
 				expect(response.headers.get("location")).toBe(destination);
 				const bindings = await database.query<{
 					providerId: string;
@@ -547,6 +630,223 @@ describe.skipIf(!existsSync(fixturePath))(
 				query: { disableRefresh: true },
 			});
 			expect(active?.user.email).toBe(brokerEmail);
+		});
+
+		it("starts a link on the owning session and completes it through either callback implementation", async () => {
+			const binding = (
+				await database.query<{ userId: string }>(
+					`SELECT "userId" FROM "${schema}"."account" WHERE "providerId" = 'allauth' AND "accountId" = $1`,
+					[brokerUserId],
+				)
+			).rows[0]!;
+			const source = await persistedSession(binding.userId);
+			const otherSession = await persistedSession(binding.userId);
+			const authorization = vi.fn(async () => true);
+			const candidate = owned(schema, false, authorization);
+			const begin = () =>
+				candidate.startLink(
+					accountRequest("/link-social", source.cookie, startBody),
+					startBody,
+				);
+			const count = async () =>
+				(
+					await database.query(
+						`SELECT COUNT(*)::int AS count FROM "${schema}"."session" WHERE "userId" = $1`,
+						[binding.userId],
+					)
+				).rows[0];
+			const before = await count();
+			const authorized = await brokerAuthorization(await begin());
+			const swapped = await candidate.callback(
+				callbackWithSession(authorized, otherSession.cookie),
+				"allauth",
+			);
+			expect(
+				new URL(swapped.headers.get("location")!).searchParams.get("error"),
+			).toBe("state_mismatch");
+			const complete = await candidate.callback(
+				callbackWithSession(authorized, source.cookie),
+				"allauth",
+			);
+			expect(complete.headers.get("location")).toBe(destination);
+			expect(
+				complete.headers
+					.getSetCookie()
+					.some((cookie) => cookie.startsWith(`${sessionCookie}=`)),
+			).toBe(false);
+			const rollback = await brokerAuthorization(await begin());
+			const nativeResult = await native.handler(
+				callbackWithSession(rollback, source.cookie),
+			);
+			expect(nativeResult.headers.get("location")).toBe(destination);
+			expect(await count()).toEqual(before);
+			expect(authorization.mock.calls).toHaveLength(3);
+			const startedAudit = await database.query(
+				`SELECT id FROM "${schema}"."allauthEvent" WHERE type = 'account.link-started' AND "userId" = $1`,
+				[binding.userId],
+			);
+			expect(startedAudit.rows).toHaveLength(2);
+		});
+
+		it("links a new Google subject to the signed-in owner and enforces callback-time policy", async () => {
+			const owner = await accountOwner();
+			await persistedAccount(owner.userId, "credential");
+			const input = { ...startBody, provider: "google" as const };
+			const begin = async (candidate: ReturnType<typeof owned>) => {
+				const start = await candidate.startLink(
+					accountRequest("/link-social", owner.cookie, input),
+					input,
+				);
+				return callbackWithSession(
+					await googleAuthorization(
+						start,
+						`${owner.userId}@fixture.example`,
+						"new-google-linked-subject",
+					),
+					owner.cookie,
+				);
+			};
+			const records = async () =>
+				(
+					await database.query(
+						`SELECT "userId", "accountId" FROM "${schema}"."account" WHERE "providerId" = 'google' AND "userId" = $1`,
+						[owner.userId],
+					)
+				).rows;
+			try {
+				const denied = owned(
+					schema,
+					false,
+					async (_client, { operation }) => operation !== "link-callback",
+				);
+				const deniedResult = await denied.callback(
+					await begin(denied),
+					"google",
+				);
+				expect(
+					new URL(deniedResult.headers.get("location")!).searchParams.get(
+						"error",
+					),
+				).toBe("account_not_linked");
+				expect(await records()).toEqual([]);
+				const candidate = owned();
+				const result = await candidate.callback(
+					await begin(candidate),
+					"google",
+				);
+				expect(result.headers.get("location")).toBe(destination);
+				expect(await records()).toEqual([
+					{ userId: owner.userId, accountId: "new-google-linked-subject" },
+				]);
+				const sessionCount = await database.query(
+					`SELECT id FROM "${schema}"."session" WHERE "userId" = $1`,
+					[owner.userId],
+				);
+				expect(sessionCount.rows).toEqual([{ id: owner.id }]);
+			} finally {
+				googleNetwork = undefined;
+			}
+		});
+
+		it("returns the native token-free account list to the owning live cookie only", async () => {
+			const owner = await accountOwner();
+			const foreign = await accountOwner(foreignSchema);
+			const expected = await persistedAccount(owner.userId, "google");
+			await persistedAccount(foreign.userId, "google", foreignSchema);
+			const request = accountRequest("/list-accounts", owner.cookie);
+			const response = await owned().listAccounts(request);
+			expect(response.status).toBe(200);
+			const actual: unknown = await response.json();
+			expect(actual).toEqual(await (await native.handler(request)).json());
+			expect(actual).toMatchObject([expected]);
+			expect(JSON.stringify(actual)).not.toContain("fixture-private");
+			expect((await owned(foreignSchema).listAccounts(request)).status).toBe(
+				401,
+			);
+			expect(
+				(
+					await owned().listAccounts(
+						accountRequest("/list-accounts", foreign.cookie),
+					)
+				).status,
+			).toBe(401);
+			const bearer = accountRequest("/list-accounts", owner.cookie);
+			bearer.headers.set("authorization", "Bearer fixture-browser-bearer");
+			expect((await owned().listAccounts(bearer)).status).toBe(403);
+		});
+
+		it("serializes concurrent unlink requests and leaves the last linked sign-in account", async () => {
+			const owner = await accountOwner();
+			const brokerAccount = await persistedAccount(owner.userId, "allauth");
+			const googleAccount = await persistedAccount(owner.userId, "google");
+			const candidate = owned();
+			const first = { accountId: brokerAccount.id };
+			const second = {
+				providerId: "google" as const,
+				accountId: googleAccount.accountId,
+			};
+			const remove = (input: typeof first | typeof second) =>
+				candidate.unlinkAccount(
+					accountRequest("/unlink-account", owner.cookie, input),
+					input,
+				);
+			const results = await Promise.all([remove(first), remove(second)]);
+			expect(results.map((result) => result.status).sort()).toEqual([200, 400]);
+			expect(
+				await results.find((result) => result.status === 400)!.json(),
+			).toMatchObject({ code: "FAILED_TO_UNLINK_LAST_ACCOUNT" });
+			const remaining = await candidate.listAccounts(
+				accountRequest("/list-accounts", owner.cookie),
+			);
+			expect(await remaining.json()).toHaveLength(1);
+			const audit = await database.query(
+				`SELECT type FROM "${schema}"."allauthEvent" WHERE "userId" = $1 ORDER BY type`,
+				[owner.userId],
+			);
+			expect(audit.rows).toEqual([
+				{ type: "account.deleted" },
+				{ type: "account.unlinked" },
+			]);
+		});
+
+		it("checks unlink freshness, target ownership and ambiguous SDK provider selectors", async () => {
+			const owner = await accountOwner();
+			const foreign = await accountOwner(foreignSchema);
+			const first = await persistedAccount(owner.userId, "google");
+			await persistedAccount(owner.userId, "google");
+			const foreignAccount = await persistedAccount(
+				foreign.userId,
+				"allauth",
+				foreignSchema,
+			);
+			const stale = await persistedSession(owner.userId, schema, 2);
+			const candidate = owned();
+			const remove = (
+				input: { accountId?: string; providerId?: "google" },
+				cookie = owner.cookie,
+			) =>
+				candidate.unlinkAccount(
+					accountRequest("/unlink-account", cookie, input),
+					input,
+				);
+			expect(
+				await (await remove({ accountId: first.id }, stale.cookie)).json(),
+			).toMatchObject({ code: "SESSION_NOT_FRESH" });
+			expect(
+				await (await remove({ accountId: foreignAccount.id })).json(),
+			).toMatchObject({ code: "ACCOUNT_NOT_FOUND" });
+			expect(
+				await (await remove({ providerId: "google" })).json(),
+			).toMatchObject({ code: "ACCOUNT_SELECTION_AMBIGUOUS" });
+			expect(
+				await (
+					await remove({ accountId: first.id, providerId: "google" })
+				).json(),
+			).toEqual({ status: true });
+			const retained = await owned(foreignSchema).listAccounts(
+				accountRequest("/list-accounts", foreign.cookie),
+			);
+			expect(await retained.json()).toMatchObject([foreignAccount]);
 		});
 
 		it("preserves prior refresh data on sign-in and rolls back an unadmitted callback", async () => {

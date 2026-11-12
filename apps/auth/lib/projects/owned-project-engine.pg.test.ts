@@ -492,6 +492,44 @@ describe.skipIf(!existsSync(fixturePath))("isolated PostgreSQL owned project eng
 		}
 	});
 
+	it("routes linked accounts through the existing signed session authority", async () => {
+		const id = await seed("owned-linked-accounts@fixture.example");
+		const active = await legacySession(id, 1200);
+		const account = randomUUID();
+		const subject = randomUUID();
+		await database.query(
+			`INSERT INTO "${schema}"."account"(id,"accountId","providerId","userId","accessToken","updatedAt")
+			 VALUES ($1,$2,'google',$3,'fixture-token-never-in-public-json',statement_timestamp())`,
+			[account, subject, id],
+		);
+		const owner = createOwnedProjectEngine({
+			database, project: { slug, schemaName: schema }, baseURL: origin, basePath, trustedOrigins: [],
+			signingSecret, policy: defaultAuthPolicy, trustedIP: () => "203.0.113.198",
+			oauth: {
+				defaultErrorURL: `${origin}/auth-error`,
+				broker: {
+					issuer: "https://broker.fixture.example",
+					discoveryURL: "https://broker.fixture.example/.well-known/openid-configuration",
+					clientId: "project-fixture", clientSecret: "isolated-broker-fixture-client-secret",
+					redirectURI: `${origin}/api/auth/callback/allauth`,
+				},
+			},
+		});
+		const headers = { cookie: active.cookie };
+		const list = await owner.dispatch(request("/list-accounts", undefined, headers));
+		expect(list.status).toBe(200);
+		const listed = await list.json();
+		expect(listed).toEqual(expect.arrayContaining([expect.objectContaining({ id: account, accountId: subject, providerId: "google" })]));
+		expect(JSON.stringify(listed)).not.toContain("fixture-token-never-in-public-json");
+		expect((await owner.dispatch(request("/list-accounts", undefined, { ...headers, Authorization: "Bearer unsupported" }))).status).toBe(403);
+		const unlinked = await owner.dispatch(request("/unlink-account", { accountId: account }, headers));
+		expect(unlinked.status).toBe(200);
+		expect(await unlinked.json()).toEqual({ status: true });
+		expect(await nativeGetSession(new Headers(headers))).toMatchObject({ user: { id } });
+		const retained = await database.query(`SELECT "providerId" FROM "${schema}"."account" WHERE "userId" = $1`, [id]);
+		expect(retained.rows).toEqual([{ providerId: "credential" }]);
+	});
+
 	it("routes email codes through the same MFA and session authority as passwords", async () => {
 		const email = "email-otp-mfa@fixture.example";
 		const id = await seed(email, { mfa: true });

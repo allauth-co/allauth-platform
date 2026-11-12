@@ -4,6 +4,15 @@ import type { AuthPolicy } from "../auth-policy/policy";
 import { isPlatformAdmin } from "../configuration";
 import type { ProjectSession, ProjectUser } from "./owned-project-engine-store";
 import { createProjectEngineStore } from "./owned-project-engine-store";
+import {
+	hasOrganizationPermission,
+	organizationPermissionRequest,
+	organizationRolePermissions,
+} from "./owned-project-organization-access";
+import type {
+	OwnedProjectInvitationEmail,
+	OwnedProjectInvitationNotification,
+} from "./owned-project-organization-email";
 import { projectOrganizations } from "./owned-project-organization-store";
 import type { Project } from "./registry";
 
@@ -25,6 +34,8 @@ export interface OwnedProjectOrganizationOptions {
 	readBody(request: Request): Promise<unknown>;
 	/** Null represents the unlimited workspace entitlement. Omission retains the native default. */
 	membershipLimit?(client: PoolClient): Promise<number | null>;
+	/** Deliver after the invitation transaction commits. A resend reuses the pending row. */
+	invitationEmail?: OwnedProjectInvitationEmail;
 	/** Reissue the existing token with its existing persistence on native cookie-refresh operations. */
 	sessionCookies?(request: Request, principal: OrganizationSession): Headers;
 }
@@ -56,6 +67,21 @@ const roleQuery = organizationQuery.extend({ userId: field.optional() });
 const checkSlugInput = z.object({ slug: requiredField });
 const invitationBody = z.object({ invitationId: requiredField });
 const invitationQuery = z.object({ id: requiredField });
+const permissionInput = z
+	.object({ organizationId: field.optional() })
+	.and(
+		z.xor([
+			z.object({ permissions: organizationPermissionRequest }),
+			z.object({ permission: organizationPermissionRequest }),
+		]),
+	);
+const inviteInput = z.object({
+	email: field,
+	role: z.union([field, z.array(field)]),
+	organizationId: field.optional(),
+	teamId: z.union([field, z.array(field)]).optional(),
+	resend: z.boolean().optional(),
+});
 
 const routeMethods = {
 	"/organization/check-slug": "POST",
@@ -70,6 +96,9 @@ const routeMethods = {
 	"/organization/list-user-invitations": "GET",
 	"/organization/accept-invitation": "POST",
 	"/organization/reject-invitation": "POST",
+	"/organization/has-permission": "POST",
+	"/organization/invite-member": "POST",
+	"/organization/cancel-invitation": "POST",
 } as const;
 
 type RoutePath = keyof typeof routeMethods;
@@ -131,12 +160,203 @@ const membershipLimitReached = () =>
 		"Organization membership limit reached",
 	);
 
-function missingInvitation(operation: "read" | "accept" | "reject") {
+function missingInvitation(operation: "read" | "accept" | "reject" | "cancel") {
 	return failure(
 		400,
 		operation === "read" ? "BAD_REQUEST" : "INVITATION_NOT_FOUND",
-		operation === "accept" ? "Invitation not found" : "Invitation not found!",
+		operation === "read" || operation === "reject"
+			? "Invitation not found!"
+			: "Invitation not found",
 	);
+}
+
+type RealmOrganizations = ReturnType<typeof projectOrganizations>;
+type RouteResult =
+	| Response
+	| { response: Response; notification: OwnedProjectInvitationNotification };
+
+const memberMissing = () =>
+	failure(400, "MEMBER_NOT_FOUND", "Member not found");
+const invalidPermissions = () =>
+	failure(500, "INTERNAL_SERVER_ERROR", "Invalid organization permissions.");
+const alreadyMember = () =>
+	failure(
+		400,
+		"USER_IS_ALREADY_A_MEMBER_OF_THIS_ORGANIZATION",
+		"User is already a member of this organization",
+	);
+const teamMissing = () => failure(400, "TEAM_NOT_FOUND", "Team not found");
+
+async function checkPermission(
+	realm: RealmOrganizations,
+	input: unknown,
+	principal: OrganizationSession,
+) {
+	const body = permissionInput.safeParse(input);
+	if (!body.success) return invalidBody();
+	const organizationId =
+		body.data.organizationId || principal.session.activeOrganizationId;
+	if (!organizationId) return noActiveOrganization();
+	const member = await realm.member(principal.user.id, organizationId, true);
+	if (!member)
+		return failure(
+			401,
+			"USER_IS_NOT_A_MEMBER_OF_THE_ORGANIZATION",
+			"User is not a member of the organization",
+		);
+	const roles = organizationRolePermissions(await realm.roles(organizationId));
+	if (!roles) return invalidPermissions();
+	const permissions =
+		"permissions" in body.data ? body.data.permissions : undefined;
+	return json({
+		error: null,
+		success: hasOrganizationPermission(roles, member.role, permissions),
+	});
+}
+
+async function issueInvitation(
+	realm: RealmOrganizations,
+	input: unknown,
+	principal: OrganizationSession,
+): Promise<RouteResult> {
+	const parsed = inviteInput.safeParse(input);
+	if (!parsed.success) return invalidBody();
+	const body = parsed.data;
+	const organizationId =
+		body.organizationId || principal.session.activeOrganizationId;
+	if (!organizationId) return organizationMissing();
+	const email = body.email.toLowerCase();
+	if (!z.email().safeParse(email).success)
+		return failure(400, "INVALID_EMAIL", "Invalid email");
+	// Serialize the pending quota and duplicate check with other invitation writers for this organization.
+	const organization = await realm.organization(organizationId, "id", "write");
+	const member = await realm.member(principal.user.id, organizationId, true);
+	if (!member) return memberMissing();
+	const roles = organizationRolePermissions(
+		await realm.roles(organizationId, true),
+	);
+	if (!roles) return invalidPermissions();
+	if (
+		!hasOrganizationPermission(roles, member.role, { invitation: ["create"] })
+	)
+		return failure(
+			403,
+			"YOU_ARE_NOT_ALLOWED_TO_INVITE_USERS_TO_THIS_ORGANIZATION",
+			"You are not allowed to invite users to this organization",
+		);
+	const role = Array.isArray(body.role) ? body.role.join(",") : body.role;
+	const requestedRoles = role
+		.split(",")
+		.map((part) => part.trim())
+		.filter(Boolean);
+	const unknownRoles = requestedRoles.filter((part) => !roles.has(part));
+	if (!requestedRoles.length || unknownRoles.length)
+		return failure(
+			400,
+			"BAD_REQUEST",
+			unknownRoles.length
+				? `Role not found: ${unknownRoles.join(", ")}`
+				: "Role not found",
+		);
+	if (
+		requestedRoles.includes("owner") &&
+		!member.role
+			.split(",")
+			.map((part) => part.trim())
+			.includes("owner")
+	)
+		return failure(
+			403,
+			"YOU_ARE_NOT_ALLOWED_TO_INVITE_USER_WITH_THIS_ROLE",
+			"You are not allowed to invite a user with this role",
+		);
+	if (await realm.memberByEmail(organizationId, email)) return alreadyMember();
+	const existing = await realm.pendingInvitation(organizationId, email);
+	if (existing && !body.resend)
+		return failure(
+			400,
+			"USER_IS_ALREADY_INVITED_TO_THIS_ORGANIZATION",
+			"User is already invited to this organization",
+		);
+	if (!organization) return organizationMissing();
+	if (existing) {
+		const invitation = await realm.renewInvitation(existing.id);
+		if (!invitation) return missingInvitation("cancel");
+		return {
+			response: json(invitation),
+			notification: { invitation, organization, inviter: principal.user },
+		};
+	}
+	if ((await realm.pendingInvitationCount(organizationId)) >= 100)
+		return failure(403, "INVITATION_LIMIT_REACHED", "Invitation limit reached");
+	const teamIds =
+		typeof body.teamId === "string" ? [body.teamId] : (body.teamId ?? []);
+	if (teamIds.some((id) => id.includes(",")))
+		return failure(
+			400,
+			"INVALID_TEAM_ID",
+			"Team id contains a reserved character",
+		);
+	if (
+		body.teamId &&
+		!(await realm.lockTeamIds(organizationId, [...new Set(teamIds)]))
+	)
+		return teamMissing();
+	const invitation = await realm.createInvitation({
+		organizationId,
+		email,
+		role,
+		teamIds,
+		inviterId: principal.user.id,
+	});
+	return {
+		response: json(invitation),
+		notification: { invitation, organization, inviter: principal.user },
+	};
+}
+
+async function cancelInvitation(
+	realm: RealmOrganizations,
+	input: unknown,
+	principal: OrganizationSession,
+) {
+	const body = invitationBody.safeParse(input);
+	if (!body.success) return invalidBody();
+	const candidate = await realm.invitation(body.data.invitationId);
+	if (!candidate) return missingInvitation("cancel");
+	const organization = await realm.organization(
+		candidate.organizationId,
+		"id",
+		true,
+	);
+	const member = await realm.member(
+		principal.user.id,
+		candidate.organizationId,
+		true,
+	);
+	if (!member) return memberMissing();
+	const roles = organizationRolePermissions(
+		await realm.roles(candidate.organizationId, true),
+	);
+	if (!roles) return invalidPermissions();
+	if (
+		!hasOrganizationPermission(roles, member.role, { invitation: ["cancel"] })
+	)
+		return failure(
+			403,
+			"YOU_ARE_NOT_ALLOWED_TO_CANCEL_THIS_INVITATION",
+			"You are not allowed to cancel this invitation",
+		);
+	if (!organization) return organizationMissing();
+	const current = await realm.invitation(candidate.id, true);
+	if (!current || current.organizationId !== candidate.organizationId)
+		return missingInvitation("cancel");
+	if (current.status === "canceled") {
+		const { expired: _expired, ...invitation } = current;
+		return json(invitation);
+	}
+	const canceled = await realm.setInvitationStatus(current.id, "canceled");
+	return canceled ? json(canceled) : missingInvitation("cancel");
 }
 
 function parseQuery(request: Request) {
@@ -157,7 +377,9 @@ export function createOwnedProjectOrganizationHttp(
 		request: Request,
 		principal: OrganizationSession,
 	) {
-		const lockedUser = await store.lockUser(client, principal.user.id);
+		const lockedUser = await projectOrganizations(client).lockActor(
+			principal.user.id,
+		);
 		if (
 			!lockedUser ||
 			!(await store.lockSession(
@@ -188,7 +410,7 @@ export function createOwnedProjectOrganizationHttp(
 			? await options.readBody(request)
 			: parseQuery(request);
 		try {
-			return await store.transaction(async (client) => {
+			const result = await store.transaction<RouteResult>(async (client) => {
 				if (
 					path === "/organization/list-user-invitations" &&
 					new URL(request.url).searchParams.get("email")
@@ -209,7 +431,9 @@ export function createOwnedProjectOrganizationHttp(
 						: unauthorized();
 				// A stale full-organization selection can clear the active organization, as on the native route.
 				const principal =
-					(mutation && path !== "/organization/check-slug") ||
+					(mutation &&
+						path !== "/organization/check-slug" &&
+						path !== "/organization/has-permission") ||
 					path === "/organization/get-full-organization"
 						? await lockPrincipal(client, request, observed)
 						: observed;
@@ -218,6 +442,12 @@ export function createOwnedProjectOrganizationHttp(
 				const { user, session } = principal;
 
 				switch (path) {
+					case "/organization/has-permission":
+						return checkPermission(realm, input, principal);
+					case "/organization/invite-member":
+						return issueInvitation(realm, input, principal);
+					case "/organization/cancel-invitation":
+						return cancelInvitation(realm, input, principal);
 					case "/organization/list":
 						return json(await realm.list(user.id));
 					case "/organization/check-slug": {
@@ -467,7 +697,7 @@ export function createOwnedProjectOrganizationHttp(
 							teamIds.length &&
 							!(await realm.lockTeamIds(invitation.organizationId, teamIds))
 						)
-							return failure(400, "TEAM_NOT_FOUND", "Team not found");
+							return teamMissing();
 						await realm.lockMemberBudget(invitation.organizationId);
 						const limit = options.membershipLimit
 							? await options.membershipLimit(client)
@@ -478,11 +708,7 @@ export function createOwnedProjectOrganizationHttp(
 						)
 							return membershipLimitReached();
 						if (await realm.member(user.id, invitation.organizationId, true))
-							return failure(
-								400,
-								"USER_IS_ALREADY_A_MEMBER_OF_THIS_ORGANIZATION",
-								"User is already a member of this organization",
-							);
+							return alreadyMember();
 						for (const teamId of teamIds)
 							await realm.addTeamMember(teamId, user.id);
 						const member = await realm.insertMember(
@@ -516,6 +742,13 @@ export function createOwnedProjectOrganizationHttp(
 					}
 				}
 			});
+			if (result instanceof Response) return result;
+			try {
+				await options.invitationEmail?.send(result.notification);
+			} catch {
+				options.invitationEmail?.onFailure?.();
+			}
+			return result.response;
 		} catch (error) {
 			if (error instanceof Response) return error;
 			if (

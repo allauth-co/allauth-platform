@@ -27,6 +27,7 @@ import {
 import {
 	createOwnedProjectOAuth,
 	ownedProjectOAuthStartInput,
+	ownedProjectOAuthUnlinkInput,
 	type OwnedProjectOAuthOptions,
 } from "./owned-project-oauth";
 import {
@@ -103,9 +104,13 @@ interface OwnedProjectEngineOptions {
 		| "signingSecret"
 		| "signUpEnabled"
 		| "requireEmailVerification"
+		| "authorizeLinkedAccounts"
 		| "complete"
 	>;
-	organization?: Pick<OwnedProjectOrganizationOptions, "membershipLimit">;
+	organization?: Pick<
+		OwnedProjectOrganizationOptions,
+		"membershipLimit" | "invitationEmail"
+	>;
 	security?: {
 		requireTrustedIP?: boolean;
 		newDevice?: {
@@ -1164,6 +1169,10 @@ export function createOwnedProjectEngine(
 			signingSecret: options.signingSecret,
 			signUpEnabled: policy.signUpEnabled,
 			requireEmailVerification: policy.requireEmailVerification,
+			async authorizeLinkedAccounts(client, { request, user }) {
+				const active = await currentSession(request.headers, client);
+				return active?.user.id === user.id;
+			},
 			async complete(client, { user, request, provider, destination }) {
 				const result = await primaryResult(
 					client,
@@ -1186,6 +1195,7 @@ export function createOwnedProjectEngine(
 		trustedRequest,
 		readBody: requestBody,
 		membershipLimit: options.organization?.membershipLimit,
+		invitationEmail: options.organization?.invitationEmail,
 		sessionCookies(request, principal) {
 			const headers = new Headers();
 			const remember = !tokenFrom(request.headers, rememberCookie);
@@ -1215,7 +1225,22 @@ export function createOwnedProjectEngine(
 		if (emailSignIn) return emailSignIn;
 		const organizationResponse = await organization(path, request);
 		if (organizationResponse) return organizationResponse;
-		if (oauth && path === "/sign-in/social" && request.method === "POST") {
+		if (oauth && path === "/list-accounts" && request.method === "GET")
+			return oauth.listAccounts(request);
+		if (oauth && path === "/unlink-account" && request.method === "POST") {
+			if (!trustedRequest(request.headers, true)) return forbidden();
+			const body = ownedProjectOAuthUnlinkInput.safeParse(
+				await requestBody(request),
+			);
+			return body.success
+				? oauth.unlinkAccount(request, body.data)
+				: failure(400, "INVALID_BODY", "Invalid linked-account request.");
+		}
+		if (
+			oauth &&
+			(path === "/sign-in/social" || path === "/link-social") &&
+			request.method === "POST"
+		) {
 			if (!trustedRequest(request.headers, true)) return forbidden();
 			const body = ownedProjectOAuthStartInput.safeParse(
 				await requestBody(request),
@@ -1226,6 +1251,7 @@ export function createOwnedProjectEngine(
 					"INVALID_BODY",
 					"Invalid provider sign-in request.",
 				);
+			if (path === "/link-social") return oauth.startLink(request, body.data);
 			const denied = await store.transaction((client) =>
 				security.admit(client, request),
 			);

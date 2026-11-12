@@ -25,7 +25,10 @@ const stateData = z.object({
 		})
 		.optional(),
 	serverContext: z
-		.object({ ownedProjectProvider: providerId.optional() })
+		.object({
+			ownedProjectProvider: providerId.optional(),
+			linkedSessionId: z.string().min(1).max(512).optional(),
+		})
 		.optional(),
 });
 export type ProjectOAuthState = z.infer<typeof stateData>;
@@ -57,8 +60,12 @@ export function createProjectOAuthStore(
 	const schema = checkedProjectSchema(schemaName);
 	const realm = createProjectEngineStore(database, schema);
 
-	async function issue(state: string, value: ProjectOAuthState) {
-		await database.query(
+	async function issue(
+		state: string,
+		value: ProjectOAuthState,
+		client?: PoolClient,
+	) {
+		await (client ?? database).query(
 			`INSERT INTO "${schema}"."verification" (id, identifier, value, "expiresAt")
 			VALUES ($1, $2, $3, statement_timestamp() + $4::int * interval '1 second')`,
 			[
@@ -105,12 +112,17 @@ export function createProjectOAuthStore(
 			)
 				return null;
 			if (data.data.link) {
-				const owner = await client.query(
-					`SELECT 1 FROM "${schema}"."session" WHERE token = $1 AND "userId" = $2
+				const owner = await client.query<{ id: string }>(
+					`SELECT id FROM "${schema}"."session" WHERE token = $1 AND "userId" = $2
 					AND "expiresAt" > statement_timestamp() AND "impersonatedBy" IS NULL`,
 					[sessionToken, data.data.link.userId],
 				);
-				if (owner.rowCount !== 1) return null;
+				if (
+					owner.rowCount !== 1 ||
+					(data.data.serverContext?.linkedSessionId &&
+						owner.rows[0]?.id !== data.data.serverContext.linkedSessionId)
+				)
+					return null;
 			}
 			const consumed = await client.query(
 				`DELETE FROM "${schema}"."verification" WHERE id = $1 AND "expiresAt" > statement_timestamp()`,

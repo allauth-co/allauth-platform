@@ -18,7 +18,7 @@ interface MemberRecord {
 	createdAt: Date;
 }
 
-interface InvitationRecord {
+export interface InvitationRecord {
 	id: string;
 	organizationId: string;
 	email: string;
@@ -39,10 +39,14 @@ export type OrganizationCreate = {
 
 /** All queries use a realm transaction with a schema selected by the server. */
 export function projectOrganizations(client: PoolClient) {
-	async function organization(value: string, by: "id" | "slug", lock = false) {
+	async function organization(
+		value: string,
+		by: "id" | "slug",
+		lock: boolean | "write" = false,
+	) {
 		const result = await client.query<OrganizationRecord>(
 			`SELECT id, name, slug, logo, metadata, "createdAt" FROM "organization"
-			 WHERE ${by === "id" ? "id" : "slug"} = $1${lock ? " FOR KEY SHARE" : ""}`,
+			 WHERE ${by === "id" ? "id" : "slug"} = $1${lock === "write" ? " FOR NO KEY UPDATE" : lock ? " FOR KEY SHARE" : ""}`,
 			[value],
 		);
 		return result.rows[0] ?? null;
@@ -58,7 +62,7 @@ export function projectOrganizations(client: PoolClient) {
 			 json_build_object('id', u.id, 'name', u.name, 'email', u.email, 'image', u.image) AS "user"
 			 FROM "member" m JOIN "user" u ON u.id = m."userId"
 			 WHERE m."userId" = $1 AND m."organizationId" = $2
-			 ORDER BY m."createdAt", m.id LIMIT 1${lock ? " FOR KEY SHARE OF m" : ""}`,
+			 ORDER BY m."createdAt", m.id LIMIT 1${lock ? " FOR SHARE OF m" : ""}`,
 			[userId, organizationId],
 		);
 		return result.rows[0] ?? null;
@@ -200,7 +204,7 @@ export function projectOrganizations(client: PoolClient) {
 
 	async function setInvitationStatus(
 		id: string,
-		status: "accepted" | "rejected",
+		status: "accepted" | "rejected" | "canceled",
 	) {
 		const result = await client.query<InvitationRecord>(
 			`UPDATE "invitation" SET status = $2 WHERE id = $1 AND status = 'pending'
@@ -245,6 +249,82 @@ export function projectOrganizations(client: PoolClient) {
 		return result.rows.length === ids.length;
 	}
 
+	async function lockActor(userId: string) {
+		const result = await client.query(
+			`SELECT id FROM "user" WHERE id = $1 FOR NO KEY UPDATE`,
+			[userId],
+		);
+		return result.rowCount === 1;
+	}
+
+	async function roles(organizationId: string, lock = false) {
+		const result = await client.query<{ role: string; permission: string }>(
+			`SELECT role, permission FROM "organizationRole" WHERE "organizationId" = $1 ORDER BY id${lock ? " FOR SHARE" : ""}`,
+			[organizationId],
+		);
+		return result.rows;
+	}
+
+	async function memberByEmail(organizationId: string, email: string) {
+		const result = await client.query(
+			`SELECT 1 FROM "member" m JOIN "user" u ON u.id = m."userId"
+			 WHERE m."organizationId" = $1 AND u.email = $2 LIMIT 1`,
+			[organizationId, email],
+		);
+		return result.rowCount === 1;
+	}
+
+	async function pendingInvitation(organizationId: string, email: string) {
+		const result = await client.query<InvitationRecord>(
+			`SELECT id, "organizationId", email, role, "teamId", status, "inviterId", "createdAt", "expiresAt"
+			 FROM "invitation" WHERE "organizationId" = $1 AND email = $2 AND status = 'pending'
+			 AND "expiresAt" > statement_timestamp() ORDER BY "createdAt", id LIMIT 1 FOR UPDATE`,
+			[organizationId, email],
+		);
+		return result.rows[0] ?? null;
+	}
+
+	async function pendingInvitationCount(organizationId: string) {
+		const result = await client.query<{ total: string }>(
+			`SELECT count(*) AS total FROM "invitation" WHERE "organizationId" = $1 AND status = 'pending' AND "expiresAt" > statement_timestamp()`,
+			[organizationId],
+		);
+		return Number(result.rows[0]?.total ?? 0);
+	}
+
+	async function createInvitation(input: {
+		organizationId: string;
+		email: string;
+		role: string;
+		teamIds: string[];
+		inviterId: string;
+	}) {
+		const result = await client.query<InvitationRecord>(
+			`INSERT INTO "invitation" (id, "organizationId", email, role, "teamId", status, "inviterId", "createdAt", "expiresAt")
+			 VALUES ($1, $2, $3, $4, $5, 'pending', $6, statement_timestamp(), statement_timestamp() + interval '48 hours')
+			 RETURNING id, "organizationId", email, role, "teamId", status, "inviterId", "createdAt", "expiresAt"`,
+			[
+				randomUUID(),
+				input.organizationId,
+				input.email,
+				input.role,
+				input.teamIds.length ? input.teamIds.join(",") : null,
+				input.inviterId,
+			],
+		);
+		return result.rows[0]!;
+	}
+
+	async function renewInvitation(invitationId: string) {
+		const result = await client.query<InvitationRecord>(
+			`UPDATE "invitation" SET "expiresAt" = statement_timestamp() + interval '48 hours'
+			 WHERE id = $1 AND status = 'pending'
+			 RETURNING id, "organizationId", email, role, "teamId", status, "inviterId", "createdAt", "expiresAt"`,
+			[invitationId],
+		);
+		return result.rows[0] ?? null;
+	}
+
 	return {
 		organization,
 		member,
@@ -261,5 +341,12 @@ export function projectOrganizations(client: PoolClient) {
 		lockMemberBudget,
 		memberCount,
 		lockTeamIds,
+		lockActor,
+		roles,
+		memberByEmail,
+		pendingInvitation,
+		pendingInvitationCount,
+		createInvitation,
+		renewInvitation,
 	};
 }

@@ -11,6 +11,12 @@ import * as z from "zod";
 import { validAvatarPath } from "../avatars/protocol";
 import type { LegacyMfaKeys } from "./legacy-mfa-record";
 import { readLegacySessionCookie } from "./legacy-session-cookie";
+import type {
+	AuthorizeLinkedAccounts,
+	OwnedProjectOAuthUnlink,
+} from "./owned-project-linked-accounts";
+import { createOwnedProjectLinkedAccounts } from "./owned-project-linked-accounts";
+export { ownedProjectOAuthUnlinkInput } from "./owned-project-linked-accounts";
 import type { ProjectUser } from "./owned-project-engine-store";
 import type {
 	ProjectOAuthProvider,
@@ -103,6 +109,7 @@ export interface OwnedProjectOAuthOptions {
 			registered: boolean;
 		},
 	): Promise<Response>;
+	authorizeLinkedAccounts?: AuthorizeLinkedAccounts;
 	fetch?: ProjectOAuthFetch;
 }
 
@@ -126,6 +133,18 @@ function safeURL(value: string, base: string, origins: ReadonlySet<string>) {
 function publicJSON(body: unknown, status: number, headers = new Headers()) {
 	headers.set("cache-control", "no-store");
 	return Response.json(body, { status, headers });
+}
+
+function publicFailure(code: string, message: string, status: number) {
+	return publicJSON({ code, message }, status);
+}
+
+function rejectedResponse(result: {
+	code: string;
+	message: string;
+	httpStatus: number;
+}) {
+	return publicFailure(result.code, result.message, result.httpStatus);
 }
 
 function boundedExpiry(seconds: unknown) {
@@ -168,6 +187,11 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 		options.database,
 		options.project.schemaName,
 		options.tokenKeys ?? { secret: options.signingSecret },
+	);
+	const linked = createOwnedProjectLinkedAccounts(
+		options.database,
+		options.project.schemaName,
+		options.authorizeLinkedAccounts,
 	);
 	const secure = origin.startsWith("https:");
 	const stateCookie = `${secure ? "__Secure-" : ""}allauth_project_${slug}.state`;
@@ -268,6 +292,29 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 			: null;
 	}
 
+	function browserRequest(
+		request: Request,
+		path: string,
+		method: "GET" | "POST",
+	) {
+		const caller = request.headers.get("origin");
+		return (
+			request.method === method &&
+			route(request, path) &&
+			!request.headers.has("authorization") &&
+			request.headers.get("sec-fetch-site") !== "cross-site" &&
+			(caller === null ? method === "GET" : origins.has(caller))
+		);
+	}
+
+	function browserToken(request: Request) {
+		return readLegacySessionCookie(
+			request.headers,
+			sessionCookie,
+			options.signingSecret,
+		);
+	}
+
 	function errorRedirect(
 		code: string,
 		state?: ProjectOAuthState,
@@ -284,23 +331,28 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 		return result;
 	}
 
-	async function start(request: Request, input: OwnedProjectOAuthStart) {
+	async function redirectStart(
+		request: Request,
+		input: OwnedProjectOAuthStart,
+		linking: boolean,
+	) {
 		const requestOrigin = request.headers.get("origin");
 		if (
-			request.method !== "POST" ||
-			!route(request, "sign-in/social") ||
 			!requestOrigin ||
-			!origins.has(requestOrigin) ||
-			request.headers.has("authorization") ||
-			request.headers.get("sec-fetch-site") === "cross-site"
+			!browserRequest(
+				request,
+				linking ? "link-social" : "sign-in/social",
+				"POST",
+			)
 		)
-			return publicJSON(
-				{
-					code: "FORBIDDEN",
-					message: "This authentication request is not permitted.",
-				},
+			return publicFailure(
+				"FORBIDDEN",
+				"This authentication request is not permitted.",
 				403,
 			);
+		const linkToken = linking ? browserToken(request) : null;
+		if (linking && !linkToken)
+			return publicFailure("UNAUTHORIZED", "Unauthorized", 401);
 		const parsed = ownedProjectOAuthStartInput.safeParse(input);
 		if (!parsed.success)
 			return publicJSON(
@@ -364,7 +416,7 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 				authorization.searchParams.set("include_granted_scopes", "true");
 			if (body.provider === "allauth" && options.broker.hintGoogle)
 				authorization.searchParams.set("idp_hint", "google");
-			await store.issue(state, {
+			const flow: ProjectOAuthState = {
 				...body.additionalData,
 				link: undefined,
 				callbackURL: destination.href,
@@ -376,7 +428,40 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 				idTokenNonce: nonce,
 				requestSignUp: body.requestSignUp,
 				serverContext: { ownedProjectProvider: body.provider },
-			});
+			};
+			if (!linking) await store.issue(state, flow);
+			else {
+				const result = await store.transaction(async (client) => {
+					const authority = await linked.lockAuthority(
+						client,
+						request,
+						linkToken,
+						"link",
+					);
+					if (authority.status === "rejected") return authority;
+					await store.issue(
+						state,
+						{
+							...flow,
+							link: { userId: authority.user.id, email: authority.user.email },
+							serverContext: {
+								ownedProjectProvider: body.provider,
+								linkedSessionId: authority.session.id,
+							},
+						},
+						client,
+					);
+					await linked.record(
+						client,
+						"account.link-started",
+						"success",
+						"/link-social",
+						authority.user.id,
+					);
+					return authority;
+				});
+				if (result.status === "rejected") return rejectedResponse(result);
+			}
 		} catch {
 			return publicJSON(
 				{
@@ -395,6 +480,43 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 		const redirect = !body.disableRedirect;
 		if (redirect) headers.set("location", authorization.href);
 		return publicJSON({ url: authorization.href, redirect }, 200, headers);
+	}
+
+	function start(request: Request, input: OwnedProjectOAuthStart) {
+		return redirectStart(request, input, false);
+	}
+
+	function startLink(request: Request, input: OwnedProjectOAuthStart) {
+		return redirectStart(request, input, true);
+	}
+
+	async function listAccounts(request: Request) {
+		if (!browserRequest(request, "list-accounts", "GET"))
+			return publicFailure(
+				"FORBIDDEN",
+				"This authentication request is not permitted.",
+				403,
+			);
+		const result = await linked.list(request, browserToken(request));
+		return result.status === "rejected"
+			? rejectedResponse(result)
+			: publicJSON(result.accounts, 200);
+	}
+
+	async function unlinkAccount(
+		request: Request,
+		input: OwnedProjectOAuthUnlink,
+	) {
+		if (!browserRequest(request, "unlink-account", "POST"))
+			return publicFailure(
+				"FORBIDDEN",
+				"This authentication request is not permitted.",
+				403,
+			);
+		const result = await linked.unlink(request, browserToken(request), input);
+		return result.status === "rejected"
+			? rejectedResponse(result)
+			: publicJSON({ status: true }, 200);
 	}
 
 	async function getIdentity(
@@ -547,11 +669,7 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 		let flow: ProjectOAuthState | null = null;
 		const rejected = Symbol("project OAuth session rejected");
 		try {
-			const linkSession = readLegacySessionCookie(
-				request.headers,
-				sessionCookie,
-				options.signingSecret,
-			);
+			const linkSession = browserToken(request);
 			flow = await store.consume(state, provider, linkSession);
 			if (!flow) return errorRedirect("state_mismatch", undefined, true);
 			const destination = safeURL(flow.callbackURL, origin, origins);
@@ -574,7 +692,18 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 			const response = await store.transaction(async (client) => {
 				const account = await store.bind(client, identity, options, link);
 				if (!account) throw rejected;
-				if (link) return publicRedirect(destination.href);
+				if (link) {
+					if (
+						options.authorizeLinkedAccounts &&
+						!(await options.authorizeLinkedAccounts(client, {
+							request,
+							user: account.user,
+							operation: "link-callback",
+						}))
+					)
+						throw rejected;
+					return publicRedirect(destination.href);
+				}
 				const response = await options.complete(client, {
 					request,
 					user: account.user,
@@ -595,5 +724,5 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 		}
 	}
 
-	return { start, callback };
+	return { start, startLink, listAccounts, unlinkAccount, callback };
 }
