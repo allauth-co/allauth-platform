@@ -88,7 +88,7 @@ jobs:
           lib/projects/owned-project-issuer-device.pg.test.ts
           lib/projects/owned-project-account-links.pg.test.ts lib/projects/owned-project-broker-mfa.test.ts
           lib/projects/owned-project-admin-deletion.pg.test.ts lib/projects/owned-project-clerk-import.pg.test.ts
-          lib/projects/owned-project-invitation-import.pg.test.ts
+          lib/projects/owned-project-invitation-import.pg.test.ts lib/projects/owned-project-webhook-management.pg.test.ts
           lib/projects/owned-password-reset.pg.test.ts
           lib/projects/owned-project-password-change.pg.test.ts lib/auth-policy/password.test.ts
           lib/projects/owned-mfa.pg.test.ts lib/projects/owned-mfa-enrollment.pg.test.ts

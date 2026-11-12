@@ -67,6 +67,7 @@ import { createOwnedProjectOneTimeToken } from "./owned-project-one-time-token";
 import type { OwnedProjectPasswordChangeOptions } from "./owned-project-password-change";
 import { createOwnedProjectPasswordChange } from "./owned-project-password-change";
 import { createOwnedProjectPersonalKeys } from "./owned-project-personal-keys";
+import { createOwnedProjectRealmImpersonation } from "./owned-project-realm-impersonation";
 import { createOwnedProjectProfile } from "./owned-project-profile";
 import {
 	createOwnedProjectSCIMDiscovery,
@@ -89,6 +90,7 @@ import { createOwnedProjectSsoManagement } from "./owned-project-sso-management"
 import type { OwnedProjectSupportOptions } from "./owned-project-support";
 import { createOwnedProjectSupportHttp } from "./owned-project-support";
 import { createOwnedProjectWallet } from "./owned-project-wallet";
+import { createOwnedProjectWebhookManagement } from "./owned-project-webhook-management";
 import { createOwnedRecoveryHttp } from "./owned-recovery-http";
 import {
 	createOwnedSignUpHttp,
@@ -241,6 +243,10 @@ interface OwnedProjectEngineOptions {
 	};
 	passkeys?: Parameters<typeof createOwnedProjectPasskeyHttp>[0]["rp"];
 	walletOrigin?: string;
+	webhookManagement?: Pick<
+		Parameters<typeof createOwnedProjectWebhookManagement>[0],
+		"resolver"
+	>;
 	recovery?: Omit<
 		Parameters<typeof createOwnedRecoveryHttp>[0],
 		| "database"
@@ -1173,7 +1179,7 @@ export function createOwnedProjectEngine(
 		const headers = new Headers();
 		const token = tokenFrom(request.headers);
 		const observed = token ? await store.session(token, refreshWindow) : null;
-		if (support && observed?.session.impersonatedBy) {
+		if (observed?.session.impersonatedBy) {
 			const url = new URL(request.url);
 			if (
 				request.method !== "GET" ||
@@ -1181,7 +1187,11 @@ export function createOwnedProjectEngine(
 				url.pathname !== `${options.basePath}/get-session`
 			)
 				return forbidden();
-			return (await support.readBrowserSession(request)) ?? json(null);
+			return (
+				(await realmImpersonation.read(request)) ??
+				(await support?.readBrowserSession(request)) ??
+				json(null)
+			);
 		}
 		let current = ordinarySession(token, observed);
 		if (!current) {
@@ -1893,6 +1903,21 @@ export function createOwnedProjectEngine(
 			basePath: options.basePath,
 			readBody: (request) => requestBody(request, 1024 * 1024),
 		});
+	const webhookManagement =
+		options.webhookManagement &&
+		options.adminDeletion &&
+		adminProject &&
+		createOwnedProjectWebhookManagement({
+			...options.webhookManagement,
+			...options.adminDeletion,
+			project: adminProject,
+			store,
+			origin,
+			basePath: options.basePath,
+			signingSecret: options.signingSecret,
+			trustedIP: options.trustedIP,
+			readBody: requestBody,
+		});
 
 	const beforeGuestDelete = accountLinks?.beforeDelete;
 	const guest =
@@ -2258,6 +2283,34 @@ export function createOwnedProjectEngine(
 				return removed.ids.length > 0;
 			},
 		});
+	const impersonationCookies = {
+		admin: `${prefix}admin_session`,
+		session: sessionCookie,
+		remember: rememberCookie,
+	};
+	const realmImpersonation = createOwnedProjectRealmImpersonation({
+		store,
+		trustedRequest,
+		readBody: requestBody,
+		trustedIP: security.trustedIP,
+		readCookie: (headers, kind) =>
+			tokenFrom(headers, impersonationCookies[kind]),
+		writeCookie: (headers, kind, value, maxAge) =>
+			writeCookie(headers, impersonationCookies[kind], value, maxAge),
+		clearCookies: clearSessionCookies,
+		async revoke(client, request, token, actorId) {
+			const removed = await store.revoke(
+				{ tokens: [token] },
+				"/admin/stop-impersonating",
+				Boolean(backchannel),
+				client,
+				actorId,
+			);
+			if (!removed) throw unavailableLogout;
+			deliverLogoutAfterCommit(client, request, removed.targets);
+			return removed.ids.length === 1;
+		},
+	});
 	const personalKeys = createOwnedProjectPersonalKeys({
 		database: options.database,
 		schemaName: options.project.schemaName,
@@ -2375,6 +2428,8 @@ export function createOwnedProjectEngine(
 		)
 			return forbidden();
 		const path = url.pathname.slice(options.basePath.length);
+		const impersonation = await realmImpersonation.dispatch(path, request);
+		if (impersonation) return impersonation;
 		if (
 			wallet &&
 			request.method === "POST" &&
@@ -2394,6 +2449,8 @@ export function createOwnedProjectEngine(
 		if (imported) return imported;
 		const importedInvitations = await invitationImport?.(request, path);
 		if (importedInvitations) return importedInvitations;
+		const webhook = await webhookManagement?.(request, path);
+		if (webhook) return webhook;
 		const issuerResponse = issuer && (await issuer.dispatch(path, request));
 		if (issuerResponse) return issuerResponse;
 		if (

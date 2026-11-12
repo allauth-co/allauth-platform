@@ -1,4 +1,3 @@
-import { lookup } from "node:dns/promises";
 import { request } from "node:https";
 import type { RequestOptions } from "node:https";
 import type { GenericEndpointContext } from "@better-auth/core";
@@ -6,15 +5,25 @@ import { APIError } from "better-auth";
 import { createAuthEndpoint } from "better-auth/api";
 import { symmetricDecrypt, symmetricEncrypt } from "better-auth/crypto";
 import { sql } from "kysely";
-import * as z from "zod";
 import { publicControlEvent } from "./events";
-import { canonicalIP } from "./security";
 import type { ControlDatabase, ControlEvent, ControlEventInput, ControlPrincipal } from "./types";
 
-/** Exact events and explicit category subscriptions supported by the local delivery trigger. */
-export const webhookEventTypes = ["*", "user.*", "user.created", "user.updated", "user.deleted", "session.*", "session.created", "session.deleted", "auth.sign-in", "account.*", "organization.*", "mfa.*", "admin.*", "security.*", "directory.*", "oauth2.*", "passkey.*", "sso.*", "api-key.*", "legacy.audit"] as const;
-export interface ControlWebhookEndpoint { id: string; url: string; description: string; eventTypes: string[]; enabled: boolean; createdAt: string; updatedAt: string }
-export interface ControlWebhookDelivery { id: string; endpointId: string; eventId: string; eventType: string; status: "pending" | "processing" | "delivered" | "failed"; attempts: number; nextAttemptAt: string; createdAt: string; deliveredAt?: string; statusCode?: number; lastError?: string }
+import type { Resolver } from "./webhook-contract";
+import {
+	newWebhookSigningSecret,
+	publicDelivery,
+	publicEndpoint,
+	validateWebhookDestination,
+	webhookCreateInput,
+	webhookDeliveryInput,
+	webhookDeliveryQuery,
+	webhookEndpointInput,
+	webhookSignature,
+} from "./webhook-contract";
+
+export type { ControlWebhookEndpoint, ControlWebhookDelivery } from "./webhook-contract";
+export { isPublicWebhookAddress, validateWebhookDestination, webhookEventTypes, webhookSignature } from "./webhook-contract";
+
 export interface ControlWebhookEnvelope { id: string; type: string; timestamp: string; data: { event: ControlEvent; user?: { id: string; name: string; email: string; emailVerified: boolean; image?: string; publicMetadata?: Record<string, unknown> } } }
 export interface ControlWebhookOptions {
 	database: ControlDatabase;
@@ -25,55 +34,6 @@ export interface ControlWebhookOptions {
 	/** Trusted operator/test DNS resolver; HTTP clients cannot override this function. */
 	resolver?: Resolver;
 }
-type ResolvedAddress = { address: string; family: number };
-type Resolver = (hostname: string) => Promise<ResolvedAddress[]>;
-const resolveAddresses: Resolver = (hostname) => lookup(hostname, { all: true, verbatim: true });
-const bytesToBase64 = (bytes: Uint8Array) => btoa(Array.from(bytes, (value) => String.fromCharCode(value)).join(""));
-const base64ToBytes = (value: string) => Uint8Array.from(atob(value), (character) => character.charCodeAt(0));
-const iso = (value: unknown) => new Date(value as Date | string).toISOString();
-const identifier = z.string().uuid();
-const page = { limit: z.coerce.number().int().min(1).max(100).default(25), offset: z.coerce.number().int().min(0).max(100000).default(0) };
-
-/** Only globally routable addresses can receive identity webhooks. */
-export function isPublicWebhookAddress(value: string): boolean {
-	const canonical = canonicalIP(value);
-	if (!canonical) return false;
-	if (canonical.includes(".")) {
-		const octets = canonical.split(".").map(Number);
-		const integer = (((octets[0] * 256 + octets[1]) * 256 + octets[2]) * 256 + octets[3]) >>> 0;
-		const blocked: [number[], number][] = [[[0,0,0,0],8],[[10,0,0,0],8],[[100,64,0,0],10],[[127,0,0,0],8],[[169,254,0,0],16],[[172,16,0,0],12],[[192,0,0,0],24],[[192,0,2,0],24],[[192,88,99,0],24],[[192,168,0,0],16],[[198,18,0,0],15],[[198,51,100,0],24],[[203,0,113,0],24],[[224,0,0,0],4],[[240,0,0,0],4]];
-		return !blocked.some(([parts, prefix]) => { const network = (((parts[0] * 256 + parts[1]) * 256 + parts[2]) * 256 + parts[3]) >>> 0; const mask = (0xffffffff << (32 - prefix)) >>> 0; return ((integer & mask) >>> 0) === ((network & mask) >>> 0); });
-	}
-	const parts = canonical.split(":"); const first = Number.parseInt(parts[0], 16); const second = Number.parseInt(parts[1] || "0",16);
-	// Conservatively exclude protocol allocations, transition tunnels and documentation ranges.
-	return first >= 0x2000 && first <= 0x3fff && !(first === 0x2001 && second <= 0x1ff) && !/^2001:db8(?::|$)/.test(canonical) && first !== 0x2002 && first !== 0x3ffe && !(first === 0x3fff && second <= 0x0fff);
-}
-
-/** Validate every current DNS answer, then pin the selected public address for TLS delivery. */
-export async function validateWebhookDestination(input: string, resolver: Resolver = resolveAddresses): Promise<{ url: URL; address: ResolvedAddress }> {
-	let url: URL;
-	try { url = new URL(input); } catch { throw new Error("INVALID_DESTINATION"); }
-	if (input.length > 2048 || url.protocol !== "https:" || (url.port && url.port !== "443") || url.username || url.password || url.hash || !url.hostname.includes(".") || canonicalIP(url.hostname.replace(/^\[|\]$/g, "")) || /[\u0000-\u0020\\]/.test(input)) throw new Error("INVALID_DESTINATION");
-	let timeout: ReturnType<typeof setTimeout> | undefined;
-	let addresses: ResolvedAddress[];
-	try { addresses = await Promise.race([resolver(url.hostname),new Promise<never>((_resolve,reject) => { timeout=setTimeout(() => reject(new Error("DNS_TIMEOUT")),10_000); timeout.unref?.(); })]); }
-	finally { if (timeout) clearTimeout(timeout); }
-	if (!addresses.length || addresses.length > 32 || addresses.some((address) => ![4,6].includes(address.family) || !isPublicWebhookAddress(address.address))) throw new Error("UNSAFE_DESTINATION");
-	return { url, address: addresses[0] };
-}
-
-/** Standard Webhooks-compatible signed identity envelope; retries have a stable delivery ID. */
-export async function webhookSignature(secret: string, id: string, timestamp: string, body: string): Promise<string> {
-	if (!secret.startsWith("whsec_")) throw new Error("INVALID_WEBHOOK_SECRET");
-	const bytes = base64ToBytes(secret.slice(6));
-	if (bytes.length !== 32) throw new Error("INVALID_WEBHOOK_SECRET");
-	const key = await crypto.subtle.importKey("raw", bytes, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
-	const digest = new Uint8Array(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(`${id}.${timestamp}.${body}`)));
-	return `v1,${bytesToBase64(digest)}`;
-}
-
-const publicEndpoint = (row: Record<string, unknown>): ControlWebhookEndpoint => ({ id: String(row.id), url: String(row.url), description: String(row.description || ""), eventTypes: Array.isArray(row.eventTypes) ? row.eventTypes.filter((value): value is string => typeof value === "string") : [], enabled: row.enabled === true, createdAt: iso(row.createdAt), updatedAt: iso(row.updatedAt) });
-const publicDelivery = (row: Record<string, unknown>): ControlWebhookDelivery => ({ id: String(row.id), endpointId: String(row.endpointId), eventId: String(row.eventId), eventType: String(row.eventType), status: row.status as ControlWebhookDelivery["status"], attempts: Number(row.attempts), nextAttemptAt: iso(row.nextAttemptAt), createdAt: iso(row.createdAt), ...(row.deliveredAt ? { deliveredAt: iso(row.deliveredAt) } : {}), ...(row.statusCode ? { statusCode: Number(row.statusCode) } : {}), ...(typeof row.lastError === "string" ? { lastError: row.lastError } : {}) });
 
 /** Native management APIs never expose the encrypted signing secret or queued identity payloads. */
 export function createControlWebhooks(options: ControlWebhookOptions) {
@@ -85,7 +45,6 @@ export function createControlWebhooks(options: ControlWebhookOptions) {
 		if (write && (ctx.headers?.get("origin") !== origin || ctx.headers?.get("sec-fetch-site") === "cross-site")) throw new APIError("FORBIDDEN", { message: "Webhook changes require a same-origin request." });
 		return actor;
 	};
-	const newSecret = () => `whsec_${bytesToBase64(crypto.getRandomValues(new Uint8Array(32)))}`;
 	return {
 		endpoints: {
 			controlWebhooks: createAuthEndpoint("/control/webhooks", { method: "GET", requireHeaders: true }, async (ctx) => {
@@ -93,11 +52,11 @@ export function createControlWebhooks(options: ControlWebhookOptions) {
 				const rows = await sql<Record<string, unknown>>`SELECT id,url,description,"eventTypes",enabled,"createdAt","updatedAt" FROM "allauthWebhookEndpoint" ORDER BY "createdAt" DESC LIMIT 20`.execute(database);
 				return ctx.json({ endpoints: rows.rows.map(publicEndpoint), deliveryRetentionDays: 30, maxAttempts: 8 });
 			}),
-			controlWebhookCreate: createAuthEndpoint("/control/webhooks/create", { method: "POST", requireHeaders: true, body: z.object({ url: z.string().max(2048), description: z.string().trim().max(200).default(""), eventTypes: z.array(z.enum(webhookEventTypes)).min(1).max(webhookEventTypes.length) }).strict() }, async (ctx) => {
+			controlWebhookCreate: createAuthEndpoint("/control/webhooks/create", { method: "POST", requireHeaders: true, body: webhookCreateInput }, async (ctx) => {
 				const actor = await requireAdmin(ctx, true);
 				let destination: Awaited<ReturnType<typeof validateWebhookDestination>>;
 				try { destination = await validateWebhookDestination(ctx.body.url, options.resolver); } catch { throw new APIError("BAD_REQUEST", { message: "Webhook destinations require public HTTPS on port 443." }); }
-				const secret = newSecret(); const encryptedSecret = await symmetricEncrypt({ key: options.secret, data: secret });
+				const secret = newWebhookSigningSecret(); const encryptedSecret = await symmetricEncrypt({ key: options.secret, data: secret });
 				const endpoint = await database.transaction().execute(async (transaction) => {
 					await sql`SELECT pg_advisory_xact_lock(hashtext('allauth-webhook-endpoint-limit'))`.execute(transaction);
 					const total = await sql<{ total: string }>`SELECT COUNT(*)::text AS total FROM "allauthWebhookEndpoint"`.execute(transaction);
@@ -107,20 +66,20 @@ export function createControlWebhooks(options: ControlWebhookOptions) {
 				await options.recordEvent(ctx, { type: "webhook.created", outcome: "success", actorId: actor.user.id, targetId: String(endpoint.id) });
 				return ctx.json({ endpoint: publicEndpoint(endpoint), secret });
 			}),
-			controlWebhookRotate: createAuthEndpoint("/control/webhooks/rotate", { method: "POST", requireHeaders: true, body: z.object({ id: identifier }).strict() }, async (ctx) => {
-				const actor = await requireAdmin(ctx, true); const secret = newSecret(); const encrypted = await symmetricEncrypt({ key: options.secret, data: secret });
+			controlWebhookRotate: createAuthEndpoint("/control/webhooks/rotate", { method: "POST", requireHeaders: true, body: webhookEndpointInput }, async (ctx) => {
+				const actor = await requireAdmin(ctx, true); const secret = newWebhookSigningSecret(); const encrypted = await symmetricEncrypt({ key: options.secret, data: secret });
 				const updated = await sql`UPDATE "allauthWebhookEndpoint" SET "encryptedSecret"=${encrypted},"updatedAt"=CURRENT_TIMESTAMP WHERE id=${ctx.body.id} RETURNING id`.execute(database);
 				if (!updated.rows.length) throw new APIError("NOT_FOUND", { message: "Webhook endpoint not found." });
 				await options.recordEvent(ctx, { type: "webhook.secret-rotated", outcome: "success", actorId: actor.user.id, targetId: ctx.body.id });
 				return ctx.json({ secret });
 			}),
-			controlWebhookDelete: createAuthEndpoint("/control/webhooks/delete", { method: "POST", requireHeaders: true, body: z.object({ id: identifier }).strict() }, async (ctx) => {
+			controlWebhookDelete: createAuthEndpoint("/control/webhooks/delete", { method: "POST", requireHeaders: true, body: webhookEndpointInput }, async (ctx) => {
 				const actor = await requireAdmin(ctx, true);
 				await sql`DELETE FROM "allauthWebhookEndpoint" WHERE id=${ctx.body.id}`.execute(database);
 				await options.recordEvent(ctx, { type: "webhook.deleted", outcome: "success", actorId: actor.user.id, targetId: ctx.body.id });
 				return ctx.json({ success: true });
 			}),
-			controlWebhookDeliveries: createAuthEndpoint("/control/webhooks/deliveries", { method: "GET", requireHeaders: true, query: z.object({ endpointId: identifier.optional(), ...page }).strict().prefault({}) }, async (ctx) => {
+			controlWebhookDeliveries: createAuthEndpoint("/control/webhooks/deliveries", { method: "GET", requireHeaders: true, query: webhookDeliveryQuery }, async (ctx) => {
 				await requireAdmin(ctx); const conditions = [sql`"createdAt" >= CURRENT_TIMESTAMP - INTERVAL '30 days'`]; if (ctx.query.endpointId) conditions.push(sql`"endpointId"=${ctx.query.endpointId}`);
 				const where = sql.join(conditions, sql` AND `);
 				const [records,count] = await Promise.all([
@@ -129,7 +88,7 @@ export function createControlWebhooks(options: ControlWebhookOptions) {
 				]);
 				return ctx.json({ deliveries: records.rows.map(publicDelivery), total: Number(count.rows[0].total), limit: ctx.query.limit, offset: ctx.query.offset, retentionDays: 30 });
 			}),
-			controlWebhookRetry: createAuthEndpoint("/control/webhooks/retry", { method: "POST", requireHeaders: true, body: z.object({ id: identifier }).strict() }, async (ctx) => {
+			controlWebhookRetry: createAuthEndpoint("/control/webhooks/retry", { method: "POST", requireHeaders: true, body: webhookDeliveryInput }, async (ctx) => {
 				const actor = await requireAdmin(ctx, true);
 				const updated = await sql`UPDATE "allauthWebhookDelivery" SET status='pending',"nextAttemptAt"=CURRENT_TIMESTAMP,"lastError"=NULL,"leaseId"=NULL,"lockedUntil"=NULL WHERE id=${ctx.body.id} AND status='failed' AND attempts < 8 AND "createdAt" >= CURRENT_TIMESTAMP-INTERVAL '30 days' RETURNING id`.execute(database);
 				if (!updated.rows.length) throw new APIError("BAD_REQUEST", { message: "Only failed deliveries with remaining attempts can be retried." });

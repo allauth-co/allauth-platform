@@ -81,6 +81,10 @@ const credentials = {
 		id: "fixture-project-account",
 		email: "account@runtime.fixture.example",
 	},
+	realmAdmin: {
+		id: "fixture-project-administrator",
+		email: "project-administrator@runtime.fixture.example",
+	},
 	password: "Fixture-native-password-92!",
 	updated: "Fixture-rotated-password-73!",
 };
@@ -702,17 +706,18 @@ async function seed(databaseURL: string) {
 		async function insertAccount(
 			schema: string,
 			account: { id: string; email: string },
+			role = "user",
 		) {
 			await database.query(
-				`INSERT INTO "${schema}"."user" (id,name,email,"emailVerified",role) VALUES ($1,'Fixture User',$2,true,'user')`,
-				[account.id, account.email],
+				`INSERT INTO "${schema}"."user" (id,name,email,"emailVerified",role) VALUES ($1,'Fixture User',$2,true,$3)`,
+				[account.id, account.email, role],
 			);
 			await database.query(
 				`INSERT INTO "${schema}"."account" (id,"accountId","providerId","userId",password,"updatedAt") VALUES ($1,$1,'credential',$1,$2,now())`,
 				[account.id, hash],
 			);
 			await database.query(
-				`INSERT INTO "${schema}"."allauthSecurityPolicy" (id,policy) VALUES ('default',$1::jsonb)`,
+				`INSERT INTO "${schema}"."allauthSecurityPolicy" (id,policy) VALUES ('default',$1::jsonb) ON CONFLICT (id) DO NOTHING`,
 				[
 					JSON.stringify({
 						...defaultSecurityPolicy,
@@ -770,6 +775,7 @@ async function seed(databaseURL: string) {
 		}
 		const alpha = await provision("runtime-owned-fixture", [supportOrigin]);
 		const beta = await provision("runtime-control-fixture");
+		await insertAccount(alpha.schemaName, credentials.realmAdmin, "admin");
 		const samlKeys = await createRuntimeSamlKeys();
 		await database.query(
 			`INSERT INTO "${alpha.schemaName}"."ssoProvider" (id,"providerId",issuer,domain,"domainVerified","userId","samlConfig")
@@ -991,6 +997,34 @@ describe.skipIf(!existsSync(fixture))(
 				});
 				expect(rootLogin.status).toBe(200);
 				const rootCookie = cookie(rootLogin);
+				const realmAdminLogin = await service.request(
+					"/api/auth/sign-in/email",
+					{
+						host: alphaHost,
+						clientIP: "192.0.2.78",
+						body: {
+							email: credentials.realmAdmin.email,
+							password: credentials.password,
+						},
+					},
+				);
+				expect(realmAdminLogin.status).toBe(200);
+				const nativeRealmSupport = await service.request(
+					"/api/auth/admin/impersonate-user",
+					{
+						host: alphaHost,
+						cookie: cookie(realmAdminLogin),
+						body: { userId: supportTarget },
+					},
+				);
+				expect(
+					nativeRealmSupport.status,
+					nativeRealmSupport.ok
+						? undefined
+						: await nativeRealmSupport.clone().text(),
+				).toBe(200);
+				const realmSupportCookie = cookie(nativeRealmSupport);
+				expect(realmSupportCookie).toContain(".admin_session=");
 				const walletSignup = await walletProof(service, directWallet, 1);
 				const nativeWallet = await service.request(`${alphaPath}/siwe/verify`, {
 					...directWallet,
@@ -1141,6 +1175,57 @@ describe.skipIf(!existsSync(fixture))(
 
 				service = await open(restored, true);
 				expect((await service.request("/api/health")).status).toBe(200);
+				const realmSupport = await service.request("/api/auth/get-session", {
+					host: alphaHost,
+					cookie: realmSupportCookie,
+				});
+				expect(await realmSupport.json()).toMatchObject({
+					session: { impersonatedBy: credentials.realmAdmin.id },
+					user: { id: supportTarget },
+				});
+				const stripped = realmSupportCookie
+					.split("; ")
+					.filter((part) => !part.includes(".admin_session="))
+					.join("; ");
+				expect(
+					await (
+						await service.request("/api/auth/get-session", {
+							host: alphaHost,
+							cookie: stripped,
+						})
+					).json(),
+				).toBeNull();
+				const realmStop = await service.request(
+					"/api/auth/admin/stop-impersonating",
+					{
+						host: alphaHost,
+						cookie: realmSupportCookie,
+						body: {},
+					},
+				);
+				expect(
+					realmStop.status,
+					realmStop.ok ? undefined : await realmStop.clone().text(),
+				).toBe(200);
+				expect(await realmStop.json()).toMatchObject({
+					session: { impersonatedBy: null },
+					user: { id: credentials.realmAdmin.id },
+				});
+				const ownedRealmSupport = await service.request(
+					"/api/auth/admin/impersonate-user",
+					{
+						host: alphaHost,
+						cookie: cookie(realmStop),
+						body: { userId: supportTarget },
+					},
+				);
+				expect(
+					ownedRealmSupport.status,
+					ownedRealmSupport.ok
+						? undefined
+						: await ownedRealmSupport.clone().text(),
+				).toBe(200);
+				const newRealmSupport = cookie(ownedRealmSupport);
 				const ownedSaml = [];
 				for (const started of nativeSaml) {
 					const { transport } = started;
@@ -2077,6 +2162,30 @@ describe.skipIf(!existsSync(fixture))(
 
 				service = await open(restored, false);
 				expect((await service.request("/api/health")).status).toBe(200);
+				const nativeRealmStop = await service.request(
+					"/api/auth/admin/stop-impersonating",
+					{
+						host: alphaHost,
+						cookie: newRealmSupport,
+						body: {},
+					},
+				);
+				expect(
+					nativeRealmStop.status,
+					nativeRealmStop.ok ? undefined : await nativeRealmStop.clone().text(),
+				).toBe(200);
+				expect(await nativeRealmStop.json()).toMatchObject({
+					session: { impersonatedBy: null },
+					user: { id: credentials.realmAdmin.id },
+				});
+				expect(
+					await (
+						await service.request("/api/auth/get-session", {
+							host: alphaHost,
+							cookie: newRealmSupport,
+						})
+					).json(),
+				).toBeNull();
 				for (const started of ownedSaml)
 					await finishRuntimeSaml(service, samlKeys, started);
 				const rolledBackWallet = await service.request(
