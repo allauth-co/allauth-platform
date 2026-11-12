@@ -21,6 +21,37 @@ export type {
 /** Only additive fixes belong in this compatible release feed. Never silently upgrade customer packages. */
 export const sdkReleases: readonly [AnnouncedSdkRelease, ...SdkRelease[]] = [
 	{
+		kind: "sdk",
+		id: "sdk-1.4.7",
+		slug: "sdk-1-4-7",
+		version: "1.4.7",
+		title: "AllAuth React SDK 1.4.7 fixes the compact organization switcher chevron",
+		summary:
+			"Aligns the dropdown chevron in the native compact organization switcher across fonts and narrow headers. This backward-compatible patch updates the appearance of the existing control.",
+		notes: [
+			"The compact OrganizationSwitcher uses a fixed-size chevron aligned with the organization label and avatar. It stays visible when long names truncate.",
+			"To get the fix, update the pinned @allauth/react dependency to 1.4.7 and rebuild your application. Existing component props, menu behavior, accessibility labels, and authentication configuration continue to work.",
+		],
+		sourceUrl:
+			"https://github.com/allauth-co/allauth-sdk/tree/v1.4.7/packages/react",
+		provenance: [
+			{
+				kind: "release",
+				details:
+					"Immutable GitHub release v1.4.7 was published at 2026-11-12T01:29:11Z from SDK-only source 001bdfd779d53935e559f35355873ed8ac96c0b6. The public archive and SHA-256 assets match the versioned package.",
+				files: ["header.tsx", "header.css"],
+			},
+		],
+		sha256: "341f8c6441f8e3edd7dbeb31ff4466247a177ed60c24b56c9f62c526cdc39e01",
+		upgradeUrl: "https://allauth.co/sdk/quickstart",
+		changelogUrl: "https://allauth.co/releases/sdk-1-4-7",
+		downloadUrl: "https://allauth.co/sdk/allauth-react-1.4.7.tgz",
+		announce: true,
+		dateConfidence: "known",
+		compatibility: "backward-compatible",
+		publishedAt: "2026-11-12T01:29:11Z",
+	},
+	{
 		title: "AllAuth React SDK 1.4.6: in-app two-factor verification",
 		summary:
 			"Applications can explicitly display the shared AllAuth authenticator or backup-code challenge inside their own sign-in screen. AllAuth continues to verify the factor and resume native OAuth; existing integrations retain hosted verification unless they upgrade and opt in.",
@@ -53,7 +84,7 @@ export const sdkReleases: readonly [AnnouncedSdkRelease, ...SdkRelease[]] = [
 		kind: "sdk",
 		id: "sdk-1.4.6",
 		slug: "sdk-1-4-6",
-		announce: true,
+		announce: false,
 		dateConfidence: "known",
 		compatibility: "backward-compatible",
 		publishedAt: "2026-11-06T21:30:55Z",

@@ -3,7 +3,10 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { sdkReleases } from "../lib/notifications/releases";
+import { sdkRepositoryUrl } from "../lib/public-site";
 import sdkPackage from "../sdk/package.json";
+
+const sdkVersionsBeforeRepositoryTransfer = /^1\.(?:[0-3]\.\d+|4\.[0-6])$/;
 
 test("the default SDK release has immutable download metadata and customer-facing upgrade notes", async () => {
 	const release = sdkReleases.find((candidate) => candidate.version === sdkPackage.version);
@@ -30,10 +33,11 @@ test("every immutable public SDK has versioned source, checksum and factual publ
 		assert.ok(release, `Missing public release notes for ${version}`);
 		assert.equal(release.sha256, sha256);
 		assert.equal(release.downloadUrl, `https://allauth.co/sdk/${archiveName}`);
-		assert.equal(release.sourceUrl, `https://github.com/thegarty/allauth-sdk/tree/v${version}/packages/react`);
+		const repository = sdkVersionsBeforeRepositoryTransfer.test(version) ? "https://github.com/thegarty/allauth-sdk" : sdkRepositoryUrl;
+		assert.equal(release.sourceUrl, `${repository}/tree/v${version}/packages/react`);
 		assert.ok(release.notes.length > 0);
 		assert.equal(new URL(release.changelogUrl).pathname, `/releases/${release.slug}`);
 		if (release.dateConfidence === "unknown") assert.equal(release.publishedAt, null);
-		if (version !== sdkPackage.version) assert.equal(release.announce, false, "backfilling history must not notify customers");
+		if (version !== sdkPackage.version) assert.equal(release.announce, false, "older SDK releases remain silent");
 	}
 });

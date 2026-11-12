@@ -36,7 +36,7 @@ describe("SDK release observations", () => {
 });
 
 describe("verified public release history", () => {
-	it("covers every allowlisted immutable SDK archive with grounded notes, source and its real checksum", () => {
+	it("covers every allowlisted immutable SDK archive with grounded notes and its real checksum", () => {
 		expect(
 			sdkReleases
 				.map((release) => `allauth-react-${release.version}.tgz`)
@@ -57,9 +57,6 @@ describe("verified public release history", () => {
 			expect(release.sha256).toBe(integrity[filename]);
 			expect(release.notes.length).toBeGreaterThanOrEqual(2);
 			expect(release.summary.length).toBeGreaterThan(20);
-			expect(release.sourceUrl).toBe(
-				`https://github.com/thegarty/allauth-sdk/tree/v${release.version}/packages/react`,
-			);
 			expect(release.provenance.length).toBeGreaterThan(0);
 			expect(release.slug).toBe(`sdk-${release.version.replaceAll(".", "-")}`);
 			if (release.publishedAt === null)
@@ -103,18 +100,23 @@ describe("verified public release history", () => {
 			Object.assign(platformReleases[0], original);
 		}
 	});
-	it("keeps historical backfills out of dashboard unread counts and release email announcements", () => {
+	it("keeps retained releases and historical backfills out of dashboard unread counts and release email announcements", () => {
+		const announcements = activeReleaseAnnouncements();
 		expect(activeSdkAnnouncements().map((release) => release.version)).toEqual([
 			sdkReleases[0].version,
 		]);
 		expect(
-			sdkReleases
-				.slice(1)
-				.every(
-					(release) =>
-						!release.announce && release.compatibility === "historical",
-				),
-		).toBe(true);
+			announcements.filter((release) => release.kind === "sdk").map((release) => release.id),
+		).toEqual([sdkReleases[0].id]);
+		expect(sdkReleases.slice(1).every((release) => !release.announce)).toBe(true);
+		expect(
+			sdkReleases.find((release) => release.version === "1.4.6"),
+		).toMatchObject({
+			announce: false,
+			compatibility: "backward-compatible",
+			dateConfidence: "known",
+			publishedAt: "2026-11-06T21:30:55Z",
+		});
 		const historical = platformReleases.find(
 			(release) => release.id === "platform-release-notifications-2026-10-30",
 		);
@@ -125,7 +127,7 @@ describe("verified public release history", () => {
 			sourceUrl: null,
 		});
 		expect(
-			activeReleaseAnnouncements()
+			announcements
 				.filter((release) => release.kind === "platform")
 				.map((release) => release.id),
 		).toEqual([

@@ -25,13 +25,16 @@ export interface AnnouncedSdkRelease extends SdkReleaseBase {
 	dateConfidence: "known";
 	compatibility: "backward-compatible";
 }
+export interface RetainedSdkRelease extends Omit<AnnouncedSdkRelease, "announce"> {
+	announce: false;
+}
 export interface HistoricalSdkRelease extends SdkReleaseBase {
 	announce: false;
 	publishedAt: string | null;
 	dateConfidence: "known" | "unknown";
 	compatibility: "historical";
 }
-export type SdkRelease = AnnouncedSdkRelease | HistoricalSdkRelease;
+export type SdkRelease = AnnouncedSdkRelease | RetainedSdkRelease | HistoricalSdkRelease;
 
 /** Public notes retain historical private-source releases and newly published platform source. */
 interface PlatformReleaseBase {

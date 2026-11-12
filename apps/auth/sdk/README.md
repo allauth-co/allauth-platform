@@ -1,10 +1,11 @@
 <!-- cspell:words organisation organisations -->
 
-# AllAuth React SDK 1.4.6
+# AllAuth React SDK 1.4.7
 
-Previous verified published SDK: **1.4.5**, [download](https://allauth.co/sdk/allauth-react-1.4.5.tgz).
-SHA-256: `63c5fc7cdf264f92f065d800ef0b6ea53650ccb5f5d3232ac1ff6633d6e5c397`.
-The prepared SDK candidate is **1.4.6**. Publication and deployment must be verified separately.
+SDK 1.4.7 centers the chevron in the compact `OrganizationSwitcher` with a
+fixed-size SVG. Update your pinned SDK archive and rebuild your application to
+pick up this backward-compatible visual fix. No configuration changes are
+required.
 
 SDK 1.4.6 adds opt-in in-app verification for the shared AllAuth broker's authenticator and backup-code challenge. Use the matching portable `SignIn` component and standard `/api/allauth` proxy, then add `brokerTwoFactor: { signInUrl: "/sign-in" }` to the server's `createAllAuthProxy` options. Keep the sign-in page public. The option is disabled by default; older SDKs, services and unsupported integrations retain hosted MFA. Direct providers and application-account MFA keep their existing behaviour.
 
