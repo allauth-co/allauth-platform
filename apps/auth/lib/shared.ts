@@ -1,5 +1,5 @@
 import type { ReadonlyURLSearchParams } from "next/navigation";
-import { authClient } from "./auth-client";
+import { submitOAuthBrowserAction } from "./oauth-browser";
 import { deviceProject } from "./features/device";
 export function getCallbackURL(
 	params: ReadonlyURLSearchParams | URLSearchParams,
@@ -50,15 +50,7 @@ export async function completeAuthentication(
 	)
 		return;
 	if (params.has("client_id")) {
-		const { data, error } = await authClient.oauth2.continue({
-			selected: true,
-		});
-		if (error)
-			throw new Error(error.message || "Unable to continue authorization");
-		if (!data?.redirect || !data.url)
-			throw new Error("The authorization server returned no continuation");
-		// The native client's redirect plugin follows this one-use authorization
-		// result. A second navigation can race it and redeem the same code twice.
+		await submitOAuthBrowserAction("continue", params, { selected: true });
 		return;
 	}
 	window.location.assign(getCallbackURL(params));

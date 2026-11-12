@@ -2,21 +2,21 @@ import { headers } from "next/headers";
 import { getAuthEnvironment } from "@/lib/auth";
 import {
 	authConfiguration,
-	setting,
 	projectEmailEnvironment,
+	setting,
 } from "@/lib/configuration";
 import { portalHeader } from "@/lib/domains/edge";
-import { withPortalHeadersEngine } from "@/lib/domains/hosting";
+import type {
+	HostedSdkSearchParams,
+	HostedSdkView,
+} from "@/lib/domains/hosted-sdk-policy";
 import {
 	hostedSdkBasePath,
 	hostedSdkProjectEnabled,
 	hostedSdkProjectIdsSetting,
 	hostedSdkViewRequest,
 } from "@/lib/domains/hosted-sdk-policy";
-import type {
-	HostedSdkSearchParams,
-	HostedSdkView,
-} from "@/lib/domains/hosted-sdk-policy";
+import { withPortalHeadersEngine } from "@/lib/domains/hosting";
 import { emailConfigured } from "@/lib/email/send";
 import { AllAuthAuth } from "./better-auth-ui/allauth-auth";
 import { HostedProjectAuth } from "./hosted-project-auth";
@@ -58,6 +58,25 @@ export async function HostedProjectAuthPage({
 				!hostedSdkProjectEnabled(configured, binding.project)
 			)
 				return null;
+			if (request.oauthQuery) {
+				const context = await engine.readOAuthContext(
+					new Request(
+						`https://${binding.hostname}/api/oauth/context?${request.oauthQuery}`,
+						{
+							headers: { accept: "application/json" },
+						},
+					),
+				);
+				if (!context.ok) return null;
+				const result: unknown = await context.json().catch(() => null);
+				if (
+					!result ||
+					typeof result !== "object" ||
+					!("continueURL" in result) ||
+					result.continueURL !== request.destination
+				)
+					return null;
+			}
 			const config = await engine.dispatch(
 				new Request(`https://${binding.hostname}/api/auth/sdk/config`, {
 					headers: { accept: "application/json" },

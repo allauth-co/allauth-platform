@@ -1,7 +1,7 @@
 import { beforeEach, expect, it, vi } from "vitest";
-import { HostedProjectAuthPage } from "@/components/hosted-project-auth-page";
-import { HostedProjectAuth } from "@/components/hosted-project-auth";
 import { AllAuthAuth } from "@/components/better-auth-ui/allauth-auth";
+import { HostedProjectAuth } from "@/components/hosted-project-auth";
+import { HostedProjectAuthPage } from "@/components/hosted-project-auth-page";
 import { portalHeader } from "./domains/edge";
 
 const runtime = vi.hoisted(() => ({
@@ -24,6 +24,10 @@ vi.mock("@/components/better-auth-ui/allauth-auth", () => ({
 function engineConfiguration(configuration: Record<string, unknown>) {
 	return {
 		dispatch: vi.fn(async (_request: Request) => Response.json(configuration)),
+		readOAuthContext: vi.fn(
+			async (_request: Request): Promise<Response> =>
+				new Response(null, { status: 400 }),
+		),
 	};
 }
 
@@ -54,7 +58,7 @@ it("uses the standard page for an unverified account hostname without looking up
 	expect(runtime.withPortalHeadersEngine).not.toHaveBeenCalled();
 });
 
-it("keeps hosted OAuth continuation in the standard page even when preview is configured", async () => {
+it("keeps an unsigned OAuth query in the standard page even when preview is configured", async () => {
 	runtime.headers.mockResolvedValue(
 		new Headers({ [portalHeader]: "fixture-proof" }),
 	);
@@ -64,6 +68,58 @@ it("keeps hosted OAuth continuation in the standard page even when preview is co
 	});
 	expect(result.type).toBe(AllAuthAuth);
 	expect(runtime.withPortalHeadersEngine).not.toHaveBeenCalled();
+});
+
+it("renders verified signed OAuth sign-in and MFA with the exact continuation", async () => {
+	runtime.headers.mockResolvedValue(
+		new Headers({ [portalHeader]: "fixture-proof" }),
+	);
+	const engine = engineConfiguration({ emailPassword: true });
+	runtime.withPortalHeadersEngine.mockImplementation(async (_headers, select) =>
+		select(engine, new Headers(), {
+			kind: "accounts",
+			project,
+			hostname: accountsHostname,
+		}),
+	);
+	const signed = {
+		client_id: "fixture",
+		sig: "fixture-signature",
+		exp: "1700000000",
+	};
+	const query = new URLSearchParams(signed).toString();
+	const destination = `/oauth2/continue?${query}`;
+	engine.readOAuthContext.mockResolvedValue(
+		Response.json({ continueURL: destination }),
+	);
+	const signIn = await HostedProjectAuthPage({
+		view: "signIn",
+		searchParams: Promise.resolve(signed),
+	});
+	expect(signIn.type).toBe(HostedProjectAuth);
+	expect(signIn.props).toMatchObject({ destination });
+	expect(engine.readOAuthContext.mock.calls[0]?.[0].url).toBe(
+		`https://${accountsHostname}/api/oauth/context?${query}`,
+	);
+
+	engine.readOAuthContext.mockResolvedValue(
+		Response.json({ continueURL: destination }),
+	);
+	const factor = await HostedProjectAuthPage({
+		view: "twoFactor",
+		searchParams: Promise.resolve({ callbackUrl: destination }),
+	});
+	expect(factor.type).toBe(HostedProjectAuth);
+	expect(factor.props).toMatchObject({ destination, view: "twoFactor" });
+
+	engine.readOAuthContext.mockResolvedValue(
+		new Response(null, { status: 400 }),
+	);
+	const rejected = await HostedProjectAuthPage({
+		view: "signIn",
+		searchParams: Promise.resolve(signed),
+	});
+	expect(rejected.type).toBe(AllAuthAuth);
 });
 
 it("uses the first-party page for an allowlisted development accounts realm with an exact callback", async () => {

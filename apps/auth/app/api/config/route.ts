@@ -1,32 +1,100 @@
-import { authConfiguration, authOrigin, projectEmailEnvironment } from "@/lib/configuration";
-import { emailConfigured } from "@/lib/email/send";
+import * as z from "zod";
 import { json } from "@/lib/api";
-import { withPortalRequest } from "@/lib/domains/hosting";
+import { withAuth } from "@/lib/auth";
+import {
+	effectivePasswordPolicy,
+	passwordPolicySchema,
+} from "@/lib/auth-policy/password";
 import { readPublicApplicationBranding } from "@/lib/branding/portal";
-import { effectivePasswordPolicy } from "@/lib/auth-policy/password";
+import {
+	authConfiguration,
+	authOrigin,
+	projectEmailEnvironment,
+} from "@/lib/configuration";
+import { withPortalAuthEngine } from "@/lib/domains/hosting";
+import { emailConfigured } from "@/lib/email/send";
+import { publicBranding } from "@/sdk/branding";
 
-export async function GET(request: Request) {
-	return withPortalRequest(request, async (instance, env, _bound, binding) => {
-		const password = instance.options?.emailAndPassword;
-		const social = instance.options.socialProviders;
-		const appleEnabled = Boolean(social && "apple" in social && social.apple);
-		const microsoftEnabled = Boolean(social?.microsoft);
-		const configured = {
-			...authConfiguration(env),
-			apple: appleEnabled,
-			appleProvider: appleEnabled ? "apple" : null,
-			microsoft: microsoftEnabled,
-			microsoftProvider: microsoftEnabled ? "microsoft" : null,
-			email: emailConfigured(projectEmailEnvironment(env, binding?.project.slug)),
-			emailPassword: password?.enabled !== false,
-			signUpEnabled: password?.disableSignUp !== true,
-			emailVerificationRequired: password?.requireEmailVerification !== false,
-			passwordPolicy: effectivePasswordPolicy(instance.options),
-		};
-		if (!binding) return json({ ...configured, googleProvider: configured.google ? "google" : null });
-		const branding = await readPublicApplicationBranding(binding.project.id, env);
-		const directGoogle = Boolean(instance.options.socialProviders?.google);
-		const googleProvider = directGoogle ? "google" : configured.google ? "allauth" : null;
-		return json({ ...configured, google: Boolean(googleProvider), googleProvider, github: false, broker: !directGoogle, realmName: branding.name, branding, platformOrigin: authOrigin(env) });
+const projectCapabilities = z.object({
+	apple: z.boolean(),
+	microsoft: z.boolean(),
+	googleProvider: z.enum(["google", "allauth"]).nullable(),
+	emailPassword: z.boolean(),
+	signUpEnabled: z.boolean(),
+	emailVerificationRequired: z.boolean(),
+	passwordPolicy: passwordPolicySchema,
+	branding: z.unknown().optional(),
+});
+
+export function GET(request: Request) {
+	return withPortalAuthEngine(request, async (engine, env, _bound, binding) => {
+		const available = authConfiguration(env);
+		if (!binding) {
+			return withAuth(async (instance) => {
+				const password = instance.options.emailAndPassword;
+				const social = instance.options.socialProviders;
+				const apple = Boolean(social && "apple" in social && social.apple);
+				const microsoft = Boolean(social?.microsoft);
+				return json({
+					...available,
+					apple,
+					appleProvider: apple ? "apple" : null,
+					microsoft,
+					microsoftProvider: microsoft ? "microsoft" : null,
+					email: emailConfigured(projectEmailEnvironment(env)),
+					emailPassword: password?.enabled !== false,
+					signUpEnabled: password?.disableSignUp !== true,
+					emailVerificationRequired:
+						password?.requireEmailVerification !== false,
+					passwordPolicy: effectivePasswordPolicy(instance.options),
+					googleProvider: available.google ? "google" : null,
+				});
+			});
+		}
+
+		const response = await engine.dispatch(
+			new Request(`https://${binding.hostname}/api/auth/sdk/config`, {
+				headers: { accept: "application/json" },
+			}),
+		);
+		const parsed = projectCapabilities.safeParse(
+			response.ok ? await response.json().catch(() => null) : null,
+		);
+		if (!parsed.success)
+			return json(
+				{ error: "Project configuration is temporarily unavailable." },
+				503,
+			);
+		const capability = parsed.data;
+		const directGoogle = capability.googleProvider === "google";
+		const googleProvider = directGoogle
+			? "google"
+			: available.google
+				? "allauth"
+				: null;
+		const branding =
+			publicBranding(capability.branding) ??
+			(await readPublicApplicationBranding(binding.project.id, env));
+		return json({
+			...available,
+			apple: capability.apple,
+			appleProvider: capability.apple ? "apple" : null,
+			microsoft: capability.microsoft,
+			microsoftProvider: capability.microsoft ? "microsoft" : null,
+			email: emailConfigured(
+				projectEmailEnvironment(env, binding.project.slug),
+			),
+			emailPassword: capability.emailPassword,
+			signUpEnabled: capability.signUpEnabled,
+			emailVerificationRequired: capability.emailVerificationRequired,
+			passwordPolicy: capability.passwordPolicy,
+			google: Boolean(googleProvider),
+			googleProvider,
+			github: false,
+			broker: !directGoogle,
+			realmName: branding.name,
+			branding,
+			platformOrigin: authOrigin(env),
+		});
 	});
 }

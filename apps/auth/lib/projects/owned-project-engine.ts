@@ -8,7 +8,9 @@ import type { AuthPolicy } from "../auth-policy/policy";
 import { authPolicySchema } from "../auth-policy/policy";
 import type { ApplicationBranding } from "../branding/types";
 import { clerkCompatiblePasswords } from "../clerk-password";
+import { discoveryHeaders } from "../discovery";
 import { applicationMfaCallback } from "../mfa-continuation";
+import { oauthBrowserReturnPath } from "../oauth-browser";
 import type { NativePasskeyCapability } from "../project-native-passkeys";
 import type { LegacyMfaKeys } from "./legacy-mfa-record";
 import { readLegacySessionCookie } from "./legacy-session-cookie";
@@ -36,6 +38,9 @@ import {
 	projectUserResponse,
 } from "./owned-project-engine-store";
 import { createOwnedProjectIssuer } from "./owned-project-issuer";
+import { readSignedProjectIssuerQuery } from "./owned-project-issuer-authorization-query";
+import { ProjectOAuthError } from "./owned-project-issuer-http";
+import { ownedProjectIssuerMetadata } from "./owned-project-issuer-metadata";
 import type { OwnedProjectOAuthOptions } from "./owned-project-oauth";
 import {
 	createOwnedProjectOAuth,
@@ -129,7 +134,7 @@ interface OwnedProjectEngineOptions {
 	};
 	appName?: string;
 	/** Enable the project issuer candidate in the isolated compatibility fixture. */
-	issuer?: boolean;
+	issuer?: boolean | { errorURL?: string; platformOrigin?: string };
 	signUp?: Omit<
 		Parameters<typeof createOwnedSignUpHttp>[0],
 		| "database"
@@ -317,15 +322,7 @@ export function createOwnedProjectEngine(
 		options.database,
 		options.project.schemaName,
 	);
-	const issuer =
-		options.issuer &&
-		createOwnedProjectIssuer({
-			database: options.database,
-			schemaName: options.project.schemaName,
-			issuer: `${origin}${options.basePath}`,
-			keys: options.oauth?.tokenKeys ??
-				options.mfaKeys ?? { secret: options.signingSecret },
-		});
+
 	const backchannel =
 		options.backchannelLogout &&
 		createOwnedProjectBackchannelLogout({
@@ -338,6 +335,46 @@ export function createOwnedProjectEngine(
 		});
 	const prefix = `${secure ? "__Secure-" : ""}allauth_project_${slug}.`;
 	const sessionCookie = `${prefix}session_token`;
+	const issuer =
+		options.issuer &&
+		createOwnedProjectIssuer({
+			database: options.database,
+			schemaName: options.project.schemaName,
+			issuer: `${origin}${options.basePath}`,
+			signingSecret: options.signingSecret,
+			trustedIP: options.trustedIP,
+			projectSlug: slug,
+			platformOrigin:
+				(typeof options.issuer === "object" && options.issuer.platformOrigin) ||
+				origin,
+			errorURL:
+				typeof options.issuer === "object"
+					? options.issuer.errorURL
+					: undefined,
+			readBody: requestBody,
+			logout: {
+				sessionCookie,
+				clearBrowserSession: clearSessionCookies,
+				async revokeSession(client, request, target) {
+					const removed = await store.revoke(
+						{ tokens: [target.token] },
+						"/oauth2/end-session",
+						Boolean(backchannel),
+						client,
+					);
+					if (!removed)
+						throw new ProjectOAuthError(
+							"server_error",
+							"Unable to complete logout",
+							503,
+						);
+					deliverLogoutAfterCommit(client, request, removed.targets);
+				},
+			},
+			readSession: (request, client) => currentSession(request.headers, client),
+			keys: options.oauth?.tokenKeys ??
+				options.mfaKeys ?? { secret: options.signingSecret },
+		});
 	const rememberCookie = `${prefix}dont_remember`;
 	const multiCookiePrefix = `${sessionCookie}_multi-`;
 	const attributes = `Path=/; HttpOnly; SameSite=Lax${secure ? "; Secure" : ""}`;
@@ -608,12 +645,29 @@ export function createOwnedProjectEngine(
 	}
 
 	function mfaContinuation(callback: string): string {
-		const { origin: callbackOrigin } = new URL(callback);
+		const callbackURL = new URL(callback);
+		const callbackOrigin = callbackURL.origin;
 		const projectProxy = options.basePath !== "/api/auth";
 		const target = new URL(
 			projectProxy ? "/sign-in?challenge=two-factor" : "/two-factor",
 			callbackOrigin,
 		);
+		if (
+			issuer &&
+			!projectProxy &&
+			callbackOrigin === origin &&
+			!callbackURL.hash
+		) {
+			const signedPath = oauthBrowserReturnPath(
+				callbackURL.pathname + callbackURL.search,
+			);
+			const query =
+				signedPath && new URL(signedPath, origin).searchParams.toString();
+			if (query && readSignedProjectIssuerQuery(query, options.signingSecret)) {
+				target.searchParams.set("callbackUrl", signedPath);
+				return target.href;
+			}
+		}
 		const destination = applicationMfaCallback(
 			callback,
 			callbackOrigin,
@@ -1780,7 +1834,7 @@ export function createOwnedProjectEngine(
 		)
 			return forbidden();
 		const path = url.pathname.slice(options.basePath.length);
-		const issuerResponse = issuer && (await issuer(path, request));
+		const issuerResponse = issuer && (await issuer.dispatch(path, request));
 		if (issuerResponse) return issuerResponse;
 		if (
 			path === projectBrokerMfaPath &&
@@ -2069,6 +2123,19 @@ export function createOwnedProjectEngine(
 				await deliverCommittedLogout(request);
 			}
 		},
+		readIssuerMetadata: async () =>
+			issuer
+				? Response.json(
+						ownedProjectIssuerMetadata({
+							origin,
+							basePath: options.basePath,
+							slug,
+						}),
+						{ headers: discoveryHeaders },
+					)
+				: unsupported(),
+		readOAuthContext: async (request) =>
+			issuer ? issuer.readContext(request) : unsupported(),
 		listAccountSessions,
 		revokeAccountSession,
 		readDirectory: async (operation, headers, query) =>

@@ -6,6 +6,10 @@ import { createProjectEngineStore } from "./owned-project-engine-store";
 import type { ProjectIssuerClient } from "./owned-project-issuer-client";
 import { authenticateIssuerClient } from "./owned-project-issuer-client";
 import { readAuthorizationCode } from "./owned-project-issuer-code";
+import {
+	consumeDeviceGrant,
+	projectDeviceGrantType,
+} from "./owned-project-issuer-device";
 import { requireIssuerDpop } from "./owned-project-issuer-dpop";
 import {
 	issuerDigest,
@@ -282,7 +286,7 @@ export function createOwnedProjectIssuerToken(options: RefreshOptions) {
 			scopes: scopesFor(form, grant, client),
 			resources: resourcesFor(form, grant),
 			actor: linked?.rows[0]?.impersonatedBy,
-			rotateId: grant.id,
+			rotation: grant,
 		});
 	}
 
@@ -363,7 +367,7 @@ export function createOwnedProjectIssuerToken(options: RefreshOptions) {
 			resources: string[];
 			actor?: string | null;
 			nonce?: string;
-			rotateId?: string;
+			rotation?: Pick<Grant, "id" | "scopes">;
 		},
 	) {
 		const {
@@ -414,9 +418,12 @@ export function createOwnedProjectIssuerToken(options: RefreshOptions) {
 
 		const iat = Math.floor(Date.now() / 1000);
 		const exp = iat + policy.accessTtl;
+		// A narrowed legacy refresh grant without offline access can issue an access
+		// token until its existing expiry, but it cannot extend that expiry.
 		const mintRefresh =
-			Boolean(input.rotateId) ||
-			(refreshAllowed(client) && requestedScopes.includes("offline_access"));
+			refreshAllowed(client) &&
+			(requestedScopes.includes("offline_access") ||
+				input.rotation?.scopes.includes("offline_access"));
 		const refreshed = mintRefresh ? tokenValue() : undefined;
 		const refreshId = mintRefresh ? randomUUID() : null;
 		const accessClaims = {
@@ -476,7 +483,7 @@ export function createOwnedProjectIssuerToken(options: RefreshOptions) {
 				.sign(signing.key);
 		}
 
-		if (!input.rotateId && grant.authorizationCodeId) {
+		if (!input.rotation && grant.authorizationCodeId) {
 			const consumed = await database.query(
 				`DELETE FROM "verification" WHERE identifier=$1 AND "expiresAt">clock_timestamp()`,
 				[grant.authorizationCodeId],
@@ -484,10 +491,10 @@ export function createOwnedProjectIssuerToken(options: RefreshOptions) {
 			if (!consumed.rowCount)
 				throw new ProjectOAuthError("invalid_grant", "invalid code");
 		}
-		if (input.rotateId)
+		if (input.rotation && mintRefresh)
 			await database.query(
 				'UPDATE "oauthRefreshToken" SET revoked=to_timestamp($2),"rotatedAt"=to_timestamp($2) WHERE id=$1',
-				[input.rotateId, iat],
+				[input.rotation.id, iat],
 			);
 		if (refreshId && refreshed)
 			await saveRefresh(database, grant, {
@@ -549,7 +556,11 @@ export function createOwnedProjectIssuerToken(options: RefreshOptions) {
 		try {
 			const form = await issuerForm(request);
 			const grantType = form.get("grant_type");
-			if (grantType !== "refresh_token" && grantType !== "authorization_code")
+			if (
+				grantType !== "refresh_token" &&
+				grantType !== "authorization_code" &&
+				grantType !== projectDeviceGrantType
+			)
 				throw new ProjectOAuthError(
 					"unsupported_grant_type",
 					"This token grant is unavailable.",
@@ -565,9 +576,31 @@ export function createOwnedProjectIssuerToken(options: RefreshOptions) {
 				// Protocol failures may consume a verified client assertion or a
 				// replayed grant. Their response must commit with that decision.
 				try {
-					return grantType === "refresh_token"
-						? await rotate(database, request, form, client)
-						: await exchangeCode(database, request, form, client);
+					if (grantType === "refresh_token")
+						return await rotate(database, request, form, client);
+					if (grantType === "authorization_code")
+						return await exchangeCode(database, request, form, client);
+					return await consumeDeviceGrant(database, request, form, client, {
+						issuer: options.issuer,
+						issue: (grant) =>
+							issue(
+								database,
+								request,
+								client,
+								{
+									clientId: client.clientId,
+									userId: grant.userId,
+									sessionId: null,
+									referenceId: null,
+									authorizationCodeId: null,
+									authTime: null,
+									confirmation: null,
+									resources: grant.originalResources ?? null,
+									requestedUserInfoClaims: null,
+								},
+								{ scopes: grant.scopes, resources: grant.resources },
+							),
+					});
 				} catch (error) {
 					if (error instanceof ProjectOAuthError) return error.response();
 					throw error;

@@ -33,6 +33,7 @@ export interface ProjectIssuerClient {
 	jwksUri: string | null;
 	metadata: unknown;
 	redirectUris: string[];
+	postLogoutRedirectUris: string[] | null;
 	applicationType: string | null;
 	responseTypes: string[] | null;
 	requirePKCE: boolean | null;
@@ -42,7 +43,7 @@ export interface ProjectIssuerClient {
 
 const clientColumns = `"clientId","clientSecret","tokenEndpointAuthMethod",disabled,
 	"grantTypes",scopes,"enableEndSession","backchannelLogoutUri","dpopBoundAccessTokens",
-	"subjectType",jwks,"jwksUri",metadata,"redirectUris","applicationType","responseTypes","requirePKCE","skipConsent",name`;
+	"subjectType",jwks,"jwksUri",metadata,"redirectUris","postLogoutRedirectUris","applicationType","responseTypes","requirePKCE","skipConsent",name`;
 const assertionType = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
 const publicJwks = z.object({
 	keys: z

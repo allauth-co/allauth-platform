@@ -39,13 +39,38 @@ export async function requestHostedBinding(request: Request, env: AuthEnvironmen
 	const binding=await resolveHostedBinding(edge.hostname,env); if(!binding) throw new APIError("NOT_FOUND",{message:"Authentication hostname is not active."});
 	return {binding,headers:hostedHeaders(request.headers,binding,edge.ip)};
 }
-async function bindPortalRequest(request: Request) {
+const confidentialOAuthPaths = new Set([
+	"/api/auth/oauth2/token",
+	"/api/auth/oauth2/introspect",
+	"/api/auth/oauth2/revoke",
+	"/api/auth/device/code",
+]);
+
+function hostedProtocolAuthorization(request: Request) {
+	const authorization = request.headers.get("authorization");
+	if (!authorization) return null;
+	const path = new URL(request.url).pathname;
+	if (request.method === "POST" && confidentialOAuthPaths.has(path))
+		return /^Basic [A-Za-z0-9+/]+=*$/i.test(authorization) ? authorization : null;
+	if (path === "/api/auth/oauth2/userinfo" && ["GET", "POST"].includes(request.method))
+		return /^(?:Bearer|DPoP) [A-Za-z0-9._~+/-]+=*$/i.test(authorization) ? authorization : null;
+	if ((path === "/api/auth/scim/v2" || path.startsWith("/api/auth/scim/v2/")) &&
+		["GET", "POST", "PUT", "PATCH", "DELETE"].includes(request.method))
+		return /^Bearer [A-Za-z0-9._~+/-]+=*$/i.test(authorization) ? authorization : null;
+	return null;
+}
+
+async function bindPortalRequest(request: Request, permitProtocolAuthorization = false) {
 	const env = await getAuthEnvironment();
 	const hosted = await requestHostedBinding(request, env);
 	if (!hosted) return { env, request, binding: null };
 	const url = new URL(request.url);
 	url.protocol = "https:";
 	url.host = hosted.binding.hostname;
+	// The signed gateway proves the realm. The protocol endpoint independently
+	// authenticates the client credential against that realm.
+	const authorization = permitProtocolAuthorization && hostedProtocolAuthorization(request);
+	if (authorization) hosted.headers.set("authorization", authorization);
 	const bound = new Request(url, {
 		method: request.method,
 		headers: hosted.headers,
@@ -71,7 +96,7 @@ export async function withPortalAuthEngine<T>(
 		binding: HostedBinding | null,
 	) => Promise<T>,
 ): Promise<T> {
-	const { env, request: bound, binding } = await bindPortalRequest(request);
+	const { env, request: bound, binding } = await bindPortalRequest(request, true);
 	if (!binding) {
 		return withAuthEngine((engine, environment) =>
 			callback(engine, environment, bound, null),

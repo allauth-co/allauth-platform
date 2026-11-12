@@ -2,8 +2,12 @@
 import { useQuery } from "@tanstack/react-query";
 import { useState } from "react";
 import { toast } from "sonner";
-import { authClient } from "@/lib/auth-client";
+import {
+	oauthBrowserQuery,
+	submitOAuthBrowserAction,
+} from "@/lib/oauth-browser";
 import { errorMessage } from "@/lib/shared";
+import { Button } from "./ui/button";
 import {
 	Card,
 	CardContent,
@@ -11,7 +15,7 @@ import {
 	CardHeader,
 	CardTitle,
 } from "./ui/card";
-import { Button } from "./ui/button";
+
 interface Context {
 	client: { client_id: string; client_name: string };
 	scopes: string[];
@@ -29,10 +33,12 @@ export function OAuthConsent({ name, email }: { name: string; email: string }) {
 	const context = useQuery({
 		queryKey: ["oauth-context"],
 		queryFn: async (): Promise<Context> => {
-			const response = await fetch(
-				`/api/oauth/context${window.location.search}`,
-				{ cache: "no-store" },
-			);
+			const signed = oauthBrowserQuery(window.location.search);
+			if (!signed)
+				throw new Error("This authorization request is invalid or has expired");
+			const response = await fetch(`/api/oauth/context?${signed}`, {
+				cache: "no-store",
+			});
 			if (!response.ok)
 				throw new Error("This authorization request is invalid or has expired");
 			return response.json();
@@ -42,12 +48,9 @@ export function OAuthConsent({ name, email }: { name: string; email: string }) {
 	const consent = async (accept: boolean) => {
 		setBusy(true);
 		try {
-			const { data, error } = await authClient.oauth2.consent({ accept });
-			if (error) throw new Error(error.message);
-			if (!data?.redirect || !data.url)
-				throw new Error("Unable to complete authorization");
-			// The native redirect plugin already follows this one-use result.
-			// Do not start a second callback request after consent succeeds.
+			await submitOAuthBrowserAction("consent", window.location.search, {
+				accept,
+			});
 		} catch (e) {
 			toast.error(errorMessage(e));
 		} finally {

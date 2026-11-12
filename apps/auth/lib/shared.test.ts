@@ -1,49 +1,98 @@
-import { redirectPlugin } from "../../../packages/better-auth/src/client/fetch-plugins";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { redirectPlugin } from "../../../packages/better-auth/src/client/fetch-plugins";
+
 const mocks = vi.hoisted(() => ({ resume: vi.fn(), assign: vi.fn() }));
-vi.mock("./auth-client", () => ({
-	authClient: { oauth2: { continue: mocks.resume } },
-}));
+
 import {
 	authenticationCallback,
 	completeAuthentication,
 	getCallbackURL,
 } from "./shared";
+
 beforeEach(() => {
 	vi.stubGlobal("window", {
 		location: { origin: "https://allauth.co", assign: mocks.assign },
 	});
 	mocks.resume.mockReset();
+	vi.stubGlobal("fetch", mocks.resume);
 	mocks.assign.mockReset();
-	Object.defineProperty(window.location, "href", { configurable: true, set: mocks.assign });
+	Object.defineProperty(window.location, "href", {
+		configurable: true,
+		set: mocks.assign,
+	});
 });
 afterEach(() => vi.unstubAllGlobals());
 describe("hosted authentication continuation", () => {
 	/** @see ../../../packages/oauth-provider/src/oauth.ts */
 	it("does not authorize again when factor verification already returned a native redirect", async () => {
-		const data = { redirect: true, url: "https://app.example/callback?code=one-use" };
-		await redirectPlugin.hooks.onSuccess({ data } as Parameters<typeof redirectPlugin.hooks.onSuccess>[0]);
-		await completeAuthentication(new URLSearchParams("client_id=fixture&sig=signed"), data);
+		const data = {
+			redirect: true,
+			url: "https://app.example/callback?code=one-use",
+		};
+		await redirectPlugin.hooks.onSuccess({ data } as Parameters<
+			typeof redirectPlugin.hooks.onSuccess
+		>[0]);
+		await completeAuthentication(
+			new URLSearchParams("client_id=fixture&sig=signed"),
+			data,
+		);
 		expect(mocks.resume).not.toHaveBeenCalled();
 		expect(mocks.assign).toHaveBeenCalledExactlyOnceWith(data.url);
 	});
 	it("accepts the exact local console entry and its query", () => {
-		expect(getCallbackURL(new URLSearchParams({ callbackUrl: "/console" }))).toBe("/console");
-		expect(getCallbackURL(new URLSearchParams({ callbackUrl: "/console?from=fixture" }))).toBe("/console?from=fixture");
+		expect(
+			getCallbackURL(new URLSearchParams({ callbackUrl: "/console" })),
+		).toBe("/console");
+		expect(
+			getCallbackURL(
+				new URLSearchParams({ callbackUrl: "/console?from=fixture" }),
+			),
+		).toBe("/console?from=fixture");
 	});
-	it.each(["/console/child", "/console#other", "/console/../admin/users", "/foo/../console"])("rejects unsupported console entry %s", (callbackUrl) => {
-		expect(getCallbackURL(new URLSearchParams({ callbackUrl }))).toBe("/account");
+	it.each([
+		"/console/child",
+		"/console#other",
+		"/console/../admin/users",
+		"/foo/../console",
+	])("rejects unsupported console entry %s", (callbackUrl) => {
+		expect(getCallbackURL(new URLSearchParams({ callbackUrl }))).toBe(
+			"/account",
+		);
 	});
 	it("returns a client to the exact authenticated workspace onboarding route", () => {
-		expect(getCallbackURL(new URLSearchParams({ callbackUrl: "/admin/workspaces" }))).toBe("/admin/workspaces");
-		expect(getCallbackURL(new URLSearchParams({ callbackUrl: "/admin/workspaces/../users" }))).toBe("/account");
+		expect(
+			getCallbackURL(new URLSearchParams({ callbackUrl: "/admin/workspaces" })),
+		).toBe("/admin/workspaces");
+		expect(
+			getCallbackURL(
+				new URLSearchParams({ callbackUrl: "/admin/workspaces/../users" }),
+			),
+		).toBe("/account");
 	});
 	it("preserves explicit local device review after login", () => {
-		expect(getCallbackURL(new URLSearchParams({ callbackUrl: "/device?user_code=ABCDEFGH" }))).toBe("/device?user_code=ABCDEFGH");
-		expect(getCallbackURL(new URLSearchParams({ callbackUrl: "/device?user_code=ABCDEFGH&project=demo-app" }))).toBe("/device?user_code=ABCDEFGH&project=demo-app");
+		expect(
+			getCallbackURL(
+				new URLSearchParams({ callbackUrl: "/device?user_code=ABCDEFGH" }),
+			),
+		).toBe("/device?user_code=ABCDEFGH");
+		expect(
+			getCallbackURL(
+				new URLSearchParams({
+					callbackUrl: "/device?user_code=ABCDEFGH&project=demo-app",
+				}),
+			),
+		).toBe("/device?user_code=ABCDEFGH&project=demo-app");
 	});
-	it.each(["/device/approve", "/device?project=platform", "/device?project=one-app&project=other-app", "/device#other", "/device/../admin"])("rejects an invalid device continuation %s", (callbackUrl) => {
-		expect(getCallbackURL(new URLSearchParams({ callbackUrl }))).toBe("/account");
+	it.each([
+		"/device/approve",
+		"/device?project=platform",
+		"/device?project=one-app&project=other-app",
+		"/device#other",
+		"/device/../admin",
+	])("rejects an invalid device continuation %s", (callbackUrl) => {
+		expect(getCallbackURL(new URLSearchParams({ callbackUrl }))).toBe(
+			"/account",
+		);
 	});
 	it("accepts internal account and invitation callbacks", () => {
 		expect(
@@ -113,20 +162,30 @@ describe("hosted authentication continuation", () => {
 			),
 		).rejects.toThrow("expired");
 	});
-	it("posts selected true and navigates exactly once through the native redirect plugin", async () => {
-		mocks.resume.mockImplementation(async () => {
-			const data = { redirect: true, url: "https://app.example/callback?code=issued" };
-			await redirectPlugin.hooks.onSuccess({ data } as Parameters<typeof redirectPlugin.hooks.onSuccess>[0]);
-			return { data, error: null };
-		});
-		await completeAuthentication(
-			new URLSearchParams("client_id=client&sig=signed"),
+	it("posts the signed query and navigates exactly once to the issuer result", async () => {
+		mocks.resume.mockResolvedValue(
+			Response.json({
+				redirect: true,
+				url: "https://app.example/callback?code=issued",
+			}),
 		);
-		expect(mocks.resume).toHaveBeenCalledWith({ selected: true });
+		const params = new URLSearchParams("client_id=client&sig=signed");
+		await completeAuthentication(params);
+		expect(mocks.resume).toHaveBeenCalledExactlyOnceWith(
+			"/api/auth/oauth2/continue",
+			expect.objectContaining({
+				method: "POST",
+				body: JSON.stringify({
+					selected: true,
+					oauth_query: params.toString(),
+				}),
+			}),
+		);
 		expect(mocks.assign).toHaveBeenCalledExactlyOnceWith(
 			"https://app.example/callback?code=issued",
 		);
 	});
+
 	it.each([
 		"",
 		"client_id=client&sig=signed",
@@ -139,10 +198,12 @@ describe("hosted authentication continuation", () => {
 		expect(mocks.assign).not.toHaveBeenCalled();
 	});
 	it("does not navigate when native continuation rejects the signed query", async () => {
-		mocks.resume.mockResolvedValue({
-			data: null,
-			error: { message: "invalid signature" },
-		});
+		mocks.resume.mockResolvedValue(
+			Response.json(
+				{ error_description: "invalid signature" },
+				{ status: 400 },
+			),
+		);
 		await expect(
 			completeAuthentication(new URLSearchParams("client_id=client&sig=bad")),
 		).rejects.toThrow("invalid signature");
@@ -154,14 +215,25 @@ describe("hosted authentication continuation", () => {
 		expect(mocks.assign).toHaveBeenCalledWith("/console");
 	});
 	it("uses the same realm entry for a direct social or magic-link callback", async () => {
-		expect(await authenticationCallback(new URLSearchParams())).toBe("https://allauth.co/console");
+		expect(await authenticationCallback(new URLSearchParams())).toBe(
+			"https://allauth.co/console",
+		);
 	});
 	it("uses the customer's own console resolver for a direct authentication callback", async () => {
-		vi.stubGlobal("window", { location: { origin: "https://accounts.customer.fixture.example", assign: mocks.assign } });
-		expect(await authenticationCallback(new URLSearchParams())).toBe("https://accounts.customer.fixture.example/console");
+		vi.stubGlobal("window", {
+			location: {
+				origin: "https://accounts.customer.fixture.example",
+				assign: mocks.assign,
+			},
+		});
+		expect(await authenticationCallback(new URLSearchParams())).toBe(
+			"https://accounts.customer.fixture.example/console",
+		);
 	});
 	it("keeps an explicit account destination after sign-in", async () => {
-		await completeAuthentication(new URLSearchParams({ callbackUrl: "/account" }));
+		await completeAuthentication(
+			new URLSearchParams({ callbackUrl: "/account" }),
+		);
 		expect(mocks.assign).toHaveBeenCalledWith("/account");
 	});
 });

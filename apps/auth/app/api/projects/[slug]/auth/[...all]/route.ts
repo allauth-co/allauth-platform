@@ -84,3 +84,26 @@ async function handle(
 }
 export const GET = handle;
 export const POST = handle;
+
+/** Other project endpoints keep their current method surface. */
+async function scimMutation(
+	request: Request,
+	context: { params: Promise<{ slug: string }> },
+) {
+	const { slug } = await context.params;
+	const path = new URL(request.url).pathname;
+	const basePath = `/api/projects/${slug}/auth/scim/v2/`;
+	if (
+		!path.startsWith(basePath) ||
+		!/^(?:Users|Groups)\/[^/]+$/.test(path.slice(basePath.length))
+	)
+		return new Response(null, {
+			status: 405,
+			headers: { Allow: "GET, POST", "Cache-Control": "no-store" },
+		});
+	return handle(request, context);
+}
+
+export const PUT = scimMutation;
+export const PATCH = scimMutation;
+export const DELETE = scimMutation;

@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { runWithEndpointContext } from "@better-auth/core/context";
@@ -230,6 +230,45 @@ describe.skipIf(!existsSync(fixturePath))("real PostgreSQL hosted authentication
 		expect(document.issuer).toBe(`https://${host(alpha)}/api/auth`);
 		for (const endpoint of [document.authorization_endpoint, document.token_endpoint, document.jwks_uri]) expect(endpoint.startsWith(`https://${host(alpha)}/api/auth/`)).toBe(true);
 		const other = await discoveryGET(await signedRequest(host(beta), "/.well-known/openid-configuration")); expect((await other.json() as { issuer: string }).issuer).toBe(`https://${host(beta)}/api/auth`);
+	});
+
+	it("forwards hosted protocol credentials only to the signed project and OAuth endpoint", async () => {
+		const clientId = randomUUID();
+		const clientSecret = "hosted-fixture-confidential-secret";
+		const accessToken = "hosted-fixture-opaque-token";
+		const digest = (value: string) => createHash("sha256").update(value).digest("base64url");
+		const database = projectRegistryPool(env);
+		await database.query(
+			`INSERT INTO "${alpha.schemaName}"."oauthClient" (id,"clientId","clientSecret","redirectUris","tokenEndpointAuthMethod")
+			 VALUES ($1,$2,$3,'[]','client_secret_basic')`,
+			[randomUUID(), clientId, digest(clientSecret)],
+		);
+		await database.query(
+			`INSERT INTO "${alpha.schemaName}"."oauthAccessToken" (id,token,"clientId","userId","expiresAt","createdAt",scopes)
+			 VALUES ($1,$2,$3,$4,statement_timestamp()+interval '5 minutes',statement_timestamp(),'["openid","profile","email"]')`,
+			[randomUUID(), digest(accessToken), clientId, alphaUserId],
+		);
+
+		const basic = `Basic ${Buffer.from(`${clientId}:${clientSecret}`).toString("base64")}`;
+		const call = async (hostname: string) => nativePOST(await signedRequest(hostname, "/api/auth/oauth2/introspect", {
+			method: "POST",
+			headers: { authorization: basic, "content-type": "application/x-www-form-urlencoded" },
+			body: new URLSearchParams({ token: accessToken }).toString(),
+		}));
+		const introspection = await call(host(alpha));
+		expect(introspection.status).toBe(200);
+		expect(await introspection.json()).toMatchObject({ active: true, sub: alphaUserId, client_id: clientId });
+		expect((await call(host(beta))).status).toBe(401);
+
+		const userinfo = await nativeGET(await signedRequest(host(alpha), "/api/auth/oauth2/userinfo", {
+			headers: { authorization: `Bearer ${accessToken}` },
+		}));
+		expect(userinfo.status).toBe(200);
+		expect(await userinfo.json()).toMatchObject({ sub: alphaUserId });
+		const ordinary = await nativeGET(await signedRequest(host(alpha), "/api/auth/get-session", {
+			headers: { authorization: `Bearer ${accessToken}` },
+		}));
+		expect(await ordinary.json()).toBeNull();
 	});
 
 	it("publishes the same project OAuth and OpenID capabilities for verified hosted and slug issuers", async () => {

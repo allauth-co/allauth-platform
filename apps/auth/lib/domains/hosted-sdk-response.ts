@@ -1,3 +1,4 @@
+import { oauthBrowserReturnPath } from "../oauth-browser";
 import { hostedSdkReturnPath } from "./hosted-sdk-policy";
 
 const privateFields = new Set([
@@ -105,7 +106,9 @@ export async function hostedSdkResponse(
 					(name) => name === "callbackUrl",
 				) &&
 				target.searchParams.getAll("callbackUrl").length <= 1 &&
-				(callback === null || hostedSdkReturnPath(callback) === callback)
+				(callback === null ||
+					hostedSdkReturnPath(callback) === callback ||
+					oauthBrowserReturnPath(callback) === callback)
 			) {
 				return Response.json({ twoFactorRedirect: true }, { headers });
 			}

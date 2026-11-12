@@ -37,6 +37,8 @@ const password = "local-fixture-old-password";
 const newPassword = "local-fixture-new-password";
 const redirect = "https://connected.fixture.example/callback";
 const resource = "https://connected.fixture.example/resource";
+const signedOut = "https://connected.fixture.example/signed-out";
+const limitedIP = "192.0.2.89";
 
 function request(
 	path: string,
@@ -71,6 +73,20 @@ function cookies(response: Response) {
 		.join("; ");
 }
 
+function tokenAdmissionRequest(client: OAuthClient) {
+	const input = request(
+		"/oauth2/token",
+		"",
+		new URLSearchParams({
+			...clientCredentials(client),
+			grant_type: "refresh_token",
+			refresh_token: "expired-fixture-refresh-token",
+		}),
+	);
+	input.headers.set("x-real-ip", limitedIP);
+	return input;
+}
+
 function connection(connectionString: string, searchPath = false) {
 	return new Pool({
 		connectionString,
@@ -90,7 +106,11 @@ async function openLegacy(connectionString: string) {
 				basePath,
 				database: { db: database, type: "postgres", transaction: true },
 				secret,
-				advanced: { cookiePrefix: `allauth_project_${project.slug}` },
+				rateLimit: { enabled: true, storage: "database", window: 60, max: 100 },
+				advanced: {
+					cookiePrefix: `allauth_project_${project.slug}`,
+					ipAddress: { ipAddressHeaders: ["x-real-ip"] },
+				},
 				emailAndPassword: { enabled: true, password: clerkCompatiblePasswords },
 				session: { cookieCache: { enabled: false } },
 				logger: { disabled: true },
@@ -218,13 +238,68 @@ async function dpopIdentity() {
 	const jkt = await calculateJwkThumbprint(jwk);
 	return {
 		jkt,
-		proof: () =>
-			new SignJWT({ htu: issuer + "/oauth2/token", htm: "POST" })
+		proof: (method = "POST", path = "/oauth2/token", accessToken?: string) =>
+			new SignJWT({
+				htu: issuer + path,
+				htm: method,
+				...(accessToken
+					? {
+							ath: createHash("sha256").update(accessToken).digest("base64url"),
+						}
+					: {}),
+			})
 				.setProtectedHeader({ typ: "dpop+jwt", alg: "ES256", jwk })
 				.setIssuedAt()
 				.setJti(randomUUID())
 				.sign(pair.privateKey),
 	};
+}
+
+async function privateClient(legacy: Legacy) {
+	const pair = await generateKeyPair("ES256");
+	const jwk = {
+		...(await exportJWK(pair.publicKey)),
+		kid: "isolated-client-key",
+		alg: "ES256",
+	};
+	const client_id = randomUUID();
+	await legacy.database
+		.insertInto("oauthClient")
+		.values({
+			id: randomUUID(),
+			clientId: client_id,
+			skipConsent: true,
+			requirePKCE: true,
+			tokenEndpointAuthMethod: "private_key_jwt",
+			jwks: JSON.stringify({ keys: [jwk] }),
+			redirectUris: JSON.stringify([redirect]),
+			grantTypes: JSON.stringify(["authorization_code", "refresh_token"]),
+		})
+		.execute();
+	return {
+		client_id,
+		assertion: () =>
+			new SignJWT({})
+				.setProtectedHeader({ alg: "ES256", kid: jwk.kid })
+				.setIssuer(client_id)
+				.setSubject(client_id)
+				.setAudience(issuer + "/oauth2/token")
+				.setIssuedAt()
+				.setExpirationTime("2m")
+				.setJti(randomUUID())
+				.sign(pair.privateKey),
+	};
+}
+
+function assertClient(form: URLSearchParams, jwt: string) {
+	const result = new URLSearchParams(form);
+	result.delete("client_secret");
+	result.set(
+		"client_assertion_type",
+		"urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+	);
+	result.set("client_assertion", jwt);
+	return result;
 }
 
 async function seedResource(legacy: Legacy, client: OAuthClient) {
@@ -351,8 +426,16 @@ async function seedLegacyRealm(url: string) {
 				token_endpoint_auth_method: "client_secret_post",
 				redirect_uris: [redirect],
 				skip_consent: true,
+				enable_end_session: true,
+				post_logout_redirect_uris: [signedOut],
 			},
 		});
+		const pendingLogout = await auth.handler(
+			request("/sign-in/email", "", { email: accountEmail, password }),
+		);
+		expect(pendingLogout.status).toBe(200);
+		const logoutCookie = cookies(pendingLogout);
+		const logoutProof = await logoutPrompt(auth.handler, client, logoutCookie);
 		const revoked = await grant(auth.handler, sibling, client, "profile");
 		expect(
 			await introspect(auth.handler, client, revoked.access_token),
@@ -367,6 +450,13 @@ async function seedLegacyRealm(url: string) {
 		expect(surviving.refresh_token).toBeTruthy();
 		await seedResource(legacy, client);
 		const dpop = await dpopIdentity();
+		const privateRegistration = await privateClient(legacy);
+		const privateCode = await authorize(
+			auth.handler,
+			mfa.cookie,
+			privateRegistration,
+			"openid offline_access",
+		);
 		const code = await authorize(
 			auth.handler,
 			mfa.cookie,
@@ -378,15 +468,23 @@ async function seedLegacyRealm(url: string) {
 				dpop_jkt: dpop.jkt,
 			},
 		);
+		for (let attempt = 0; attempt < 19; attempt++) {
+			const denied = await auth.handler(tokenAdmissionRequest(client));
+			expect(denied.status).toBe(400);
+		}
 		return {
 			account,
 			mfa,
 			mfaUser,
 			sibling,
 			client,
+			logoutCookie,
+			logoutProof,
 			revoked,
 			surviving,
 			code,
+			privateRegistration,
+			privateCode,
 			dpop,
 			pending: cookies(pending),
 			keys: await auth.api.getJwks(),
@@ -394,6 +492,42 @@ async function seedLegacyRealm(url: string) {
 	} finally {
 		await legacy.close();
 	}
+}
+
+async function logoutPrompt(
+	dispatch: (request: Request) => Promise<Response>,
+	client: OAuthClient,
+	cookie: string,
+) {
+	const query = new URLSearchParams({
+		client_id: client.client_id,
+		post_logout_redirect_uri: signedOut,
+		state: "browser-logout-state",
+	});
+	const start = request(`/oauth2/end-session?${query}`, cookie);
+	start.headers.set("accept", "text/html");
+	const response = await dispatch(start);
+	expect(response.status).toBe(200);
+	expect(await response.text()).toContain("data-oidc-logout-confirmation");
+	return cookies(response);
+}
+
+async function confirmLogout(
+	dispatch: (request: Request) => Promise<Response>,
+	cookie: string,
+	proof: string,
+) {
+	const input = request(
+		"/oauth2/end-session/confirm",
+		`${cookie}; ${proof}`,
+		new URLSearchParams({ action: "confirm" }),
+	);
+	input.headers.set("accept", "text/html");
+	const result = await dispatch(input);
+	expect(result.status).toBe(302);
+	expect(result.headers.get("location")).toBe(
+		`${signedOut}?state=browser-logout-state`,
+	);
 }
 
 type SeededRealm = Awaited<ReturnType<typeof seedLegacyRealm>>;
@@ -409,10 +543,21 @@ async function useCandidate(url: string, initial: SeededRealm) {
 			trustedOrigins: [],
 			signingSecret: secret,
 			policy: defaultAuthPolicy,
-			trustedIP: () => "192.0.2.11",
+			trustedIP: (input) => input.headers.get("x-real-ip") ?? "192.0.2.11",
 			passwordChange: { checkPasswordSafety: async () => "allowed" },
 			issuer: true,
 		});
+		expect((await dispatch(tokenAdmissionRequest(initial.client))).status).toBe(
+			400,
+		);
+		const limited = await dispatch(tokenAdmissionRequest(initial.client));
+		expect(limited.status).toBe(429);
+		expect(Number(limited.headers.get("x-retry-after"))).toBeGreaterThan(0);
+		await confirmLogout(dispatch, initial.logoutCookie, initial.logoutProof);
+		const loggedOut = await dispatch(
+			request("/get-session", initial.logoutCookie),
+		);
+		expect(await loggedOut.json()).toBeNull();
 		const prior = await dispatch(
 			request("/get-session", initial.account.cookie),
 		);
@@ -512,6 +657,17 @@ async function useCandidate(url: string, initial: SeededRealm) {
 		});
 		expect(token.refresh_token).not.toBe(initial.surviving.refresh_token);
 		expect(token.id_token).toBeTruthy();
+		const usedAssertion = await initial.privateRegistration.assertion();
+		const privateResponse = await dispatch(
+			request(
+				"/oauth2/token",
+				"",
+				assertClient(initial.privateCode, usedAssertion),
+			),
+		);
+		expect(privateResponse.status).toBe(200);
+		const privateGrant = (await privateResponse.json()) as Tokens;
+		expect(privateGrant.refresh_token).toBeTruthy();
 		const exchange = async (
 			identity: Awaited<ReturnType<typeof dpopIdentity>>,
 		) => {
@@ -530,6 +686,21 @@ async function useCandidate(url: string, initial: SeededRealm) {
 		const bound = await dispatch(codeRequest);
 		expect(bound.status).toBe(200);
 		const resourceToken = (await bound.json()) as Tokens;
+		const userinfo = request("/oauth2/userinfo");
+		userinfo.headers.set("authorization", `DPoP ${resourceToken.access_token}`);
+		const unproven = await dispatch(userinfo);
+		expect(unproven.status).toBe(401);
+		userinfo.headers.set(
+			"dpop",
+			await initial.dpop.proof(
+				"GET",
+				"/oauth2/userinfo",
+				resourceToken.access_token,
+			),
+		);
+		const profile = await dispatch(userinfo);
+		expect(profile.status).toBe(200);
+		expect(await profile.json()).toEqual({ sub: initial.mfaUser.id });
 		expect(resourceToken).toMatchObject({
 			expires_in: 110,
 			token_type: "DPoP",
@@ -578,6 +749,13 @@ async function useCandidate(url: string, initial: SeededRealm) {
 			recovered: cookies(recovery),
 			token,
 			resourceToken: currentBound,
+			privateGrant,
+			usedAssertion,
+			logoutProof: await logoutPrompt(
+				dispatch,
+				initial.client,
+				cookies(change),
+			),
 		};
 	} finally {
 		await database.end();
@@ -613,15 +791,17 @@ async function verifyRollback(
 		expect(await session(initial.account.cookie)).toBeNull();
 		expect(await session(initial.sibling)).toBeNull();
 
-		const signIn = (value: string) =>
-			dispatch(
-				request("/sign-in/email", "", { email: accountEmail, password: value }),
-			);
-		expect((await signIn(password)).status).toBe(401);
-		expect((await signIn(newPassword)).status).toBe(200);
-		const retry = await dispatch(
-			request("/sign-in/email", "", { email: mfaEmail, password }),
-		);
+		const signIn = (email: string, value: string) => {
+			const input = request("/sign-in/email", "", {
+				email,
+				password: value,
+			});
+			input.headers.set("x-real-ip", "192.0.2.90");
+			return dispatch(input);
+		};
+		expect((await signIn(accountEmail, password)).status).toBe(401);
+		expect((await signIn(accountEmail, newPassword)).status).toBe(200);
+		const retry = await signIn(mfaEmail, password);
 		expect(await retry.json()).toMatchObject({ twoFactorRedirect: true });
 		const consumed = await dispatch(
 			request("/two-factor/verify-backup-code", cookies(retry), {
@@ -676,6 +856,26 @@ async function verifyRollback(
 				.subarray(0, 16)
 				.toString("base64url"),
 		);
+		const privateRefresh = new URLSearchParams({
+			client_id: initial.privateRegistration.client_id,
+			grant_type: "refresh_token",
+			refresh_token: state.privateGrant.refresh_token ?? "",
+		});
+		const repeatedAssertion = await dispatch(
+			request(
+				"/oauth2/token",
+				"",
+				assertClient(privateRefresh, state.usedAssertion),
+			),
+		);
+		expect(await repeatedAssertion.json()).toMatchObject({
+			error: "invalid_client",
+		});
+		const newAssertion = await initial.privateRegistration.assertion();
+		const renewedPrivate = await dispatch(
+			request("/oauth2/token", "", assertClient(privateRefresh, newAssertion)),
+		);
+		expect(renewedPrivate.status).toBe(200);
 		const boundRefresh = request(
 			"/oauth2/token",
 			"",
@@ -701,6 +901,13 @@ async function verifyRollback(
 		const reused = await refresh();
 		expect(reused.status).toBe(400);
 		expect(await reused.json()).toMatchObject({ error: "invalid_grant" });
+		await confirmLogout(dispatch, state.updated, state.logoutProof);
+		expect(await session(state.updated)).toBeNull();
+		const limited = await dispatch(tokenAdmissionRequest(initial.client));
+		expect(limited.status).toBe(429);
+		expect(await limited.json()).toEqual({
+			message: "Too many requests. Please try again later.",
+		});
 	} finally {
 		await rollback.close();
 	}

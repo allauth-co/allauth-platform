@@ -1,4 +1,5 @@
 import { applicationMfaCallback } from "../mfa-continuation";
+import { oauthBrowserQuery, oauthBrowserReturnPath } from "../oauth-browser";
 
 export const hostedSdkBasePath = "/api/auth/hosted-ui";
 export const hostedSdkProjectIdsSetting =
@@ -56,11 +57,52 @@ export function hostedSdkReturnPath(value: string | undefined) {
 	return "/account";
 }
 
-/** OAuth, broker, error and legacy recovery states stay with the existing hosted routes. */
+function hostedOAuthRequest(
+	view: HostedSdkView,
+	params: HostedSdkSearchParams,
+) {
+	if (
+		params.interface !== undefined ||
+		params.allauth_mfa !== undefined ||
+		(params.method !== undefined &&
+			(view !== "signIn" || params.method !== "username"))
+	)
+		return null;
+	const raw = params.returnTo ?? params.callbackUrl;
+	const nested = oauthBrowserReturnPath(raw);
+	const direct = new URLSearchParams();
+	for (const [name, value] of Object.entries(params)) {
+		if (typeof value === "string") direct.append(name, value);
+		else for (const part of value ?? []) direct.append(name, part);
+	}
+	const signed = nested
+		? new URL(nested, localOrigin).searchParams
+		: oauthBrowserQuery(direct);
+	if (!signed || (view === "resetPassword" && typeof params.token !== "string"))
+		return null;
+	const oauthQuery = signed.toString();
+	const fallback = new URL(views[view], localOrigin);
+	fallback.search = oauthQuery;
+	fallback.searchParams.set("interface", "legacy");
+	if (params.method === "username")
+		fallback.searchParams.set("method", "username");
+	if (view === "resetPassword" && typeof params.token === "string")
+		fallback.searchParams.set("token", params.token);
+	return {
+		destination: `/oauth2/continue?${oauthQuery}`,
+		legacyPath: fallback.pathname + fallback.search,
+		oauthQuery,
+		username: params.method === "username",
+	};
+}
+
+/** Signed project continuations are verified against the selected issuer before rendering. */
 export function hostedSdkViewRequest(
 	view: HostedSdkView,
 	params: HostedSdkSearchParams,
 ) {
+	const oauth = hostedOAuthRequest(view, params);
+	if (oauth) return oauth;
 	const allowed = new Set([
 		"returnTo",
 		"callbackUrl",
@@ -89,6 +131,7 @@ export function hostedSdkViewRequest(
 		destination,
 		legacyPath: fallback.pathname + fallback.search,
 		...(params.method === "username" ? { username: true } : {}),
+		oauthQuery: undefined,
 	};
 }
 

@@ -1,11 +1,19 @@
 import { runWithAdapter } from "@better-auth/core/context";
+import { verifyOAuthQueryParams } from "@better-auth/oauth-provider";
+import { APIError } from "better-auth";
 import type { AuthInstance } from "./api";
 import type { AuthEngine } from "./auth-engine";
+import { discoveryDocument, discoveryHeaders } from "./discovery";
 
 type LegacyInstance = Pick<AuthInstance, "$context" | "handler"> & {
 	api: Pick<
 		AuthInstance["api"],
-		"getSession" | "accountSessions" | "accountRevokeSession"
+		| "getSession"
+		| "accountSessions"
+		| "accountRevokeSession"
+		| "getOpenIdConfig"
+		| "getOAuthServerConfig"
+		| "getOAuthClientPublicPrelogin"
 	>;
 };
 
@@ -22,6 +30,55 @@ export function legacyAuthEngine(instance: LegacyInstance): AuthEngine {
 
 	const engine: AuthEngine = {
 		dispatch: (request) => instance.handler(request),
+		readIssuerMetadata: (kind) =>
+			withAdapter(async () => {
+				const document =
+					kind === "openid"
+						? await instance.api.getOpenIdConfig()
+						: await instance.api.getOAuthServerConfig();
+				return Response.json(discoveryDocument(document), {
+					headers: discoveryHeaders,
+				});
+			}),
+		readOAuthContext: (request) =>
+			withAdapter(async () => {
+				const query = new URL(request.url).searchParams;
+				const serialized = query.toString();
+				if (
+					!(await verifyOAuthQueryParams(
+						serialized,
+						(
+							await instance.$context
+						).secret,
+					))
+				)
+					throw new APIError("BAD_REQUEST", {
+						message: "The authorization request is invalid or expired.",
+					});
+				const clientId = query.get("client_id");
+				if (!clientId) throw new APIError("BAD_REQUEST");
+				const client = await instance.api.getOAuthClientPublicPrelogin({
+					headers: request.headers,
+					body: { client_id: clientId, oauth_query: serialized },
+				});
+				return Response.json(
+					{
+						client: {
+							client_id: client.client_id,
+							client_name: client.client_name,
+						},
+						scopes: (query.get("scope") || "").split(" ").filter(Boolean),
+						continueURL: `/oauth2/continue?${serialized}`,
+					},
+					{
+						headers: {
+							"cache-control": "no-store",
+							pragma: "no-cache",
+							"x-content-type-options": "nosniff",
+						},
+					},
+				);
+			}),
 		readPrincipal: (headers) =>
 			withAdapter(async () => {
 				const current = await instance.api.getSession({
@@ -51,7 +108,10 @@ export function legacyAuthEngine(instance: LegacyInstance): AuthEngine {
 				instance.api.getSession({
 					headers: request.headers,
 					request,
-					query: { disableCookieCache: true },
+					query: {
+						disableCookieCache: true,
+						...(new URL(request.url).searchParams.get("disableRefresh") === "true" ? { disableRefresh: true } : {}),
+					},
 					asResponse: true,
 				}),
 			),

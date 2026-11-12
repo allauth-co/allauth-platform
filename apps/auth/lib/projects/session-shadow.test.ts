@@ -21,6 +21,8 @@ describe("project session comparison", () => {
 		const authoritative = Response.json(null, { headers: { "Set-Cookie": sessionCookie } });
 		const engine: AuthEngine = {
 			dispatch: vi.fn(),
+			readIssuerMetadata: vi.fn(),
+			readOAuthContext: vi.fn(),
 			readPrincipal: vi.fn(),
 			readSession: vi.fn().mockResolvedValue(authoritative),
 			listAccountSessions: vi.fn(),
