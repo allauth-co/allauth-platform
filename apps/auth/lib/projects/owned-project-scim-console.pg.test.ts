@@ -1,6 +1,7 @@
 import { createHmac, randomUUID } from "node:crypto";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { symmetricEncrypt } from "better-auth/crypto";
 import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { GET as hostedGET } from "../../app/api/auth/[...all]/route";
@@ -10,6 +11,7 @@ import {
 } from "../../app/api/auth/hosted-ui/[...all]/route";
 import { POST as retire } from "../../app/api/organizations/[organizationId]/scim/[connectionId]/decommission/route";
 import { POST as revoke } from "../../app/api/organizations/[organizationId]/scim/[connectionId]/revoke/route";
+import { POST as rotate } from "../../app/api/organizations/[organizationId]/scim/[connectionId]/rotate/route";
 import {
 	POST as create,
 	GET as list,
@@ -23,7 +25,11 @@ import type { AuthInstance } from "../api";
 import { auth, withAuthEngine } from "../auth";
 import type { AuthEnvironment } from "../configuration";
 import { setting } from "../configuration";
+import { consoleDatabase } from "../console/database";
 import type { ControlDatabase, ControlPrincipal } from "../control/types";
+import { newWebhookSigningSecret } from "../control/webhook-contract";
+import type { ControlWebhookEnvelope } from "../control/webhooks";
+import { deliverPendingWebhooks } from "../control/webhooks";
 import { signEdgeRequest } from "../domains/edge";
 import { resolveHostedBinding } from "../domains/hosting";
 import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
@@ -722,6 +728,273 @@ describe.skipIf(!existsSync(fixturePath))(
 				).status,
 			).toBe(503);
 			connectorHost = frontendHost;
+		});
+
+		it("preserves signed directory lifecycle envelopes through native and selected console writes", async () => {
+			const endpointId = randomUUID();
+			const signingSecret = newWebhookSigningSecret();
+			const callback = "https://directory-webhook.scim-fixture.net/events";
+			const scope = `"${alpha.schemaName}"`;
+			const otherScope = `"${beta.schemaName}"`;
+			const providers = [
+				"fixture-webhook-native",
+				"fixture-webhook-owned",
+			] as const;
+			const native = await withProjectAuth(
+				alpha.slug,
+				async (instance) => ({
+					database: await consoleDatabase(instance),
+					secret: (await instance.$context).secret,
+				}),
+				env,
+			);
+			await registry!.query(
+				`INSERT INTO ${scope}."allauthWebhookEndpoint" (id,url,"eventTypes","encryptedSecret")
+				 VALUES ($1,$2,'["directory.*"]',$3)`,
+				[
+					endpointId,
+					callback,
+					await symmetricEncrypt({ key: native.secret, data: signingSecret }),
+				],
+			);
+			const otherSecret = await withProjectAuth(
+				beta.slug,
+				async (instance) => (await instance.$context).secret,
+				env,
+			);
+			await registry!.query(
+				`INSERT INTO ${otherScope}."allauthWebhookEndpoint" (id,url,"eventTypes","encryptedSecret")
+				 VALUES ($1,$2,'["directory.*"]',$3)`,
+				[
+					endpointId,
+					callback,
+					await symmetricEncrypt({ key: otherSecret, data: signingSecret }),
+				],
+			);
+			for (const id of providers)
+				await registry!.query(
+					`INSERT INTO ${scope}."ssoProvider" (id,issuer,"oidcConfig","userId","providerId","organizationId",domain,"domainVerified")
+					 VALUES ($1,'https://issuer.scim-fixture.net','{}',$2,$1,$3,'scim-fixture.net',true)`,
+					[id, localAdmin, organizationId],
+				);
+
+			function change(
+				connectionId: string,
+				action: "rotate" | "revoke" | "decommission",
+				body: object = {},
+				cookie = rootCookie,
+			) {
+				const route = { rotate, revoke, decommission: retire }[action];
+				return route(
+					consoleRequest(alpha.slug, {
+						path: `/${connectionId}/${action}`,
+						method: "POST",
+						cookie,
+						body: JSON.stringify(body),
+					}),
+					detail(connectionId),
+				);
+			}
+
+			async function operate(provider: string) {
+				const created = await create(
+					consoleRequest(alpha.slug, {
+						method: "POST",
+						cookie: rootCookie,
+						body: JSON.stringify({ providerId: provider }),
+					}),
+					collection,
+				);
+				expect(
+					created.status,
+					created.ok ? undefined : await created.clone().text(),
+				).toBe(201);
+				const first = (await created.json()) as Issued;
+				const id = first.connection.connectionId;
+				const rotated = await change(id, "rotate");
+				expect(
+					rotated.status,
+					rotated.ok ? undefined : await rotated.clone().text(),
+				).toBe(200);
+				const second = (await rotated.json()) as Issued;
+				const revoked = await change(id, "revoke", {
+					credentialId: first.credential.credentialId,
+				});
+				expect(
+					revoked.status,
+					revoked.ok ? undefined : await revoked.clone().text(),
+				).toBe(200);
+				const retired = await change(id, "decommission");
+				expect(
+					retired.status,
+					retired.ok ? undefined : await retired.clone().text(),
+				).toBe(200);
+				expect(await retired.json()).toMatchObject({
+					connection: { status: "decommissioned" },
+					decommission: { status: "complete" },
+				});
+				return {
+					id,
+					revokedId: first.credential.credentialId,
+					issuedTokens: [first.token, second.token],
+				};
+			}
+
+			async function deliveredEvents(
+				expectedCount: number,
+				actorId = workspaceOwner,
+			) {
+				const deliveryTime = new Date(Date.now() + 2_000);
+				const deliveries: {
+					url: string;
+					body: string;
+					headers: Record<string, string>;
+				}[] = [];
+				expect(
+					await deliverPendingWebhooks({
+						database: native.database,
+						secret: native.secret,
+						now: () => deliveryTime,
+						resolver: async () => [{ address: "93.184.216.34", family: 4 }],
+						maxDeliveries: 10,
+						async transport({ destination, body, headers }) {
+							deliveries.push({ url: destination.url.href, body, headers });
+							return 204;
+						},
+					}),
+				).toEqual({
+					claimed: expectedCount,
+					delivered: expectedCount,
+					retried: 0,
+					failed: 0,
+				});
+				const events = [];
+				for (const { url, body, headers } of deliveries) {
+					expect(url).toBe(callback);
+					expect(headers["webhook-signature"]).toBe(
+						`v1,${createHmac(
+							"sha256",
+							Buffer.from(signingSecret.slice(6), "base64"),
+						)
+							.update(
+								`${headers["webhook-id"]}.${headers["webhook-timestamp"]}.${body}`,
+							)
+							.digest("base64")}`,
+					);
+					const envelope = JSON.parse(body) as ControlWebhookEnvelope;
+					const event = envelope.data.event;
+					expect(envelope).toEqual({
+						id: event.id,
+						type: event.type,
+						timestamp: event.createdAt,
+						data: {
+							event: {
+								id: expect.any(String),
+								type: expect.any(String),
+								outcome: "success",
+								actorId,
+								organizationId,
+								targetId: expect.any(String),
+								createdAt: expect.any(String),
+								metadata: {},
+							},
+						},
+					});
+					expect(body).not.toContain(signingSecret);
+					expect(body).not.toMatch(
+						/tokenDigest|encryptedSecret|scopes|credentialHash|providerId/,
+					);
+					events.push({ type: event.type, targetId: event.targetId, body });
+				}
+				return events;
+			}
+
+			try {
+				fixtureConsoles.delete(alpha.id);
+				const old = await operate(providers[0]);
+				const legacyEvents = await deliveredEvents(4);
+				fixtureConsoles.set(alpha.id, alphaConsole);
+				const selected = await operate(providers[1]);
+				const selectedEvents = await deliveredEvents(4);
+				for (const [result, events] of [
+					[old, legacyEvents],
+					[selected, selectedEvents],
+				] as const) {
+					expect(
+						events.map(({ type, targetId }) => ({ type, targetId })),
+					).toEqual(
+						expect.arrayContaining([
+							{ type: "directory.created", targetId: result.id },
+							{ type: "directory.credential.rotated", targetId: result.id },
+							{
+								type: "directory.credential.revoked",
+								targetId: result.revokedId,
+							},
+							{ type: "directory.decommissioned", targetId: result.id },
+						]),
+					);
+					for (const { body } of events)
+						for (const token of result.issuedTokens)
+							expect(body).not.toContain(token);
+				}
+				expect(
+					(await change(selected.id, "decommission", {}, outsiderCookie)).ok,
+				).toBe(false);
+				expect(await deliveredEvents(0)).toEqual([]);
+				const selectedState = () =>
+					registry!.query(
+						`SELECT status,revision,"decommissionedBy","decommissionedAt" FROM ${scope}."scimManagedConnection" WHERE "connectionId"=$1`,
+						[selected.id],
+					);
+				const completed = (await selectedState()).rows;
+				expect(
+					(await change(selected.id, "decommission", {}, localAdminCookie))
+						.status,
+				).toBe(200);
+				expect(await deliveredEvents(1, localAdmin)).toEqual([
+					expect.objectContaining({
+						type: "directory.decommissioned",
+						targetId: selected.id,
+					}),
+				]);
+				expect((await selectedState()).rows).toEqual(completed);
+				expect(
+					(
+						await registry!.query(
+							`SELECT id FROM ${scope}."allauthAudit" WHERE action='directory.decommissioned' AND "targetId"=$1`,
+							[selected.id],
+						)
+					).rowCount,
+				).toBe(1);
+				fixtureConsoles.delete(alpha.id);
+				expect(
+					(await change(old.id, "decommission", {}, localAdminCookie)).status,
+				).toBe(200);
+				expect(await deliveredEvents(1, localAdmin)).toEqual([
+					expect.objectContaining({
+						type: "directory.decommissioned",
+						targetId: old.id,
+					}),
+				]);
+				expect(
+					(
+						await registry!.query(
+							`SELECT id FROM ${otherScope}."allauthWebhookDelivery" WHERE "endpointId"=$1`,
+							[endpointId],
+						)
+					).rows,
+				).toEqual([]);
+			} finally {
+				fixtureConsoles.set(alpha.id, alphaConsole);
+				await registry!.query(
+					`DELETE FROM ${scope}."allauthWebhookEndpoint" WHERE id=$1`,
+					[endpointId],
+				);
+				await registry!.query(
+					`DELETE FROM ${otherScope}."allauthWebhookEndpoint" WHERE id=$1`,
+					[endpointId],
+				);
+			}
 		});
 
 		it("binds the standalone listener to the configured console origin and rejects other hosts", async () => {

@@ -454,6 +454,14 @@ describe.skipIf(!existsSync(fixturePath))(
 			expect(await checkpoint(retiring.connectionId)).toMatchObject({
 				lease: "legacy-in-flight",
 			});
+			expect(
+				(
+					await database.query(
+						`SELECT id FROM "allauthEvent" WHERE type='directory.decommissioned' AND "targetId"=$1`,
+						[retiring.connectionId],
+					)
+				).rowCount,
+			).toBe(0);
 			await database.query(
 				`UPDATE "scimConnectionBinding" SET "decommissionLeaseExpiresAt" = now() - interval '1 minute' WHERE "connectionId" = $1`,
 				[retiring.connectionId],

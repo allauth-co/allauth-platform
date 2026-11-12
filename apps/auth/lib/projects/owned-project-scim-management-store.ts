@@ -18,6 +18,11 @@ type ManagedEvent =
 	| "credential.revoked"
 	| "connection.decommissioning"
 	| "connection.decommissioned";
+type DirectoryAction =
+	| "directory.created"
+	| "directory.credential.rotated"
+	| "directory.credential.revoked"
+	| "directory.decommissioned";
 
 export interface OwnedSCIMManagedConnection {
 	id: string;
@@ -179,24 +184,20 @@ export function ownedSCIMManagementStore(
 			],
 		);
 	}
-	async function audit(
-		action:
-			| "directory.created"
-			| "directory.credential.rotated"
-			| "directory.credential.revoked"
-			| "directory.decommissioned",
-		target: string,
-	) {
-		await client.query(
-			`INSERT INTO "allauthAudit" (id, "actorId", action, "targetId", "organizationId", "createdAt")
-			VALUES ($1,$2,$3,$4,$5,statement_timestamp())`,
-			[randomUUID(), actorId, action, target, organizationId],
-		);
+	async function recordDirectoryEvent(action: DirectoryAction, target: string) {
 		await client.query(
 			`INSERT INTO "allauthEvent" (id,type,outcome,"actorId","targetId","organizationId","createdAt",metadata)
 			VALUES ($1,$2,'success',$3,$4,$5,statement_timestamp(),'{}')`,
 			[randomUUID(), action, actorId, target, organizationId],
 		);
+	}
+	async function audit(action: DirectoryAction, target: string) {
+		await client.query(
+			`INSERT INTO "allauthAudit" (id, "actorId", action, "targetId", "organizationId", "createdAt")
+			VALUES ($1,$2,$3,$4,$5,statement_timestamp())`,
+			[randomUUID(), actorId, action, target, organizationId],
+		);
+		await recordDirectoryEvent(action, target);
 	}
 	async function issueCredential(
 		connection: OwnedSCIMManagedConnection,
@@ -378,6 +379,7 @@ export function ownedSCIMManagementStore(
 		state,
 		event,
 		audit,
+		recordDirectoryEvent,
 		lockBoundConnection,
 	};
 }

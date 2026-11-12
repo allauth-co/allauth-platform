@@ -91,16 +91,21 @@ export function ownedSCIMDecommissionStore(
 		return binding;
 	}
 
+	async function completedReplay(connection: OwnedSCIMManagedConnection) {
+		// The console reports each authorized terminal response to existing
+		// subscribers. The transition audit and managed revision are written once.
+		await store.recordDirectoryEvent("directory.decommissioned", connectionId);
+		return {
+			...(await store.state(connection)),
+			decommission: { status: "complete" as const, retryAfter: null },
+		};
+	}
+
 	async function begin() {
 		await lockOrganization();
 		let connection = await store.lockBoundConnection(connectionId);
 		if (connection.status === "decommissioned")
-			return {
-				response: {
-					...(await store.state(connection)),
-					decommission: { status: "complete", retryAfter: null },
-				},
-			};
+			return { response: await completedReplay(connection) };
 		if (connection.status === "active") {
 			const at = new Date();
 			const update = await client.query<OwnedSCIMManagedConnection>(
@@ -256,10 +261,7 @@ export function ownedSCIMDecommissionStore(
 		await lockOrganization();
 		let connection = await store.lockBoundConnection(connectionId);
 		if (connection.status === "decommissioned")
-			return {
-				...(await store.state(connection)),
-				decommission: { status: "complete", retryAfter: null },
-			};
+			return completedReplay(connection);
 		const binding = await getBinding(false);
 		if (
 			connection.status !== "decommissioning" ||
