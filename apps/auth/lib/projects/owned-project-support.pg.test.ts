@@ -25,10 +25,8 @@ import {
 	newWebhookSigningSecret,
 	webhookSignature,
 } from "../control/webhook-contract";
-import {
-	type ControlWebhookEnvelope,
-	deliverPendingWebhooks,
-} from "../control/webhooks";
+import type { ControlWebhookEnvelope } from "../control/webhooks";
+import { deliverPendingWebhooks } from "../control/webhooks";
 import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
 import { sealLegacyMfaRecord } from "./legacy-mfa-record";
 import { readLegacySessionCookie } from "./legacy-session-cookie";
@@ -747,6 +745,180 @@ describe.skipIf(!existsSync(fixturePath))(
 							type: "session.created",
 							outcome: "success",
 							userId: session?.userId,
+							targetId: sessionId,
+							metadata: { path: session?.path },
+						},
+					});
+					expected.delete(sessionId);
+				}
+				expect(expected.size).toBe(0);
+			} finally {
+				await database.query(
+					`DELETE FROM "${schema}"."allauthWebhookEndpoint" WHERE id=$1`,
+					[endpoint],
+				);
+			}
+		});
+
+		it("delivers the native session deletion actor for support teardown", async () => {
+			const endpoint = randomUUID();
+			const secret = newWebhookSigningSecret();
+			await database.query(
+				`INSERT INTO "${schema}"."allauthWebhookEndpoint" (id,url,"eventTypes","encryptedSecret") VALUES ($1,$2,'["session.deleted"]',$3)`,
+				[
+					endpoint,
+					"https://support-deletion.fixture.example/receive",
+					await sealLegacyMfaRecord(secret, { secret: signingSecret }),
+				],
+			);
+			try {
+				const expected = new Map<
+					string,
+					{ writer: string; path: string; userId: string; actorId?: string }
+				>();
+				for (const [writerName, writer] of [
+					["legacy", native],
+					["owned", ownedEngine()],
+				] as const) {
+					for (const path of [
+						"/sdk/support/application/revoke",
+						"/sdk/support/stop",
+						"/sdk/support/session",
+						"/get-session",
+					]) {
+						const fixture = await nativeApplicationSupport();
+						const revoke = path === "/sdk/support/application/revoke";
+						const stop = path === "/sdk/support/stop";
+						if (!revoke && !stop) registration = null;
+						try {
+							const response = await writer(
+								request(path, {
+									caller: revoke ? applicationOrigin : supportOrigin,
+									cookie: revoke ? fixture.original.cookie : fixture.cookie,
+									...(revoke
+										? {
+												body: {
+													sessionId: fixture.sessionId,
+													applicationAuditId: fixture.applicationAuditId,
+												},
+											}
+										: stop
+											? { body: {} }
+											: {}),
+								}),
+							);
+							expect(response.status, path).toBe(200);
+							if (!revoke && !stop) expect(await response.json()).toBeNull();
+						} finally {
+							registration = config;
+						}
+						expect(
+							(
+								await database.query(
+									`SELECT id FROM "${schema}".session WHERE id=$1`,
+									[fixture.original.id],
+								)
+							).rows,
+						).toEqual([{ id: fixture.original.id }]);
+						expected.set(fixture.sessionId, {
+							writer: writerName,
+							path,
+							userId: fixture.target.id,
+						});
+					}
+					const target = await account();
+					const workspaceActor = await session(
+						await account("admin", "public"),
+						"public",
+					);
+					const realmActor = await session(await account("admin"));
+					for (const [prefix, actor] of [
+						["/project-admin", workspaceActor],
+						["/admin", realmActor],
+					] as const) {
+						const created = await native(
+							request(`${prefix}/impersonate-user`, {
+								caller: origin,
+								cookie: actor.cookie,
+								signed: false,
+								body: { userId: target.id },
+							}),
+						);
+						expect(created.status).toBe(200);
+						const { session: issued } =
+							(await created.json()) as BrowserSupport;
+						const path = `${prefix}/stop-impersonating`;
+						const supportCookie = created.headers
+							.getSetCookie()
+							.filter((value) => !value.includes("Max-Age=0"))
+							.map((value) => value.split(";", 1)[0])
+							.join("; ");
+						const stopped = await writer(
+							request(path, {
+								caller: origin,
+								cookie: supportCookie,
+								signed: false,
+								body: {},
+							}),
+						);
+						expect(stopped.status, path).toBe(200);
+						expected.set(issued.id, {
+							writer: writerName,
+							path,
+							userId: target.id,
+							actorId: target.id,
+						});
+					}
+				}
+				expect(expected.size).toBe(12);
+				expect(
+					(
+						await database.query(
+							`SELECT id FROM "${schema}".session WHERE id=ANY($1::text[])`,
+							[[...expected.keys()]],
+						)
+					).rows,
+				).toEqual([]);
+				const captured: Array<{
+					body: string;
+					headers: Record<string, string>;
+				}> = [];
+				expect(
+					await deliverPendingWebhooks({
+						database: legacyDatabase!,
+						secret: signingSecret,
+						resolver: async () => [{ address: "93.184.216.34", family: 4 }],
+						now: () => new Date(Date.now() + 1_000),
+						maxDeliveries: 20,
+						transport: async ({ body, headers }) => {
+							captured.push({ body, headers });
+							return 204;
+						},
+					}),
+				).toMatchObject({ claimed: 12, delivered: 12 });
+				for (const { body, headers } of captured) {
+					expect(headers["webhook-signature"]).toBe(
+						await webhookSignature(
+							secret,
+							headers["webhook-id"],
+							headers["webhook-timestamp"],
+							body,
+						),
+					);
+					const { id, timestamp, data } = JSON.parse(
+						body,
+					) as ControlWebhookEnvelope;
+					const sessionId = data.event.targetId!;
+					const session = expected.get(sessionId);
+					expect(session).toBeDefined();
+					expect(data, `${session?.writer} ${session?.path}`).toEqual({
+						event: {
+							id,
+							createdAt: timestamp,
+							type: "session.deleted",
+							outcome: "success",
+							userId: session?.userId,
+							...(session?.actorId ? { actorId: session.actorId } : {}),
 							targetId: sessionId,
 							metadata: { path: session?.path },
 						},

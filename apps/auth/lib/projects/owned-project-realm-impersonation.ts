@@ -70,12 +70,7 @@ export function createOwnedProjectRealmImpersonation(options: {
 	): void;
 	clearCookies(headers: Headers): void;
 	trustedIP(request: Request): string | null;
-	revoke(
-		client: PoolClient,
-		request: Request,
-		token: string,
-		actorId: string,
-	): Promise<boolean>;
+	revoke(client: PoolClient, request: Request, token: string): Promise<boolean>;
 }) {
 	const { store } = options;
 	type Session = NonNullable<Awaited<ReturnType<typeof store.session>>>;
@@ -283,9 +278,7 @@ export function createOwnedProjectRealmImpersonation(options: {
 				locked.impersonatedBy !== restoredUser.id
 			)
 				return fail(unauthorized());
-			if (
-				!(await options.revoke(client, request, targetToken, restoredUser.id))
-			)
+			if (!(await options.revoke(client, request, targetToken)))
 				return fail(unauthorized());
 			await store.record(
 				client,

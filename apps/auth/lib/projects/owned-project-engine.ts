@@ -604,6 +604,7 @@ export function createOwnedProjectEngine(
 		if (
 			!token ||
 			!current ||
+			current.expired ||
 			current.user.banned ||
 			current.user.directoryDisabled ||
 			current.session.impersonatedBy ||
@@ -1423,7 +1424,26 @@ export function createOwnedProjectEngine(
 		if (!trustedRequest(request.headers, false)) return forbidden();
 		let headers = new Headers();
 		const token = tokenFrom(request.headers);
-		const observed = token ? await store.session(token, refreshWindow) : null;
+		let observed = token
+			? await store.session(token, refreshWindow, undefined, {
+					includeExpired: true,
+				})
+			: null;
+		if (token && observed?.expired) {
+			const removed = await store.transaction(async (client) => {
+				const result = await store.revoke(
+					{ tokens: [token], expiredOnly: true },
+					"/get-session",
+					Boolean(backchannel),
+					client,
+				);
+				if (result) deliverLogoutAfterCommit(client, request, result.targets);
+				return result;
+			});
+			observed = removed?.ids.length === 0
+				? await store.session(token, refreshWindow)
+				: null;
+		}
 		if (observed?.session.impersonatedBy) {
 			const url = new URL(request.url);
 			if (
@@ -2858,6 +2878,7 @@ export function createOwnedProjectEngine(
 					path,
 					Boolean(backchannel),
 					client,
+					path === "/project-admin/stop-impersonating" ? current.userId : null,
 				);
 				if (!removed) throw unavailableLogout;
 				deliverLogoutAfterCommit(client, request, removed.targets);
@@ -2898,13 +2919,12 @@ export function createOwnedProjectEngine(
 		writeCookie: (headers, kind, value, maxAge) =>
 			writeCookie(headers, impersonationCookies[kind], value, maxAge),
 		clearCookies: clearSessionCookies,
-		async revoke(client, request, token, actorId) {
+		async revoke(client, request, token) {
 			const removed = await store.revoke(
 				{ tokens: [token] },
 				"/admin/stop-impersonating",
 				Boolean(backchannel),
 				client,
-				actorId,
 			);
 			if (!removed) throw unavailableLogout;
 			deliverLogoutAfterCommit(client, request, removed.targets);

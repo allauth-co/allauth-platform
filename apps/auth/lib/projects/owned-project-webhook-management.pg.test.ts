@@ -1402,6 +1402,219 @@ describe.skipIf(!existsSync(fixture))(
 			}
 		});
 
+		it("delivers the native session deletion event when the browser reads an expired session", async () => {
+			const realm = `"${alpha.schemaName}"`;
+			async function exercise(writer: "legacy" | "owned") {
+				const expired = await browserSession(eventEmail);
+				const active = await browserSession(eventEmail);
+				const clientId = randomUUID();
+				await database.query(
+					`INSERT INTO ${realm}."oauthClient" (id,"clientId","redirectUris") VALUES ($1,$1,'[]')`,
+					[clientId],
+				);
+				const grants = {
+					access: randomUUID(),
+					online: randomUUID(),
+					offline: randomUUID(),
+				};
+				const tokenScope = [expired.id, eventUserId, clientId];
+				await database.query(
+					`INSERT INTO ${realm}."oauthAccessToken" (id,token,"sessionId","userId","clientId","expiresAt","createdAt",scopes)
+					 VALUES ($4,$4,$1,$2,$3,now()+interval '1 day',now(),'["openid"]')`,
+					[...tokenScope, grants.access],
+				);
+				await database.query(
+					`INSERT INTO ${realm}."oauthRefreshToken" (id,token,"sessionId","userId","clientId","expiresAt","createdAt",scopes)
+					 VALUES ($4,$4,$1,$2,$3,now()+interval '1 day',now(),'["openid"]'),
+					        ($5,$5,$1,$2,$3,now()+interval '1 day',now(),'["openid","offline_access"]')`,
+					[...tokenScope, grants.online, grants.offline],
+				);
+				await database.query(
+					`UPDATE ${realm}.session SET "expiresAt"=statement_timestamp()-interval '1 minute' WHERE id=$1`,
+					[expired.id],
+				);
+				const subscription = await endpoint(
+					"legacy",
+					`expired-read-${writer}`,
+					["session.deleted"],
+				);
+				const read = (cookie: string) => {
+					const current = request(
+						`${alpha.path}/get-session?disableRefresh=true`,
+						undefined,
+						cookie,
+					);
+					return writer === "legacy"
+						? legacy.api.getSession({
+								request: current,
+								headers: current.headers,
+								query: { disableCookieCache: true, disableRefresh: true },
+								asResponse: true,
+							})
+						: owned.readSession(current);
+				};
+				try {
+					const repeated =
+						writer === "legacy"
+							? [await read(expired.cookie), await read(expired.cookie)]
+							: await Promise.all([read(expired.cookie), read(expired.cookie)]);
+					for (const response of repeated) {
+						expect(response.status).toBe(200);
+						expect(await response.json()).toBeNull();
+						expect(response.headers.getSetCookie()).toEqual(
+							expect.arrayContaining([
+								expect.stringMatching(/\.session_token=;.*Max-Age=0/),
+							]),
+						);
+					}
+					expect(await (await read(active.cookie)).json()).toMatchObject({
+						session: { id: active.id },
+					});
+					const events = await signedEvents(
+						subscription,
+						[
+							expired.cookie,
+							active.cookie,
+							eventEmail,
+							...Object.values(grants),
+						],
+						new Map([[expired.id, "expired-browser"]]),
+					);
+					expect(
+						(
+							await database.query(
+								`SELECT 1 FROM ${realm}.session WHERE id=$1`,
+								[expired.id],
+							)
+						).rowCount,
+					).toBe(0);
+					const state = await database.query<{
+						id: string;
+						revoked: boolean;
+						sessionId: string | null;
+					}>(
+						`SELECT id, revoked IS NOT NULL AS revoked, "sessionId" FROM ${realm}."oauthAccessToken" WHERE id=$1
+						 UNION ALL SELECT id, revoked IS NOT NULL AS revoked, "sessionId" FROM ${realm}."oauthRefreshToken" WHERE id=ANY($2::text[])`,
+						[grants.access, [grants.online, grants.offline]],
+					);
+					expect(state.rows).toHaveLength(3);
+					for (const [kind, id] of Object.entries(grants))
+						expect(state.rows.find((row) => row.id === id)).toEqual({
+							id,
+							revoked: kind !== "offline",
+							sessionId: null,
+						});
+					return events;
+				} finally {
+					await database.query(
+						`DELETE FROM ${realm}."oauthClient" WHERE id=$1`,
+						[clientId],
+					);
+					await database.query(
+						`DELETE FROM ${realm}.session WHERE id=ANY($1::text[])`,
+						[[expired.id, active.id]],
+					);
+					expect(
+						(
+							await send("legacy", `${base}/delete`, {
+								id: subscription.endpoint.id,
+							})
+						).status,
+					).toBe(200);
+				}
+			}
+			const native = await exercise("legacy");
+			expect(native).toEqual([
+				{
+					event: {
+						type: "session.deleted",
+						outcome: "success",
+						actorId: eventUserId,
+						userId: eventUserId,
+						targetId: "expired-browser",
+						metadata: { path: "/get-session" },
+					},
+				},
+			]);
+			expect(await exercise("owned")).toEqual(native);
+		});
+
+		it("keeps a session whose concurrent renewal commits during expiration cleanup", async () => {
+			const active = await browserSession(eventEmail);
+			const realm = `"${alpha.schemaName}"`;
+			const renewal = await database.connect();
+			let pending: Promise<Response> | undefined;
+			let committed = false;
+			try {
+				await database.query(
+					`UPDATE ${realm}.session SET "expiresAt"=statement_timestamp()+interval '2 seconds' WHERE id=$1`,
+					[active.id],
+				);
+				await renewal.query("BEGIN");
+				const renewed = await renewal.query(
+					`UPDATE ${realm}.session SET "expiresAt"=statement_timestamp()+interval '7 days'
+					 WHERE id=$1 AND "expiresAt">statement_timestamp()`,
+					[active.id],
+				);
+				expect(renewed.rowCount).toBe(1);
+				await expect
+					.poll(
+						async () => {
+							const { rows } = await database.query<{ expired: boolean }>(
+								`SELECT "expiresAt"<=statement_timestamp() AS expired FROM ${realm}.session WHERE id=$1`,
+								[active.id],
+							);
+							return rows[0]?.expired;
+						},
+						{ timeout: 5000 },
+					)
+					.toBe(true);
+				pending = owned.readSession(
+					request(
+						`${alpha.path}/get-session?disableRefresh=true`,
+						undefined,
+						active.cookie,
+					),
+				);
+				void pending.catch(() => {});
+				await expect
+					.poll(
+						async () => {
+							const { rows } = await database.query<{ waiting: boolean }>(
+								`SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE datname=current_database()
+						 AND wait_event_type='Lock' AND query LIKE '%WHERE token = ANY($1::text[])%' AND query LIKE '%FOR UPDATE%') AS waiting`,
+							);
+							return rows[0]?.waiting;
+						},
+						{ timeout: 4000 },
+					)
+					.toBe(true);
+				await renewal.query("COMMIT");
+				committed = true;
+				const result = await pending;
+				expect(result.status).toBe(200);
+				expect(await result.json()).toMatchObject({
+					session: { id: active.id },
+				});
+				expect(result.headers.getSetCookie()).toEqual([]);
+				expect(
+					(
+						await database.query(
+							`SELECT id FROM ${realm}."allauthEvent" WHERE type='session.deleted' AND "targetId"=$1`,
+							[active.id],
+						)
+					).rows,
+				).toEqual([]);
+			} finally {
+				if (!committed) await renewal.query("ROLLBACK");
+				renewal.release();
+				await pending?.catch(() => {});
+				await database.query(`DELETE FROM ${realm}.session WHERE id=$1`, [
+					active.id,
+				]);
+			}
+		});
+
 		it("delivers native bulk session events for the exact deleted sessions and request actor", async () => {
 			async function exercise(writer: "legacy" | "owned") {
 				await database.query(

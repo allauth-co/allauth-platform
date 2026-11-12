@@ -184,18 +184,21 @@ export function createProjectEngineStore(database: Pool, schemaName: string) {
 		token: string,
 		refreshWindow: number,
 		client?: PoolClient,
+		options?: { includeExpired: boolean },
 	) {
 		const result = await (client ?? database).query<{
 			session: ProjectSession;
 			user: ProjectUser;
 			refreshDue: boolean;
+			expired: boolean;
 		}>(
 			`SELECT row_to_json(s) AS session, row_to_json(u) AS "user",
-				s."expiresAt" <= statement_timestamp() + $2::int * interval '1 second' AS "refreshDue"
+				s."expiresAt" <= statement_timestamp() + $2::int * interval '1 second' AS "refreshDue",
+				s."expiresAt" <= statement_timestamp() AS expired
 			FROM (SELECT ${sessionFields} FROM "${schema}"."session" s
-				WHERE s.token = $1 AND s."expiresAt" > statement_timestamp()) s
+				WHERE s.token = $1 AND ($3::boolean OR s."expiresAt" > statement_timestamp())) s
 			JOIN LATERAL (SELECT ${userFields} FROM "${schema}"."user" u WHERE u.id = s."userId") u ON true`,
-			[token, refreshWindow],
+			[token, refreshWindow, options?.includeExpired ?? false],
 		);
 		return result.rows[0] ?? null;
 	}
@@ -282,20 +285,21 @@ export function createProjectEngineStore(database: Pool, schemaName: string) {
 	/** Delete only sessions in this realm, recording existing audit events in the same transaction. */
 	async function revoke(
 		selector:
-			| { tokens: string[] }
+			| { tokens: string[]; expiredOnly?: boolean }
 			| { id: string; userId: string; currentToken: string }
 			| { userId: string; exceptActiveToken?: string },
 		path: string,
 		canDeliverBackchannel = false,
 		client?: PoolClient,
-		actorId?: string,
+		actorId?: string | null,
 	) {
 		async function remove(client: PoolClient) {
 			const selected =
 				"tokens" in selector
 					? await client.query<{ id: string; userId: string }>(
-							'SELECT id, "userId" FROM "session" WHERE token = ANY($1::text[]) ORDER BY id FOR UPDATE',
-							[selector.tokens],
+							`SELECT id, "userId" FROM "session" WHERE token = ANY($1::text[])
+							 AND (NOT $2::boolean OR "expiresAt" <= statement_timestamp()) ORDER BY id FOR UPDATE`,
+							[selector.tokens, selector.expiredOnly ?? false],
 						)
 					: "id" in selector
 						? await client.query<{ id: string; userId: string }>(
@@ -359,7 +363,10 @@ export function createProjectEngineStore(database: Pool, schemaName: string) {
 				await recordOwnedProjectEvent(client, {
 					type: "session.deleted",
 					outcome: "success",
-					actorId: path === "/sign-out" ? undefined : (actorId ?? row.userId),
+					actorId:
+						path === "/sign-out" || actorId === null
+							? undefined
+							: (actorId ?? row.userId),
 					userId: row.userId,
 					targetId: row.id,
 					metadata: { path },
