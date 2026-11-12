@@ -8,6 +8,7 @@ import {
 import {
 	organizationFailure as failure,
 	organizationJson as json,
+	organizationValidationFailure,
 } from "./owned-project-organization-response";
 import type { projectOrganizations } from "./owned-project-organization-store";
 import { projectOrganizationTeams } from "./owned-project-organization-team-store";
@@ -50,7 +51,7 @@ const listTeamMemberInput = z.object({ teamId: field.optional() });
 const setActiveInput = z.object({ teamId: field.nullish() });
 
 const badInput = () =>
-	failure(400, "BAD_REQUEST", "Invalid organization team request.");
+	organizationValidationFailure("Invalid organization team request.");
 const noActiveOrg = () =>
 	failure(400, "NO_ACTIVE_ORGANIZATION", "No active organization");
 const noOrg = () =>

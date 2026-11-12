@@ -7,6 +7,7 @@ import {
 import {
 	organizationFailure as failure,
 	organizationJson as json,
+	organizationValidationFailure as badInput,
 } from "./owned-project-organization-response";
 import type { projectOrganizations } from "./owned-project-organization-store";
 
@@ -46,8 +47,6 @@ export function isOrganizationLifecycleRoute(path: string): path is Path {
 	return Object.hasOwn(organizationLifecycleRoutes, path);
 }
 
-const badInput = () =>
-	failure(400, "BAD_REQUEST", "Invalid organization request.");
 const noOrganization = () =>
 	failure(400, "ORGANIZATION_NOT_FOUND", "Organization not found");
 const noActiveOrganization = () =>
@@ -260,7 +259,8 @@ async function updateMemberRole(
 		.flatMap((role) => role.split(","))
 		.map((role) => role.trim())
 		.filter(Boolean);
-	if (!rolesToSet.length) return badInput();
+	if (!rolesToSet.length)
+		return failure(400, "BAD_REQUEST", "Invalid organization request.");
 	if (!(await realm.organization(organizationId, "id", "write")))
 		return noMember();
 	const actor = await realm.member(principal.user.id, organizationId, true);

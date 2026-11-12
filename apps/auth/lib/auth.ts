@@ -29,6 +29,8 @@ import { postgresDatabase } from "./postgres-database";
 import { databasePoolSize, isNodeRuntime } from "./runtime";
 import { allauthControl } from "./control";
 import type { ControlDatabase, ControlPrincipal } from "./control";
+import { mutationEventType } from "./control/event-contract";
+import { isNativeEndpointValidationError } from "./control/events";
 import { extraServerPlugins } from "./features/server";
 import type { NativeProjectAgentReplayBridge } from "./projects/owned-project-agent-native-replay";
 import { accountSessions } from "./account-sessions";
@@ -212,6 +214,11 @@ export function createAuthOptions(database: BetterAuthOptions["database"], env: 
 					await recordAudit(database, { actorId: current.user.id, action: current.user.twoFactorEnabled ? "two-factor.enrolled" : "two-factor.disabled", targetId: current.user.id });
 				}
 				if (!ctx.path || !auditPaths.has(ctx.path) || ctx.context.returned instanceof APIError) return;
+				if (
+					realm &&
+					mutationEventType(ctx.path)?.startsWith("admin.") &&
+					isNativeEndpointValidationError(ctx.context.returned)
+				) return;
 				const session = ctx.context.session;
 				if (!session) return;
 				const body = ctx.body as Record<string, unknown> | undefined;
@@ -229,7 +236,7 @@ export function createAuthOptions(database: BetterAuthOptions["database"], env: 
 			}),
 			admin({ defaultRole: "user", adminRoles: ["admin"], impersonationSessionDuration: 60 * 15, allowImpersonatingAdmins: false }),
 			productionTwoFactor(realm?.publicOrigin || realm?.primaryOrigin || url, realm && !realm.publicOrigin ? "/sign-in?challenge=two-factor" : undefined, appName),
-			allauthControl({ database: queryDatabase, secret: setting(env, "BETTER_AUTH_SECRET"), baseURL: url, ipHeader: isNodeRuntime(env) ? "x-real-ip" : "cf-connecting-ip", requireTrustedIP: isNodeRuntime(env), authorizeAdmin: realm?.authorizeAdmin,
+			allauthControl({ project: Boolean(realm), database: queryDatabase, secret: setting(env, "BETTER_AUTH_SECRET"), baseURL: url, ipHeader: isNodeRuntime(env) ? "x-real-ip" : "cf-connecting-ip", requireTrustedIP: isNodeRuntime(env), authorizeAdmin: realm?.authorizeAdmin,
 				async onRevokeUser(adapter, userId) { await revokeUserGrants(adapter, userId); await revokeAuthenticationChallenges(adapter, userId); },
 				onVerifiedNewDevice: emailConfigured(emailEnv) ? async (user, device) => { await sendAuthentication({ to: user.email, subject: (name) => `New sign-in to ${name}`, title: "New device signed in", description: (name) => `Hello ${user.name}, a new device signed in to ${name}.${device.ipAddress ? ` IP address: ${device.ipAddress}.` : ""} If this was unexpected, review your sessions and change your password.`, url: `${realm?.publicOrigin || realm?.primaryOrigin || url}/account`, actionLabel: "Review account security" }); } : undefined,
 			}),

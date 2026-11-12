@@ -194,7 +194,7 @@ describe.skipIf(!existsSync(fixturePath))(
 				baseURL: origin,
 				basePath: realm.path,
 				trustedOrigins: [],
-				trustedIP: () => clientIP,
+				trustedIP: (incoming) => incoming.headers.get("x-real-ip"),
 				signingSecret: realm.secret,
 				policy: defaultAuthPolicy,
 				issuer: Boolean(backchannelLogout),
@@ -962,12 +962,11 @@ describe.skipIf(!existsSync(fixturePath))(
 						[singleRevocationPath],
 					)
 				).rowCount;
-			// Native attributes a successful mutation to a rejected schema request.
-			expect(await auditCount()).toBe(1);
+			expect(await auditCount()).toBe(0);
 			expect(
 				await responseShape(await candidate.dispatch(malformed())),
 			).toEqual(rejected);
-			expect(await auditCount()).toBe(1);
+			expect(await auditCount()).toBe(0);
 			expect(
 				(
 					await database.query(
@@ -1567,16 +1566,26 @@ describe.skipIf(!existsSync(fixturePath))(
 						candidate.dispatch,
 						"Synthetic-native-admin-credential-8!",
 						linkedIds[0]!,
+						"198.51.100.136",
 					],
 					[
 						candidate.dispatch,
 						stock.handler,
 						"Synthetic-owned-admin-credential-8!",
 						linkedIds[1]!,
+						"198.51.100.138",
 					],
 				] as const;
+				const credentialSignIn = (userId: string, value: string, ip: string) => {
+					const incoming = request(`${alpha.path}/sign-in/email`, undefined, {
+						email: `${userId}@fixture.example`,
+						password: value,
+					});
+					incoming.headers.set("x-real-ip", ip);
+					return incoming;
+				};
 				let previous = password;
-				for (const [write, rollback, replacement, linked] of writers) {
+				for (const [write, rollback, replacement, linked, ip] of writers) {
 					for (const table of ["oauthAccessToken", "oauthRefreshToken"])
 						await database.query(
 							`INSERT INTO ${scope}."${table}" (id,token,"clientId","sessionId","userId","expiresAt","createdAt",scopes)
@@ -1609,19 +1618,11 @@ describe.skipIf(!existsSync(fixturePath))(
 						expect(account?.password).toMatch(/^[a-f0-9]{32}:[a-f0-9]{128}$/);
 						if (userId === id) expect(account?.id).toBe(original?.id);
 						const signedIn = await rollback(
-							request(`${alpha.path}/sign-in/email`, undefined, {
-								email: `${userId}@fixture.example`,
-								password: replacement,
-							}),
+							credentialSignIn(userId, replacement, ip),
 						);
 						expect(signedIn.status, await signedIn.clone().text()).toBe(200);
 					}
-					const stale = await rollback(
-						request(`${alpha.path}/sign-in/email`, undefined, {
-							email: `${id}@fixture.example`,
-							password: previous,
-						}),
-					);
+					const stale = await rollback(credentialSignIn(id, previous, ip));
 					expect(stale.status).toBe(401);
 					previous = replacement;
 					const session = await rollback(
@@ -2440,6 +2441,228 @@ describe.skipIf(!existsSync(fixturePath))(
 					)
 				).rowCount,
 			).toBe(0);
+		});
+
+		it("delivers matching signed realm administrator create, update, password and session revocation events", async () => {
+			const outbound = vi
+				.spyOn(globalThis, "fetch")
+				.mockImplementation(async (input) => {
+					const url = new URL(input instanceof Request ? input.url : input);
+					if (url.href === `${origin}/.well-known/openid-configuration`)
+						return Response.json({
+							issuer: origin,
+							authorization_endpoint: `${origin}/oauth2/authorize`,
+							token_endpoint: `${origin}/oauth2/token`,
+							jwks_uri: `${origin}/jwks`,
+						});
+					expect(url.origin).toBe("https://api.pwnedpasswords.com");
+					expect(url.pathname).toMatch(/^\/range\/[0-9A-F]{5}$/);
+					return new Response(`${"0".repeat(35)}:0\r\n`);
+				});
+			const scope = `"${alpha.schemaName}"`;
+			const endpoint = randomUUID();
+			const signingSecret = newWebhookSigningSecret();
+			const destinationURL =
+				"https://admin-mutation-events.fixture.example/hook";
+			const replacement = "Synthetic-signed-admin-credential-9!";
+			try {
+				const stock = await stockRealm();
+				const candidate = localizeProjectErrors(
+					engine(
+						alpha,
+						undefined,
+						undefined,
+						createOwnedProjectPasswordSafety(),
+					),
+				);
+				await database.query(
+					`INSERT INTO ${scope}."allauthWebhookEndpoint" (id,url,"eventTypes","encryptedSecret") VALUES ($1,$2,'["admin.*"]',$3)`,
+					[
+						endpoint,
+						destinationURL,
+						await symmetricEncrypt({ key: alpha.secret, data: signingSecret }),
+					],
+				);
+				async function operate(
+					writer: string,
+					dispatch: (incoming: Request) => Promise<Response>,
+				) {
+					const email = `signed-administrator-${writer}@fixture.example`;
+					const call = (path: string, body: object, proof = realmCookie) =>
+						dispatch(request(alpha.path + path, proof, body));
+					const input = {
+						name: "Signed event fixture",
+						email,
+						data: { emailVerified: true },
+					};
+					const created = await call(createRealmUserPath, input);
+					expect(created.status, await created.clone().text()).toBe(200);
+					const { user } = (await created.json()) as { user: { id: string } };
+					expect((await call(createRealmUserPath, input)).status).toBe(400);
+					expect(
+						(
+							await call(updateRealmUserPath, {
+								userId: user.id,
+								data: { name: "Updated fixture" },
+							})
+						).status,
+					).toBe(200);
+					expect(
+						(await call(updateRealmUserPath, { userId: user.id, data: {} }))
+							.status,
+					).toBe(400);
+					expect(
+						(
+							await call(passwordPath, {
+								userId: user.id,
+								newPassword: replacement,
+							})
+						).status,
+					).toBe(200);
+					const sessions = [];
+					for (const attempt of [1, 2]) {
+						const login = await native.handler(
+							request(`${alpha.path}/sign-in/email`, undefined, {
+								email,
+								password: replacement,
+							}),
+						);
+						expect(
+							login.status,
+							`Sign-in ${attempt}: ${await login.clone().text()}`,
+						).toBe(200);
+						const signed = cookie(login);
+						const session = await native.api.getSession({
+							headers: new Headers({ cookie: signed }),
+						});
+						if (!session)
+							throw new Error("The fixture account has no session.");
+						sessions.push({ cookie: signed, ...session.session });
+					}
+					const [first, second] = sessions;
+					expect(
+						(
+							await call(
+								singleRevocationPath,
+								{ sessionToken: first!.token },
+								second!.cookie,
+							)
+						).status,
+					).toBe(403);
+					expect(
+						(await call(singleRevocationPath, { sessionToken: first!.token }))
+							.status,
+					).toBe(200);
+					expect(
+						(await call(bulkRevocationPath, { userId: user.id })).status,
+					).toBe(200);
+					expect(
+						(
+							await database.query(
+								`SELECT id FROM ${scope}."session" WHERE "userId"=$1`,
+								[user.id],
+							)
+						).rows,
+					).toEqual([]);
+
+					const events: Omit<
+						ControlWebhookEnvelope["data"]["event"],
+						"id" | "createdAt"
+					>[] = [];
+					expect(
+						await deliverPendingWebhooks({
+							database: nativeProjectDatabase,
+							secret: alpha.secret,
+							now: () => new Date(Date.now() + 2_000),
+							maxDeliveries: 12,
+							resolver: async () => [{ address: "93.184.216.34", family: 4 }],
+							async transport({ destination, body, headers }) {
+								expect(destination.url.href).toBe(destinationURL);
+								const digest = createHmac(
+									"sha256",
+									Buffer.from(signingSecret.slice(6), "base64"),
+								)
+									.update(
+										`${headers["webhook-id"]}.${headers["webhook-timestamp"]}.${body}`,
+									)
+									.digest("base64");
+								expect(headers["webhook-signature"]).toBe(`v1,${digest}`);
+								const envelope = JSON.parse(body) as ControlWebhookEnvelope;
+								const { id, createdAt, ...event } = envelope.data.event;
+								expect(envelope).toEqual({
+									id,
+									type: event.type,
+									timestamp: createdAt,
+									data: { event: { id, createdAt, ...event } },
+								});
+								for (const sensitive of [
+									replacement,
+									email,
+									first!.token,
+									second!.token,
+									signingSecret,
+								])
+									expect(body).not.toContain(sensitive);
+								events.push({
+									...event,
+									actorId: event.actorId === user.id ? "target" : event.actorId,
+									userId: event.userId === user.id ? "target" : event.userId,
+									targetId:
+										event.targetId === user.id ? "target" : event.targetId,
+								});
+								return 204;
+							},
+						}),
+					).toEqual({ claimed: 8, delivered: 8, retried: 0, failed: 0 });
+					return events.sort((left, right) =>
+						JSON.stringify(left).localeCompare(JSON.stringify(right)),
+					);
+				}
+				const nativeEvents = await operate("native", stock.handler);
+				expect(
+					nativeEvents.map(({ type, outcome }) => `${type}:${outcome}`).sort(),
+				).toEqual([
+					"admin.create-user:failure",
+					"admin.create-user:success",
+					"admin.revoke-user-session:failure",
+					"admin.revoke-user-session:success",
+					"admin.revoke-user-sessions:success",
+					"admin.set-user-password:success",
+					"admin.update-user:failure",
+					"admin.update-user:success",
+				]);
+				expect(await operate("allauth", candidate.dispatch)).toEqual(
+					nativeEvents,
+				);
+				for (const dispatch of [candidate.dispatch, stock.handler]) {
+					const rejected = await dispatch(
+						request(alpha.path + singleRevocationPath, realmCookie, {
+							sessionToken: 10,
+						}),
+					);
+					expect(rejected.status).toBe(400);
+					expect(await rejected.json()).toMatchObject({
+						code: "VALIDATION_ERROR",
+					});
+					const transport = vi.fn(async () => 204);
+					expect(
+						await deliverPendingWebhooks({
+							database: nativeProjectDatabase,
+							secret: alpha.secret,
+							now: () => new Date(Date.now() + 2_000),
+							resolver: async () => [{ address: "93.184.216.34", family: 4 }],
+							transport,
+						}),
+					).toEqual({ claimed: 0, delivered: 0, retried: 0, failed: 0 });
+					expect(transport).not.toHaveBeenCalled();
+				}
+			} finally {
+				outbound.mockRestore();
+				await database.query(
+					`DELETE FROM ${scope}."allauthWebhookEndpoint" WHERE id=$1`,
+					[endpoint],
+				);
+			}
 		});
 	},
 );

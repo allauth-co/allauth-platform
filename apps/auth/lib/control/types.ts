@@ -85,6 +85,7 @@ export type ControlDatabase = Kysely<Record<string, Record<string, unknown>>>;
 
 /** PostgreSQL is optional for audit hooks, required for indexed dashboard analytics/search. */
 export interface AllauthControlOptions {
+	project?: boolean;
 	database?: ControlDatabase;
 	secret?: string;
 	baseURL?: string;

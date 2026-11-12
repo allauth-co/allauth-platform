@@ -4,7 +4,7 @@ import { createAuthEndpoint, createAuthMiddleware, getAuthoritativeSessionFromCt
 import * as z from "zod";
 import { isPlatformAdmin, rolesInclude } from "../configuration";
 import { isPrimaryAuthenticationPath, mutationEventType } from "./event-contract";
-import { controlResponseFailure, recordControlEvent, writeControlEvent } from "./events";
+import { controlResponseFailure, isNativeEndpointValidationError, recordControlEvent, writeControlEvent } from "./events";
 import { controlEventsQuery, controlIdentifier, controlSessionsQuery } from "./read-input";
 import { controlRetentionDays, pruneControlEvents, queryControlEvents, queryControlOverview, queryControlSessions } from "./queries";
 import { createControlSecurity } from "./security";
@@ -150,6 +150,23 @@ export function allauthControl(options: AllauthControlOptions = {}) {
 			if (ctx.method === "GET" && path !== "/verify-email") return;
 			const type = mutationEventType(path);
 			if (!type) return;
+			if (
+				options.project &&
+				path === "/change-email" &&
+				isNativeEndpointValidationError(ctx.context.returned)
+			) {
+				await recordControlEvent(
+					ctx,
+					{ type, outcome: "failure", metadata: { path, errorCode: "VALIDATION_ERROR" } },
+					options.ipHeader,
+				);
+				return;
+			}
+			if (
+				options.project &&
+				type.startsWith("admin.") &&
+				isNativeEndpointValidationError(ctx.context.returned)
+			) return;
 		if (type.startsWith("api-key.")) {
 			const returned = ctx.context.returned;
 			const malformed = isAPIError(returned) && returned.statusCode === 400 && returned.body?.code === "VALIDATION_ERROR";
@@ -200,7 +217,10 @@ export function allauthControl(options: AllauthControlOptions = {}) {
 				const model = field(body, "invitationId") ? "invitation" : field(body, "teamId") ? "team" : field(body, "memberId") ? "member" : undefined;
 				if (model) organizationId = (await ctx.context.adapter.findOne<{ organizationId: string }>({ model, where: [{ field: "id", value: targetId }], select: ["organizationId"] }))?.organizationId;
 			}
-			await recordControlEvent(ctx, { type, outcome: result.failed ? "failure" : "success", actorId: actor?.session.impersonatedBy || actor?.user.id, userId: field(body, "userId") || actor?.user.id || authenticated?.user.id, targetId, organizationId, clientId: field(body, "client_id"), metadata: { path, ...(result.failed ? { errorCode: result.code } : {}) } }, options.ipHeader);
+			const malformedOrganizationMutation = options.project && type.startsWith("organization.") && isNativeEndpointValidationError(ctx.context.returned);
+			const failed = malformedOrganizationMutation || result.failed;
+			const errorCode = malformedOrganizationMutation ? "VALIDATION_ERROR" : result.code;
+			await recordControlEvent(ctx, { type, outcome: failed ? "failure" : "success", actorId: actor?.session.impersonatedBy || actor?.user.id, userId: field(body, "userId") || actor?.user.id || authenticated?.user.id, targetId, organizationId, clientId: field(body, "client_id"), metadata: { path, ...(failed ? { errorCode } : {}) } }, options.ipHeader);
 		}),
 	};
 	return {

@@ -1,7 +1,8 @@
-import { randomUUID } from "node:crypto";
+import { createHmac, randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { runWithAdapter } from "@better-auth/core/context";
 import { APIError } from "better-auth";
+import { symmetricEncrypt } from "better-auth/crypto";
 import { admin, organization } from "better-auth/plugins";
 import { getTestInstance } from "better-auth/test";
 import { Kysely, PostgresDialect } from "kysely";
@@ -10,7 +11,10 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { defaultAuthPolicy } from "../auth-policy/policy";
 import { clerkCompatiblePasswords } from "../clerk-password";
 import { allauthControl } from "../control";
-import type { ControlPrincipal } from "../control/types";
+import type { ControlDatabase, ControlPrincipal } from "../control/types";
+import { newWebhookSigningSecret } from "../control/webhook-contract";
+import type { ControlWebhookEnvelope } from "../control/webhooks";
+import { deliverPendingWebhooks } from "../control/webhooks";
 import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
 import { invitationImportPath } from "./invitation-import-contract";
 import { projectManagement } from "./management-plugin";
@@ -33,6 +37,7 @@ const ownedRecipient = "fixture-owned-recipient";
 const migrations = [
 	"001-initial-auth",
 	"002-control-plane",
+	"004-webhooks",
 	"005-free-plugins",
 	"016-invitation-import-provenance",
 ];
@@ -657,6 +662,121 @@ describe.skipIf(!existsSync(fixture))(
 			}
 			expect(sendNativeMail).not.toHaveBeenCalled();
 			expect(sendOwnedMail).not.toHaveBeenCalled();
+		});
+
+		it("delivers the native signed invitation import envelope from either writer", async () => {
+			const configured = (await legacy.$context).options.database;
+			if (
+				!configured ||
+				typeof configured !== "object" ||
+				!("db" in configured)
+			)
+				throw new Error(
+					"The isolated invitation project database is required for delivery.",
+				);
+			const scope = `"${alpha.schemaName}"`;
+			const endpoint = randomUUID();
+			const signingSecret = newWebhookSigningSecret();
+			const destinationURL =
+				"https://invitation-import-webhook.fixture.example/events";
+			await database.query(
+				`INSERT INTO ${scope}."allauthWebhookEndpoint" (id,url,"eventTypes","encryptedSecret") VALUES ($1,$2,'["admin.*"]',$3)`,
+				[
+					endpoint,
+					destinationURL,
+					await symmetricEncrypt({ key: alpha.secret, data: signingSecret }),
+				],
+			);
+			try {
+				const expected = new Map<string, string>();
+				for (const [writer, rollback] of [
+					["native", "owned"],
+					["owned", "native"],
+				] as const) {
+					const recipient = email(`signed-invitation-${writer}`);
+					const row = fixtureRow(`signed-invitation-${writer}`, recipient);
+					const preview = await response(writer, body([row], true));
+					expect(preview.invitations[0]).toMatchObject({
+						status: "would_create",
+					});
+					const imported = await response(writer, body([row], false));
+					const invitation = imported.invitations[0]!;
+					expect(invitation).toMatchObject({
+						status: "created",
+						invitationId: expect.any(String),
+					});
+					expected.set(invitation.invitationId!, recipient);
+					const replay = await response(rollback, body([row], false));
+					expect(replay.invitations[0]).toMatchObject({
+						status: "existing",
+						invitationId: invitation.invitationId,
+					});
+				}
+				const captured: { body: string; headers: Record<string, string> }[] =
+					[];
+				expect(
+					await deliverPendingWebhooks({
+						database: configured.db as ControlDatabase,
+						secret: alpha.secret,
+						now: () => new Date(Date.now() + 2_000),
+						resolver: async () => [{ address: "93.184.216.34", family: 4 }],
+						async transport({ destination, body, headers }) {
+							expect(destination.url.href).toBe(destinationURL);
+							captured.push({ body, headers });
+							return 204;
+						},
+					}),
+				).toEqual({ claimed: 2, delivered: 2, retried: 0, failed: 0 });
+				for (const { body, headers } of captured) {
+					const digest = createHmac(
+						"sha256",
+						Buffer.from(signingSecret.slice(6), "base64"),
+					)
+						.update(
+							`${headers["webhook-id"]}.${headers["webhook-timestamp"]}.${body}`,
+						)
+						.digest("base64");
+					expect(headers["webhook-signature"]).toBe(`v1,${digest}`);
+					const envelope = JSON.parse(body) as ControlWebhookEnvelope;
+					const { id, createdAt, targetId } = envelope.data.event;
+					const recipient = expected.get(targetId!);
+					expect(recipient).toBeDefined();
+					expect(envelope).toEqual({
+						id,
+						type: "admin.invitation-import",
+						timestamp: createdAt,
+						data: {
+							event: {
+								id,
+								type: "admin.invitation-import",
+								outcome: "success",
+								createdAt,
+								actorId: root,
+								targetId,
+								organizationId,
+								userAgent: "invitation-import-fixture",
+								metadata: { signal: "invitation-import", version: 1 },
+							},
+						},
+					});
+					for (const sensitive of [
+						recipient!,
+						signingSecret,
+						rootCookies,
+						sourceInstance,
+					])
+						expect(body).not.toContain(sensitive);
+					expected.delete(targetId!);
+				}
+				expect(expected.size).toBe(0);
+				expect(sendNativeMail).not.toHaveBeenCalled();
+				expect(sendOwnedMail).not.toHaveBeenCalled();
+			} finally {
+				await database.query(
+					`DELETE FROM ${scope}."allauthWebhookEndpoint" WHERE id=$1`,
+					[endpoint],
+				);
+			}
 		});
 	},
 );

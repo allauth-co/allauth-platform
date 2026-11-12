@@ -24,10 +24,12 @@ import {
 
 const age = 3600;
 const purpose = "allauth-email-change";
-const address = z.email().max(320);
+const maxEmailLength = 320;
+const maxCallbackLength = 2048;
+const address = z.email().max(maxEmailLength);
 const change = z.object({
-	newEmail: address,
-	callbackURL: z.string().max(2048).optional(),
+	newEmail: z.email(),
+	callbackURL: z.string().optional(),
 });
 const stages = z.enum([
 	"change-email-confirmation",
@@ -136,6 +138,21 @@ export function createOwnedProjectEmailChange(
 		);
 	}
 
+	function recordRequest(
+		client: PoolClient,
+		request: Request,
+		{ userId, errorCode }: { userId?: string; errorCode?: string } = {},
+	) {
+		return store.recordEvent(client, {
+			type: "user.email-change-requested",
+			outcome: errorCode ? "failure" : "success",
+			actorId: userId,
+			userId,
+			...options.auditContext?.(request),
+			metadata: { path: "/change-email", ...(errorCode && { errorCode }) },
+		});
+	}
+
 	async function start(request: Request, input: unknown) {
 		if (!links.requestURL(request, "POST", "/change-email"))
 			return accountLinkError(
@@ -144,12 +161,22 @@ export function createOwnedProjectEmailChange(
 				"This authentication request is not permitted.",
 			);
 		const parsed = change.safeParse(input);
-		if (!parsed.success)
+		if (
+			!parsed.success ||
+			parsed.data.newEmail.length > maxEmailLength ||
+			(parsed.data.callbackURL?.length ?? 0) > maxCallbackLength
+		) {
+			// Transport parse failures return before the native endpoint hook.
+			if (!parsed.success && input !== undefined)
+				await store.transaction((client) =>
+					recordRequest(client, request, { errorCode: "VALIDATION_ERROR" }),
+				);
 			return accountLinkError(
 				400,
 				"INVALID_BODY",
 				"Supply a valid new email address.",
 			);
+		}
 		const destination = links.callback(
 			parsed.data.callbackURL,
 			request.headers.get("origin") ?? undefined,
@@ -163,16 +190,8 @@ export function createOwnedProjectEmailChange(
 		const newEmail = parsed.data.newEmail.toLowerCase();
 		const result = await store.transaction(async (client) => {
 			const current = await options.authority(client, request);
-			const audit = {
-				type: "user.email-change-requested",
-				...options.auditContext?.(request),
-			};
 			if (!current) {
-				await store.recordEvent(client, {
-					...audit,
-					outcome: "failure",
-					metadata: { path: "/change-email", errorCode: "UNAUTHORIZED" },
-				});
+				await recordRequest(client, request, { errorCode: "UNAUTHORIZED" });
 				return accountLinkError(401, "UNAUTHORIZED", "Unauthorized");
 			}
 			if (current.impersonatedBy || current.eligible === false)
@@ -189,27 +208,14 @@ export function createOwnedProjectEmailChange(
 					"DELETION_PENDING",
 					"Account deletion is already being processed.",
 				);
-			const attributed = {
-				...audit,
-				actorId: user.id,
-				userId: user.id,
-			};
 			if (newEmail === user.email) {
-				await store.recordEvent(client, {
-					...attributed,
-					outcome: "failure",
-					metadata: {
-						path: "/change-email",
-						errorCode: "AUTHENTICATION_FAILED",
-					},
+				await recordRequest(client, request, {
+					userId: user.id,
+					errorCode: "AUTHENTICATION_FAILED",
 				});
 				return accountLinkError(400, "BAD_REQUEST", "Email is the same");
 			}
-			await store.recordEvent(client, {
-				...attributed,
-				outcome: "success",
-				metadata: { path: "/change-email" },
-			});
+			await recordRequest(client, request, { userId: user.id });
 			const kind = user.emailVerified
 				? "change-email-confirmation"
 				: "change-email-verification";

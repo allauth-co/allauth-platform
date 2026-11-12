@@ -552,6 +552,7 @@ describe.skipIf(!existsSync(fixturePath))(
 			const target = randomUUID();
 			const existingEmail = "email-change-signed-target@fixture.example";
 			const unusedEmail = "email-change-signed-unregistered@fixture.example";
+			const invalidEmail = "synthetic-invalid-email";
 			const endpoint = randomUUID();
 			const subscription = newWebhookSigningSecret();
 			const recipient = "https://email-change-hook.fixture.example/events";
@@ -585,7 +586,7 @@ describe.skipIf(!existsSync(fixturePath))(
 					await symmetricEncrypt({ key: secret, data: subscription }),
 				],
 			);
-			const request = (newEmail: string) =>
+			const request = (newEmail?: string) =>
 				new Request(`${origin}${basePath}${path}`, {
 					method: "POST",
 					headers: {
@@ -594,7 +595,7 @@ describe.skipIf(!existsSync(fixturePath))(
 						"x-real-ip": address,
 						"user-agent": rawUserAgent,
 					},
-					body: JSON.stringify({ newEmail }),
+					body: newEmail === undefined ? "{" : JSON.stringify({ newEmail }),
 				});
 			const expected = {
 				type: "user.email-change-requested",
@@ -604,16 +605,38 @@ describe.skipIf(!existsSync(fixturePath))(
 				metadata: { path, errorCode: "UNAUTHORIZED" },
 			};
 			async function exercise(dispatch: Dispatch) {
-				for (const email of [existingEmail, unusedEmail, existingEmail]) {
+				expect((await dispatch(request())).status).toBe(400);
+				await database.query(
+					`DELETE FROM ${scope}."rateLimit" WHERE "key"=$1`,
+					[rateKey],
+				);
+				for (const email of [existingEmail, invalidEmail, unusedEmail]) {
 					const response = await dispatch(request(email));
-					expect(response.status).toBe(401);
-					expect(await response.json()).toEqual({
-						code: "UNAUTHORIZED",
-						message: "Unauthorized",
-					});
+					const invalid = email === invalidEmail;
+					expect(response.status).toBe(invalid ? 400 : 401);
+					const body = await response.json();
+					if (!invalid)
+						expect(body).toEqual({
+							code: "UNAUTHORIZED",
+							message: "Unauthorized",
+						});
+					else if (dispatch === nativeEngine.handler)
+						expect(body).toEqual({
+							code: "VALIDATION_ERROR",
+							message: "Validation error",
+							originalMessage: "[body.newEmail] Invalid email address",
+						});
+					else
+						expect(body).toEqual({
+							code: "INVALID_BODY",
+							message: "Supply a valid new email address.",
+						});
 					expect(response.headers.getSetCookie()).toEqual([]);
 				}
-				const events = new Set<string>();
+				const events = new Map<
+					string,
+					Omit<ControlWebhookEnvelope["data"]["event"], "id" | "createdAt">
+				>();
 				const worker = await deliverPendingWebhooks({
 					database: nativeDatabase,
 					secret,
@@ -632,16 +655,17 @@ describe.skipIf(!existsSync(fixturePath))(
 						expect(headers["webhook-signature"]).toBe(`v1,${signature}`);
 						expect(body).not.toContain(existingEmail);
 						expect(body).not.toContain(unusedEmail);
+						expect(body).not.toContain(invalidEmail);
 						expect(body).not.toContain(target);
 						const envelope = JSON.parse(body) as ControlWebhookEnvelope;
-						const { id, createdAt } = envelope.data.event;
+						const { id, createdAt, ...event } = envelope.data.event;
 						expect(envelope).toEqual({
 							id,
 							type: expected.type,
 							timestamp: createdAt,
-							data: { event: { id, createdAt, ...expected } },
+							data: { event: { id, createdAt, ...event } },
 						});
-						events.add(id);
+						events.set(id, event);
 						return 204;
 					},
 				});
@@ -652,6 +676,21 @@ describe.skipIf(!existsSync(fixturePath))(
 					failed: 0,
 				});
 				expect(events.size).toBe(3);
+				expect(
+					[...events.values()].filter(
+						(event) => event.metadata.errorCode === "UNAUTHORIZED",
+					),
+				).toEqual([expected, expected]);
+				expect(
+					[...events.values()].filter(
+						(event) => event.metadata.errorCode !== "UNAUTHORIZED",
+					),
+				).toEqual([
+					{
+						...expected,
+						metadata: { path, errorCode: "VALIDATION_ERROR" },
+					},
+				]);
 				const countAudits = async () =>
 					(
 						await database.query(

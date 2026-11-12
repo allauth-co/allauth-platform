@@ -30,8 +30,10 @@ import {
 	organizationMembersQuery,
 } from "./owned-project-organization-members";
 import {
+	organizationAuditErrorCode,
 	organizationFailure as failure,
 	organizationJson as json,
+	organizationValidationFailure as invalidBody,
 } from "./owned-project-organization-response";
 import {
 	handleProjectOrganizationRole,
@@ -155,8 +157,6 @@ function isOrganizationRoute(path: string): path is RoutePath {
 }
 
 const unauthorized = () => failure(401, "UNAUTHORIZED", "Not authenticated");
-const invalidBody = () =>
-	failure(400, "BAD_REQUEST", "Invalid organization request.");
 const organizationMissing = () =>
 	failure(400, "ORGANIZATION_NOT_FOUND", "Organization not found");
 const noActiveOrganization = () =>
@@ -288,6 +288,7 @@ async function issueInvitation(
 		.map((part) => part.trim())
 		.filter(Boolean);
 	const unknownRoles = requestedRoles.filter((part) => !roles.has(part));
+	// The installed unknown-role rejection has no HTTP code, so its event uses the default failure code.
 	if (!requestedRoles.length || unknownRoles.length)
 		return failure(
 			400,
@@ -295,6 +296,7 @@ async function issueInvitation(
 			unknownRoles.length
 				? `Role not found: ${unknownRoles.join(", ")}`
 				: "Role not found",
+			unknownRoles.length ? "AUTHENTICATION_FAILED" : undefined,
 		);
 	if (
 		requestedRoles.includes("owner") &&
@@ -457,7 +459,8 @@ async function organizationMutationEvent(
 		organizationId = rows[0]?.organizationId;
 	}
 	// The installed browser organization middleware does not set the control hook's actor.
-	const error = response.ok ? undefined : auditField(body, "code");
+	const errorCode =
+		organizationAuditErrorCode(response) ?? auditField(body, "code");
 	return {
 		type,
 		outcome: response.ok ? "success" : "failure",
@@ -466,7 +469,7 @@ async function organizationMutationEvent(
 		organizationId,
 		metadata: {
 			path,
-			...(!response.ok && { errorCode: error || "AUTHENTICATION_FAILED" }),
+			...(!response.ok && { errorCode: errorCode || "AUTHENTICATION_FAILED" }),
 		},
 	};
 }

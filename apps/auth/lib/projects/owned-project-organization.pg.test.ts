@@ -308,7 +308,7 @@ describe.skipIf(!existsSync(fixturePath))(
 			return id;
 		}
 
-		it("preserves signed invitation events, team context and session renewal across writers", async () => {
+		function installedOrganizationWriters() {
 			const previous = betterAuth({
 				...createAuthOptions(
 					{ db: legacyDatabase!, type: "postgres", transaction: true },
@@ -350,12 +350,16 @@ describe.skipIf(!existsSync(fixturePath))(
 				policy: defaultAuthPolicy,
 				trustedIP: (request) => request.headers.get("x-real-ip"),
 			});
-			const writers = { native: previous.handler, owned: candidate.dispatch };
+			return { native: previous.handler, owned: candidate.dispatch };
+		}
+
+		it("preserves signed invitation events, team context and session renewal across writers", async () => {
+			const writers = installedOrganizationWriters();
 			const owner = await account();
 			const outsider = await account();
 			const selected = await organizationFixture(owner);
 			const teamId = selected.teams[0]!.id;
-			const secondTeam = await candidate.dispatch(
+			const secondTeam = await writers.owned(
 				request("create-team", owner.cookie, {
 					organizationId: selected.id,
 					name: "Second signed fixture team",
@@ -625,6 +629,203 @@ describe.skipIf(!existsSync(fixturePath))(
 						`DELETE FROM "${namespace}"."allauthWebhookEndpoint" WHERE id=$1`,
 						[endpointId],
 					);
+			}
+		});
+
+		it("signs organization schema validation and unknown invitation role failures across writers", async () => {
+			const writers = installedOrganizationWriters();
+			const owner = await account();
+			const outsider = await account();
+			const selected = await organizationFixture(owner);
+			const mutations = {
+				create: "created",
+				update: "updated",
+				delete: "deleted",
+				"remove-member": "member.removed",
+				"update-member-role": "member.role-updated",
+				"invite-member": "invitation.created",
+				"cancel-invitation": "invitation.cancelled",
+				"accept-invitation": "invitation.accepted",
+				"reject-invitation": "invitation.rejected",
+				leave: "member.left",
+				"create-team": "team.created",
+				"update-team": "team.updated",
+				"remove-team": "team.removed",
+				"add-team-member": "team.member-added",
+				"remove-team-member": "team.member-removed",
+				"create-role": "role.created",
+				"update-role": "role.updated",
+				"delete-role": "role.deleted",
+			};
+			const deliveryCount = Object.keys(mutations).length + 2;
+			const endpointId = randomUUID();
+			const url =
+				"https://organization-update-webhooks.fixture.example/receive";
+			const signingKey = newWebhookSigningSecret();
+			await database.query(
+				`INSERT INTO "${schema}"."allauthWebhookEndpoint" (id,url,"eventTypes","encryptedSecret")
+				 VALUES ($1,$2,'["organization.*"]',$3)`,
+				[endpointId, url, sealLegacyUnversionedRecord(signingKey, secret)],
+			);
+			try {
+				for (const writer of ["native", "owned"] as const) {
+					const dispatch = writers[writer];
+					const organizationId = selected.id;
+					const name = `Signed valid update from ${writer}`;
+					const updated = await dispatch(
+						request("update", owner.cookie, {
+							organizationId,
+							data: { name },
+						}),
+					);
+					expect(updated.status).toBe(200);
+					expect(await updated.json()).toMatchObject({
+						id: organizationId,
+						name,
+					});
+					for (const endpoint of Object.keys(mutations)) {
+						const malformed = await dispatch(
+							request(
+								endpoint,
+								owner.cookie,
+								endpoint === "update" ? { organizationId } : {},
+							),
+						);
+						expect(malformed.status, `${writer} ${endpoint}`).toBe(400);
+						expect(await malformed.json()).toMatchObject({
+							code: writer === "native" ? "VALIDATION_ERROR" : "BAD_REQUEST",
+						});
+					}
+					const denied = await dispatch(
+						request("update", outsider.cookie, {
+							organizationId,
+							data: { name: "Unauthorized fixture update" },
+						}),
+					);
+					expect(denied.status).toBe(400);
+					const denial = "USER_IS_NOT_A_MEMBER_OF_THE_ORGANIZATION";
+					expect(await denied.json()).toMatchObject({ code: denial });
+					const persisted = await database.query(
+						`SELECT name FROM "${schema}"."organization" WHERE id=$1`,
+						[organizationId],
+					);
+					expect(persisted.rows).toEqual([{ name }]);
+
+					const received: ControlWebhookEnvelope["data"]["event"][] = [];
+					const deliveryOptions: Parameters<typeof deliverPendingWebhooks>[0] =
+						{
+							database: legacyDatabase!,
+							secret,
+							maxDeliveries: deliveryCount,
+							now: () => new Date(Date.now() + 1000),
+							resolver: async () => [{ address: "93.184.216.34", family: 4 }],
+							async transport({ destination, body, headers }) {
+								expect(destination.url.href).toBe(url);
+								expect(headers["webhook-signature"]).toBe(
+									await webhookSignature(
+										signingKey,
+										headers["webhook-id"],
+										headers["webhook-timestamp"],
+										body,
+									),
+								);
+								const envelope = JSON.parse(body) as ControlWebhookEnvelope;
+								expect(envelope.data.event).toMatchObject({
+									id: envelope.id,
+									type: envelope.type,
+									createdAt: envelope.timestamp,
+								});
+								expect(envelope.data.user).toBeUndefined();
+								expect(body).not.toContain(name);
+								expect(body).not.toContain(outsider.email);
+								expect(body).not.toContain("unavailable-fixture-role");
+								received.push(envelope.data.event);
+								return 204;
+							},
+						};
+					expect(await deliverPendingWebhooks(deliveryOptions)).toEqual({
+						claimed: deliveryCount,
+						delivered: deliveryCount,
+						retried: 0,
+						failed: 0,
+					});
+					const path = "/organization/update";
+					const common = {
+						id: expect.any(String),
+						createdAt: expect.any(String),
+						ipAddress: "192.0.2.38",
+						userAgent: "organization-rehearsal",
+					};
+					const update = {
+						...common,
+						type: "organization.updated",
+						organizationId,
+					};
+					expect(received, writer).toEqual(
+						expect.arrayContaining([
+							{ ...update, outcome: "success", metadata: { path } },
+							{
+								...update,
+								outcome: "failure",
+								metadata: { path, errorCode: denial },
+							},
+							...Object.entries(mutations).map(([endpoint, suffix]) => ({
+								...common,
+								type: `organization.${suffix}`,
+								...(endpoint === "update" && { organizationId }),
+								outcome: "failure",
+								metadata: {
+									path: `/organization/${endpoint}`,
+									errorCode: "VALIDATION_ERROR",
+								},
+							})),
+						]),
+					);
+					received.length = 0;
+					const invitation = await dispatch(
+						request("invite-member", owner.cookie, {
+							organizationId,
+							email: outsider.email,
+							role: "unavailable-fixture-role",
+						}),
+					);
+					expect(invitation.status).toBe(400);
+					expect(await invitation.json()).toEqual({
+						message: `${writer === "native" ? "ROLE_NOT_FOUND" : "Role not found"}: unavailable-fixture-role`,
+						...(writer === "owned" && { code: "BAD_REQUEST" }),
+					});
+					expect(
+						(
+							await database.query(
+								`SELECT id FROM "${schema}"."invitation" WHERE "organizationId"=$1 AND email=$2`,
+								[organizationId, outsider.email],
+							)
+						).rows,
+					).toEqual([]);
+					expect(await deliverPendingWebhooks(deliveryOptions)).toEqual({
+						claimed: 1,
+						delivered: 1,
+						retried: 0,
+						failed: 0,
+					});
+					expect(received, writer).toEqual([
+						{
+							...common,
+							type: "organization.invitation.created",
+							organizationId,
+							outcome: "failure",
+							metadata: {
+								path: "/organization/invite-member",
+								errorCode: "AUTHENTICATION_FAILED",
+							},
+						},
+					]);
+				}
+			} finally {
+				await database.query(
+					`DELETE FROM "${schema}"."allauthWebhookEndpoint" WHERE id=$1`,
+					[endpointId],
+				);
 			}
 		});
 

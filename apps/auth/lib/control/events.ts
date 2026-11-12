@@ -2,6 +2,7 @@ import type { GenericEndpointContext } from "@better-auth/core";
 import { getCurrentAdapter } from "@better-auth/core/context";
 import type { DBTransactionAdapter } from "@better-auth/core/db/adapter";
 import { APIError } from "better-auth";
+import { isAPIError } from "better-auth/api";
 import {
 	controlEventAttributes,
 	sanitizeControlMetadata,
@@ -56,6 +57,15 @@ export async function recordControlEvent(
 			(ipHeader ? headers?.get(ipHeader) || undefined : undefined),
 		userAgent: event.userAgent || headers?.get("user-agent") || undefined,
 	});
+}
+
+/** Endpoint schema validation uses the base error recognized by the native dispatcher. */
+export function isNativeEndpointValidationError(returned: unknown): boolean {
+	return (
+		isAPIError(returned) &&
+		returned.statusCode === 400 &&
+		returned.body?.code === "VALIDATION_ERROR"
+	);
 }
 
 /** Interpret genuine errors returned by the legacy adapter within the browser result precedence. */

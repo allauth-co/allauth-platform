@@ -11,6 +11,7 @@ import {
 import {
 	organizationFailure as failure,
 	organizationJson as json,
+	organizationValidationFailure as invalidBody,
 } from "./owned-project-organization-response";
 import { projectOrganizationRoleStore } from "./owned-project-organization-role-store";
 import type { projectOrganizations } from "./owned-project-organization-store";
@@ -65,8 +66,6 @@ const routePermission = {
 	"/organization/delete-role": ["delete", "DELETE"],
 } as const;
 
-const invalidBody = () =>
-	failure(400, "BAD_REQUEST", "Invalid organization request.");
 const roleMissing = () => failure(400, "ROLE_NOT_FOUND", "Role not found");
 const roleTaken = () =>
 	failure(400, "ROLE_NAME_IS_ALREADY_TAKEN", "That role name is already taken");
