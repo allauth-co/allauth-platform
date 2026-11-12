@@ -111,13 +111,14 @@ afterEach(async () => {
 	vi.unstubAllGlobals();
 });
 
-type View = "invitation" | "list" | "switch" | "manager" | "settings";
+type View = "invitation" | "list" | "switch" | "manager" | "settings" | "teams";
 
 function Preview({ view }: { view: View }) {
 	const client = useHostedOrganizationClient();
 	if (view === "manager") return createElement(OrganizationManager);
-	if (view === "settings")
+	if (view === "settings" || view === "teams")
 		return createElement(HostedOrganizationDetail, {
+			view,
 			children: createElement("p", null, "Legacy organization detail"),
 		});
 	if (!client) return createElement("p", null, "Standard portal");
@@ -172,6 +173,14 @@ function network(
 	});
 	vi.stubGlobal("fetch", calls);
 	return calls;
+}
+
+function setInput(input: HTMLInputElement, value: string) {
+	Object.getOwnPropertyDescriptor(
+		Object.getPrototypeOf(input),
+		"value",
+	)!.set!.call(input, value);
+	input.dispatchEvent(new Event("input", { bubbles: true }));
 }
 
 it("keeps preview transport off by default and does not query a signed-out invitation", async () => {
@@ -481,13 +490,6 @@ it("edits the selected hosted organization and requires explicit confirmation to
 	).toBe("/organization/settings");
 	const [name, slug] = [...container.querySelectorAll("input")];
 	expect(name!.value).toBe(organization.name);
-	const setInput = (input: HTMLInputElement, value: string) => {
-		Object.getOwnPropertyDescriptor(
-			Object.getPrototypeOf(input),
-			"value",
-		)!.set!.call(input, value);
-		input.dispatchEvent(new Event("input", { bubbles: true }));
-	};
 	await act(async () => {
 		setInput(name!, "Operations Group");
 		setInput(slug!, "Operations Group");
@@ -580,4 +582,129 @@ it("keeps the standard organization detail component outside the hosted preview"
 	const container = await render("settings", false);
 	expect(container.textContent).toBe("Legacy organization detail");
 	expect(requests).not.toHaveBeenCalled();
+});
+
+it("keeps team roster access tied to membership and renames the selected hosted team", async () => {
+	const active = {
+		id: "active-team",
+		name: "Active Team",
+		organizationId: organization.id,
+	};
+	const other = {
+		id: "other-team",
+		name: "Other Team",
+		organizationId: organization.id,
+	};
+	const rename = vi.fn();
+	const readRoster = vi.fn();
+	const addMember = vi.fn();
+	const newUser = {
+		id: "new-user",
+		name: "Available Member",
+		email: "new-member@fixture.example",
+	};
+	let roster = [
+		{ id: "owner-membership", teamId: active.id, userId: session.user.id },
+	];
+	network(async (path, request) => {
+		const query = new URL(request.url).searchParams;
+		switch (path) {
+			case "get-session":
+				return {
+					...session,
+					session: { ...session.session, activeTeamId: active.id },
+				};
+			case "organization/get-full-organization":
+				return organization;
+			case "organization/has-permission": {
+				const body = (await request.json()) as { organizationId: string };
+				expect(body.organizationId).toBe(organization.id);
+				return { success: true };
+			}
+			case "organization/list-teams":
+				expect(query.get("organizationId")).toBe(organization.id);
+				return [active, other];
+			case "organization/list-user-teams":
+				expect(query.get("organizationId")).toBe(organization.id);
+				return [active];
+			case "organization/list-members":
+				return {
+					members: [
+						{ id: "active-user", userId: session.user.id, user: session.user },
+						{ id: "available-user", userId: newUser.id, user: newUser },
+					],
+					total: 2,
+				};
+			case "organization/list-team-members":
+				readRoster(query.get("teamId"));
+				return roster;
+			case "organization/add-team-member":
+				addMember(await request.json());
+				roster = [
+					...roster,
+					{ id: "new-membership", teamId: active.id, userId: newUser.id },
+				];
+				return roster.at(-1);
+			case "organization/update-team": {
+				const body = (await request.json()) as {
+					teamId: string;
+					data: { name: string };
+				};
+				rename(body);
+				active.name = body.data.name;
+				return active;
+			}
+			default:
+				throw new Error(`Unexpected organization operation ${path}`);
+		}
+	});
+	const container = await render("teams");
+	await act(async () => new Promise<void>((resolve) => setTimeout(resolve, 0)));
+	const manage = (name: string) =>
+		[...container.querySelectorAll("button")].find(
+			(button) => button.getAttribute("aria-label") === `Manage ${name}`,
+		)!;
+	await act(async () => manage(other.name).click());
+	let dialog = document.querySelector('[role="dialog"]')!;
+	expect(dialog.textContent).toContain(other.name);
+	expect(dialog.textContent).not.toContain("Team members");
+	expect(readRoster).not.toHaveBeenCalled();
+	const close = [...dialog.querySelectorAll("button")].find(
+		(button) => button.textContent === "Close",
+	)!;
+	await act(async () => close.click());
+	await act(async () => manage(active.name).click());
+	await act(async () => new Promise<void>((resolve) => setTimeout(resolve, 0)));
+	dialog = document.querySelector('[role="dialog"]')!;
+	expect(readRoster).toHaveBeenCalledExactlyOnceWith(active.id);
+	const deleteTeam = [...dialog.querySelectorAll("button")].find(
+		(button) => button.textContent === "Delete team",
+	)!;
+	expect(deleteTeam.disabled).toBe(true);
+	const picker = dialog.querySelector("select")!;
+	await act(async () => {
+		picker.value = newUser.id;
+		picker.dispatchEvent(new Event("change", { bubbles: true }));
+	});
+	const add = [...dialog.querySelectorAll("button")].find(
+		(button) => button.textContent === "Add to team",
+	)!;
+	await act(async () => add.click());
+	expect(addMember).toHaveBeenCalledExactlyOnceWith({
+		organizationId: organization.id,
+		teamId: active.id,
+		userId: newUser.id,
+	});
+	const input = dialog.querySelector("input")!;
+	await act(async () => setInput(input, "Renamed Team"));
+	await act(async () =>
+		dialog
+			.querySelector("form")!
+			.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })),
+	);
+	expect(rename).toHaveBeenCalledExactlyOnceWith({
+		teamId: active.id,
+		data: { name: "Renamed Team", organizationId: organization.id },
+	});
+	expect(container.textContent).toContain("Renamed Team");
 });

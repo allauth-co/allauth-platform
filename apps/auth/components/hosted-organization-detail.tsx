@@ -9,6 +9,8 @@ import { toast } from "sonner";
 import type { AllAuthClient, AllAuthOrganization } from "@/sdk/client";
 import { authError } from "@/sdk/helpers";
 import { useHostedOrganizationClient } from "./hosted-organization-client";
+import { useHostedOrganizationPermission } from "./hosted-organization-management";
+import { HostedOrganizationTeams } from "./hosted-organization-teams";
 import {
 	AlertDialog,
 	AlertDialogCancel,
@@ -32,55 +34,34 @@ const views = {
 	people: "People",
 } as const;
 
-type Access =
-	| { resource: "organization"; action: "update" | "delete" }
-	| { resource: "ac"; action: "read" };
+type DetailView = "settings" | "teams";
 
-function usePermission(
-	client: AllAuthClient,
-	userId: string | undefined,
-	organizationId: string | undefined,
-	{ resource, action }: Access,
-) {
-	return useQuery({
-		queryKey: [
-			"hosted-organization",
-			"permission",
-			userId,
-			organizationId,
-			resource,
-			action,
-		],
-		enabled: Boolean(userId && organizationId),
-		queryFn: async () => {
-			const result = await client.organization.hasPermission({
-				organizationId,
-				permissions: { [resource]: [action] },
-			});
-			if (result.error) throw new Error(result.error.message);
-			return result.data?.success === true;
-		},
-	});
-}
-
-/** First-party settings for the organization selected in the verified hosted session. */
+/** First-party management for the organization selected in the verified hosted session. */
 export function HostedOrganizationDetail({
 	children,
+	view = "settings",
 }: {
 	children: ReactNode;
+	view?: DetailView;
 }) {
 	const client = useHostedOrganizationClient();
-	return client ? <OrganizationDetail client={client} /> : children;
+	return client ? <OrganizationDetail client={client} view={view} /> : children;
 }
 
-function OrganizationDetail({ client }: { client: AllAuthClient }) {
+function OrganizationDetail({
+	client,
+	view,
+}: {
+	client: AllAuthClient;
+	view: DetailView;
+}) {
 	const router = useRouter();
 	const session = client.useSession();
 	const organizationId =
 		session.data?.session.activeOrganizationId || undefined;
 	const userId = session.data?.user.id;
 	const organization = useQuery({
-		queryKey: ["hosted-organization", "settings", userId, organizationId],
+		queryKey: ["hosted-organization", "detail", userId, organizationId],
 		enabled: Boolean(userId && organizationId),
 		queryFn: async () => {
 			const result = await client.organization.getFullOrganization({
@@ -90,18 +71,28 @@ function OrganizationDetail({ client }: { client: AllAuthClient }) {
 			return result.data?.id === organizationId ? result.data : null;
 		},
 	});
-	const update = usePermission(client, userId, organizationId, {
-		resource: "organization",
-		action: "update",
-	});
-	const remove = usePermission(client, userId, organizationId, {
-		resource: "organization",
-		action: "delete",
-	});
-	const roles = usePermission(client, userId, organizationId, {
-		resource: "ac",
-		action: "read",
-	});
+	const settingsOrg = view === "settings" ? organizationId : undefined;
+	const update = useHostedOrganizationPermission(
+		client,
+		userId,
+		settingsOrg,
+		"organization",
+		"update",
+	);
+	const remove = useHostedOrganizationPermission(
+		client,
+		userId,
+		settingsOrg,
+		"organization",
+		"delete",
+	);
+	const roles = useHostedOrganizationPermission(
+		client,
+		userId,
+		organizationId,
+		"ac",
+		"read",
+	);
 	useEffect(() => {
 		if (session.isPending || session.error) return;
 		if (!session.data) router.replace("/sign-in");
@@ -133,21 +124,21 @@ function OrganizationDetail({ client }: { client: AllAuthClient }) {
 	return (
 		<div className="account-settings space-y-4 md:space-y-6">
 			<nav aria-label="Organization" className="flex flex-wrap gap-2">
-				{Object.entries(views).map(([view, label]) =>
-					view === "roles" && !roles.data ? (
-						<Button key={view} variant="ghost" size="sm" disabled>
+				{Object.entries(views).map(([item, label]) =>
+					item === "roles" && !roles.data ? (
+						<Button key={item} variant="ghost" size="sm" disabled>
 							{label}
 						</Button>
 					) : (
 						<Button
-							key={view}
-							variant={view === "settings" ? "secondary" : "ghost"}
+							key={item}
+							variant={item === view ? "secondary" : "ghost"}
 							size="sm"
 							asChild
 						>
 							<Link
-								href={`/organization/${view}`}
-								aria-current={view === "settings" ? "page" : undefined}
+								href={`/organization/${item}`}
+								aria-current={item === view ? "page" : undefined}
 							>
 								{label}
 							</Link>
@@ -160,18 +151,29 @@ function OrganizationDetail({ client }: { client: AllAuthClient }) {
 					{accessError}
 				</p>
 			)}
-			<OrganizationProfile
-				key={organization.data.id}
-				client={client}
-				organization={organization.data}
-				canUpdate={update.data === true}
-				canDelete={remove.data === true}
-				permissionsLoading={remove.isLoading}
-				updated={async () => {
-					await organization.refetch();
-				}}
-				departed={() => router.replace(organizationListPath)}
-			/>
+			{view === "teams" ? (
+				<HostedOrganizationTeams
+					key={organization.data.id}
+					client={client}
+					organizationId={organization.data.id}
+					userId={userId}
+					activeTeamId={session.data?.session.activeTeamId}
+					refreshSession={session.refetch}
+				/>
+			) : (
+				<OrganizationProfile
+					key={organization.data.id}
+					client={client}
+					organization={organization.data}
+					canUpdate={update.data === true}
+					canDelete={remove.data === true}
+					permissionsLoading={remove.isLoading}
+					updated={async () => {
+						await organization.refetch();
+					}}
+					departed={() => router.replace(organizationListPath)}
+				/>
+			)}
 		</div>
 	);
 }

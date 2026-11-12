@@ -181,6 +181,8 @@ describe("hosted SDK transport", () => {
 			"get-full-organization",
 			"list-members",
 			"list-team-members",
+			"list-teams",
+			"list-user-teams",
 			"list-roles",
 		];
 		const writes = [
@@ -194,6 +196,7 @@ describe("hosted SDK transport", () => {
 			"update-member-role",
 			"remove-member",
 			"create-team",
+			"update-team",
 			"remove-team",
 			"add-team-member",
 			"remove-team-member",

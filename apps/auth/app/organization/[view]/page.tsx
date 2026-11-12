@@ -20,8 +20,10 @@ export default async function Page({
 				title="Organization"
 				description="Manage organization settings, members, teams and access roles."
 			/>
-			{view === "settings" ? (
-				<HostedOrganizationDetail>{legacy}</HostedOrganizationDetail>
+			{view === "settings" || view === "teams" ? (
+				<HostedOrganizationDetail view={view}>
+					{legacy}
+				</HostedOrganizationDetail>
 			) : (
 				legacy
 			)}
