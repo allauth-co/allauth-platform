@@ -1772,6 +1772,49 @@ export function createOwnedProjectEngine(
 			},
 		});
 
+	function passkeyGuestUser(
+		user: ProjectUser | null,
+	): user is ProjectUser & { isAnonymous: true; role: "guest" } {
+		return Boolean(
+			user?.isAnonymous === true &&
+				user.role === "guest" &&
+				!user.banned &&
+				!user.directoryManaged &&
+				!user.directoryDisabled &&
+				!user.emailVerified &&
+				!user.twoFactorEnabled &&
+				policy.mfaMode === "optional" &&
+				!policy.requireEmailVerification,
+		);
+	}
+
+	function passkeyOwner(user: ProjectUser | null): user is ProjectUser {
+		return (activeUser(user) && verifiedUser(user)) || passkeyGuestUser(user);
+	}
+
+	async function completePasskeySession(
+		client: PoolClient,
+		user: ProjectUser | null,
+		request: Request,
+		path: "/passkey/verify-registration" | "/passkey/verify-authentication",
+	) {
+		if (!passkeyGuestUser(user))
+			return primaryResult(client, user, request, true, path);
+		if (missingSupportAdapter) return unsupported();
+		if (await security.denySession(client, request, user.email))
+			return securityBlocked();
+		// A verified passkey restores the same guest identity. It cannot convert
+		// the current or another guest into an ordinary account.
+		const { headers, session, user: value } = await createSession(
+			client,
+			user,
+			request,
+			true,
+			path,
+		);
+		return json({ session, user: value }, 200, headers);
+	}
+
 	const passkeyHttp =
 		options.passkeys &&
 		createOwnedProjectPasskeyHttp({
@@ -1799,8 +1842,7 @@ export function createOwnedProjectEngine(
 				return store.transaction(async (client) => {
 					const user = await store.lockUser(client, userId);
 					if (
-						!activeUser(user) ||
-						!verifiedUser(user) ||
+						!passkeyOwner(user) ||
 						!(await store.lockSession(client, token, userId, fresh))
 					)
 						return null;
@@ -1846,24 +1888,22 @@ export function createOwnedProjectEngine(
 			async completeSignIn(request, userId, record) {
 				return store.transaction(async (client) => {
 					const user = await store.lockUser(client, userId);
-					if (!activeUser(user) || user.directoryManaged || !verifiedUser(user))
+					if (!passkeyOwner(user) || user.directoryManaged)
 						return null;
 					if (!(await record(client))) return null;
-					return primaryResult(
+					return completePasskeySession(
 						client,
 						user,
 						request,
-						true,
 						"/passkey/verify-authentication",
 					);
 				});
 			},
 			async completeRegistration(client, request, userId) {
-				return primaryResult(
+				return completePasskeySession(
 					client,
 					await store.lockUser(client, userId),
 					request,
-					true,
 					"/passkey/verify-registration",
 				);
 			},

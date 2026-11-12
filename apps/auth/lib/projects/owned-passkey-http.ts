@@ -23,8 +23,7 @@ import { checkedProjectSchema } from "./validation";
 
 const challengeMaxAge = 300;
 const webAuthnBytes = 262144;
-const identifier = z.string().min(1).max(160);
-const name = z.string().trim().min(1).max(256);
+const name = z.string().trim();
 const encoded = z
 	.string()
 	.min(1)
@@ -46,15 +45,16 @@ const credentialResponse = z.object({
 	authenticatorAttachment: z.enum(["platform", "cross-platform"]).optional(),
 });
 const registration = z.object({
-	response: credentialResponse.extend({
-		response: z.object({
-			clientDataJSON: encoded,
-			attestationObject: encoded,
-			transports: z.array(transports).max(8).optional(),
-		}),
-	}),
+	response: z.unknown(),
 	name: name.optional(),
 	createSession: z.boolean().optional(),
+});
+const registrationProof = credentialResponse.extend({
+	response: z.object({
+		clientDataJSON: encoded,
+		attestationObject: encoded,
+		transports: z.array(transports).max(8).optional(),
+	}),
 });
 const authentication = z.object({
 	response: credentialResponse.extend({
@@ -80,8 +80,8 @@ const passkeyMutationEvents = {
 	"/passkey/update-passkey": "passkey.updated",
 } as const;
 type PasskeyMutationPath = keyof typeof passkeyMutationEvents;
-const passkeyUpdate = z.object({ id: identifier, name: name.optional() });
-const passkeyTarget = passkeyUpdate.pick({ id: true });
+const passkeyTarget = z.object({ id: z.string() });
+const passkeyUpdate = passkeyTarget.extend({ name: name.min(1) });
 const eventError = z.object({ code: z.string().regex(/^[A-Z0-9_-]{1,100}$/) });
 
 interface PasskeySession {
@@ -150,6 +150,21 @@ const notFound = () =>
 	json({ code: "PASSKEY_NOT_FOUND", message: "Passkey not found" }, 404);
 const challengeNotFound = () =>
 	json({ code: "CHALLENGE_NOT_FOUND", message: "Challenge not found" }, 400);
+const verificationFailed = () =>
+	json(
+		{
+			code: "FAILED_TO_VERIFY_REGISTRATION",
+			message: "Failed to verify registration",
+		},
+		400,
+	);
+
+function validationFailure(issues: readonly z.core.$ZodIssue[]) {
+	const message = issues
+		.map((issue) => `[${["body", ...issue.path].join(".")}] ${issue.message}`)
+		.join("; ");
+	return json({ code: "VALIDATION_ERROR", message }, 400);
+}
 
 function descriptors(rows: StoredProjectPasskey[]) {
 	return rows.map((row) => ({
@@ -229,7 +244,6 @@ export function createOwnedProjectPasskeyHttp(options: Options) {
 		response: Response,
 		userId?: string,
 		targetId?: string,
-		errorCode?: string,
 	) {
 		const parsed = eventError.safeParse(
 			await response
@@ -241,15 +255,13 @@ export function createOwnedProjectPasskeyHttp(options: Options) {
 			recordMutation(client, request, path, {
 				userId,
 				targetId,
-				errorCode:
-					errorCode ??
-					(parsed.success ? parsed.data.code : "AUTHENTICATION_FAILED"),
+				errorCode: parsed.success ? parsed.data.code : "AUTHENTICATION_FAILED",
 			}),
 		);
 		return response;
 	}
 
-	async function anonymousTarget(request: Request) {
+	function readMutationBody(request: Request, limit: number) {
 		if (
 			!request.body ||
 			request.headers
@@ -258,19 +270,17 @@ export function createOwnedProjectPasskeyHttp(options: Options) {
 				?.trim()
 				.toLowerCase() !== "application/json"
 		)
-			return undefined;
-		// Preserve the native requested row ID in an anonymous denial without
-		// waiting indefinitely for an unauthenticated request body.
+			return options.readBody(request, limit);
+		// Classify the native DTO before authentication without holding a realm
+		// request open indefinitely on an unauthenticated body stream.
 		const timed = timedProjectProtocolStream(request.body);
-		const body = await options.readBody(
+		return options.readBody(
 			new Request(request, {
 				body: timed.stream,
 				duplex: "half",
 			} as RequestInit),
-			8192,
+			limit,
 		);
-		const parsed = passkeyTarget.safeParse(body);
-		return parsed.success ? parsed.data.id : undefined;
 	}
 
 	async function issueChallenge(
@@ -430,24 +440,21 @@ export function createOwnedProjectPasskeyHttp(options: Options) {
 	async function verifyRegistration(request: Request) {
 		const path = "/passkey/verify-registration";
 		const session = await options.readSession(request);
+		const body = await readMutationBody(request, webAuthnBytes);
+		if (body === undefined) return invalid();
+		const input = registration.safeParse(body);
+		if (!input.success)
+			return failedMutation(
+				request,
+				path,
+				validationFailure(input.error.issues),
+				session?.userId,
+			);
 		if (!session) return failedMutation(request, path, unauthorized());
 		if (!session.fresh)
 			return failedMutation(request, path, staleSession(), session.userId);
 		const refused = await options.admit(request, "verification");
 		if (refused) return refused;
-		const body = await options.readBody(request, webAuthnBytes);
-		const input = registration.safeParse(body);
-		if (!input.success)
-			return body === undefined
-				? invalid()
-				: failedMutation(
-						request,
-						path,
-						invalid(),
-						session.userId,
-						undefined,
-						"VALIDATION_ERROR",
-					);
 		const token = readLegacySessionCookie(
 			request.headers,
 			cookie,
@@ -455,13 +462,21 @@ export function createOwnedProjectPasskeyHttp(options: Options) {
 		);
 		if (!token)
 			return failedMutation(request, path, challengeNotFound(), session.userId);
+		const proof = registrationProof.safeParse(input.data.response);
+		if (!proof.success)
+			return failedMutation(
+				request,
+				path,
+				verificationFailed(),
+				session.userId,
+			);
 		let signIn: Response | undefined;
 		const registrationRefused = Symbol("Session issuance was refused");
 		const result = await verify
 			.register({
 				token,
 				name: input.data.name,
-				response: input.data.response satisfies RegistrationResponseJSON,
+				response: proof.data satisfies RegistrationResponseJSON,
 				freshUserId: async () => session.userId,
 				async registerCredential(userId, credential) {
 					return options.withSession(request, userId, true, async (client) => {
@@ -505,13 +520,7 @@ export function createOwnedProjectPasskeyHttp(options: Options) {
 			const failed =
 				result.reason === "challenge"
 					? challengeNotFound()
-					: json(
-							{
-								code: "FAILED_TO_VERIFY_REGISTRATION",
-								message: "Failed to verify registration",
-							},
-							400,
-						);
+					: verificationFailed();
 			return failedMutation(
 				request,
 				path,
@@ -561,30 +570,33 @@ export function createOwnedProjectPasskeyHttp(options: Options) {
 			)
 				return null;
 			const current = await options.readSession(request);
-			if (!current)
-				return failedMutation(
-					request,
-					path,
-					unauthorized(),
-					undefined,
-					await anonymousTarget(request),
-				);
-			const body = await options.readBody(request, 8192);
-			const input = passkeyUpdate.safeParse(body);
-			if (!input.success) {
-				if (body === undefined) return invalid();
+			const body = await readMutationBody(request, 8192);
+			if (body === undefined) return invalid();
+			const mutation =
+				path === "/passkey/delete-passkey"
+					? ({ kind: "delete", input: passkeyTarget.safeParse(body) } as const)
+					: ({ kind: "rename", input: passkeyUpdate.safeParse(body) } as const);
+			if (!mutation.input.success) {
 				const target = passkeyTarget.safeParse(body);
 				return failedMutation(
 					request,
 					path,
-					invalid(),
-					current.userId,
+					validationFailure(mutation.input.error.issues),
+					current?.userId,
 					target.success ? target.data.id : undefined,
-					"VALIDATION_ERROR",
 				);
 			}
-			const { id, name: updatedName } = input.data;
-			if (path === "/passkey/delete-passkey") {
+			const { id } = mutation.input.data;
+			if (!current)
+				return failedMutation(request, path, unauthorized(), undefined, id);
+			if (!id)
+				return failedMutation(
+					request,
+					path,
+					json({ message: "Missing required parameter: id" }, 400),
+					current.userId,
+				);
+			if (mutation.kind === "delete") {
 				const response = await options.withSession(
 					request,
 					current.userId,
@@ -608,15 +620,7 @@ export function createOwnedProjectPasskeyHttp(options: Options) {
 					failedMutation(request, path, notFound(), current.userId, id)
 				);
 			}
-			if (!updatedName)
-				return failedMutation(
-					request,
-					path,
-					invalid(),
-					current.userId,
-					id,
-					"VALIDATION_ERROR",
-				);
+			const { name: updatedName } = mutation.input.data;
 			const response = await options.withSession(
 				request,
 				current.userId,

@@ -175,6 +175,24 @@ export function allauthControl(options: AllauthControlOptions = {}) {
 				}, options.ipHeader);
 				return;
 			}
+			if (type.startsWith("passkey.")) {
+				const returned = ctx.context.returned;
+				const malformed = isAPIError(returned) && returned.statusCode === 400 && returned.body?.code === "VALIDATION_ERROR";
+				// Publish the same failure for missing or foreign credentials without changing the legacy HTTP response.
+				const opaqueOwnership = actor && isAPIError(returned) && returned.statusCode === 401 && (
+					(path === "/passkey/delete-passkey" && !returned.body?.code) ||
+					(path === "/passkey/update-passkey" && returned.body?.code === "YOU_ARE_NOT_ALLOWED_TO_REGISTER_THIS_PASSKEY")
+				);
+				const errorCode = opaqueOwnership ? "PASSKEY_NOT_FOUND" : malformed ? "VALIDATION_ERROR" : result.failed ? result.code : undefined;
+				await recordControlEvent(ctx, {
+					type, outcome: malformed || result.failed ? "failure" : "success",
+					actorId: actor?.session.impersonatedBy || actor?.user.id,
+					userId: actor?.user.id || authenticated?.user.id,
+					targetId: path === "/passkey/verify-registration" ? undefined : field(body, "id"),
+					metadata: { path, ...(errorCode ? { errorCode } : {}) },
+				}, options.ipHeader);
+				return;
+			}
 			const targetId = field(body, "userId") || field(body, "memberId") || field(body, "teamId") || field(body, "invitationId") || field(body, "providerId") || field(body, "client_id") || field(body, "id");
 			let organizationId = field(body, "organizationId") || field(response, "organizationId") || field(object(response?.organization), "id") || field(object(response?.team), "organizationId");
 			if (path.startsWith("/organization/") && !organizationId && targetId) {

@@ -3,6 +3,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { passkey } from "@better-auth/passkey";
 import { isoCBOR } from "@simplewebauthn/server/helpers";
 import { symmetricEncrypt } from "better-auth/crypto";
+import { admin, anonymous } from "better-auth/plugins";
 import { getTestInstance } from "better-auth/test";
 import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -97,12 +98,12 @@ function legacyFixture(database: ReturnType<typeof postgresDatabase>, audit = fa
 		logger: { disabled: true },
 		plugins: [
 			passkey({ rpID: rpId, origin, requireUserVerification: true }),
-			...(audit ? [allauthControl({ database: database.db, secret: fixtureSecret, baseURL: origin, ipHeader: "x-real-ip", requireTrustedIP: true }), featureBoundaries()] : []),
+			...(audit ? [admin(), allauthControl({ database: database.db, secret: fixtureSecret, baseURL: origin, ipHeader: "x-real-ip", requireTrustedIP: true }), featureBoundaries(), anonymous()] : []),
 		],
 	}, { disableTestUser: true });
 }
 
-function ownedHttpFixture(database: Pool) {
+function ownedHttpFixture(database: Pool, policy = defaultAuthPolicy) {
 	return createOwnedProjectEngine({
 		database,
 		project: { slug: projectSlug, schemaName: primary },
@@ -110,7 +111,7 @@ function ownedHttpFixture(database: Pool) {
 		basePath: "/api/auth",
 		trustedOrigins: [],
 		signingSecret: fixtureSecret,
-		policy: defaultAuthPolicy,
+		policy,
 		trustedIP: (request) => request.headers.get("x-real-ip"),
 		passkeys: {
 			id: rpId,
@@ -340,11 +341,17 @@ describe.skipIf(!existsSync(fixturePath))("project passkey PostgreSQL interopera
 				return cookie;
 			}
 			const staleCookie = await agedSession("stale");
+			const foreignLogin = await legacy.auth.api.signInEmail({
+				body: { email: foreignEmail, password: fixturePassword },
+				asResponse: true,
+			});
+			expect(foreignLogin.status).toBe(200);
+			const foreignCookie = foreignLogin.headers.getSetCookie().map((value) => value.split(";", 1)[0]).join("; ");
 			const absent = "synthetic-missing-passkey";
 			const label = "Synthetic passkey label";
 			async function exercise(
 				dispatch: (request: Request) => Promise<Response>,
-				checkRollback = false,
+				candidateWriter = false,
 			) {
 				function send(operation: string, body?: object, session = cookie) {
 					return dispatch(
@@ -372,6 +379,22 @@ describe.skipIf(!existsSync(fixturePath))("project passkey PostgreSQL interopera
 					.getSetCookie()
 					.map((value) => value.split(";", 1)[0])
 					.join("; ");
+				async function expectValidation(operation: string, body: object, message: string, session = cookie) {
+					const rejected = await send(operation, body, session);
+					expect(rejected.status).toBe(400);
+					expect(await rejected.json()).toEqual({ code: "VALIDATION_ERROR", message });
+				}
+				await expectValidation(
+					"verify-registration", { ...request, createSession: "true" },
+					"[body.createSession] Invalid input: expected boolean, received string",
+					`${staleCookie}; ${challengeCookie}`,
+				);
+				const invalidProofOptions = await send("generate-register-options");
+				expect(invalidProofOptions.status).toBe(200);
+				const invalidProofCookie = invalidProofOptions.headers.getSetCookie().map((value) => value.split(";", 1)[0]).join("; ");
+				const invalidProof = await send("verify-registration", { response: {} }, `${cookie}; ${invalidProofCookie}`);
+				expect(invalidProof.status).toBe(candidateWriter ? 400 : 500);
+				expect(await invalidProof.json()).toMatchObject({ code: "FAILED_TO_VERIFY_REGISTRATION" });
 				const stale = { code: "SESSION_NOT_FRESH", message: "Session is not fresh" };
 				const unauthenticated = { code: "UNAUTHORIZED", message: "Unauthorized" };
 				const expiredCookie = await agedSession("expired");
@@ -395,7 +418,12 @@ describe.skipIf(!existsSync(fixturePath))("project passkey PostgreSQL interopera
 				);
 				expect(registered.status).toBe(200);
 				const { id } = (await registered.json()) as StoredProjectPasskey;
-				if (checkRollback) {
+				await expectValidation("update-passkey", { id, name: 7 }, "[body.name] Invalid input: expected string, received number");
+				await expectValidation("delete-passkey", { id: 7 }, "[body.id] Invalid input: expected string, received number", "");
+				const missingId = await send("delete-passkey", { id: "" });
+				expect(missingId.status).toBe(400);
+				expect(await missingId.json()).toMatchObject({ message: "Missing required parameter: id" });
+				if (candidateWriter) {
 					if (!pool) throw new Error("Missing PostgreSQL fixture.");
 					await pool.query(
 						`ALTER TABLE "${primary}"."allauthEvent" ADD CONSTRAINT test_passkey_event_failure CHECK (type<>'passkey.updated') NOT VALID`,
@@ -417,11 +445,17 @@ describe.skipIf(!existsSync(fixturePath))("project passkey PostgreSQL interopera
 				expect(
 					(await send("update-passkey", { id: absent, name: label })).status,
 				).toBe(404);
-				expect((await send("update-passkey", { id, name: label })).status).toBe(
-					200,
-				);
+				const extendedLabel = label.repeat(20);
+				const renamed = await send("update-passkey", { id, name: extendedLabel });
+				expect(renamed.status).toBe(200);
+				expect(await renamed.json()).toMatchObject({ passkey: { id, name: extendedLabel } });
+				for (const operation of ["update-passkey", "delete-passkey"]) {
+					const rejected = await send(operation, { id, name: label }, foreignCookie);
+					expect(rejected.status).toBe(candidateWriter ? 404 : 401);
+					if (candidateWriter) expect(await rejected.json()).toEqual({ code: "PASSKEY_NOT_FOUND", message: "Passkey not found" });
+				}
 				expect((await send("delete-passkey", { id }, "")).status).toBe(401);
-				expect((await send("delete-passkey", { id })).status).toBe(200);
+				expect((await send("delete-passkey", { id, name: 7, organizationId: "unrelated-fixture-field" })).status).toBe(200);
 				expect((await send("delete-passkey", { id: absent })).status).toBe(404);
 				const delivered: Array<{
 					body: string;
@@ -461,11 +495,13 @@ describe.skipIf(!existsSync(fixturePath))("project passkey PostgreSQL interopera
 						createdAt: envelope.timestamp,
 					});
 					expect(envelope.data.user).toBeUndefined();
+					expect(envelope.data.event.organizationId).toBeUndefined();
 					for (const privateValue of [
 						proof.id,
 						label,
 						response.response.attestationObject,
 						cookie,
+						foreignCookie,
 						signingKey,
 					])
 						expect(body).not.toContain(privateValue);
@@ -495,15 +531,27 @@ describe.skipIf(!existsSync(fixturePath))("project passkey PostgreSQL interopera
 				).toEqual([
 					"passkey.deleted:failure",
 					"passkey.deleted:failure",
+					"passkey.deleted:failure",
+					"passkey.deleted:failure",
+					"passkey.deleted:failure",
 					"passkey.deleted:success",
+					"passkey.registered:failure",
+					"passkey.registered:failure",
 					"passkey.registered:failure",
 					"passkey.registered:failure",
 					"passkey.registered:failure",
 					"passkey.registered:failure",
 					"passkey.registered:success",
 					"passkey.updated:failure",
+					"passkey.updated:failure",
+					"passkey.updated:failure",
 					"passkey.updated:success",
 				]);
+				for (const [type, operation] of [["passkey.deleted", "delete-passkey"], ["passkey.updated", "update-passkey"]])
+					expect(expected).toContainEqual({
+						...browser, type, outcome: "failure", actorId: foreignId, userId: foreignId, targetId: "credential-row",
+						metadata: { path: `/passkey/${operation}`, errorCode: "PASSKEY_NOT_FOUND" },
+					});
 				expect(expected).toContainEqual({
 					...browser,
 					type: "passkey.registered", outcome: "failure", actorId: ownerId, userId: ownerId,
@@ -545,6 +593,241 @@ describe.skipIf(!existsSync(fixturePath))("project passkey PostgreSQL interopera
 				);
 			}
 		});
+
+	it("keeps passkeys with the same existing unverified and guest identities", async () => {
+		if (!pool || !nativeDatabase)
+			throw new Error("Missing PostgreSQL fixture.");
+		const { auth } = await legacyFixture(nativeDatabase, true);
+		const candidate = ownedHttpFixture(pool, {
+			...defaultAuthPolicy,
+			requireEmailVerification: false,
+		});
+		const requiresVerification = ownedHttpFixture(pool);
+		const makeRequest = (path: string, cookie: string, body?: object) =>
+			new Request(`${origin}/api/auth/${path}`, {
+				method: body ? "POST" : "GET",
+				headers: {
+					origin,
+					cookie,
+					"x-real-ip": "192.0.2.86",
+					...(body ? { "content-type": "application/json" } : {}),
+				},
+				body: body ? JSON.stringify(body) : undefined,
+			});
+		const sessionCookie = (response: Response) =>
+			response.headers
+				.getSetCookie()
+				.filter((value) => !value.includes("Max-Age=0"))
+				.map((value) => value.split(";", 1)[0])
+				.join("; ");
+		const signedUp = await auth.handler(
+			makeRequest("sign-up/email", "", {
+				name: "Existing unverified fixture",
+				email: "unverified@passkey-storage.fixture.example",
+				password: fixturePassword,
+			}),
+		);
+		const guest = await auth.handler(
+			makeRequest("sign-in/anonymous", "", {}),
+		);
+		for (const [session, guestAccount] of [
+			[signedUp, false],
+			[guest, true],
+		] as const) {
+			expect(session.status).toBe(200);
+			const { user } = (await session.json()) as {
+				user: { id: string; emailVerified: boolean };
+			};
+			expect(user.emailVerified).toBe(false);
+			if (guestAccount)
+				await pool.query(
+					`UPDATE "${primary}"."user" SET role='guest' WHERE id=$1`,
+					[user.id],
+				);
+			const cookie = sessionCookie(session);
+			const proof = virtualCredential();
+			const nativeOptions = await auth.handler(
+				makeRequest("passkey/generate-register-options", cookie),
+			);
+			expect(nativeOptions.status).toBe(200);
+			const { challenge } = (await nativeOptions.json()) as {
+				challenge: string;
+			};
+			const saved = await auth.handler(
+				makeRequest(
+					"passkey/verify-registration",
+					`${cookie}; ${sessionCookie(nativeOptions)}`,
+					{
+						response: proof.registration(challenge),
+						name: "Legacy unverified key",
+					},
+				),
+			);
+			expect(saved.status).toBe(200);
+			const key = (await saved.json()) as StoredProjectPasskey;
+			expect(key.userId).toBe(user.id);
+			const legacyAuth = await auth.handler(
+				makeRequest("passkey/generate-authenticate-options", ""),
+			);
+			expect(legacyAuth.status).toBe(200);
+			const authentication = (await legacyAuth.json()) as {
+				challenge: string;
+			};
+			const legacySession = await auth.handler(
+				makeRequest(
+					"passkey/verify-authentication",
+					sessionCookie(legacyAuth),
+					{
+						response: proof.assertion(authentication.challenge, 1),
+					},
+				),
+			);
+			expect(legacySession.status).toBe(200);
+			expect(await legacySession.json()).toMatchObject({
+				user: {
+					id: user.id,
+					emailVerified: false,
+					...(guestAccount ? { isAnonymous: true } : {}),
+				},
+			});
+			const strictOptions = await requiresVerification.dispatch(
+				makeRequest("passkey/generate-authenticate-options", ""),
+			);
+			expect(strictOptions.status).toBe(200);
+			const strictChallenge = (await strictOptions.json()) as {
+				challenge: string;
+			};
+			const refused = await requiresVerification.dispatch(
+				makeRequest(
+					"passkey/verify-authentication",
+					sessionCookie(strictOptions),
+					{
+						response: proof.assertion(strictChallenge.challenge, 2),
+					},
+				),
+			);
+			expect(refused.status).toBe(401);
+			expect((await store.findCredential(proof.id))?.counter).toBe(1);
+			if (guestAccount) {
+				await pool.query(
+					`UPDATE "${primary}"."user" SET "twoFactorEnabled"=TRUE WHERE id=$1`,
+					[user.id],
+				);
+				try {
+					const options = await candidate.dispatch(
+						makeRequest("passkey/generate-authenticate-options", ""),
+					);
+					expect(options.status).toBe(200);
+					const { challenge } = (await options.json()) as {
+						challenge: string;
+					};
+					const blocked = await candidate.dispatch(
+						makeRequest(
+							"passkey/verify-authentication",
+							sessionCookie(options),
+							{ response: proof.assertion(challenge, 2) },
+						),
+					);
+					expect(blocked.status).toBe(401);
+					expect((await store.findCredential(proof.id))?.counter).toBe(1);
+				} finally {
+					await pool.query(
+						`UPDATE "${primary}"."user" SET "twoFactorEnabled"=FALSE WHERE id=$1`,
+						[user.id],
+					);
+				}
+			}
+			const ownAuth = await candidate.dispatch(
+				makeRequest("passkey/generate-authenticate-options", ""),
+			);
+			expect(ownAuth.status).toBe(200);
+			const ownChallenge = (await ownAuth.json()) as { challenge: string };
+			const authenticated = await candidate.dispatch(
+				makeRequest("passkey/verify-authentication", sessionCookie(ownAuth), {
+					response: proof.assertion(ownChallenge.challenge, 2),
+				}),
+			);
+			expect(
+				authenticated.status,
+				guestAccount ? "Existing guest" : "Existing unverified account",
+			).toBe(200);
+			expect(await authenticated.json()).toMatchObject({
+				user: {
+					id: user.id,
+					emailVerified: false,
+					...(guestAccount ? { isAnonymous: true, role: "guest" } : {}),
+				},
+			});
+			const renamed = await candidate.dispatch(
+				makeRequest("passkey/update-passkey", cookie, {
+					id: key.id,
+					name: "Same owner key",
+				}),
+			);
+			expect(renamed.status).toBe(200);
+			const removed = await candidate.dispatch(
+				makeRequest("passkey/delete-passkey", cookie, { id: key.id }),
+			);
+			expect(removed.status).toBe(200);
+			const candidateOptions = await candidate.dispatch(
+				makeRequest("passkey/generate-register-options", cookie),
+			);
+			expect(candidateOptions.status).toBe(200);
+			const nextChallenge = (await candidateOptions.json()) as {
+				challenge: string;
+			};
+			const nextProof = virtualCredential();
+			const candidateRegistration = await candidate.dispatch(
+				makeRequest(
+					"passkey/verify-registration",
+					`${cookie}; ${sessionCookie(candidateOptions)}`,
+					{
+						response: nextProof.registration(nextChallenge.challenge),
+						createSession: true,
+					},
+				),
+			);
+			expect(candidateRegistration.status).toBe(200);
+			const nextKey =
+				(await candidateRegistration.json()) as StoredProjectPasskey;
+			expect(nextKey.userId).toBe(user.id);
+			const nextCookie = sessionCookie(candidateRegistration);
+			expect(
+				await auth.api.getSession({
+					headers: new Headers({ cookie: nextCookie }),
+				}),
+			).toMatchObject({
+				user: {
+					id: user.id,
+					emailVerified: false,
+					...(guestAccount ? { isAnonymous: true, role: "guest" } : {}),
+				},
+			});
+			const rollback = await auth.handler(
+				makeRequest("passkey/delete-passkey", nextCookie, { id: nextKey.id }),
+			);
+			expect(rollback.status).toBe(200);
+			expect(await store.listForUser(user.id)).toEqual([]);
+			const events = await pool.query(
+				`SELECT type,outcome,"actorId","userId" FROM "${primary}"."allauthEvent" WHERE type LIKE 'passkey.%' AND "userId"=$1 ORDER BY type`,
+				[user.id],
+			);
+			expect(events.rows).toEqual(
+				[
+					"passkey.deleted",
+					"passkey.deleted",
+					"passkey.registered",
+					"passkey.registered",
+					"passkey.updated",
+				].map((type) => ({
+					type,
+					outcome: "success",
+					actorId: user.id,
+					userId: user.id,
+				})),
+			);
+		}
+	});
 
 	it("reads the exact native row format and preserves owner-scoped rename and delete", async () => {
 		const adapter = (await legacy.auth.$context).adapter;
