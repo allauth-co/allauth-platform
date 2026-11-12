@@ -8,10 +8,12 @@ import {
 } from "./owned-project-agent-approvals";
 import {
 	ownedAgentRevokeInput,
+	ownedAgentUpdateInput,
 	ownedBrowserAgentQuery,
 	readOwnedBrowserAgent,
 	revokeOwnedBrowserAgent,
 	revokeOwnedHostAgent,
+	updateOwnedBrowserAgent,
 } from "./owned-project-agent-browser";
 import { readOwnedAgentCatalog } from "./owned-project-agent-catalog";
 import {
@@ -267,11 +269,13 @@ export function createOwnedProjectAgentHosts(options: BrowserHosts) {
 			request.method === "GET" &&
 			(path === "/agent/get" || path === "/agent/list");
 		const agentRevoke = request.method === "POST" && path === agentRevokePath;
+		const agentUpdate = request.method === "POST" && path === "/agent/update";
 		const hostRevoke = request.method === "POST" && path === revokePath;
 		const hostUpdate = request.method === "POST" && path === "/host/update";
 		const write =
 			decision ||
 			agentRevoke ||
+			agentUpdate ||
 			hostRevoke ||
 			hostUpdate ||
 			(request.method === "POST" && path === "/host/create");
@@ -300,7 +304,12 @@ export function createOwnedProjectAgentHosts(options: BrowserHosts) {
 						? 5
 						: pending || status
 							? 300
-							: agentRead || agentRevoke || catalog || introspect || session
+							: agentRead ||
+									agentRevoke ||
+									agentUpdate ||
+									catalog ||
+									introspect ||
+									session
 								? 60
 								: 100,
 				windowMs: 60_000,
@@ -373,13 +382,15 @@ export function createOwnedProjectAgentHosts(options: BrowserHosts) {
 			? ownedBrowserAgentQuery(path, request)
 			: null;
 		const browserRevoke = agentRevoke ? ownedAgentRevokeInput(body) : null;
+		const browserUpdate = agentUpdate ? ownedAgentUpdateInput(body) : null;
 		if (browserQuery instanceof Response) return browserQuery;
 		if (browserRevoke instanceof Response) return browserRevoke;
+		if (browserUpdate instanceof Response) return browserUpdate;
 		return options.store.transaction(async (client) => {
 			const userId = await options.authorizeBrowser(
 				client,
 				request,
-				agentRevoke ? "write" : write ? "fresh" : "read",
+				agentRevoke || agentUpdate ? "write" : write ? "fresh" : "read",
 			);
 			if (!userId) {
 				if (agentRevoke)
@@ -387,7 +398,7 @@ export function createOwnedProjectAgentHosts(options: BrowserHosts) {
 						{ error: "unauthorized", message: "Authentication required" },
 						401,
 					);
-				return write
+				return write && !agentUpdate
 					? forbidden(
 							"Sign in again with a verified account before approving access.",
 						)
@@ -397,6 +408,8 @@ export function createOwnedProjectAgentHosts(options: BrowserHosts) {
 				return readOwnedBrowserAgent(client, userId, browserQuery);
 			if (browserRevoke)
 				return revokeOwnedBrowserAgent(client, userId, browserRevoke);
+			if (browserUpdate)
+				return updateOwnedBrowserAgent(client, userId, browserUpdate);
 			if (decision) return decideOwnedAgentApproval(client, userId, body);
 			if (pending) return listOwnedAgentApprovals(client, userId);
 			if (write) {

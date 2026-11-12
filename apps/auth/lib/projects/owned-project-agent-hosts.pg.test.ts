@@ -471,6 +471,128 @@ describe.skipIf(!existsSync(fixture))(
 			).toBe(501);
 		});
 
+		it("updates only the live browser owner's agent name and metadata across writers", async () => {
+			const path = "/agent/update";
+			const host = await createHost("Agent profile host");
+			const [agentId, otherId] = await seedDependents(host.hostId);
+			const schema = `"${alpha.schemaName}"`;
+			await database.query(
+				`UPDATE ${schema}."agent" SET "userId"=$2 WHERE id=$1`,
+				[otherId, peer.id],
+			);
+			const body = { agent_id: agentId };
+			const readAuthority = () =>
+				database.query(
+					`SELECT a."userId",a."hostId",a.status,a.mode,a."publicKey",a.kid,a."expiresAt",g.status AS grant FROM ${schema}."agent" a JOIN ${schema}."agentCapabilityGrant" g ON g."agentId"=a.id WHERE a.id=$1`,
+					[agentId],
+				);
+			const before = (await readAuthority()).rows;
+			await expectSame(path, "", 401, body);
+			await expectSame(path, peerCookie, 404, body);
+			await expectSame(path, ownerCookie, 404, { agent_id: otherId });
+			await expectSame(path, ownerCookie, 400, {
+				...body,
+				metadata: { nested: { value: true } },
+			});
+			await expectSame(path, ownerCookie, 400, {
+				...body,
+				jwks_url: "https://unused.fixture.example/jwks",
+			});
+			expect(
+				(await outside.dispatch(request(beta, path, ownerCookie, body))).status,
+			).toBe(401);
+			expect(
+				(await disabled.dispatch(request(alpha, path, ownerCookie, body)))
+					.status,
+			).toBe(501);
+			const aged = await signIn(owner.email);
+			const active = await legacy.handler(request(alpha, "/get-session", aged));
+			const { session } = (await active.json()) as { session: { id: string } };
+			await database.query(
+				`UPDATE ${schema}."session" SET "createdAt"=now()-interval '6 minutes' WHERE id=$1`,
+				[session.id],
+			);
+			const prior = await legacy.handler(
+				request(alpha, path, aged, {
+					...body,
+					name: "Native profile",
+					metadata: { revision: 1, prior: true },
+				}),
+			);
+			expect(prior.status).toBe(200);
+			const priorProfile = (await prior.json()) as { updated_at: string };
+			expect(priorProfile).toMatchObject({
+				agent_id: agentId,
+				name: "Native profile",
+				metadata: { revision: 1, prior: true },
+			});
+			const rename = await owned.dispatch(
+				request(alpha, path, aged, { ...body, name: "Owned profile" }),
+			);
+			expect(rename.status).toBe(200);
+			const renamed = (await rename.json()) as { updated_at: string };
+			expect(renamed).toMatchObject({
+				agent_id: agentId,
+				name: "Owned profile",
+				metadata: { revision: 1, prior: true },
+			});
+			expect(Date.parse(renamed.updated_at)).toBeGreaterThanOrEqual(
+				Date.parse(priorProfile.updated_at),
+			);
+			const metadata = {
+				revision: 2,
+				enabled: false,
+				note: "fixture",
+				empty: null,
+			};
+			const replacement = await owned.dispatch(
+				request(alpha, path, aged, { ...body, name: "", metadata }),
+			);
+			expect(replacement.status).toBe(200);
+			expect(await replacement.json()).toMatchObject({
+				agent_id: agentId,
+				name: "",
+				metadata,
+			});
+			const { rows } = await database.query(
+				`SELECT name,metadata FROM ${schema}."agent" WHERE id=$1`,
+				[agentId],
+			);
+			expect(rows).toEqual([{ name: "", metadata: JSON.stringify(metadata) }]);
+			expect((await readAuthority()).rows).toEqual(before);
+			legacy = await native(nativePool);
+			const read = await legacy.handler(
+				request(alpha, `/agent/get?agent_id=${agentId}`, aged),
+			);
+			expect(read.status).toBe(200);
+			expect(await read.json()).toMatchObject({
+				agent_id: agentId,
+				name: `Agent ${agentId.slice(0, 8)}`,
+				metadata,
+			});
+			const resumed = await legacy.handler(
+				request(alpha, path, aged, { ...body, name: "Resumed native profile" }),
+			);
+			expect(resumed.status).toBe(200);
+			expect(await resumed.json()).toMatchObject({
+				agent_id: agentId,
+				name: "Resumed native profile",
+				metadata,
+			});
+			await database.query(`DELETE FROM ${schema}."session" WHERE id=$1`, [
+				session.id,
+			]);
+			await expectSame(path, aged, 401, { ...body, name: "Discarded update" });
+			const ownerOfOther = await owned.dispatch(
+				request(alpha, path, peerCookie, { agent_id: otherId, metadata: {} }),
+			);
+			expect(ownerOfOther.status).toBe(200);
+			expect(await ownerOfOther.json()).toMatchObject({
+				agent_id: otherId,
+				metadata: {},
+			});
+		});
+
 		it("revokes one agent using its ordinary live browser or stored host owner and rolls back to native reads", async () => {
 			const nativeHost = await createHost("Native browser agent revoke");
 			const ownedHost = await createHost("Owned browser agent revoke");

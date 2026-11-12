@@ -1,6 +1,6 @@
 import type { PoolClient } from "pg";
 import { agentHostJSON as json } from "./owned-project-agent-enrollment";
-import { parseOwnedAgentConstraints } from "./owned-project-agent-grants";
+import { parseOwnedAgentStoredJSON } from "./owned-project-agent-grants";
 import {
 	agentMachineAudience,
 	agentMachineProblem as problem,
@@ -109,7 +109,7 @@ export async function readOwnedAgentSession(
 			: grants
 	).map(({ constraints, ...grant }) => ({
 		...grant,
-		constraints: constraints ? parseOwnedAgentConstraints(constraints) : null,
+		constraints: constraints ? parseOwnedAgentStoredJSON(constraints) : null,
 	}));
 	const refreshed = await refreshOwnedAgentRead(client, agent, url.origin);
 	if (refreshed instanceof Response) return refreshed;

@@ -5,10 +5,22 @@ import {
 	agentHostJSON as json,
 	invalidAgentBody,
 } from "./owned-project-agent-enrollment";
-import { readOwnedAgentGrants } from "./owned-project-agent-grants";
+import {
+	parseOwnedAgentStoredJSON,
+	readOwnedAgentGrants,
+} from "./owned-project-agent-grants";
 import { agentMachineProblem as problem } from "./owned-project-agent-machine";
 
 const detailInput = z.object({ agent_id: z.string() });
+const updateInput = detailInput.extend({
+	name: z.string().optional(),
+	metadata: z
+		.record(
+			z.string(),
+			z.union([z.string(), z.number(), z.boolean(), z.null()]),
+		)
+		.optional(),
+});
 const listInput = z.object({
 	status: z
 		.enum(["active", "pending", "expired", "revoked", "rejected", "claimed"])
@@ -152,15 +164,60 @@ export async function readOwnedBrowserAgent(
 	});
 }
 
+function remoteAgentKeysDisabled() {
+	return json(
+		{
+			message: "Use an inline public key. Remote key discovery is not active.",
+		},
+		400,
+	);
+}
+
+export function ownedAgentUpdateInput(body: unknown) {
+	if (hasRemoteAgentKeys(body)) return remoteAgentKeysDisabled();
+	const parsed = updateInput.safeParse(body);
+	return parsed.success ? parsed.data : invalidAgentBody(parsed.error);
+}
+
+/** Replace the verified browser owner's display name or metadata on the same agent. */
+export async function updateOwnedBrowserAgent(
+	client: PoolClient,
+	userId: string,
+	input: z.infer<typeof updateInput>,
+) {
+	const { agent_id: id, name, metadata } = input;
+	if (id.includes("\0")) return notFound();
+	const {
+		rows: [updated],
+	} = await client.query<{
+		id: string;
+		name: string;
+		metadata: string | null;
+		updatedAt: Date;
+	}>(
+		`UPDATE "agent" SET name=COALESCE($3,name),metadata=COALESCE($4,metadata),"updatedAt"=statement_timestamp()
+		 WHERE id=$1 AND "userId"=$2 RETURNING id,name,metadata,"updatedAt"`,
+		[
+			id,
+			userId,
+			name ?? null,
+			metadata === undefined ? null : JSON.stringify(metadata),
+		],
+	);
+	return updated
+		? json({
+				agent_id: updated.id,
+				name: updated.name,
+				metadata: updated.metadata
+					? parseOwnedAgentStoredJSON(updated.metadata)
+					: null,
+				updated_at: updated.updatedAt,
+			})
+		: notFound();
+}
+
 export function ownedAgentRevokeInput(body: unknown) {
-	if (hasRemoteAgentKeys(body))
-		return json(
-			{
-				message:
-					"Use an inline public key. Remote key discovery is not active.",
-			},
-			400,
-		);
+	if (hasRemoteAgentKeys(body)) return remoteAgentKeysDisabled();
 	const parsed = revokeInput.safeParse(body);
 	return parsed.success ? parsed.data : invalidAgentBody(parsed.error);
 }

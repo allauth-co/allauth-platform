@@ -16,8 +16,9 @@ The platform installs `@better-auth/agent-auth` 0.6.2. The endpoint inventory be
 | Agent introspection | `POST /agent/introspect` | Inline delegated agent JWT in the `token` body field, with the native compact public claims and replay checks. |
 | Signed agent status | `GET /agent/status` | Known inline Ed25519 host or active delegated agent. Keeps native status and grant fields and the normal active-agent heartbeat. |
 | Agent listing and detail | `GET /agent/list`, `GET /agent/get` | Current owner’s signed browser session. |
+| Agent profile | `POST /agent/update` | Current agent owner’s signed browser session, with native name and metadata updates. |
 | Agent revocation | `POST /agent/revoke` | Signed browser session of the agent or host owner, or an active signed host selecting an agent on that host. Direct agent JWT revocation is pending. |
-| Other agent lifecycle | `POST /agent/update`, `POST /agent/rotate-key`, `POST /agent/reactivate`, `POST /agent/cleanup` | Pending. |
+| Other agent lifecycle | `POST /agent/rotate-key`, `POST /agent/reactivate`, `POST /agent/cleanup` | Pending. |
 | Browser approvals | `GET /agent/ciba/pending`, `POST /agent/approve-capability` | Current owner’s pending device and CIBA summaries. Fresh verified owner can approve or deny an existing, owner-bound delegated registration without capability grants. The decision accepts native `approval_id` or `agent_id`. |
 | Agent approval requests and grants | `POST /agent/request-capability`, `POST /agent/grant-capability`, `POST /agent/revoke-capability`, `POST /agent/ciba/authorize`, `POST /agent/device/code` | Pending |
 | Capability catalog | `GET /capability/list`, `GET /capability/describe` | A live signed host or agent can read the configured empty catalog. |
@@ -45,6 +46,8 @@ Signed status accepts a host ID or unique key ID and scopes the requested agent 
 Delegated registration binds the new agent to the same owner and host, retains its inline public key and native 15-minute lifetime, and updates the host heartbeat on success. The fixture serializes the five-active-agent limit across an owner’s hosts and consumes registration JWT IDs separately from repeatable host status reads. Legacy reads recognize the owned rows. Forced or pending enrollment and registration retries that create a new approval remain outside this slice.
 
 Browser agent list and detail accept the current owner’s signed session and expose the native grant projections. List preserves status, mode, and host filters and pagination. Browser revocation locks the live session and target authority, clears the agent’s inline signing key and key ID, and revokes its grants in one realm-scoped transaction. The persisted host owner can revoke an agent on that host even when the agent is unbound. The installed client’s disconnect operation uses an active signed host and an explicit agent ID. This operation remains repeatable under the same valid host proof and leaves the host and other agents usable. Legacy reads after rollback recognize the updated rows.
+
+Browser profile updates require the agent owner’s live session. The native metadata map accepts string, number, boolean and null values. A supplied map replaces the stored map, and a request containing only the name retains the previous metadata. The write changes the profile and update time under the same agent ID.
 
 Signed host self-revocation verifies the active host’s existing inline key, accepts its exact ID or an unambiguous key ID as the issuer, and applies the same grant cascade as browser revocation. Successful revocation clears the verifying key. A retry using that key receives the native authentication error, including after rollback. The fixture covers direct requests to the selected realm.
 
