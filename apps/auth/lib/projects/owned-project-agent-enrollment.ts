@@ -13,6 +13,10 @@ const createInput = z.object({
 	public_key: jwkInput.optional(),
 	default_capabilities: z.array(z.string()).optional(),
 });
+const updateInput = createInput.extend({
+	host_id: z.string(),
+	jwks_url: z.url().optional(),
+});
 const enrollInput = z.object({
 	token: z.string(),
 	public_key: jwkInput,
@@ -38,6 +42,8 @@ type Host = {
 	defaultCapabilities: string | null;
 };
 const fields = `id,name,"userId",status,"defaultCapabilities"`;
+export const agentHostOwnerRequired =
+	"Only the owner of this agent host can change it.";
 
 export function agentHostJSON(value: object, status = 200) {
 	return Response.json(value, {
@@ -229,6 +235,96 @@ export async function createOwnedAgentHost(
 		status: "pending_enrollment",
 		enrollmentToken: token,
 		enrollmentTokenExpiresAt: pending.expires,
+	});
+}
+
+/** Update the current browser owner's host without changing its ID or dependent rows. */
+export async function updateOwnedAgentHost(
+	client: PoolClient,
+	userId: string,
+	body: unknown,
+) {
+	const parsed = updateInput.safeParse(body);
+	if (!parsed.success) return invalidAgentBody(parsed.error);
+	const { host_id: id, name, public_key, default_capabilities } = parsed.data;
+	const forbidden = () =>
+		agentHostJSON({ message: agentHostOwnerRequired }, 403);
+	const revoked = () =>
+		protocolError(403, "host_revoked", "Host has been revoked");
+	const remoteKeysDisabled = () =>
+		agentHostJSON(
+			{
+				message:
+					"Use an inline public key. Remote key discovery is not active.",
+			},
+			400,
+		);
+	if (!id || id.includes("\0")) return forbidden();
+	const {
+		rows: [observed],
+	} = await client.query<{ status: string }>(
+		`SELECT status FROM "agentHost" WHERE id=$1 AND "userId"=$2`,
+		[id, userId],
+	);
+	if (!observed) return forbidden();
+	if (hasRemoteAgentKeys(body)) return remoteKeysDisabled();
+	if (observed.status === "revoked") return revoked();
+	const key = public_key ? await readOwnedAgentPublicKey(public_key) : null;
+	if (key instanceof Response) return key;
+	if (default_capabilities?.length)
+		return protocolError(
+			400,
+			"invalid_capabilities",
+			"One or more requested capability names don't exist or are blocked",
+		);
+	if (key) await lockKey(client, key);
+	const {
+		rows: [host],
+	} = await client.query<{ status: string; jwksUrl: string | null }>(
+		`SELECT status,"jwksUrl" FROM "agentHost" WHERE id=$1 AND "userId"=$2 FOR UPDATE`,
+		[id, userId],
+	);
+	if (!host) return forbidden();
+	if (host.status === "revoked") return revoked();
+	if (key) {
+		if (host.jwksUrl) return remoteKeysDisabled();
+		const collision = await client.query(
+			`SELECT 1 FROM "agentHost" WHERE id<>$1 AND (id=NULLIF($2,'') OR kid=NULLIF($2,'') OR "publicKey"=$3) LIMIT 1`,
+			[id, key.kid, key.serialized],
+		);
+		if (collision.rowCount)
+			return protocolError(
+				409,
+				"host_already_linked",
+				"Host is already linked to a different user",
+			);
+	}
+	const {
+		rows: [saved],
+	} = await client.query<{
+		id: string;
+		defaultCapabilities: string | null;
+		jwksUrl: string | null;
+		status: string;
+		updatedAt: Date;
+	}>(
+		`UPDATE "agentHost" SET name=COALESCE($2,name),"publicKey"=COALESCE($3,"publicKey"),
+		 kid=CASE WHEN $3::text IS NULL THEN kid ELSE $4 END,"defaultCapabilities"=COALESCE($5,"defaultCapabilities"),"updatedAt"=statement_timestamp()
+		 WHERE id=$1 RETURNING id,"defaultCapabilities","jwksUrl",status,"updatedAt"`,
+		[
+			id,
+			name ?? null,
+			key?.serialized ?? null,
+			key?.kid ?? null,
+			default_capabilities === undefined ? null : "[]",
+		],
+	);
+	return agentHostJSON({
+		id: saved.id,
+		default_capabilities: agentHostCapabilities(saved.defaultCapabilities),
+		jwks_url: saved.jwksUrl,
+		status: saved.status,
+		updated_at: saved.updatedAt,
 	});
 }
 

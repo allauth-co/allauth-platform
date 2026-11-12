@@ -16,9 +16,11 @@ import {
 import {
 	agentHostCapabilities,
 	agentHostJSON as json,
+	agentHostOwnerRequired,
 	createOwnedAgentHost,
 	enrollOwnedAgentHost,
 	invalidAgentBody,
+	updateOwnedAgentHost,
 } from "./owned-project-agent-enrollment";
 import {
 	agentMachineAudience,
@@ -41,7 +43,6 @@ const listInput = z.object({
 });
 const detailInput = z.object({ host_id: z.string() });
 const revokeInput = z.object({ host_id: z.string().optional() });
-const ownerRequired = "Only the owner of this agent host can change it.";
 const revokePath = "/host/revoke";
 const agentRevokePath = "/agent/revoke";
 
@@ -136,7 +137,7 @@ async function revokeBrowserHost(
 	);
 	return host
 		? revokeLockedHost(client, hostId, host.status)
-		: forbidden(ownerRequired);
+		: forbidden(agentHostOwnerRequired);
 }
 
 function hasSignedHostType(request: Request) {
@@ -252,10 +253,12 @@ export function createOwnedProjectAgentHosts(options: BrowserHosts) {
 			(path === "/agent/get" || path === "/agent/list");
 		const agentRevoke = request.method === "POST" && path === agentRevokePath;
 		const hostRevoke = request.method === "POST" && path === revokePath;
+		const hostUpdate = request.method === "POST" && path === "/host/update";
 		const write =
 			decision ||
 			agentRevoke ||
 			hostRevoke ||
+			hostUpdate ||
 			(request.method === "POST" && path === "/host/create");
 		const enroll = request.method === "POST" && path === "/host/enroll";
 		const read =
@@ -367,11 +370,12 @@ export function createOwnedProjectAgentHosts(options: BrowserHosts) {
 			if (write) {
 				if (path === "/host/create")
 					return createOwnedAgentHost(client, userId, body);
+				if (hostUpdate) return updateOwnedAgentHost(client, userId, body);
 				// AllAuth's owner guard rejects missing IDs along with unknown and foreign hosts.
 				const target = revokeInput.safeParse(body);
 				return target.success && target.data.host_id
 					? revokeBrowserHost(client, userId, target.data.host_id)
-					: forbidden(ownerRequired);
+					: forbidden(agentHostOwnerRequired);
 			}
 			if ("host_id" in input) {
 				const host = (

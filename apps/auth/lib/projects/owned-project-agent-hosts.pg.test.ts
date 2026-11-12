@@ -1580,6 +1580,204 @@ describe.skipIf(!existsSync(fixture))(
 			});
 		});
 
+		it("updates the fresh browser owner's host and replaces its inline key under the stable ID across writers", async () => {
+			const path = "/host/update";
+			const host = await nativeMachineHost("Browser key update", ownerCookie);
+			const collision = await nativeMachineHost(
+				"Other browser key",
+				peerCookie,
+			);
+			const [agentId] = await seedDependents(host.hostId);
+			const approval = await pendingApproval(host.hostId, "ciba");
+			const originalAgents = (await persisted(host.hostId)).agents;
+			const schema = `"${alpha.schemaName}"`;
+			const body = { host_id: host.hostId };
+			await expectSame(path, "", 403, body);
+			await expectSame(path, peerCookie, 403, body);
+			await expectSame(path, ownerCookie, 403, { host_id: randomUUID() });
+			await expectSame(path, ownerCookie, 400, {
+				...body,
+				jwks_url: "https://unused.fixture.example/jwks",
+			});
+			await expectSame(path, ownerCookie, 400, {
+				...body,
+				default_capabilities: ["fixture.read"],
+			});
+			await expectSame(path, ownerCookie, 400, {
+				...body,
+				public_key: { kty: "OKP", crv: "Ed25519" },
+			});
+			const stale = await signIn(owner.email);
+			const current = await legacy.handler(
+				request(alpha, "/get-session", stale),
+			);
+			const { session } = (await current.json()) as { session: { id: string } };
+			await database.query(
+				`UPDATE ${schema}."session" SET "createdAt"=now()-interval '6 minutes' WHERE id=$1`,
+				[session.id],
+			);
+			await expectSame(path, stale, 403, body);
+			expect(
+				(await outside.dispatch(request(beta, path, ownerCookie, body))).status,
+			).toBe(403);
+			expect(
+				(await disabled.dispatch(request(alpha, path, ownerCookie, body)))
+					.status,
+			).toBe(501);
+			const denied = await owned.dispatch(
+				request(alpha, path, ownerCookie, {
+					...body,
+					public_key: {
+						...(await exportJWK(collision.hostKey.publicKey)),
+						kid: collision.kid,
+					},
+				}),
+			);
+			expect(denied.status).toBe(409);
+			expect(await denied.json()).toMatchObject({
+				error: "host_already_linked",
+			});
+			const nativeKey = await generateKeyPair("EdDSA", { extractable: true });
+			const nativeKid = "fixture-native-host-update";
+			const nativeUpdate = await legacy.handler(
+				request(alpha, path, ownerCookie, {
+					...body,
+					name: "Native replacement",
+					default_capabilities: [],
+					public_key: {
+						...(await exportJWK(nativeKey.publicKey)),
+						kid: nativeKid,
+					},
+				}),
+			);
+			expect(nativeUpdate.status).toBe(200);
+			const { updated_at: nativeUpdated, ...nativeResult } =
+				(await nativeUpdate.json()) as { updated_at: string };
+			expect(nativeResult).toEqual({
+				id: host.hostId,
+				default_capabilities: [],
+				jwks_url: null,
+				status: "active",
+			});
+			expect(Date.parse(nativeUpdated)).toBeGreaterThan(0);
+			const poll = async (machine: typeof host) =>
+				request(
+					alpha,
+					`${statusPath}?agent_id=${agentId}`,
+					"",
+					undefined,
+					`Bearer ${await hostProof(machine)}`,
+				);
+			expect((await owned.dispatch(await poll(host))).status).toBe(401);
+			const nativeMachine = { ...host, hostKey: nativeKey, kid: nativeKid };
+			expect((await owned.dispatch(await poll(nativeMachine))).status).toBe(
+				200,
+			);
+			const ownedKey = await generateKeyPair("EdDSA", { extractable: true });
+			const publicKey = await exportJWK(ownedKey.publicKey);
+			const ownedUpdate = await owned.dispatch(
+				request(alpha, path, ownerCookie, {
+					...body,
+					name: "Owned replacement",
+					default_capabilities: [],
+					public_key: publicKey,
+				}),
+			);
+			expect(ownedUpdate.status).toBe(200);
+			const { updated_at: updatedAt, ...ownedResult } =
+				(await ownedUpdate.json()) as { updated_at: string };
+			expect(ownedResult).toEqual(nativeResult);
+			expect(Date.parse(updatedAt)).toBeGreaterThanOrEqual(
+				Date.parse(nativeUpdated),
+			);
+			const after = await persisted(host.hostId);
+			expect(after.hosts).toEqual([
+				{ status: "active", kid: null, publicKey: JSON.stringify(publicKey) },
+			]);
+			expect(after.agents).toEqual(originalAgents);
+			const { rows } = await database.query(
+				`SELECT "hostId",status FROM ${schema}."approvalRequest" WHERE id=$1`,
+				[approval.approvalId],
+			);
+			expect(rows).toEqual([{ hostId: host.hostId, status: "pending" }]);
+			legacy = await native(nativePool);
+			expect((await legacy.handler(await poll(nativeMachine))).status).toBe(
+				401,
+			);
+			const afterRollback = await legacy.handler(
+				await poll({ ...host, hostKey: ownedKey, kid: "" }),
+			);
+			expect(afterRollback.status).toBe(200);
+			expect(await afterRollback.json()).toMatchObject({
+				agent_id: agentId,
+				host_id: host.hostId,
+				status: "active",
+			});
+			const detail = await expectSame(
+				`/host/get?host_id=${host.hostId}`,
+				ownerCookie,
+				200,
+			);
+			expect(detail).toMatchObject({
+				id: host.hostId,
+				name: "Owned replacement",
+			});
+		});
+
+		it("serializes simultaneous browser key-ID replacements across owners in one realm", async () => {
+			const path = "/host/update";
+			const first = await nativeMachineHost(
+				"First key replacement",
+				ownerCookie,
+			);
+			const second = await nativeMachineHost(
+				"Second key replacement",
+				peerCookie,
+			);
+			const keyId = "fixture-competing-browser-host-key";
+			const [firstKey, secondKey] = await Promise.all([
+				enrollmentKey(keyId),
+				enrollmentKey(keyId),
+			]);
+			const reservedId = await owned.dispatch(
+				request(alpha, path, ownerCookie, {
+					host_id: first.hostId,
+					public_key: { ...firstKey, kid: second.hostId },
+				}),
+			);
+			expect(reservedId.status).toBe(409);
+			const hosts = [first, second];
+			const cookies = [ownerCookie, peerCookie];
+			const keys = [firstKey, secondKey];
+			const before = await Promise.all(
+				hosts.map(({ hostId }) => persisted(hostId)),
+			);
+			const results = await Promise.all(
+				hosts.map(({ hostId }, index) =>
+					owned.dispatch(
+						request(alpha, path, cookies[index], {
+							host_id: hostId,
+							public_key: keys[index],
+						}),
+					),
+				),
+			);
+			expect(results.map(({ status }) => status).sort()).toEqual([200, 409]);
+			const winner = results.findIndex(({ ok }) => ok);
+			const loser = 1 - winner;
+			const after = await Promise.all(
+				hosts.map(({ hostId }) => persisted(hostId)),
+			);
+			expect(after[winner].hosts).toEqual([
+				{
+					status: "active",
+					kid: keyId,
+					publicKey: JSON.stringify(keys[winner]),
+				},
+			]);
+			expect(after[loser]).toEqual(before[loser]);
+		});
+
 		it("validates native host status reads against its own inline host and projects legacy grants", async () => {
 			const machine = await nativeMachine("Status host");
 			const other = await nativeMachine("Other status host");
