@@ -47,6 +47,25 @@ const unavailable = () =>
 		503,
 		"Directory provisioning is temporarily unavailable.",
 	);
+const listenerHosts = new Set(["localhost", "127.0.0.1", "0.0.0.0", "[::1]"]);
+
+function bindStandaloneConsoleRequest(request: Request, origin: string) {
+	const incoming = new URL(request.url);
+	const browserOrigin = request.headers.get("origin");
+	if (
+		incoming.origin === origin ||
+		incoming.protocol !== "http:" ||
+		!listenerHosts.has(incoming.hostname) ||
+		(browserOrigin !== null && browserOrigin !== origin)
+	)
+		return request;
+	// The standalone listener can supply its local URL. Browser authority is still
+	// verified against the configured console origin and the live workspace session.
+	const bound = new URL(origin);
+	bound.pathname = incoming.pathname;
+	bound.search = incoming.search;
+	return new Request(bound, request);
+}
 
 function matchingRoute(
 	request: Request,
@@ -159,7 +178,8 @@ export function createOwnedProjectSCIMConsole(options: {
 		managementOrigin,
 	};
 
-	return async (request, route) => {
+	return async (incoming, route) => {
+		const request = bindStandaloneConsoleRequest(incoming, managementOrigin);
 		if (!matchingRoute(request, route, project, managementOrigin))
 			return forbidden();
 		if (

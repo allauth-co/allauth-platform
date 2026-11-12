@@ -636,6 +636,23 @@ describe.skipIf(!existsSync(fixturePath))(
 			connectorHost = frontendHost;
 		});
 
+		it("binds the standalone listener to the configured console origin and rejects other hosts", async () => {
+			const ordinary = consoleRequest(alpha.slug, { cookie: rootCookie });
+			const original = new URL(ordinary.url);
+			const listener = new URL("http://0.0.0.0:3000");
+			listener.pathname = original.pathname;
+			listener.search = original.search;
+			expect(
+				(await list(new Request(listener, ordinary), collection)).status,
+			).toBe(200);
+			const other = new URL("https://different.scim-client.net");
+			other.pathname = original.pathname;
+			other.search = original.search;
+			expect(
+				(await list(new Request(other, ordinary), collection)).status,
+			).toBe(403);
+		});
+
 		it("leaves project and platform routes on legacy when their engine has no SCIM console method", async () => {
 			const unselected = await list(
 				consoleRequest(beta.slug, { cookie: outsiderCookie }),
