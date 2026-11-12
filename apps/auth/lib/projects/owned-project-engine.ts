@@ -25,6 +25,8 @@ import { createOwnedProjectPasskeyHttp } from "./owned-passkey-http";
 import type { OwnedProjectAccountDeletionOptions } from "./owned-project-account-deletion";
 import { createOwnedProjectAccountDeletion } from "./owned-project-account-deletion";
 import type { ProjectAccountLinkOptions } from "./owned-project-account-links";
+import type { OwnedProjectAdminDeletionOptions } from "./owned-project-admin-deletion";
+import { createOwnedProjectAdminDeletion } from "./owned-project-admin-deletion";
 import type { ProjectBackchannelTarget } from "./owned-project-backchannel-logout";
 import { createOwnedProjectBackchannelLogout } from "./owned-project-backchannel-logout";
 import type { AuthorizeProjectBrokerMfa } from "./owned-project-broker-mfa";
@@ -56,6 +58,7 @@ import {
 } from "./owned-project-oauth";
 import type { OwnedProjectOrganizationOptions } from "./owned-project-organization";
 import { createOwnedProjectOrganizationHttp } from "./owned-project-organization";
+import { createOwnedProjectOneTimeToken } from "./owned-project-one-time-token";
 import type { OwnedProjectPasswordChangeOptions } from "./owned-project-password-change";
 import { createOwnedProjectPasswordChange } from "./owned-project-password-change";
 import { createOwnedProjectPersonalKeys } from "./owned-project-personal-keys";
@@ -129,6 +132,11 @@ interface OwnedProjectEngineOptions {
 		emailChange?: boolean;
 		beforeDelete?: OwnedProjectAccountDeletionOptions["beforeDelete"];
 	};
+	adminDeletion?: Pick<
+		OwnedProjectAdminDeletionOptions,
+		"platformOrigin" | "readWorkspacePrincipal"
+	> &
+		Pick<Project, "id" | "workspaceId">;
 	passwordChange?: Pick<
 		OwnedProjectPasswordChangeOptions,
 		"checkPasswordSafety"
@@ -1720,6 +1728,37 @@ export function createOwnedProjectEngine(
 				return headers;
 			},
 		});
+	const adminDeletion =
+		options.adminDeletion &&
+		accountLinks?.beforeDelete &&
+		createOwnedProjectAdminDeletion({
+			...options.adminDeletion,
+			project: {
+				id: options.adminDeletion.id,
+				workspaceId: options.adminDeletion.workspaceId,
+				schemaName: options.project.schemaName,
+				slug: options.project.slug,
+			},
+			database: options.database,
+			baseURL: origin,
+			basePath: options.basePath,
+			trustedOrigins: options.trustedOrigins,
+			requireMfa: policy.mfaMode === "required",
+			readRealmSession: (request, client) =>
+				currentSession(request.headers, client),
+			beforeDelete: accountLinks.beforeDelete,
+			async revokeSessions(client, request, userId, path, actorId) {
+				const removed = await store.revoke(
+					{ userId },
+					path,
+					Boolean(backchannel),
+					client,
+					actorId,
+				);
+				if (!removed) throw unavailableLogout;
+				deliverLogoutAfterCommit(client, request, removed.targets);
+			},
+		});
 
 	const oauth =
 		options.oauth &&
@@ -1973,6 +2012,14 @@ export function createOwnedProjectEngine(
 		},
 	});
 
+	const oneTimeToken = createOwnedProjectOneTimeToken({
+		store,
+		readBody: requestBody,
+		trustedIP: options.trustedIP,
+		sessionToken: (headers) => serverSessionBearer(headers) ?? tokenFrom(headers),
+		eligible: (token, client) => eligibleSession(token, client),
+	});
+
 	async function publicSDKConfiguration() {
 		const providerOptions = options.oauth;
 		const googleProvider = providerOptions?.google
@@ -2039,6 +2086,8 @@ export function createOwnedProjectEngine(
 					),
 				readBody: (verified) => requestBody(verified, 2048),
 			});
+		if (path.startsWith("/one-time-token/"))
+			return (await oneTimeToken.dispatch(path, request)) ?? unsupported();
 		if (path.startsWith("/api-key/"))
 			return (
 				(await personalKeys(path, request)) ??
@@ -2129,6 +2178,12 @@ export function createOwnedProjectEngine(
 			const response = await emailChange.verify(request);
 			if (response) return response;
 		}
+		if (
+			adminDeletion &&
+			request.method === "POST" &&
+			(path === "/project-admin/remove-user" || path === "/admin/remove-user")
+		)
+			return adminDeletion(request, path, await requestBody(request));
 		if (
 			accountDeletion &&
 			path === "/delete-user" &&
@@ -2352,6 +2407,7 @@ export function createOwnedProjectEngine(
 				: unsupported(),
 		readOAuthContext: async (request) =>
 			issuer ? issuer.readContext(request) : unsupported(),
+		issueOneTimeToken: oneTimeToken.issue,
 		manageSCIMConsole: options.manageSCIMConsole,
 		listAccountSessions,
 		revokeAccountSession,

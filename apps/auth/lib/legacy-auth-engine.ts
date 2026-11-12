@@ -4,6 +4,7 @@ import { APIError } from "better-auth";
 import type { AuthInstance } from "./api";
 import type { AuthEngine } from "./auth-engine";
 import { discoveryDocument, discoveryHeaders } from "./discovery";
+import { isServerTokenRequest } from "./features/helpers";
 
 type LegacyInstance = Pick<AuthInstance, "$context" | "handler"> & {
 	api: Pick<
@@ -14,6 +15,7 @@ type LegacyInstance = Pick<AuthInstance, "$context" | "handler"> & {
 		| "getOpenIdConfig"
 		| "getOAuthServerConfig"
 		| "getOAuthClientPublicPrelogin"
+		| "generateOneTimeToken"
 	>;
 };
 
@@ -30,6 +32,25 @@ export function legacyAuthEngine(instance: LegacyInstance): AuthEngine {
 
 	const engine: AuthEngine = {
 		dispatch: (request) => instance.handler(request),
+		issueOneTimeToken: (headers) =>
+			isServerTokenRequest(headers)
+				? withAdapter(async () => {
+						const result = await instance.api.generateOneTimeToken({
+							headers,
+							asResponse: true,
+						});
+						result.headers.set("cache-control", "no-store");
+						return result;
+					})
+				: Promise.resolve(
+						Response.json(
+							{
+								message:
+									"One-time session tokens are reserved for server integrations.",
+							},
+							{ status: 403, headers: { "cache-control": "no-store" } },
+						),
+					),
 		readIssuerMetadata: (kind) =>
 			withAdapter(async () => {
 				const document =
@@ -110,7 +131,10 @@ export function legacyAuthEngine(instance: LegacyInstance): AuthEngine {
 					request,
 					query: {
 						disableCookieCache: true,
-						...(new URL(request.url).searchParams.get("disableRefresh") === "true" ? { disableRefresh: true } : {}),
+						...(new URL(request.url).searchParams.get("disableRefresh") ===
+						"true"
+							? { disableRefresh: true }
+							: {}),
 					},
 					asResponse: true,
 				}),

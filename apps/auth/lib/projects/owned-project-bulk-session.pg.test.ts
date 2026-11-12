@@ -61,7 +61,11 @@ async function createNative(database: LegacyDB) {
 				...extraServerPlugins(
 					{ ALLAUTH_AUTH_SECRET: signingSecret, ALLAUTH_AUTH_URL: origin },
 					{ project: true, origin, projectSlug: slug },
-				).filter((plugin) => plugin.id === "bearer"),
+				).filter((plugin) =>
+					["bearer", "one-time-token", "allauth-feature-boundaries"].includes(
+						plugin.id,
+					),
+				),
 			],
 		},
 		{ disableTestUser: true },
@@ -89,7 +93,7 @@ function revoke(
 }
 
 describe.skipIf(!existsSync(fixturePath))(
-	"isolated PostgreSQL project bulk session revocation",
+	"isolated PostgreSQL project session revocation and transfer",
 	() => {
 		const name = `allauth_hosted_${randomUUID().replaceAll("-", "")}`;
 		const schema = `allauth_project_${randomUUID().replaceAll("-", "")}`;
@@ -213,6 +217,77 @@ describe.skipIf(!existsSync(fixturePath))(
 			expect(response.status).toBe(200);
 			return response.json() as Promise<unknown>;
 		}
+
+		it("exchanges legacy and owned one-time session transfers once without setting a cookie", async () => {
+			const user = await account("server-session-transfer");
+			const signed = await signIn(user.email);
+			const candidate = engine();
+			const headers = new Headers({ cookie: signed.cookie });
+			const transferPath = `${issuer}/one-time-token`;
+			const redeem = (token: string, browser = false) =>
+				new Request(`${transferPath}/verify`, {
+					method: "POST",
+					headers: {
+						"content-type": "application/json",
+						...(browser ? { origin } : {}),
+					},
+					body: JSON.stringify({ token }),
+				});
+
+			const nativeIssued = await native.api.generateOneTimeToken({ headers });
+			expect(
+				(await candidate.dispatch(redeem(nativeIssued.token, true))).status,
+			).toBe(403);
+			expect(
+				(
+					await candidate.dispatch(
+						new Request(`${transferPath}/generate`, { headers }),
+					)
+				).status,
+			).toBe(400);
+			const race = await Promise.all(
+				Array.from({ length: 2 }, () =>
+					candidate.dispatch(redeem(nativeIssued.token)),
+				),
+			);
+			expect(race.map((result) => result.status).sort()).toEqual([200, 400]);
+			const accepted = race.find((result) => result.ok)!;
+			expect(accepted.headers.getSetCookie()).toHaveLength(0);
+			expect(await accepted.json()).toMatchObject({
+				session: { id: signed.id, userId: user.id, token: expect.any(String) },
+				user: { id: user.id, email: user.email },
+			});
+
+			const issued = await candidate.issueOneTimeToken!(headers);
+			expect(issued.status).toBe(200);
+			const { token } = (await issued.json()) as { token: string };
+			const {
+				rows: [stored],
+			} = await database.query<{ identifier: string }>(
+				`SELECT identifier FROM "${schema}"."verification" WHERE identifier=$1`,
+				[`one-time-token:${issuerDigest(token)}`],
+			);
+			expect(stored?.identifier).not.toContain(token);
+			const rollback = await native.handler(redeem(token));
+			expect(rollback.status).toBe(200);
+			expect(rollback.headers.getSetCookie()).toHaveLength(0);
+			expect(await rollback.json()).toMatchObject({
+				session: { id: signed.id },
+				user: { id: user.id },
+			});
+			expect((await candidate.dispatch(redeem(token))).status).toBe(400);
+
+			const stale = (await (
+				await candidate.issueOneTimeToken!(headers)
+			).json()) as { token: string };
+			await expire(signed.id);
+			const rejected = await candidate.dispatch(redeem(stale.token));
+			expect(rejected.status).toBe(400);
+			expect(await rejected.json()).toMatchObject({
+				message: "Session expired",
+			});
+			expect((await native.handler(redeem(stale.token))).status).toBe(400);
+		});
 
 		async function expire(id: string, seconds = -10) {
 			await database.query(

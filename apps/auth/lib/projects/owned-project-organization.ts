@@ -13,6 +13,15 @@ import type {
 	OwnedProjectInvitationEmail,
 	OwnedProjectInvitationNotification,
 } from "./owned-project-organization-email";
+import {
+	handleOrganizationLifecycle,
+	isOrganizationLifecycleRoute,
+	organizationLifecycleRoutes,
+} from "./owned-project-organization-lifecycle";
+import {
+	organizationFailure as failure,
+	organizationJson as json,
+} from "./owned-project-organization-response";
 import { projectOrganizations } from "./owned-project-organization-store";
 import type { Project } from "./registry";
 
@@ -84,6 +93,7 @@ const inviteInput = z.object({
 });
 
 const routeMethods = {
+	...organizationLifecycleRoutes,
 	"/organization/check-slug": "POST",
 	"/organization/create": "POST",
 	"/organization/list": "GET",
@@ -104,16 +114,6 @@ const routeMethods = {
 type RoutePath = keyof typeof routeMethods;
 function isOrganizationRoute(path: string): path is RoutePath {
 	return Object.hasOwn(routeMethods, path);
-}
-
-function json(value: unknown, status = 200, headers = new Headers()) {
-	headers.set("Cache-Control", "no-store");
-	headers.set("Pragma", "no-cache");
-	return Response.json(value, { status, headers });
-}
-
-function failure(status: number, code: string, message: string) {
-	return json({ code, message }, status);
 }
 
 const unauthorized = () => failure(401, "UNAUTHORIZED", "Not authenticated");
@@ -372,6 +372,25 @@ export function createOwnedProjectOrganizationHttp(
 		options.project.schemaName,
 	);
 
+	async function retryTransaction<T>(
+		work: (client: PoolClient) => Promise<T>,
+		retries = 2,
+	): Promise<T> {
+		try {
+			return await store.transaction(work);
+		} catch (error) {
+			if (
+				retries > 0 &&
+				error &&
+				typeof error === "object" &&
+				"code" in error &&
+				(error.code === "40P01" || error.code === "40001")
+			)
+				return retryTransaction(work, retries - 1);
+			throw error;
+		}
+	}
+
 	async function lockPrincipal(
 		client: PoolClient,
 		request: Request,
@@ -410,7 +429,10 @@ export function createOwnedProjectOrganizationHttp(
 			? await options.readBody(request)
 			: parseQuery(request);
 		try {
-			const result = await store.transaction<RouteResult>(async (client) => {
+			const runTransaction = isOrganizationLifecycleRoute(path)
+				? retryTransaction
+				: store.transaction;
+			const result = await runTransaction<RouteResult>(async (client) => {
 				if (
 					path === "/organization/list-user-invitations" &&
 					new URL(request.url).searchParams.get("email")
@@ -440,6 +462,8 @@ export function createOwnedProjectOrganizationHttp(
 				if (!principal) return unauthorized();
 				const realm = projectOrganizations(client);
 				const { user, session } = principal;
+				if (isOrganizationLifecycleRoute(path))
+					return handleOrganizationLifecycle(path, realm, principal, input);
 
 				switch (path) {
 					case "/organization/has-permission":
@@ -751,6 +775,20 @@ export function createOwnedProjectOrganizationHttp(
 			return result.response;
 		} catch (error) {
 			if (error instanceof Response) return error;
+			if (
+				path === "/organization/update" &&
+				error &&
+				typeof error === "object" &&
+				"code" in error &&
+				error.code === "23505" &&
+				"constraint" in error &&
+				error.constraint === "organization_slug_key"
+			)
+				return failure(
+					400,
+					"ORGANIZATION_SLUG_ALREADY_TAKEN",
+					"Organization slug already taken",
+				);
 			if (
 				error &&
 				typeof error === "object" &&

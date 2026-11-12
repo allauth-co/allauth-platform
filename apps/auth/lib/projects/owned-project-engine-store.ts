@@ -256,6 +256,7 @@ export function createProjectEngineStore(database: Pool, schemaName: string) {
 		path: string,
 		canDeliverBackchannel = false,
 		client?: PoolClient,
+		actorId?: string,
 	) {
 		async function remove(client: PoolClient) {
 			const selected =
@@ -330,6 +331,7 @@ export function createProjectEngineStore(database: Pool, schemaName: string) {
 					path,
 					row.userId,
 					row.id,
+					actorId,
 				);
 			return { ids, targets };
 		}
@@ -343,14 +345,16 @@ export function createProjectEngineStore(database: Pool, schemaName: string) {
 		path: string,
 		userId?: string,
 		targetId?: string,
+		actorId = userId,
 	) {
 		await client.query(
 			`INSERT INTO "allauthEvent" (id, type, outcome, "actorId", "userId", "targetId", "createdAt", metadata)
-			 VALUES ($1, $2, $3, $4, $4, $5, statement_timestamp(), jsonb_build_object('path', $6::text))`,
+			 VALUES ($1, $2, $3, $4, $5, $6, statement_timestamp(), jsonb_build_object('path', $7::text))`,
 			[
 				crypto.randomUUID(),
 				type,
 				outcome,
+				actorId ?? null,
 				userId ?? null,
 				targetId ?? null,
 				path,

@@ -1,5 +1,5 @@
 import type { Pool } from "pg";
-import { withAuth } from "../auth";
+import { withAuth, withAuthEngine } from "../auth";
 import type { AuthPolicy } from "../auth-policy/policy";
 import {
 	eraseOwnedAvatarsBeforeDelete,
@@ -466,6 +466,13 @@ export async function createOwnedProjectRuntimeCandidate(options: Options) {
 				);
 				return revokeAppleGrants(user.id);
 			},
+		},
+		adminDeletion: {
+			id: project.id,
+			workspaceId: project.workspaceId,
+			platformOrigin: platform,
+			readWorkspacePrincipal: (headers) =>
+				withAuthEngine((root) => root.readPrincipal(headers)),
 		},
 		organization: {
 			membershipLimit: async (client) =>

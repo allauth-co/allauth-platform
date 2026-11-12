@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { PoolClient } from "pg";
+import { projectOrganizationLifecycle } from "./owned-project-organization-lifecycle-store";
 
 export interface OrganizationRecord {
 	id: string;
@@ -326,6 +327,7 @@ export function projectOrganizations(client: PoolClient) {
 	}
 
 	return {
+		...projectOrganizationLifecycle(client),
 		organization,
 		member,
 		insertMember,

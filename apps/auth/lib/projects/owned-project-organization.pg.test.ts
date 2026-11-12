@@ -787,11 +787,322 @@ describe.skipIf(!existsSync(fixturePath))(
 			userId: string,
 			roleName: string,
 		) {
+			const id = randomUUID();
 			await database.query(
 				`INSERT INTO "${schema}".member (id, "organizationId", "userId", role, "createdAt") VALUES ($1, $2, $3, $4, statement_timestamp())`,
-				[randomUUID(), organizationId, userId, roleName],
+				[id, organizationId, userId, roleName],
 			);
+			return id;
 		}
+
+		async function organizationGrant(organizationId: string, user: Account) {
+			const id = randomUUID();
+			const code = createHash("sha256")
+				.update(randomUUID())
+				.digest("base64url");
+			await database.query(
+				`INSERT INTO "${schema}"."oauthClient"(id,"clientId","redirectUris") VALUES ($1,$1,'[]')`,
+				[id],
+			);
+			const values = [id, user.id, user.sessionId, organizationId];
+			await database.query(
+				`INSERT INTO "${schema}"."oauthRefreshToken"(id,token,"clientId","userId","sessionId","referenceId","expiresAt","createdAt",scopes,"rotationReplayResponse","rotationReplayExpiresAt")
+				 VALUES ($1,$1,$1,$2,$3,$4,now()+interval '1 hour',now(),'["organization:read","offline_access"]','fixture-encrypted-replay',now()+interval '1 minute')`,
+				values,
+			);
+			await database.query(
+				`INSERT INTO "${schema}"."oauthAccessToken"(id,token,"clientId","userId","sessionId","referenceId","refreshId","expiresAt","createdAt",scopes)
+				 VALUES ($1,$1,$1,$2,$3,$4,$1,now()+interval '1 hour',now(),'["organization:read"]')`,
+				values,
+			);
+			await database.query(
+				`INSERT INTO "${schema}"."oauthConsent"(id,"clientId","userId","referenceId","createdAt","updatedAt",scopes)
+				 VALUES ($1,$1,$2,$3,now(),now(),'["organization:read"]')`,
+				[id, user.id, organizationId],
+			);
+			await database.query(
+				`INSERT INTO "${schema}".verification(id,identifier,value,"expiresAt")
+				 VALUES ($1,$1,$2,now()+interval '1 minute')`,
+				[
+					code,
+					JSON.stringify({
+						type: "authorization_code",
+						referenceId: organizationId,
+						userId: user.id,
+					}),
+				],
+			);
+			return { id, code };
+		}
+
+		async function grantState(grant: { id: string; code: string }) {
+			const { rows } = await database.query(
+				`SELECT a.revoked IS NOT NULL AS "accessRevoked", r.revoked IS NOT NULL AS "refreshRevoked",
+				 r."rotationReplayResponse" IS NOT NULL AS replay,
+				 EXISTS (SELECT 1 FROM "${schema}"."oauthConsent" WHERE id = $1) AS consent,
+				 EXISTS (SELECT 1 FROM "${schema}".verification WHERE id = $2) AS code
+				 FROM "${schema}"."oauthAccessToken" a JOIN "${schema}"."oauthRefreshToken" r ON a."refreshId" = r.id
+				 WHERE a.id = $1`,
+				[grant.id, grant.code],
+			);
+			return rows[0];
+		}
+
+		const activeGrant = {
+			accessRevoked: false,
+			refreshRevoked: false,
+			replay: true,
+			consent: true,
+			code: true,
+		};
+		const revokedGrant = {
+			accessRevoked: true,
+			refreshRevoked: true,
+			replay: false,
+			consent: false,
+			code: false,
+		};
+
+		it("updates organization data with the native dynamic permissions and duplicate-slug response", async () => {
+			const engine = owned();
+			const owner = await account();
+			const editor = await account();
+			const outsider = await account();
+			const selected = await organizationFixture(owner, engine);
+			const foreign = await organizationFixture(outsider, engine);
+			await member(selected.id, editor.id, "editor");
+			await role(selected.id, "editor", { organization: ["update"] });
+			const input = {
+				organizationId: selected.id,
+				data: {
+					name: "Updated name",
+					logo: null,
+					metadata: { profile: { visible: true } },
+				},
+			};
+			const old = await native(request("update", editor.cookie, input));
+			expect(old.status).toBe(200);
+			const updated = await engine("update", editor.cookie, input);
+			expect(updated.status).toBe(200);
+			expect(await updated.json()).toEqual(await old.json());
+			expect((await engine("update", outsider.cookie, input)).status).toBe(400);
+			const conflict = {
+				organizationId: selected.id,
+				data: { slug: foreign.slug },
+			};
+			const legacyConflict = await native(
+				request("update", editor.cookie, conflict),
+			);
+			const ownedConflict = await engine("update", editor.cookie, conflict);
+			expect(ownedConflict.status).toBe(legacyConflict.status);
+			expect(await ownedConflict.json()).toEqual(await legacyConflict.json());
+			const audit = await database.query(
+				`SELECT "actorId","organizationId" FROM "${schema}"."allauthEvent" WHERE type='organization.updated' AND "organizationId"=$1`,
+				[selected.id],
+			);
+			expect(audit.rows).toEqual([
+				{ actorId: editor.id, organizationId: selected.id },
+			]);
+		});
+
+		it("updates roles and removes members using legacy response shapes and scoped revocation", async () => {
+			const engine = owned();
+			const owner = await account();
+			const target = await account();
+			const other = await account();
+			const selected = await organizationFixture(owner, engine);
+			const foreign = await organizationFixture(other, engine);
+			const targetId = await member(selected.id, target.id, "member");
+			const foreignId = await member(foreign.id, target.id, "member");
+			const teamId = selected.teams[0]!.id;
+			await database.query(
+				`INSERT INTO "${schema}"."teamMember"(id,"teamId","userId","createdAt") VALUES ($1,$2,$3,now())`,
+				[randomUUID(), teamId, target.id],
+			);
+			await database.query(
+				`UPDATE "${schema}".team SET "memberCount"=2 WHERE id=$1`,
+				[teamId],
+			);
+			await database.query(
+				`UPDATE "${schema}".session SET "activeOrganizationId"=$2,"activeTeamId"=$3 WHERE id=$1`,
+				[target.sessionId, selected.id, teamId],
+			);
+			const scoped = await organizationGrant(selected.id, target);
+			const unrelatedOrganization = await organizationGrant(foreign.id, target);
+			const unrelatedMember = await organizationGrant(selected.id, owner);
+			await role(selected.id, "editor", { organization: ["update"] });
+			const denied = await engine("update-member-role", owner.cookie, {
+				organizationId: selected.id,
+				memberId: foreignId,
+				role: "admin",
+			});
+			expect(denied.status).toBe(403);
+			const roleChange = {
+				organizationId: selected.id,
+				memberId: targetId,
+				role: [" editor ", "member"],
+			};
+			const expected = await native(
+				request("update-member-role", owner.cookie, roleChange),
+			);
+			expect(expected.status).toBe(200);
+			await database.query(
+				`UPDATE "${schema}".member SET role='member' WHERE id=$1`,
+				[targetId],
+			);
+			const updated = await engine(
+				"update-member-role",
+				owner.cookie,
+				roleChange,
+			);
+			expect(updated.status, await updated.clone().text()).toBe(200);
+			expect(await updated.json()).toEqual(await expected.json());
+			expect(await grantState(scoped)).toEqual(revokedGrant);
+			expect(await grantState(unrelatedOrganization)).toEqual(activeGrant);
+			expect(await grantState(unrelatedMember)).toEqual(activeGrant);
+
+			const newlyGranted = await organizationGrant(selected.id, target);
+			const pending = await invite(selected.id, owner, other);
+			const removed = await engine("remove-member", owner.cookie, {
+				organizationId: selected.id,
+				memberIdOrEmail: target.email.toUpperCase(),
+			});
+			expect(removed.status, await removed.clone().text()).toBe(200);
+			expect(await removed.json()).toMatchObject({
+				member: {
+					id: targetId,
+					role: "editor,member",
+					user: { id: target.id, email: target.email },
+				},
+			});
+			expect(await grantState(newlyGranted)).toEqual(revokedGrant);
+			expect(await grantState(unrelatedOrganization)).toEqual(activeGrant);
+			expect(await grantState(unrelatedMember)).toEqual(activeGrant);
+			const records = await database.query(
+				`SELECT s."activeOrganizationId",s."activeTeamId",t."memberCount",i.status
+				 FROM "${schema}".session s CROSS JOIN "${schema}".team t CROSS JOIN "${schema}".invitation i
+				 WHERE s.id=$1 AND t.id=$2 AND i.id=$3`,
+				[target.sessionId, teamId, pending],
+			);
+			expect(records.rows).toEqual([
+				{
+					activeOrganizationId: null,
+					activeTeamId: null,
+					memberCount: 1,
+					status: "pending",
+				},
+			]);
+			expect(
+				(
+					await native(
+						request(
+							`get-full-organization?organizationId=${selected.id}`,
+							target.cookie,
+						),
+					)
+				).status,
+			).toBe(403);
+			expect(
+				(
+					await native(
+						request(
+							`get-full-organization?organizationId=${foreign.id}`,
+							target.cookie,
+						),
+					)
+				).status,
+			).toBe(200);
+		});
+
+		it("serializes concurrent departures and demotions without losing the last owner", async () => {
+			const engine = owned();
+			const first = await account();
+			const second = await account();
+			const selected = await organizationFixture(first, engine);
+			const secondId = await member(selected.id, second.id, "owner,admin");
+			const results = await Promise.all([
+				engine("leave", first.cookie, { organizationId: selected.id }),
+				engine("update-member-role", second.cookie, {
+					organizationId: selected.id,
+					memberId: secondId,
+					role: "admin",
+				}),
+			]);
+			expect(results.map((response) => response.status).sort()).toEqual([
+				200, 400,
+			]);
+			const owners = await database.query(
+				`SELECT "userId" FROM "${schema}".member WHERE "organizationId"=$1 AND 'owner'=ANY(string_to_array(role,','))`,
+				[selected.id],
+			);
+			expect(owners.rows).toHaveLength(1);
+			const last = owners.rows[0]?.userId === first.id ? first : second;
+			const expected = await native(
+				request("leave", last.cookie, { organizationId: selected.id }),
+			);
+			const replacement = await engine("leave", last.cookie, {
+				organizationId: selected.id,
+			});
+			expect(replacement.status).toBe(expected.status);
+			expect(await replacement.json()).toEqual(await expected.json());
+		});
+
+		it("deletes only the selected organization's data and preserves configured enterprise authority", async () => {
+			const engine = owned();
+			const owner = await account();
+			const invited = await account();
+			const selected = await organizationFixture(owner, engine);
+			const foreign = await organizationFixture(owner, engine);
+			await engine("set-active", owner.cookie, { organizationId: selected.id });
+			const invitation = await invite(selected.id, owner, invited);
+			const otherInvitation = await invite(foreign.id, owner, invited);
+			const grant = await organizationGrant(selected.id, owner);
+			const otherGrant = await organizationGrant(foreign.id, owner);
+			const provider = randomUUID();
+			await database.query(
+				`INSERT INTO "${schema}"."ssoProvider"(id,issuer,"providerId","userId","organizationId",domain)
+				 VALUES ($1,'https://sso.fixture.example',$1,$2,$3,'fixture.example')`,
+				[provider, owner.id, selected.id],
+			);
+			const guarded = await engine("delete", owner.cookie, {
+				organizationId: selected.id,
+			});
+			expect(guarded.status).toBe(409);
+			expect(await guarded.json()).toMatchObject({
+				code: "ORGANIZATION_ENTERPRISE_CONFIGURATION_ACTIVE",
+			});
+			expect(await grantState(grant)).toEqual(activeGrant);
+			await database.query(
+				`DELETE FROM "${schema}"."ssoProvider" WHERE id=$1`,
+				[provider],
+			);
+			const deleted = await engine("delete", owner.cookie, {
+				organizationId: selected.id,
+			});
+			expect(deleted.status, await deleted.clone().text()).toBe(200);
+			expect(await deleted.json()).toMatchObject({
+				id: selected.id,
+				slug: selected.slug,
+				metadata: '{"example":true}',
+			});
+			expect(await grantState(grant)).toEqual(revokedGrant);
+			expect(await grantState(otherGrant)).toEqual(activeGrant);
+			const rows = await database.query(
+				`SELECT id FROM "${schema}".invitation WHERE id=ANY($1::text[])`,
+				[[invitation, otherInvitation]],
+			);
+			expect(rows.rows).toEqual([{ id: otherInvitation }]);
+			expect(
+				await (await native(request("list", owner.cookie))).json(),
+			).toMatchObject([{ id: foreign.id }]);
+			const session = await database.query(
+				`SELECT "activeOrganizationId","activeTeamId" FROM "${schema}".session WHERE id=$1`,
+				[owner.sessionId],
+			);
+			expect(session.rows).toEqual([
+				{ activeOrganizationId: null, activeTeamId: null },
+			]);
+		});
 
 		it("matches native static and dynamic permission composition, scoping and immediate revocation", async () => {
 			const owner = await account();

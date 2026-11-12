@@ -33,6 +33,74 @@ export interface AccountDeletionFence {
 	verify(client: PoolClient): Promise<boolean>;
 }
 
+/** Serialize self-service and administrator erasure while external cleanup runs. */
+export async function claimProjectUserDeletion(
+	client: PoolClient,
+	userId: string,
+	lease: string,
+) {
+	const key = `${leasePrefix}${userId}`;
+	const acquired = await client.query(
+		`INSERT INTO "verification" AS v (id,identifier,value,"expiresAt") VALUES ($1,$1,$2,statement_timestamp() + interval '5 minutes')
+		 ON CONFLICT (id) DO UPDATE SET value=EXCLUDED.value,"expiresAt"=EXCLUDED."expiresAt","updatedAt"=statement_timestamp()
+		 WHERE v."expiresAt" <= clock_timestamp()`,
+		[key, lease],
+	);
+	return acquired.rowCount === 1 ? key : null;
+}
+
+export async function lockProjectUserDeletion(
+	client: PoolClient,
+	key: string,
+	lease: string,
+) {
+	const reserved = await client.query(
+		`SELECT id FROM "verification" WHERE id=$1 AND value=$2 AND "expiresAt" > clock_timestamp() FOR UPDATE`,
+		[key, lease],
+	);
+	return reserved.rowCount === 1;
+}
+
+export async function releaseProjectUserDeletion(
+	client: PoolClient,
+	key: string,
+	lease: string,
+) {
+	await client.query('DELETE FROM "verification" WHERE id=$1 AND value=$2', [
+		key,
+		lease,
+	]);
+}
+
+/** The caller holds the user and deletion locks and has revoked live sessions. */
+export async function eraseLockedProjectUser(
+	client: PoolClient,
+	userId: string,
+	leaseKey: string,
+) {
+	const accounts = await client.query<{ id: string; providerId: string }>(
+		'DELETE FROM "account" WHERE "userId"=$1 RETURNING id,"providerId"',
+		[userId],
+	);
+	await client.query(
+		`DELETE FROM "apikey" WHERE "referenceId"=$1 AND "configId"='default'`,
+		[userId],
+	);
+	await client.query(
+		`DELETE FROM "verification" WHERE id=$2 OR (value=$1 AND (
+		 starts_with(identifier, 'delete-account-') OR starts_with(identifier, 'reset-password:')
+		 OR starts_with(identifier, 'trust-device-') OR starts_with(identifier, '2fa-') OR starts_with(identifier, 'allauth-change-email-used:')
+		 )) OR id=$3`,
+		[userId, leaseKey, `allauth-change-email-generation:${userId}`],
+	);
+	const removed = await client.query('DELETE FROM "user" WHERE id=$1', [
+		userId,
+	]);
+	if (removed.rowCount !== 1)
+		throw new Error("Account deletion lost its user lock.");
+	return accounts.rows;
+}
+
 export interface OwnedProjectAccountDeletionOptions
 	extends ProjectAccountLinkOptions {
 	/** Resolve the realm's existing avatar erasure and provider grant hooks before SQL deletion. */
@@ -142,14 +210,12 @@ export function createOwnedProjectAccountDeletion(
 			);
 			const proof = rows.length === 1 ? rows[0] : null;
 			if (!proof?.live || proof.value !== current.user.id) return invalid();
-			const key = `${leasePrefix}${current.user.id}`;
-			const acquired = await client.query(
-				`INSERT INTO "verification" AS v (id,identifier,value,"expiresAt") VALUES ($1,$1,$2,statement_timestamp() + interval '5 minutes')
-				 ON CONFLICT (id) DO UPDATE SET value=EXCLUDED.value,"expiresAt"=EXCLUDED."expiresAt","updatedAt"=statement_timestamp()
-				 WHERE v."expiresAt" <= clock_timestamp()`,
-				[key, lease],
+			const key = await claimProjectUserDeletion(
+				client,
+				current.user.id,
+				lease,
 			);
-			if (!acquired.rowCount)
+			if (!key)
 				return accountLinkError(
 					409,
 					"DELETION_PENDING",
@@ -188,11 +254,8 @@ export function createOwnedProjectAccountDeletion(
 					current.user.email !== claim.user.email
 				)
 					return invalid();
-				const reserved = await client.query(
-					`SELECT id FROM "verification" WHERE id=$1 AND value=$2 AND "expiresAt" > clock_timestamp() FOR UPDATE`,
-					[claim.key, lease],
-				);
-				if (reserved.rowCount !== 1) return invalid();
+				if (!(await lockProjectUserDeletion(client, claim.key, lease)))
+					return invalid();
 				if (fence && !(await fence.verify(client)))
 					return accountLinkError(
 						503,
@@ -206,11 +269,12 @@ export function createOwnedProjectAccountDeletion(
 					userId,
 					path,
 				);
-				const accounts = await client.query<{ id: string }>(
-					'DELETE FROM "account" WHERE "userId"=$1 RETURNING id',
-					[userId],
+				const accounts = await eraseLockedProjectUser(
+					client,
+					userId,
+					claim.key,
 				);
-				for (const account of accounts.rows)
+				for (const account of accounts)
 					await store.record(
 						client,
 						"account.deleted",
@@ -219,22 +283,6 @@ export function createOwnedProjectAccountDeletion(
 						userId,
 						account.id,
 					);
-				await client.query(
-					`DELETE FROM "apikey" WHERE "referenceId"=$1 AND "configId"='default'`,
-					[userId],
-				);
-				await client.query(
-					`DELETE FROM "verification" WHERE id=$2 OR (value=$1 AND (
-					 starts_with(identifier, 'delete-account-') OR starts_with(identifier, 'reset-password:')
-					 OR starts_with(identifier, 'trust-device-') OR starts_with(identifier, '2fa-') OR starts_with(identifier, 'allauth-change-email-used:')
-					 )) OR id=$3`,
-					[userId, claim.key, `allauth-change-email-generation:${userId}`],
-				);
-				const removed = await client.query('DELETE FROM "user" WHERE id=$1', [
-					userId,
-				]);
-				if (removed.rowCount !== 1)
-					throw new Error("Account deletion lost its user lock.");
 				await store.record(
 					client,
 					"user.deleted",
@@ -252,12 +300,9 @@ export function createOwnedProjectAccountDeletion(
 				: accountLinkJson(deleted, 200, result.headers);
 		} finally {
 			if (!finished)
-				await store.transaction(async (client) => {
-					await client.query(
-						'DELETE FROM "verification" WHERE id=$1 AND value=$2',
-						[claim.key, lease],
-					);
-				});
+				await store.transaction((client) =>
+					releaseProjectUserDeletion(client, claim.key, lease),
+				);
 		}
 	}
 

@@ -8,6 +8,8 @@ export interface AuthEngine {
 	dispatch(request: Request): Promise<Response>;
 	readIssuerMetadata(kind: "openid" | "oauth"): Promise<Response>;
 	readOAuthContext(request: Request): Promise<Response>;
+	/** Server-only session transfer. The HTTP generation endpoint stays disabled. */
+	issueOneTimeToken?(headers: Headers): Promise<Response>;
 	manageSCIMConsole?: OwnedProjectSCIMConsole;
 	/** Resolve live identity without trusting the cookie cache. Callers enforce role policy. */
 	readPrincipal(headers: Headers): Promise<ControlPrincipal | null>;
