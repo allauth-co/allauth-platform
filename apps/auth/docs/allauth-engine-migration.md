@@ -57,7 +57,7 @@ The records cover sign-in and second-factor requests, provider callbacks, sessio
 
 ## Internal project selection
 
-`ALLAUTH_PROJECT_ENGINE_INTERNAL_ID` allows one immutable development project in the protected AllAuth platform workspace to enter the pilot. The setting defaults to empty. Deployment readiness checks the registry and builds the AllAuth engine for both the signed proxy and verified managed accounts hostname. The admitted writer comes from PostgreSQL and starts at `legacy` revision `0`. When the admitted writer is `allauth`, new sign-in pages on the verified accounts hostname use the first-party forms.
+`ALLAUTH_PROJECT_ENGINE_INTERNAL_ID` allows one immutable development project in the protected AllAuth platform workspace to enter the pilot. The setting defaults to empty. Initial deployment readiness checks the registry and prepares the AllAuth engine for both the signed proxy and verified managed accounts hostname. Activation builds fresh engines and checks compatibility against the current stored configuration. Readiness follows the restored writer after rollback. The admitted writer comes from PostgreSQL and starts at `legacy` revision `0`. When the admitted writer is `allauth`, new sign-in pages on the verified accounts hostname use the first-party forms.
 
 Deploy the pilot-capable release with the exact project ID and confirm readiness. Before switching, confirm that the preceding deployment has drained and that each running replica uses the pilot-capable release with the same selection. Check the configuration, signed proxy, default accounts and any active custom domains while the legacy writer is still active. Use the existing project session comparison and collect baseline route metrics for the same project ID.
 

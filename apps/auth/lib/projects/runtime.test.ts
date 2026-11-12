@@ -237,3 +237,30 @@ it("rejects readiness when either verified transport loses the exact internal re
 		confirm.mockRestore();
 	}
 });
+
+it("rechecks candidate compatibility at activation and checks legacy readiness after rollback", async () => {
+	const id = "8d0da368-94b3-4897-988e-39c320a3e852";
+	const internal: Project = {
+		...project(),
+		id,
+		schemaName: `allauth_project_${id.replaceAll("-", "")}`,
+		workspaceId: platformWorkspaceId,
+		environment: "development",
+	};
+	const env = { ...environment, ALLAUTH_PROJECT_ENGINE_INTERNAL_ID: id };
+	fixture.getProject.mockResolvedValue(internal);
+	fixture.readAuthPolicy.mockResolvedValue(defaultStoredAuthPolicy());
+	await projectRuntime.confirmInternalProjectEngine(internal, env);
+	expect(fixture.createOwned).toHaveBeenCalledTimes(1);
+
+	fixture.admitted = { writer: "allauth", revision: 1 };
+	fixture.createOwned.mockRejectedValueOnce(new Error("Incompatible persisted setting."));
+	await expect(withProjectAuthEngine(internal.slug, async () => undefined, env))
+		.rejects.toThrow("Incompatible persisted setting.");
+	expect(fixture.createOwned).toHaveBeenCalledTimes(2);
+
+	fixture.admitted = { writer: "legacy", revision: 2 };
+	await projectRuntime.confirmInternalProjectEngine(internal, env);
+	expect(fixture.createOwned).toHaveBeenCalledTimes(2);
+	expect(fixture.createAuth).toHaveBeenCalledOnce();
+});

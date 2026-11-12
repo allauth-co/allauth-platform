@@ -555,6 +555,7 @@ async function withConfiguredProjectEntry<T>(
 	callback: (entry: Entry, project: Project) => Promise<T>,
 	owned?: ProjectEngineBuilder,
 	writer?: ProjectEngineWriterState,
+	preparing = false,
 ) {
 	const [configured, googleProvider] = await Promise.all([
 		readAuthPolicy(project.id, env),
@@ -565,7 +566,7 @@ async function withConfiguredProjectEntry<T>(
 	// Transport secrets can rotate while the native auth instance remains cached.
 	// Verification must receive the registry row read for this request.
 	return entries.use(
-		`${project.id}:${configured.version}:engine:${writer ? `${writer.writer}:${writer.revision}` : owned ? "owned-fixture" : "legacy"}:metrics:${projectEngineMetricsSelected(env, project.id)}:shadow:${projectSessionShadowSelected(env, project)}:origins:${projectOriginFingerprint(project)}:owned-avatars:${ownedAvatarSelected(env, project.id)}:native-passkeys:${selectedNativePasskeys(env, project, publicOrigin).version}:google:${googleProvider.version}:microsoft:${microsoftConfigurationVersion(microsoft)}:apple:${appleConfigurationVersion(apple)}:${apple ? Math.floor(Date.now() / 86400000) : 0}:${publicOrigin ?? ""}`,
+		`${project.id}:${configured.version}:engine:${preparing ? "preflight:" : ""}${writer ? `${writer.writer}:${writer.revision}` : owned ? "owned-fixture" : "legacy"}:metrics:${projectEngineMetricsSelected(env, project.id)}:shadow:${projectSessionShadowSelected(env, project)}:origins:${projectOriginFingerprint(project)}:owned-avatars:${ownedAvatarSelected(env, project.id)}:native-passkeys:${selectedNativePasskeys(env, project, publicOrigin).version}:google:${googleProvider.version}:microsoft:${microsoftConfigurationVersion(microsoft)}:apple:${appleConfigurationVersion(apple)}:${apple ? Math.floor(Date.now() / 86400000) : 0}:${publicOrigin ?? ""}`,
 		() => build(project, env, configured.policy, googleProvider, publicOrigin, owned, writer),
 		(entry) => callback(entry, project),
 	);
@@ -713,7 +714,7 @@ export function withHostedProjectAuth<T>(
 	);
 }
 
-/** Check the immutable internal realm and its selected writer without dispatching a request. */
+/** Check the active internal writer and prepare the initial candidate without dispatching a request. */
 export function confirmInternalProjectEngine(
 	project: Project,
 	env: AuthEnvironment,
@@ -724,15 +725,24 @@ export function confirmInternalProjectEngine(
 	if (!candidate || !lease)
 		throw new Error("The internal project selection changed.");
 	const origin = hostname ? `https://${hostname}` : undefined;
-	return lease.withCurrent(async (active) => {
-		const prepared: ProjectEngineWriterState = {
-			writer: "allauth",
-			revision: active.revision + (active.writer === "legacy" ? 1 : 0),
-		};
-		await withConfiguredProjectEntry(project, env, origin, async (entry) => {
-			if (entry.kind !== "owned" || !internalProjectEngineSelected(env, entry.project))
-				throw new Error("The internal project writer is unavailable.");
-		}, candidate, prepared);
+	return lease.withCurrent(async ({ writer, revision }) => {
+		// Keep the initial preflight separate from live cache entries. Legacy can
+		// still change configuration until the database commits the switch.
+		const preparing = revision === 0;
+		const useCandidate = preparing || writer === "allauth";
+		await withConfiguredProjectEntry(
+			project,
+			env,
+			origin,
+			async (entry) => {
+				const expected = useCandidate ? "owned" : "legacy";
+				if (entry.kind !== expected || !internalProjectEngineSelected(env, entry.project))
+					throw new Error("The internal project writer is unavailable.");
+			},
+			useCandidate ? candidate : undefined,
+			preparing ? { writer: "allauth", revision: 1 } : { writer, revision },
+			preparing,
+		);
 	});
 }
 
