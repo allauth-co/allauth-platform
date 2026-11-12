@@ -613,32 +613,30 @@ try {
 	const connected = internalSelection ? await startConnectedApplication(owned, originalHostedCookie) : undefined;
 	const managedHost = `${owned.slug}-accounts.${portalDomain}`;
 	const managedApi = `${owned.slug}-api.${portalDomain}`;
-	let nativeManagedSession: { cookie: string; id: string } | undefined;
+	const nativeHostedSessions: { hostname: string; cookie: string; id: string }[] = [];
 	let ownedManagedCookie: string | undefined;
 	if (internalSelection) {
-		const nativeManaged = await request("/api/auth/sign-in/email", {
-			host: managedHost,
-			clientIP: "192.0.2.56",
-			body: ownedLogin,
-		});
-		expectStatus(
-			nativeManaged,
-			200,
-			"Native sign-in works on the managed accounts hostname.",
-		);
-		const cookie = sessionCookie(nativeManaged);
-		const current = await readSession("/api/auth/get-session", {
-			host: managedHost,
-			cookie,
-		});
-		assert.equal(current?.user.id, accountId);
-		assert.ok(current?.session.id);
-		nativeManagedSession = { cookie, id: current.session.id };
-		assert.ok(
-			nativeManaged.cookies
-				.filter((cookie) => cookie.includes(".session_token="))
-				.every((cookie) => !/; domain=/i.test(cookie)),
-		);
+		for (const { hostname, clientIP } of [
+			{ hostname: managedHost, clientIP: "192.0.2.56" },
+			{ hostname: host, clientIP: "192.0.2.57" },
+		]) {
+			const native = await request("/api/auth/sign-in/email", {
+				host: hostname,
+				clientIP,
+				body: ownedLogin,
+			});
+			expectStatus(native, 200, "Native sign-in works on the verified accounts hostname.");
+			const cookie = sessionCookie(native);
+			const current = await readSession("/api/auth/get-session", { host: hostname, cookie });
+			assert.equal(current?.user.id, accountId);
+			assert.ok(current?.session.id);
+			nativeHostedSessions.push({ hostname, cookie, id: current.session.id });
+			assert.ok(
+				native.cookies
+					.filter((cookie) => cookie.includes(".session_token="))
+					.every((cookie) => !/; domain=/i.test(cookie)),
+			);
+		}
 		const redirects = await query(
 			source,
 			`SELECT c."redirectUris"::text FROM public."oauthClient" c
@@ -737,16 +735,17 @@ try {
 		return (await readSession(path, options))?.user.id ?? null;
 	}
 
-	async function checkOriginalManagedSession(
-		original: NonNullable<typeof nativeManagedSession>,
-	) {
-		const current = await readSession("/api/auth/hosted-ui/get-session", {
-			host: managedHost,
-			cookie: original.cookie,
-			accept: "application/json",
-		});
-		assert.equal(current?.user.id, accountId);
-		assert.equal(current?.session.id, original.id);
+	async function checkOriginalHostedSessions() {
+		assert.equal(nativeHostedSessions.length, 2);
+		for (const { hostname, cookie, id } of nativeHostedSessions) {
+			const current = await readSession("/api/auth/hosted-ui/get-session", {
+				host: hostname,
+				cookie,
+				accept: "application/json",
+			});
+			assert.equal(current?.user.id, accountId);
+			assert.equal(current?.session.id, id);
+		}
 	}
 
 	let internalEnvironment: Record<string, string> = {};
@@ -787,11 +786,13 @@ try {
 			"The protected project keeps the legacy writer until the database switch.",
 		);
 		await hostedPage(managedHost, false);
+		await hostedPage(host, false);
 		assert.deepEqual(await internalWriter("switch", "legacy", "0", "allauth"), {
 			writer: "allauth", revision: 1,
 		});
 		await assert.rejects(internalWriter("switch", "legacy", "0", "allauth"));
 		await hostedPage(managedHost, true);
+		await hostedPage(host, true);
 		await configuredWebhook?.rotate();
 		expectStatus(
 			await request("/api/auth/hosted-ui/sdk/config", { host }),
@@ -915,13 +916,17 @@ try {
 		return sessionCookie(changed);
 	}
 	const ownedCookie = await switchDirectSession();
-	const ownedHosted = await request("/api/auth/sign-in/email", {
-		host,
-		body: { ...ownedLogin, password: fixturePassword },
-	});
+	const ownedHosted = await request(
+		internalSelection ? "/api/auth/hosted-ui/sign-in/email" : "/api/auth/sign-in/email",
+		{
+			host,
+			accept: "application/json",
+			body: { ...ownedLogin, password: fixturePassword },
+		},
+	);
 	expectStatus(ownedHosted, 200, "The AllAuth hosted route signs in.");
 	const ownedHostedCookie = sessionCookie(ownedHosted);
-	if (nativeManagedSession) {
+	if (internalSelection) {
 		expectStatus(
 			await request("/api/auth/hosted-ui/sdk/config", { host: managedHost }),
 			200,
@@ -932,7 +937,7 @@ try {
 			404,
 			"The frontend API hostname keeps its existing hosted UI boundary.",
 		);
-		await checkOriginalManagedSession(nativeManagedSession);
+		await checkOriginalHostedSessions();
 		const ownedManaged = await request("/api/auth/hosted-ui/sign-in/email", {
 			host: managedHost,
 			clientIP: "192.0.2.56",
@@ -1003,13 +1008,13 @@ try {
 		assert.deepEqual(await internalWriter("status"), { writer: "legacy", revision: 2 });
 		expectStatus(await request("/api/health"), 200, "The restored writer remains ready.");
 		await hostedPage(managedHost, false);
+		await hostedPage(host, false);
 		expectStatus(
 			await request("/api/auth/hosted-ui/sdk/config", { host: managedHost }),
 			200,
 			"A first-party page already open at rollback keeps its transport.",
 		);
-		assert.ok(nativeManagedSession);
-		await checkOriginalManagedSession(nativeManagedSession);
+		await checkOriginalHostedSessions();
 	} else await start(releaseImage, restored, selected);
 	expectStatus(
 		await request(`${direct}/not-installed`, { realm: owned }),

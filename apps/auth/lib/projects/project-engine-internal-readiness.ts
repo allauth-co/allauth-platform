@@ -2,15 +2,17 @@ import type { Pool } from "pg";
 import type { AuthEnvironment } from "../configuration";
 import { setting } from "../configuration";
 import { resolveHostedBinding } from "../domains/hosting";
+import { listStoredActiveProjectAccountsHostnames } from "../domains/repository";
 import { domainDefaults } from "../domains/validation";
 import {
 	internalProjectEngineIdSetting,
 	internalProjectEngineSelected,
 } from "./project-engine-internal-selection";
+import { protectedProjectWriterLease } from "./project-engine-internal-writer";
 import { getProject } from "./registry";
 import { confirmInternalProjectEngine } from "./runtime";
 
-/** Resolve both selected transports before allowing a deployment to accept traffic. */
+/** Resolve the selected direct and active hosted transports under one writer lease. */
 export async function verifyInternalProjectEngineReadiness(
 	database: Pick<Pool, "query">,
 	env: AuthEnvironment,
@@ -36,18 +38,51 @@ export async function verifyInternalProjectEngineReadiness(
 		throw new Error(
 			"The internal project is outside the allowed workspace or environment.",
 		);
-	const hostname = new URL(domainDefaults(project.slug, env).accounts).hostname;
-	const binding = await resolveHostedBinding(hostname, env);
-	if (
-		binding?.kind !== "accounts" ||
-		!internalProjectEngineSelected(env, binding.project)
-	)
-		throw new Error("The internal project accounts hostname is unavailable.");
-
-	await Promise.all([
-		confirmInternalProjectEngine(project, env),
-		confirmInternalProjectEngine(binding.project, env, binding.hostname),
-	]);
-	if (!internalProjectEngineSelected(env, await getProject(project.slug, env)))
-		throw new Error("The internal project selection changed during readiness.");
+	const lease = protectedProjectWriterLease(project, env);
+	if (!lease) throw new Error("The internal project writer is unavailable.");
+	await lease.withCurrent(async () => {
+		const managed = new URL(domainDefaults(project.slug, env).accounts)
+			.hostname;
+		const custom = await listStoredActiveProjectAccountsHostnames(
+			project.id,
+			database,
+		);
+		const bindings = await Promise.all(
+			[managed, ...custom].map(async (hostname) => {
+				const binding = await resolveHostedBinding(hostname, env);
+				if (
+					binding?.kind !== "accounts" ||
+					binding.hostname !== hostname ||
+					!internalProjectEngineSelected(env, binding.project)
+				)
+					throw new Error(
+						"The internal project accounts hostname is unavailable.",
+					);
+				return binding;
+			}),
+		);
+		await Promise.all([
+			confirmInternalProjectEngine(project, env),
+			...bindings.map(({ project, hostname }) =>
+				confirmInternalProjectEngine(project, env, hostname),
+			),
+		]);
+		if (
+			!internalProjectEngineSelected(env, await getProject(project.slug, env))
+		)
+			throw new Error(
+				"The internal project selection changed during readiness.",
+			);
+		const current = await listStoredActiveProjectAccountsHostnames(
+			project.id,
+			database,
+		);
+		if (
+			current.length !== custom.length ||
+			current.some((hostname, index) => hostname !== custom[index])
+		)
+			throw new Error(
+				"The internal project accounts hostnames changed during readiness.",
+			);
+	});
 }

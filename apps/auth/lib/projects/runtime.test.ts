@@ -241,7 +241,7 @@ it("rejects readiness when either verified transport loses the exact internal re
 		environment: "development",
 	};
 	const selected = { ...environment, ALLAUTH_PROJECT_ENGINE_INTERNAL_ID: id };
-	const query = vi.fn(async () => ({ rows: [{ slug: internal.slug, webhookGuardInstalled: true }] }));
+	const query = vi.fn(async (sql: string) => ({ rows: sql.includes('"allauthCustomHostname"') ? [] : [{ slug: internal.slug, webhookGuardInstalled: true }] }));
 	const database = { query } as unknown as Pick<Pool, "query">;
 	query.mockResolvedValueOnce({ rows: [{ slug: internal.slug, webhookGuardInstalled: false }] });
 	await expect(verifyInternalProjectEngineReadiness(database, selected))
@@ -267,6 +267,67 @@ it("rejects readiness when either verified transport loses the exact internal re
 		expect(confirm).toHaveBeenNthCalledWith(1, internal, selected);
 		expect(confirm).toHaveBeenNthCalledWith(2, internal, selected, hostname);
 	} finally {
+		confirm.mockRestore();
+	}
+});
+
+it("requires each active custom accounts transport to prepare the selected project", async () => {
+	const id = "8d0da368-94b3-4897-988e-39c320a3e852";
+	const internal: Project = {
+		...project(),
+		id,
+		schemaName: `allauth_project_${id.replaceAll("-", "")}`,
+		workspaceId: platformWorkspaceId,
+		environment: "development",
+	};
+	const selected = { ...environment, ALLAUTH_PROJECT_ENGINE_INTERNAL_ID: id };
+	const managed = "fixture-app-accounts.allauth.co";
+	const custom = "accounts.customer.fixture.example";
+	const additional = "accounts.other.fixture.example";
+	let customHostnames = [custom, additional];
+	const query = vi.fn(async (sql: string) => ({
+		rows: sql.includes('"allauthCustomHostname"')
+			? customHostnames.map((hostname) => ({ hostname }))
+			: [{ slug: internal.slug, webhookGuardInstalled: true }],
+	}));
+	const database = { query } as unknown as Pick<Pool, "query">;
+	fixture.getProject.mockReset().mockResolvedValue(internal);
+	fixture.resolveHostedBinding.mockImplementation(async (hostname: string) => ({
+		kind: "accounts", hostname, project: internal,
+	}));
+	const confirm = vi.spyOn(projectRuntime, "confirmInternalProjectEngine").mockImplementation(
+		async (_project, _settings, hostname) => {
+			if (hostname === custom) throw new Error("Fixture custom transport is unavailable.");
+		},
+	);
+	try {
+		await expect(verifyInternalProjectEngineReadiness(database, selected)).rejects.toThrow(
+			"Fixture custom transport is unavailable.",
+		);
+		expect(confirm).toHaveBeenCalledWith(internal, selected);
+		for (const hostname of [managed, custom, additional])
+			expect(confirm).toHaveBeenCalledWith(internal, selected, hostname);
+		confirm.mockResolvedValue(undefined);
+		await expect(verifyInternalProjectEngineReadiness(database, selected)).resolves.toBeUndefined();
+		fixture.resolveHostedBinding.mockImplementation(async (hostname: string) => ({
+			kind: "accounts",
+			hostname,
+			project: hostname === custom ? { ...internal, id: "0953c4f5-a783-4e91-9055-a05ead278cd0" } : internal,
+		}));
+		await expect(verifyInternalProjectEngineReadiness(database, selected)).rejects.toThrow(
+			"The internal project accounts hostname is unavailable.",
+		);
+		fixture.resolveHostedBinding.mockImplementation(async (hostname: string) => ({
+			kind: "accounts", hostname, project: internal,
+		}));
+		confirm.mockImplementation(async (_project, _settings, hostname) => {
+			if (hostname === managed) customHostnames = [custom];
+		});
+		await expect(verifyInternalProjectEngineReadiness(database, selected)).rejects.toThrow(
+			"The internal project accounts hostnames changed during readiness.",
+		);
+	} finally {
+		fixture.resolveHostedBinding.mockReset();
 		confirm.mockRestore();
 	}
 });

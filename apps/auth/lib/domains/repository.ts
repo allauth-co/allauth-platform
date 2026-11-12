@@ -171,10 +171,32 @@ export async function deleteProjectDomains(principal: ControlPrincipal, identifi
 		return { success: true };
 	});
 }
+const activeHostnamePairs = `FROM public."allauthCustomHostname" h
+	JOIN public."allauthDomainPair" d ON d.id=h."pairId" AND d."projectId"=h."projectId"
+	JOIN public."allauthProject" p ON p.id=h."projectId"
+	WHERE NOT d.deleting AND (SELECT COUNT(*) FROM public."allauthCustomHostname" s
+		WHERE s."pairId"=d.id AND s."ownershipVerifiedAt" IS NOT NULL AND s."providerStatus"='active'
+			AND s."sslStatus"='active' AND s."routingVerifiedAt" IS NOT NULL AND s."lastIssue" IS NULL)=2`;
+
+/** Read saved active accounts names even when deployment hosting settings are missing. */
+export async function listStoredActiveProjectAccountsHostnames(
+	projectId: string,
+	database: WorkspaceDatabase,
+): Promise<string[]> {
+	const { rows } = await database.query<{ hostname: string }>(
+		`SELECT h.hostname ${activeHostnamePairs} AND p.id=$1 AND h.kind='accounts' ORDER BY h.hostname`,
+		[projectId],
+	);
+	return rows.map(({ hostname }) => hostname);
+}
+
 /** Only a completely active pair can select a tenant; caller-supplied origin headers are not authority. */
 export async function lookupActiveHostname(hostname: string, env: AuthEnvironment, database: WorkspaceDatabase = projectRegistryPool(env)): Promise<ActiveHostname | null> {
 	if (!domainInfrastructure(env).configured) return null;
-	const row = (await database.query<Project & { domainKind: StoredCustomHostname["kind"]; domainId: string }>('SELECT p.*,h.kind AS "domainKind",h."pairId" AS "domainId" FROM public."allauthCustomHostname" h JOIN public."allauthDomainPair" d ON d.id=h."pairId" JOIN public."allauthProject" p ON p.id=h."projectId" WHERE h.hostname=$1 AND d.deleting=false AND (SELECT COUNT(*) FROM public."allauthCustomHostname" s WHERE s."pairId"=d.id AND s."ownershipVerifiedAt" IS NOT NULL AND s."providerStatus"=\'active\' AND s."sslStatus"=\'active\' AND s."routingVerifiedAt" IS NOT NULL AND s."lastIssue" IS NULL)=2 LIMIT 1', [hostname])).rows[0];
+	const { rows: [row] } = await database.query<Project & { domainKind: StoredCustomHostname["kind"]; domainId: string }>(
+		`SELECT p.*,h.kind AS "domainKind",h."pairId" AS "domainId" ${activeHostnamePairs} AND h.hostname=$1 LIMIT 1`,
+		[hostname],
+	);
 	if (!row) return null;
 	const { domainKind: kind, domainId, ...project } = row;
 	return { project, kind, domainId, source: "custom" };
