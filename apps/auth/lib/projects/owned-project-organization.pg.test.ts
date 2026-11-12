@@ -829,6 +829,199 @@ describe.skipIf(!existsSync(fixturePath))(
 			}
 		});
 
+		it.each([
+			"native",
+			"owned",
+		] as const)("signs successful membership, team, role and deletion events with the %s writer", async (writer) => {
+			const dispatch = installedOrganizationWriters()[writer];
+			const owner = await account();
+			const removed = await account();
+			const leaving = await account();
+			const { id: organizationId } = await organizationFixture(owner);
+			const memberId = await member(organizationId, removed.id, "member");
+			await member(organizationId, leaving.id, "member");
+			const endpointId = randomUUID();
+			const url =
+				"https://organization-lifecycle-webhooks.fixture.example/receive";
+			const signingKey = newWebhookSigningSecret();
+			await database.query(
+				`INSERT INTO "${schema}"."allauthWebhookEndpoint" (id,url,"eventTypes","encryptedSecret")
+					 VALUES ($1,$2,'["organization.*"]',$3)`,
+				[endpointId, url, sealLegacyUnversionedRecord(signingKey, secret)],
+			);
+			try {
+				type EventScope = Pick<
+					ControlWebhookEnvelope["data"]["event"],
+					"organizationId" | "targetId" | "userId"
+				>;
+				const expected = new Map<string, EventScope & { type: string }>();
+				async function mutate(
+					endpoint: string,
+					suffix: string,
+					body: object,
+					fields: EventScope = {},
+					caller = owner,
+				) {
+					const response = await dispatch(
+						request(endpoint, caller.cookie, body),
+					);
+					expect(response.status, `${writer} ${endpoint}`).toBe(200);
+					expected.set(`/organization/${endpoint}`, {
+						type: `organization.${suffix}`,
+						...fields,
+					});
+					return response;
+				}
+				const scope = { organizationId };
+				const team = await mutate(
+					"create-team",
+					"team.created",
+					{
+						...scope,
+						name: "Webhook fixture team",
+					},
+					scope,
+				);
+				const { id: teamId } = (await team.json()) as { id: string };
+				const teamMember = { teamId, userId: removed.id };
+				const teamMemberEvent = { userId: removed.id, targetId: removed.id };
+				await mutate(
+					"add-team-member",
+					"team.member-added",
+					{ ...scope, ...teamMember },
+					{ ...scope, ...teamMemberEvent },
+				);
+				await mutate(
+					"remove-team-member",
+					"team.member-removed",
+					teamMember,
+					teamMemberEvent,
+				);
+				await mutate(
+					"update-team",
+					"team.updated",
+					{
+						teamId,
+						data: { name: "Renamed webhook fixture team" },
+					},
+					{ ...scope, targetId: teamId },
+				);
+				await mutate(
+					"remove-team",
+					"team.removed",
+					{ teamId },
+					{ targetId: teamId },
+				);
+				await mutate(
+					"update-member-role",
+					"member.role-updated",
+					{ memberId, role: "admin" },
+					{ ...scope, targetId: memberId },
+				);
+				await mutate("remove-member", "member.removed", {
+					memberIdOrEmail: removed.email,
+				});
+				await mutate("leave", "member.left", scope, scope, leaving);
+				const role = await mutate(
+					"create-role",
+					"role.created",
+					{
+						...scope,
+						role: "fixture-reporter",
+						permission: { team: ["create"] },
+					},
+					scope,
+				);
+				const {
+					roleData: { id: roleId },
+				} = (await role.json()) as { roleData: { id: string } };
+				await mutate(
+					"update-role",
+					"role.updated",
+					{
+						...scope,
+						roleId,
+						data: { permission: { team: ["create", "update"] } },
+					},
+					scope,
+				);
+				await mutate(
+					"delete-role",
+					"role.deleted",
+					{ ...scope, roleId },
+					scope,
+				);
+				await mutate("delete", "deleted", scope, scope);
+
+				const received: {
+					url: string;
+					body: string;
+					headers: Record<string, string>;
+				}[] = [];
+				const delivered = await deliverPendingWebhooks({
+					database: legacyDatabase!,
+					secret,
+					maxDeliveries: expected.size,
+					now: () => new Date(Date.now() + 1000),
+					resolver: async () => [{ address: "93.184.216.34", family: 4 }],
+					async transport({ destination, body, headers }) {
+						received.push({ url: destination.url.href, body, headers });
+						return 204;
+					},
+				});
+				expect(delivered).toEqual({
+					claimed: expected.size,
+					delivered: expected.size,
+					retried: 0,
+					failed: 0,
+				});
+				const ids = new Set<string>();
+				for (const delivery of received) {
+					const { body, headers } = delivery;
+					expect(delivery.url).toBe(url);
+					expect(headers["content-type"]).toBe("application/json");
+					const digest = createHmac(
+						"sha256",
+						Buffer.from(signingKey.slice(6), "base64"),
+					)
+						.update(
+							`${headers["webhook-id"]}.${headers["webhook-timestamp"]}.${body}`,
+						)
+						.digest("base64");
+					expect(headers["webhook-signature"]).toBe(`v1,${digest}`);
+					const envelope = JSON.parse(body) as ControlWebhookEnvelope;
+					const path = String(envelope.data.event.metadata.path);
+					const event = expected.get(path);
+					expect(event, `${writer} ${path}`).toBeDefined();
+					expect(envelope).toEqual({
+						id: expect.any(String),
+						type: event?.type,
+						timestamp: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
+						data: {
+							event: {
+								...event,
+								id: envelope.id,
+								createdAt: envelope.timestamp,
+								outcome: "success",
+								ipAddress: "192.0.2.38",
+								userAgent: "organization-rehearsal",
+								metadata: { path },
+							},
+						},
+					});
+					ids.add(envelope.id);
+					expected.delete(path);
+				}
+				expect(expected.size).toBe(0);
+				expect(ids.size).toBe(received.length);
+			} finally {
+				await database.query(
+					`DELETE FROM "${schema}"."allauthWebhookEndpoint" WHERE id=$1`,
+					[endpointId],
+				);
+			}
+		});
+
 		it("delivers the same organization mutation outbox as the native writer", async () => {
 			const owner = await account();
 			const recipient = await account();
