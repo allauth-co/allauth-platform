@@ -18,7 +18,7 @@ import { Kysely, PostgresDialect } from "kysely";
 import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import type { createAllAuthClient } from "../../sdk/client";
-import type { createAllAuthProxy } from "../../sdk/next";
+import { createAllAuthProxy } from "../../sdk/next";
 import { defaultAuthPolicy } from "../auth-policy/policy";
 import { clerkCompatiblePasswords } from "../clerk-password";
 import { createControlSecurity } from "../control/security";
