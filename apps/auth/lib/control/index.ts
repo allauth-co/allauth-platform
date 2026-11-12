@@ -149,6 +149,18 @@ export function allauthControl(options: AllauthControlOptions = {}) {
 			if (ctx.method === "GET" && path !== "/verify-email") return;
 			const type = mutationEventType(path);
 			if (!type) return;
+		if (type.startsWith("api-key.")) {
+			const returned = ctx.context.returned;
+			const malformed = isAPIError(returned) && returned.statusCode === 400 && returned.body?.code === "VALIDATION_ERROR";
+			const errorCode = malformed ? "VALIDATION_ERROR" : result.failed ? result.code : undefined;
+			await recordControlEvent(ctx, {
+				type, outcome: malformed || result.failed ? "failure" : "success",
+				actorId: malformed ? undefined : actor?.session.impersonatedBy || actor?.user.id,
+				userId: malformed ? undefined : actor?.user.id || (!ctx.request && !ctx.headers && !result.failed ? field(body, "userId") : undefined),
+				metadata: { path, ...(errorCode ? { errorCode } : {}) },
+			}, options.ipHeader);
+			return;
+		}
 			if (type.startsWith("mfa.")) {
 				const returned = ctx.context.returned;
 				// Body validation errors are emitted by the endpoint library's base APIError.

@@ -13,7 +13,17 @@ import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { defaultAuthPolicy } from "../auth-policy/policy";
 import { isPlatformAdmin } from "../configuration";
+import { allauthControl } from "../control";
+import {
+	newWebhookSigningSecret,
+	webhookSignature,
+} from "../control/webhook-contract";
+import {
+	type ControlWebhookEnvelope,
+	deliverPendingWebhooks,
+} from "../control/webhooks";
 import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
+import { sealLegacyMfaRecord } from "./legacy-mfa-record";
 import { createOwnedProjectEngine } from "./owned-project-engine";
 import { issuerDigest } from "./owned-project-issuer-http";
 
@@ -65,6 +75,7 @@ async function legacyFixture(database: LegacyDatabase) {
 				},
 				plugins: [
 					organization({ dynamicAccessControl: { enabled: true } }),
+					allauthControl({ ipHeader: "x-real-ip" }),
 					apiKey({
 						defaultPrefix: "allauth_",
 						requireName: true,
@@ -148,6 +159,7 @@ describe.skipIf(!existsSync(fixturePath))(
 			for (const migration of [
 				"001-initial-auth.sql",
 				"002-control-plane.sql",
+				"004-webhooks.sql",
 				"005-free-plugins.sql",
 			])
 				await nativePool.query(
@@ -201,6 +213,161 @@ describe.skipIf(!existsSync(fixturePath))(
 		async function verify(key: string) {
 			return native.api.verifyApiKey({ body: { key, permissions } });
 		}
+
+		it("preserves signed API-key webhook outcomes across project writers", async () => {
+			const account = await user("api-key-webhook");
+			const other = await user("api-key-webhook-other");
+			const endpoint = randomUUID();
+			const secret = newWebhookSigningSecret();
+			await database.query(
+				`INSERT INTO "${schema}"."allauthWebhookEndpoint" (id,url,"eventTypes","encryptedSecret") VALUES ($1,'https://key-webhook.fixture.example',$2::jsonb,$3)`,
+				[
+					endpoint,
+					JSON.stringify(["api-key.*"]),
+					await sealLegacyMfaRecord(secret, { secret: signingSecret }),
+				],
+			);
+			try {
+				const headers = {
+					"x-real-ip": "203.0.113.81",
+					"user-agent": "api-key-webhook-fixture",
+				};
+				function post(path: string, body: object, cookie?: string) {
+					return request(`/api-key/${path}`, { body, cookie, headers });
+				}
+				async function deliveries(forbiddenKey: string) {
+					const events: Array<
+						Omit<ControlWebhookEnvelope["data"]["event"], "id" | "createdAt">
+					> = [];
+					const result = await deliverPendingWebhooks({
+						database: legacyDatabase!,
+						secret: signingSecret,
+						resolver: async () => [{ address: "93.184.216.34", family: 4 }],
+						now: () => new Date(Date.now() + 1_000),
+						maxDeliveries: 20,
+						transport: async ({ destination, body, headers }) => {
+							expect(destination.url.hostname).toBe(
+								"key-webhook.fixture.example",
+							);
+							expect(headers["webhook-signature"]).toBe(
+								await webhookSignature(
+									secret,
+									headers["webhook-id"],
+									headers["webhook-timestamp"],
+									body,
+								),
+							);
+							expect(body).not.toContain(forbiddenKey);
+							const envelope = JSON.parse(body) as ControlWebhookEnvelope;
+							expect(envelope.data.user).toBeUndefined();
+							expect(envelope.data.event).toMatchObject({
+								id: envelope.id,
+								type: envelope.type,
+								createdAt: envelope.timestamp,
+							});
+							const {
+								id: _id,
+								createdAt: _time,
+								...event
+							} = envelope.data.event;
+							events.push(event);
+							return 204;
+						},
+					});
+					expect(result).toMatchObject({ claimed: 8, delivered: 8 });
+					return events.sort((left, right) =>
+						JSON.stringify(left).localeCompare(JSON.stringify(right)),
+					);
+				}
+				async function exercise(
+					dispatch: (request: Request) => Promise<Response>,
+				) {
+					const minted = await json(
+						await dispatch(
+							post("create", { name: "Connector key" }, account.cookie),
+						),
+					);
+					const { id } = minted;
+					await json(
+						await dispatch(
+							post(
+								"update",
+								{ keyId: id, name: "Connector key v2" },
+								account.cookie,
+							),
+						),
+					);
+					await json(
+						await dispatch(post("delete", { keyId: id }, other.cookie)),
+						404,
+					);
+					await json(
+						await dispatch(post("update", { keyId: id }, account.cookie)),
+						400,
+					);
+					await json(
+						await dispatch(post("update", { keyId: {} }, account.cookie)),
+						400,
+					);
+					await json(
+						await dispatch(
+							post(
+								"update",
+								{
+									keyId: id,
+									name: "Refused owner override",
+									userId: other.id,
+								},
+								account.cookie,
+							),
+						),
+						401,
+					);
+					await json(await dispatch(post("create", {})), 401);
+					await json(
+						await dispatch(post("delete", { keyId: id }, account.cookie)),
+					);
+					return String(minted.key);
+				}
+				const expected = await deliveries(await exercise(native.handler));
+				expect(
+					expected
+						.filter(({ outcome }) => outcome === "success")
+						.map(({ type }) => type)
+						.sort(),
+				).toEqual(["api-key.create", "api-key.delete", "api-key.update"]);
+				expect(
+					expected.find(
+						({ metadata }) => metadata.errorCode === "VALIDATION_ERROR",
+					),
+				).toEqual({
+					type: "api-key.update",
+					outcome: "failure",
+					ipAddress: "203.0.113.81",
+					userAgent: "api-key-webhook-fixture",
+					metadata: { path: "/api-key/update", errorCode: "VALIDATION_ERROR" },
+				});
+				expect(
+					expected.find(
+						({ type, metadata }) =>
+							type === "api-key.update" &&
+							metadata.errorCode === "UNAUTHORIZED_SESSION",
+					),
+				).toMatchObject({
+					actorId: account.id,
+					userId: account.id,
+					outcome: "failure",
+				});
+				expect(await deliveries(await exercise(owned.dispatch))).toEqual(
+					expected,
+				);
+			} finally {
+				await database.query(
+					`DELETE FROM "${schema}"."allauthWebhookEndpoint" WHERE id=$1`,
+					[endpoint],
+				);
+			}
+		});
 
 		it("verifies the persisted key and server-only rate and expiry state across writers", async () => {
 			const account = await user("server-key-interoperation");
@@ -477,8 +644,8 @@ describe.skipIf(!existsSync(fixturePath))(
 			});
 			expect(await verify(String(otherKey.key))).toMatchObject({ valid: true });
 			const events = await database.query<{ type: string }>(
-				`SELECT type FROM "${schema}"."allauthEvent" WHERE "targetId"=$1 ORDER BY "createdAt"`,
-				[minted.id],
+				`SELECT type FROM "${schema}"."allauthEvent" WHERE "actorId"=$1 AND type IN ('api-key.update','api-key.delete') ORDER BY "createdAt"`,
+				[account.id],
 			);
 			expect(events.rows.map(({ type }) => type)).toEqual([
 				"api-key.update",

@@ -31,7 +31,10 @@ import { clerkCompatiblePasswords } from "../clerk-password";
 import { defaultSecurityPolicy } from "../control/security-policy";
 import type { SecurityRule } from "../control/security-management";
 import type { ControlPrincipal } from "../control/types";
-import { newWebhookSigningSecret, webhookSignature } from "../control/webhook-contract";
+import {
+	newWebhookSigningSecret,
+	webhookSignature,
+} from "../control/webhook-contract";
 import { deliverPendingWebhooks } from "../control/webhooks";
 import { signEdgeRequest } from "../domains/edge";
 import { googleProviderRepository } from "../project-providers/repository";
@@ -1088,7 +1091,7 @@ async function seed(databaseURL: string) {
 describe.skipIf(!existsSync(fixture))(
 	"isolated project service process cutover and rollback",
 	() => {
-		it("restarts with an approved MFA webhook and existing unverified and guest sessions", async () => {
+		it("restarts with approved MFA and API-key webhooks and existing unverified and guest sessions", async () => {
 			const local: { container: string; DATABASE_URL: string } = JSON.parse(
 				readFileSync(fixture, "utf8"),
 			);
@@ -1150,7 +1153,7 @@ describe.skipIf(!existsSync(fixture))(
 				const destination = "https://webhook.runtime.fixture.example/mfa";
 				const oldSigningKey = newWebhookSigningSecret();
 				await database.query(
-					`INSERT INTO ${schema}."allauthWebhookEndpoint" (id,url,"eventTypes","encryptedSecret") VALUES ($1,$2,'["mfa.*"]',$3)`,
+					`INSERT INTO ${schema}."allauthWebhookEndpoint" (id,url,"eventTypes","encryptedSecret") VALUES ($1,$2,'["mfa.*","api-key.*"]',$3)`,
 					[
 						endpointId,
 						destination,
@@ -1208,6 +1211,47 @@ describe.skipIf(!existsSync(fixture))(
 						ip: "192.0.2.82",
 					},
 				];
+				const accountKey = { prefix: hosted, host, cookie: users[0]!.cookie };
+				const nativeKey = await runtimeCreateApiKey(
+					service,
+					accountKey,
+					"Original subscribed key",
+				);
+				const supportLogin = await service.request(`${hosted}/sign-in/email`, {
+					host,
+					body: {
+						email: credentials.project.email,
+						password: credentials.password,
+					},
+				});
+				expect(supportLogin.status).toBe(200);
+				const supportCookie = cookie(supportLogin);
+				const session = await service.request(`${hosted}/get-session`, {
+					host,
+					cookie: supportCookie,
+				});
+				const { session: support } = (await session.json()) as {
+					session: { id: string };
+				};
+				await database.query(
+					`UPDATE ${schema}."session" SET "impersonatedBy"=$1 WHERE id=$2`,
+					[credentials.platform.id, support.id],
+				);
+				async function rejectSupportKey(
+					writer: Awaited<ReturnType<typeof openProcess>>,
+				) {
+					const attempt = await writer.request(`${hosted}/api-key/create`, {
+						host,
+						cookie: supportCookie,
+						body: { name: "Support forbidden key" },
+					});
+					expect(attempt.status, await attempt.clone().text()).toBe(403);
+					expect(await attempt.json()).toMatchObject({
+						message:
+							"Authentication changes and account deletion are unavailable during impersonation.",
+					});
+				}
+				await rejectSupportKey(service);
 				for (const user of users) {
 					const setup = await service.request(`${hosted}/two-factor/enable`, {
 						host,
@@ -1224,8 +1268,8 @@ describe.skipIf(!existsSync(fixture))(
 				const list = await service.request(webhooks, { cookie: adminCookie });
 				expect(list.status).toBe(200);
 				expect(await list.json()).toMatchObject({
-					endpoints: [{ id: endpointId, eventTypes: ["mfa.*"] }],
-					supportedEventTypes: ["mfa.*"],
+					endpoints: [{ id: endpointId, eventTypes: ["mfa.*", "api-key.*"] }],
+					supportedEventTypes: ["mfa.*", "api-key.*"],
 				});
 				const hostedManagement = await service.request(
 					`${hosted}/control/webhooks`,
@@ -1249,6 +1293,16 @@ describe.skipIf(!existsSync(fixture))(
 					secret: string;
 				};
 				expect(newSigningKey).not.toBe(oldSigningKey);
+				await rejectSupportKey(service);
+				const renamed = await service.request(`${hosted}/api-key/update`, {
+					...accountKey,
+					body: { keyId: nativeKey.id, name: "Owned subscribed key" },
+				});
+				expect(renamed.status, await renamed.clone().text()).toBe(200);
+				expect(await renamed.json()).toMatchObject({
+					id: nativeKey.id,
+					name: "Owned subscribed key",
+				});
 				const { encryptionKeys } = readLegacyProjectKeyring(
 					projectKey,
 					versionedEncryption,
@@ -1285,7 +1339,7 @@ describe.skipIf(!existsSync(fixture))(
 					cookie: adminCookie,
 					body: {
 						url: "https://webhook.runtime.fixture.example/new-mfa",
-						eventTypes: ["mfa.*"],
+						eventTypes: ["api-key.*", "mfa.*"],
 					},
 				};
 				const settings = await database.connect();
@@ -1354,7 +1408,7 @@ describe.skipIf(!existsSync(fixture))(
 					/webhook/i,
 				);
 				await database.query(
-					`UPDATE ${schema}."allauthWebhookEndpoint" SET "eventTypes"='["mfa.*"]' WHERE id=$1`,
+					`UPDATE ${schema}."allauthWebhookEndpoint" SET "eventTypes"='["mfa.*","api-key.*"]' WHERE id=$1`,
 					[endpointId],
 				);
 				const revision = await repository.read(alpha.id);
@@ -1386,7 +1440,7 @@ describe.skipIf(!existsSync(fixture))(
 					endpoints: expect.arrayContaining([
 						{
 							id: newEndpoint.id,
-							eventTypes: ["mfa.*"],
+							eventTypes: ["api-key.*", "mfa.*"],
 							url: "https://webhook.runtime.fixture.example/new-mfa",
 							enabled: true,
 							description: "",
@@ -1403,6 +1457,18 @@ describe.skipIf(!existsSync(fixture))(
 						})
 					).status,
 				).toBe(200);
+				const rollbackKeyTransport = {
+					...accountKey,
+					cookie: users[0]!.cookie,
+				};
+				expect(
+					await runtimeGetApiKey(service, rollbackKeyTransport, nativeKey.id),
+				).toMatchObject({ name: "Owned subscribed key" });
+				const removed = await service.request(`${hosted}/api-key/delete`, {
+					...rollbackKeyTransport,
+					body: { keyId: nativeKey.id },
+				});
+				expect(removed.status, await removed.clone().text()).toBe(200);
 				for (const user of users) {
 					const active = await service.request(`${hosted}/get-session`, {
 						host,
@@ -1445,7 +1511,7 @@ describe.skipIf(!existsSync(fixture))(
 							return 204;
 						},
 					}),
-				).toEqual({ claimed: 6, delivered: 6, failed: 0, retried: 0 });
+				).toEqual({ claimed: 9, delivered: 9, failed: 0, retried: 0 });
 				const subjects = new Set(users.map((user) => user.id));
 				const types = [];
 				for (const { body, headers } of deliveries) {
@@ -1469,9 +1535,13 @@ describe.skipIf(!existsSync(fixture))(
 						outcome: "success",
 					});
 					expect(body).not.toContain(credentials.password);
+					expect(body).not.toContain(nativeKey.key!);
 					types.push(event.type);
 				}
 				expect(types.sort()).toEqual([
+					"api-key.create",
+					"api-key.delete",
+					"api-key.update",
 					"mfa.disabled",
 					"mfa.disabled",
 					"mfa.enrollment-started",

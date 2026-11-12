@@ -2,6 +2,7 @@ import { randomInt, randomUUID } from "node:crypto";
 import type { Pool, PoolClient } from "pg";
 import * as z from "zod";
 import type { PersonalApiKeyVerification } from "../auth-engine";
+import { canonicalIP } from "../control/security-policy";
 import { createProjectEngineStore } from "./owned-project-engine-store";
 import { issuerDigest } from "./owned-project-issuer-http";
 import { admitOwnedProjectNativeRoute } from "./owned-project-native-admission";
@@ -87,6 +88,10 @@ const routes = {
 	"/api-key/delete": "POST",
 } as const;
 type KeyRoute = keyof typeof routes;
+type KeyMutation = "/api-key/create" | "/api-key/update" | "/api-key/delete";
+const auditError = z.object({
+	code: z.string().regex(/^[a-zA-Z0-9_-]{1,100}$/),
+});
 
 type KeyRow = Record<(typeof columns)[number], unknown> & {
 	id: string;
@@ -462,17 +467,8 @@ export function createOwnedProjectPersonalKeys(options: PersonalKeyOptions) {
 	async function create(
 		client: PoolClient,
 		authority: KeyAuthority,
-		body: unknown,
+		input: z.infer<typeof createInput>,
 	) {
-		const parsed = createInput.safeParse(body);
-		if (!parsed.success) return error("INVALID_BODY", "Invalid API key input.");
-		const input = parsed.data;
-		if (input.permissions && !authority.platformAdmin)
-			return error(
-				undefined,
-				"Custom API key permissions require a platform administrator.",
-				403,
-			);
 		if (hasServerOnlyFields(input, true))
 			return error(
 				"SERVER_ONLY_PROPERTY",
@@ -518,31 +514,14 @@ export function createOwnedProjectPersonalKeys(options: PersonalKeyOptions) {
 				JSON.stringify(defaultPermissions),
 			],
 		);
-		await store.record(
-			client,
-			"api-key.create",
-			"success",
-			"/api-key/create",
-			authority.userId,
-			row!.id,
-		);
 		return apiKeyResponse({ ...publicKey(row!), key }, authority);
 	}
 
 	async function update(
 		client: PoolClient,
 		authority: KeyAuthority,
-		body: unknown,
+		input: z.infer<typeof updateInput>,
 	) {
-		const parsed = updateInput.safeParse(body);
-		if (!parsed.success) return error("INVALID_BODY", "Invalid API key input.");
-		const input = parsed.data;
-		if (input.permissions && !authority.platformAdmin)
-			return error(
-				undefined,
-				"Custom API key permissions require a platform administrator.",
-				403,
-			);
 		if (input.userId && input.userId !== authority.userId) return noAuthority();
 		if (hasServerOnlyFields(input, false))
 			return error(
@@ -587,38 +566,68 @@ export function createOwnedProjectPersonalKeys(options: PersonalKeyOptions) {
 				input.expiresIn ?? null,
 			],
 		);
-		await store.record(
-			client,
-			"api-key.update",
-			"success",
-			"/api-key/update",
-			authority.userId,
-			row!.id,
-		);
 		return apiKeyResponse(publicKey(row!), authority);
 	}
 
 	async function revoke(
 		client: PoolClient,
 		authority: KeyAuthority,
-		body: unknown,
+		input: z.infer<typeof deleteInput>,
 	) {
-		const parsed = deleteInput.safeParse(body);
-		if (!parsed.success) return error("INVALID_BODY", "Invalid API key input.");
 		const removed = await client.query(
 			`DELETE FROM "apikey" WHERE id=$1 AND "referenceId"=$2 AND ${defaultConfiguration}`,
-			[parsed.data.keyId, authority.userId],
+			[input.keyId, authority.userId],
 		);
 		if (removed.rowCount !== 1) return keyNotFound();
-		await store.record(
-			client,
-			"api-key.delete",
-			"success",
-			"/api-key/delete",
-			authority.userId,
-			parsed.data.keyId,
-		);
 		return apiKeyResponse({ success: true }, authority);
+	}
+
+	async function mutate<Input>(
+		client: PoolClient,
+		request: Request,
+		path: KeyMutation,
+		authority: KeyAuthority | null,
+		body: unknown,
+		schema: z.ZodType<Input>,
+		change: (
+			client: PoolClient,
+			authority: KeyAuthority,
+			input: Input,
+		) => Promise<Response>,
+	) {
+		const parsed = schema.safeParse(body);
+		const response = !parsed.success
+			? error("VALIDATION_ERROR", "Invalid API key input.")
+			: authority
+				? await change(client, authority, parsed.data)
+				: path === "/api-key/delete"
+					? error("UNAUTHORIZED", "Unauthorized", 401)
+					: noAuthority();
+		const failed = response.status >= 400;
+		const detail = failed
+			? auditError.safeParse(
+					await response
+						.clone()
+						.json()
+						.catch(() => null),
+				)
+			: null;
+		const userId = parsed.success ? authority?.userId : undefined;
+		await store.recordEvent(client, {
+			type: path.slice(1).replaceAll("/", "."),
+			outcome: failed ? "failure" : "success",
+			actorId: userId,
+			userId,
+			ipAddress: canonicalIP(options.trustedIP(request)) ?? undefined,
+			userAgent: request.headers.get("user-agent") ?? undefined,
+			metadata: {
+				path,
+				...(failed
+					? { errorCode: detail?.data?.code ?? "AUTHENTICATION_FAILED" }
+					: {}),
+			},
+		});
+		return response;
 	}
 
 	async function dispatch(path: string, request: Request) {
@@ -635,22 +644,59 @@ export function createOwnedProjectPersonalKeys(options: PersonalKeyOptions) {
 		return store.transaction(async (client) => {
 			const authority = await options.authorize(request, client);
 			if (authority instanceof Response) return authority;
-			if (!authority)
-				return path === "/api-key/create" || path === "/api-key/update"
-					? noAuthority()
-					: error("UNAUTHORIZED", "Unauthorized", 401);
+			if (
+				(path === "/api-key/create" || path === "/api-key/update") &&
+				body &&
+				typeof body === "object" &&
+				"permissions" in body &&
+				body.permissions &&
+				!authority?.platformAdmin
+			)
+				return error(
+					undefined,
+					"Custom API key permissions require a platform administrator.",
+					403,
+				);
 			const params = new URL(request.url).searchParams;
 			switch (path) {
 				case "/api-key/list":
-					return list(client, authority, params);
+					return authority
+						? list(client, authority, params)
+						: error("UNAUTHORIZED", "Unauthorized", 401);
 				case "/api-key/get":
-					return get(client, authority, params);
+					return authority
+						? get(client, authority, params)
+						: error("UNAUTHORIZED", "Unauthorized", 401);
 				case "/api-key/create":
-					return create(client, authority, body);
+					return mutate(
+						client,
+						request,
+						path,
+						authority,
+						body,
+						createInput,
+						create,
+					);
 				case "/api-key/update":
-					return update(client, authority, body);
+					return mutate(
+						client,
+						request,
+						path,
+						authority,
+						body,
+						updateInput,
+						update,
+					);
 				case "/api-key/delete":
-					return revoke(client, authority, body);
+					return mutate(
+						client,
+						request,
+						path,
+						authority,
+						body,
+						deleteInput,
+						revoke,
+					);
 			}
 		});
 	}

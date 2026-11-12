@@ -2757,7 +2757,14 @@ export function createOwnedProjectEngine(
 			}
 			const token =
 				serverSessionBearer(request.headers) ?? tokenFrom(request.headers);
-			const observed = await eligibleSession(token, client);
+			const raw = token ? await store.session(token, refreshWindow, client) : null;
+			if (request.method === "POST" && raw?.session.impersonatedBy)
+				return failure(
+					403,
+					"FORBIDDEN",
+					"Authentication changes and account deletion are unavailable during impersonation.",
+				);
+			const observed = ordinarySession(token, raw);
 			if (!observed) return null;
 			const userId = observed.user.id;
 			if (

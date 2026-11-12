@@ -10,7 +10,7 @@ import { scim } from "@better-auth/scim";
 import { sso } from "@better-auth/sso";
 import type { AuthContext, BetterAuthOptions, BetterAuthPlugin } from "better-auth";
 import { APIError, betterAuth } from "better-auth";
-import { createAuthMiddleware, getSessionFromCtx } from "better-auth/api";
+import { createAuthMiddleware, getAuthoritativeSessionFromCtx, getSessionFromCtx } from "better-auth/api";
 import { nextCookies } from "better-auth/next-js";
 import { admin, emailOTP, genericOAuth, jwt, lastLoginMethod, magicLink, multiSession, organization } from "better-auth/plugins";
 import { createAccessControl } from "better-auth/plugins/access";
@@ -187,6 +187,12 @@ export function createAuthOptions(database: BetterAuthOptions["database"], env: 
 						}
 					};
 					checkURLs(ctx.body);
+				}
+				if (realm && ["/api-key/create", "/api-key/update", "/api-key/delete"].includes(ctx.path || "")) {
+					const current = await getAuthoritativeSessionFromCtx(ctx);
+					if (current?.session.impersonatedBy) throw new APIError("FORBIDDEN", {
+						message: "Authentication changes and account deletion are unavailable during impersonation.",
+					});
 				}
 				if ((ctx.path === "/api-key/create" || ctx.path === "/api-key/update") && ctx.body?.permissions) {
 					const session = await getSessionFromCtx(ctx, { disableRefresh: true });

@@ -24,9 +24,9 @@ import { lockOwnedProjectWorkspaceAdministrator } from "./owned-project-admin-au
 import type { createProjectEngineStore } from "./owned-project-engine-store";
 import { admitOwnedProjectNativeRoute } from "./owned-project-native-admission";
 import {
-	ownedMfaWebhookAccountsSupported,
-	ownedMfaWebhookPolicy,
-	ownedMfaWebhookSubscription,
+	ownedWebhookAccountsSupported,
+	ownedWebhookPolicySupported,
+	ownedWebhookUsesPolicyGuard,
 } from "./owned-project-webhook-admission";
 import type { Project } from "./registry";
 
@@ -202,7 +202,7 @@ export function createOwnedProjectWebhookManagement(options: {
 			const supported = options.supportedEventTypes;
 			if (eventTypes.some((type) => !supported.includes(type)))
 				return authorized(async () => unavailableSubscriptions());
-			const usesMfa = eventTypes.includes(ownedMfaWebhookSubscription);
+			const guardPolicy = ownedWebhookUsesPolicyGuard(eventTypes);
 			let destination: Awaited<ReturnType<typeof validateWebhookDestination>>;
 			try {
 				destination = await validateWebhookDestination(
@@ -215,16 +215,13 @@ export function createOwnedProjectWebhookManagement(options: {
 				);
 			}
 			return authorized(async (client) => {
-				if (usesMfa) {
+				if (guardPolicy) {
 					const { policy } = await authPolicyRepository(client).read(
 						project.id,
 					);
 					if (
-						!ownedMfaWebhookPolicy(policy) ||
-						!(await ownedMfaWebhookAccountsSupported(
-							client,
-							project.schemaName,
-						))
+						!ownedWebhookPolicySupported(policy) ||
+						!(await ownedWebhookAccountsSupported(client, project.schemaName))
 					)
 						return unavailableSubscriptions();
 				}
@@ -254,7 +251,7 @@ export function createOwnedProjectWebhookManagement(options: {
 				);
 				await audit(client, "webhook.created", actorId, id, ip, request);
 				return accountLinkJson({ endpoint: publicEndpoint(rows[0]), secret });
-			}, usesMfa);
+			}, guardPolicy);
 		}
 		const parsed = (
 			path === "/control/webhooks/retry"

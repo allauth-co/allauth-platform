@@ -77,8 +77,7 @@ import { ssoProviderId } from "./owned-project-sso-store";
 import { createOwnedProjectUserConsole } from "./owned-project-user-console";
 import {
 	assertOwnedProjectWebhookAdmission,
-	ownedMfaWebhookPolicy,
-	ownedMfaWebhookSubscription,
+	ownedWebhookSelectors,
 } from "./owned-project-webhook-admission";
 import type { ProjectAvatarStorage } from "./project-avatar-upload";
 import { verifiedProjectRequest } from "./proxy";
@@ -592,9 +591,7 @@ export async function createOwnedProjectRuntimeCandidate(options: Options) {
 		webhookManagement: {
 			encryptionSecret: options.signingSecret,
 			resolver: options.webhookResolver,
-			supportedEventTypes: ownedMfaWebhookPolicy(policy)
-				? [ownedMfaWebhookSubscription]
-				: [],
+			supportedEventTypes: ownedWebhookSelectors(policy),
 		},
 		sdk: {
 			avatar: avatarStorage,

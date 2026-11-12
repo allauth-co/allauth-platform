@@ -1,7 +1,7 @@
 import type { AuthPolicy } from "../auth-policy/policy";
 import { checkedProjectSchema } from "./validation";
 
-export const ownedMfaWebhookSubscription = "mfa.*";
+const supportedSelectors = ["mfa.*", "api-key.*"] as const;
 
 type Queryable = {
 	query<Row extends Record<string, unknown>>(
@@ -10,13 +10,21 @@ type Queryable = {
 	): Promise<{ rows: Row[] }>;
 };
 
-/** Only optional MFA with email verification disabled has configured webhook parity. */
-export function ownedMfaWebhookPolicy(policy: AuthPolicy) {
+/** Configured webhook compatibility covers optional MFA and disabled email verification. */
+export function ownedWebhookPolicySupported(policy: AuthPolicy) {
 	return policy.mfaMode === "optional" && !policy.requireEmailVerification;
 }
 
+export function ownedWebhookSelectors(policy: AuthPolicy) {
+	return ownedWebhookPolicySupported(policy) ? supportedSelectors : [];
+}
+
+export function ownedWebhookUsesPolicyGuard(selectors: readonly string[]) {
+	return supportedSelectors.some((selector) => selectors.includes(selector));
+}
+
 /** Fail closed for ambiguous credential records and inconsistent live sessions. */
-export async function ownedMfaWebhookAccountsSupported(
+export async function ownedWebhookAccountsSupported(
 	database: Queryable,
 	schemaName: string,
 ) {
@@ -36,7 +44,7 @@ export async function ownedMfaWebhookAccountsSupported(
 	return rows[0]?.supported === true;
 }
 
-/** Persisted rows must contain the exact selector admitted for this project policy. */
+/** Persisted rows must use supported selectors for the current policy. */
 export async function assertOwnedProjectWebhookAdmission(
 	database: Queryable,
 	schemaName: string,
@@ -50,15 +58,16 @@ export async function assertOwnedProjectWebhookAdmission(
 		unsupported: boolean;
 	}>(
 		`SELECT EXISTS (SELECT 1 FROM "${schema}"."allauthWebhookEndpoint") AS configured,
-			EXISTS (SELECT 1 FROM "${schema}"."allauthWebhookEndpoint" WHERE "eventTypes" IS DISTINCT FROM $1::jsonb) AS unsupported`,
-		[JSON.stringify([ownedMfaWebhookSubscription])],
+			EXISTS (SELECT 1 FROM "${schema}"."allauthWebhookEndpoint"
+				WHERE jsonb_typeof("eventTypes") IS DISTINCT FROM 'array'
+				OR "eventTypes" = '[]'::jsonb OR NOT ("eventTypes" <@ $1::jsonb)) AS unsupported`,
+		[JSON.stringify(ownedWebhookSelectors(policy))],
 	);
 	if (
 		!configuration ||
 		(configuration.configured &&
 			(configuration.unsupported ||
-				!ownedMfaWebhookPolicy(policy) ||
-				!(await ownedMfaWebhookAccountsSupported(database, schema))))
+				!(await ownedWebhookAccountsSupported(database, schema))))
 	)
 		throw new Error(
 			"This development project's configured webhooks are outside the candidate scope.",
