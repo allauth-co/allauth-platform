@@ -1,0 +1,487 @@
+import type { Pool } from "pg";
+import * as z from "zod";
+import type { AuthPolicy } from "../auth-policy/policy";
+import { authPolicySchema } from "../auth-policy/policy";
+import { validAvatarPath } from "../avatars/protocol";
+import type { ApplicationBranding } from "../branding/types";
+import { authenticationEmail } from "../email/authentication";
+import type { EmailEnvironment } from "../email/send";
+import { emailConfigured, sendAuthEmail } from "../email/send";
+import type { CompleteProjectEmailSignIn } from "./owned-project-email-sign-in-store";
+import { createProjectEmailSignInStore } from "./owned-project-email-sign-in-store";
+import type { Project } from "./registry";
+import type { SessionCheckAdmission } from "./session-introspection-admission";
+import { projectOrigin, projectSlug } from "./validation";
+
+const email = z.email().max(320);
+const callback = z.string().max(2048).optional();
+const magicInput = z.object({
+	email,
+	name: z.string().max(256).optional(),
+	callbackURL: callback,
+	newUserCallbackURL: callback,
+	errorCallbackURL: callback,
+});
+const otpSend = z.object({
+	email,
+	type: z.enum([
+		"sign-in",
+		"email-verification",
+		"forget-password",
+		"change-email",
+	]),
+});
+const otpSignIn = z.object({
+	email,
+	otp: z.string().max(256),
+	name: z.string().max(256).optional(),
+	image: z.string().max(2048).optional(),
+});
+
+export type ProjectEmailSignInOperation =
+	| "sign-in/magic-link"
+	| "magic-link/verify"
+	| "email-otp/send-verification-otp"
+	| "sign-in/email-otp";
+
+export interface OwnedProjectEmailSignInOptions {
+	database: Pool;
+	project: Pick<Project, "schemaName" | "slug">;
+	policy: AuthPolicy;
+	baseURL: string;
+	basePath: string;
+	/** Exact auth endpoint base used in email, including the SDK proxy path when applicable. */
+	publicLinkBaseURL: string;
+	trustedOrigins: readonly string[];
+	callbackURLs: readonly string[];
+	email: { environment: EmailEnvironment; branding?: ApplicationBranding };
+	/** Meter trusted ingress before any challenge mutation or delivery. */
+	admit(
+		request: Request,
+		operation: ProjectEmailSignInOperation,
+		normalizedEmail?: string,
+	): Promise<SessionCheckAdmission | Response>;
+	/** Schedule delivery after the HTTP response and keep the selected realm available to it. */
+	defer(delivery: () => Promise<void>): void;
+	onDeliveryFailure?(
+		operation: "sign-in/magic-link" | "email-otp/send-verification-otp",
+	): void;
+	completeSignIn: CompleteProjectEmailSignIn;
+}
+
+function privateHeaders(headers = new Headers()) {
+	headers.set("Cache-Control", "no-store");
+	headers.set("Pragma", "no-cache");
+	headers.set("Referrer-Policy", "no-referrer");
+	return headers;
+}
+
+function json(value: unknown, status = 200, headers?: Headers) {
+	return Response.json(value, { status, headers: privateHeaders(headers) });
+}
+
+function failure(
+	status: number,
+	code: string,
+	message: string,
+	headers?: Headers,
+) {
+	return json({ code, message }, status, headers);
+}
+
+function forbidden() {
+	return failure(
+		403,
+		"FORBIDDEN",
+		"This authentication request is not permitted.",
+	);
+}
+
+function unsupported() {
+	return failure(
+		501,
+		"ALLAUTH_AUTH_OPERATION_UNSUPPORTED",
+		"This authentication operation is unavailable in this realm.",
+	);
+}
+
+function normalizeURL(value: string, origin: string) {
+	if (
+		!value ||
+		value.length > 2048 ||
+		value.startsWith("//") ||
+		/[\\\u0000-\u0020\u007f]/.test(value)
+	)
+		return null;
+	try {
+		const url = new URL(value, origin);
+		return url.username || url.password || url.hash ? null : url;
+	} catch {
+		return null;
+	}
+}
+
+function redirectError(callback: URL, code: string) {
+	callback.searchParams.set("error", code);
+	return new Response(null, {
+		status: 302,
+		headers: privateHeaders(new Headers({ Location: callback.href })),
+	});
+}
+
+async function readBody(request: Request): Promise<unknown> {
+	const mime = request.headers
+		.get("content-type")
+		?.split(";", 1)[0]
+		?.trim()
+		.toLowerCase();
+	const form = mime === "application/x-www-form-urlencoded";
+	if (!form && mime !== "application/json") return undefined;
+	const reader = request.body?.getReader();
+	if (!reader) return undefined;
+	const decoder = new TextDecoder("utf-8", { fatal: true });
+	let length = 0;
+	let content = "";
+	try {
+		while (true) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			length += value.byteLength;
+			if (length > 8192) {
+				void reader.cancel().catch(() => {});
+				return undefined;
+			}
+			content += decoder.decode(value, { stream: true });
+		}
+		content += decoder.decode();
+		if (!form) return JSON.parse(content);
+		const fields = new URLSearchParams(content);
+		if (new Set(fields.keys()).size !== fields.size) return undefined;
+		return Object.fromEntries(fields);
+	} catch {
+		return undefined;
+	} finally {
+		reader.releaseLock();
+	}
+}
+
+/** Cookie-only project sign-in backed by the existing five-minute email challenge rows. */
+export function createOwnedProjectEmailSignIn(
+	options: OwnedProjectEmailSignInOptions,
+) {
+	const origin = projectOrigin.parse(options.baseURL);
+	const slug = projectSlug.parse(options.project.slug);
+	if (!["/api/auth", `/api/projects/${slug}/auth`].includes(options.basePath))
+		throw new Error("Invalid project email sign-in route.");
+	const origins = new Set([
+		origin,
+		...options.trustedOrigins.map((item) => projectOrigin.parse(item)),
+	]);
+	const linkBase = normalizeURL(options.publicLinkBaseURL, origin);
+	if (
+		!linkBase ||
+		!origins.has(linkBase.origin) ||
+		linkBase.search ||
+		!/^\/(?:[A-Za-z0-9_-]+\/)*[A-Za-z0-9_-]+$/.test(linkBase.pathname)
+	)
+		throw new Error("Invalid project magic link base.");
+	const linkOrigin = linkBase.origin;
+	const linkPath = linkBase.pathname;
+	const approved = options.callbackURLs.map((value) => {
+		const url = normalizeURL(value, origin);
+		if (
+			!url ||
+			!origins.has(url.origin) ||
+			url.searchParams.has("token") ||
+			url.searchParams.has("error")
+		)
+			throw new Error("Invalid project magic link callback.");
+		return url.href;
+	});
+	if (!approved.length)
+		throw new Error("An explicit project magic link callback is required.");
+	const policy = authPolicySchema.parse(options.policy);
+	const store = createProjectEmailSignInStore({
+		...options,
+		schemaName: options.project.schemaName,
+		policy,
+		async completeSignIn(input) {
+			const response = await options.completeSignIn(input);
+			const location = response.headers.get("location");
+			if (location) {
+				const target = normalizeURL(location, linkOrigin);
+				if (!target || !origins.has(target.origin)) return forbidden();
+			}
+			return response;
+		},
+	});
+	const branding = options.email.branding;
+	const appName = branding?.name || "AllAuth";
+
+	function selectCallback(
+		value: string | undefined,
+		caller: string,
+		fallback = approved[0],
+	) {
+		if (value === undefined) return new URL(fallback);
+		const url = normalizeURL(value, caller);
+		return url && approved.includes(url.href) ? url : null;
+	}
+
+	function schedule(
+		operation: "sign-in/magic-link" | "email-otp/send-verification-otp",
+		delivery: () => Promise<void>,
+	) {
+		if (!emailConfigured(options.email.environment))
+			return failure(
+				503,
+				"EMAIL_DELIVERY_UNAVAILABLE",
+				"Authentication email is unavailable.",
+			);
+		try {
+			options.defer(async () => {
+				try {
+					await delivery();
+				} catch {
+					options.onDeliveryFailure?.(operation);
+				}
+			});
+		} catch {
+			return failure(
+				503,
+				"EMAIL_DELIVERY_UNAVAILABLE",
+				"Authentication email is unavailable.",
+			);
+		}
+		return null;
+	}
+
+	async function admission(
+		request: Request,
+		operation: ProjectEmailSignInOperation,
+		identity?: string,
+	) {
+		const decision = await options.admit(request, operation, identity);
+		if (decision instanceof Response) return privateResponse(decision);
+		if (decision.allowed) return null;
+		return failure(
+			429,
+			"TOO_MANY_REQUESTS",
+			"Too many requests.",
+			new Headers({
+				"Retry-After": String(
+					Number.isFinite(decision.retryAfter)
+						? Math.max(1, Math.ceil(decision.retryAfter))
+						: 1,
+				),
+			}),
+		);
+	}
+
+	async function sendMagic(request: Request, caller: string) {
+		const parsed = magicInput.safeParse(await readBody(request));
+		if (!parsed.success)
+			return failure(400, "INVALID_BODY", "Supply a valid email address.");
+		const body = parsed.data;
+		const destination = selectCallback(body.callbackURL, caller);
+		if (!destination) return forbidden();
+		const created = selectCallback(
+			body.newUserCallbackURL,
+			caller,
+			destination.href,
+		);
+		const error = selectCallback(
+			body.errorCallbackURL,
+			caller,
+			destination.href,
+		);
+		if (!created || !error) return forbidden();
+		const address = body.email.toLowerCase();
+		const limited = await admission(request, "sign-in/magic-link", address);
+		if (limited) return limited;
+		const scheduled = schedule("sign-in/magic-link", async () => {
+			const token = await store.issueMagic({ email: address, name: body.name });
+			if (!token) return;
+			const url = new URL(`${linkPath}/magic-link/verify`, linkOrigin);
+			url.searchParams.set("token", token);
+			url.searchParams.set("callbackURL", destination.href);
+			if (body.newUserCallbackURL)
+				url.searchParams.set("newUserCallbackURL", created.href);
+			if (body.errorCallbackURL)
+				url.searchParams.set("errorCallbackURL", error.href);
+			await sendAuthEmail(options.email.environment, {
+				to: address,
+				fromName: appName,
+				subject: `Sign in to ${appName}`,
+				react: authenticationEmail({
+					branding,
+					title: `Sign in to ${appName}`,
+					description: "Use this link to sign in. It expires in five minutes.",
+					url: url.href,
+					actionLabel: "Sign in",
+				}),
+			});
+		});
+		return scheduled ?? json({ status: true });
+	}
+
+	async function sendOtp(request: Request) {
+		const parsed = otpSend.safeParse(await readBody(request));
+		if (!parsed.success)
+			return failure(
+				400,
+				"INVALID_BODY",
+				"Supply a valid email address and code purpose.",
+			);
+		if (parsed.data.type !== "sign-in") return unsupported();
+		const address = parsed.data.email.toLowerCase();
+		const limited = await admission(
+			request,
+			"email-otp/send-verification-otp",
+			address,
+		);
+		if (limited) return limited;
+		const scheduled = schedule("email-otp/send-verification-otp", async () => {
+			const code = await store.issueOtp(address);
+			if (!code) return;
+			await sendAuthEmail(options.email.environment, {
+				to: address,
+				fromName: appName,
+				subject: `Your ${appName} verification code`,
+				react: authenticationEmail({
+					branding,
+					title: "Your verification code",
+					description:
+						"Use this code to complete sign in. It expires in five minutes.",
+					code,
+				}),
+			});
+		});
+		return scheduled ?? json({ success: true });
+	}
+
+	async function verifyMagic(request: Request, url: URL) {
+		const fields = [
+			"token",
+			"callbackURL",
+			"newUserCallbackURL",
+			"errorCallbackURL",
+		];
+		if (fields.some((name) => url.searchParams.getAll(name).length > 1))
+			return forbidden();
+		const callbackURL = url.searchParams.get("callbackURL") ?? undefined;
+		const newUserCallback =
+			url.searchParams.get("newUserCallbackURL") ?? undefined;
+		const destination = selectCallback(callbackURL, linkOrigin);
+		if (!destination) return forbidden();
+		const created = selectCallback(
+			newUserCallback,
+			linkOrigin,
+			destination.href,
+		);
+		const error = selectCallback(
+			url.searchParams.get("errorCallbackURL") ?? undefined,
+			linkOrigin,
+			destination.href,
+		);
+		if (!created || !error) return forbidden();
+		const limited = await admission(request, "magic-link/verify");
+		if (limited) return limited;
+		const token = url.searchParams.get("token") ?? "";
+		if (!/^[A-Za-z]{32}$/.test(token))
+			return redirectError(error, "INVALID_TOKEN");
+		const result = await store.verifyMagic(token, request, {
+			existing: callbackURL ? destination.href : undefined,
+			created: callbackURL || newUserCallback ? created.href : undefined,
+		});
+		if (result.status === "authenticated")
+			return privateResponse(result.response);
+		if (result.status === "signup-disabled")
+			return redirectError(error, "new_user_signup_disabled");
+		return redirectError(
+			error,
+			result.status === "invalid" || result.status === "expired"
+				? "INVALID_TOKEN"
+				: "failed_to_create_session",
+		);
+	}
+
+	function privateResponse(response: Response) {
+		return new Response(response.body, {
+			status: response.status,
+			headers: privateHeaders(new Headers(response.headers)),
+		});
+	}
+
+	async function verifyOtp(request: Request, caller: string) {
+		const input = otpSignIn.safeParse(await readBody(request));
+		if (!input.success)
+			return failure(
+				400,
+				"INVALID_BODY",
+				"Supply a valid email address and code.",
+			);
+		const { email, otp, name, image } = input.data;
+		if (image) {
+			try {
+				if (validAvatarPath(new URL(image, caller).pathname))
+					return failure(
+						400,
+						"INVALID_PROFILE_IMAGE",
+						"Choose the original profile photo uploaded for your current account.",
+					);
+			} catch {
+				// Ordinary external profile-image values keep their existing contract.
+			}
+		}
+		const address = email.toLowerCase();
+		const limited = await admission(request, "sign-in/email-otp", address);
+		if (limited) return limited;
+		const result = await store.verifyOtp(
+			{ email: address, name, image },
+			otp,
+			request,
+		);
+		if ("response" in result) return privateResponse(result.response);
+		if (result.status === "expired")
+			return failure(400, "OTP_EXPIRED", "OTP expired");
+		if (result.status === "attempts")
+			return failure(403, "TOO_MANY_ATTEMPTS", "Too many attempts");
+		if (result.status === "unsupported") return unsupported();
+		return failure(400, "INVALID_OTP", "Invalid OTP");
+	}
+
+	return async function dispatch(request: Request): Promise<Response | null> {
+		const url = new URL(request.url);
+		if (!url.pathname.startsWith(`${options.basePath}/`)) return null;
+		const path = url.pathname.slice(options.basePath.length + 1);
+		if (
+			path !== "sign-in/magic-link" &&
+			path !== "magic-link/verify" &&
+			path !== "email-otp/send-verification-otp" &&
+			path !== "sign-in/email-otp"
+		)
+			return null;
+		const get = path === "magic-link/verify";
+		if (request.method !== (get ? "GET" : "POST"))
+			return failure(
+				405,
+				"METHOD_NOT_ALLOWED",
+				"Method not allowed.",
+				new Headers({ Allow: get ? "GET" : "POST" }),
+			);
+		const caller = request.headers.get("origin");
+		if (
+			url.origin !== origin ||
+			request.headers.has("authorization") ||
+			(caller && !origins.has(caller))
+		)
+			return forbidden();
+		if (get) return verifyMagic(request, url);
+		if (!caller || request.headers.get("sec-fetch-site") === "cross-site")
+			return forbidden();
+		if (path === "sign-in/magic-link") return sendMagic(request, caller);
+		if (path === "email-otp/send-verification-otp") return sendOtp(request);
+		return verifyOtp(request, caller);
+	};
+}

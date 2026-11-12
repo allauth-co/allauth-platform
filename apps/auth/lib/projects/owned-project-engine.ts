@@ -20,6 +20,23 @@ import {
 	createProjectEngineStore,
 	projectUserResponse,
 } from "./owned-project-engine-store";
+import {
+	createOwnedProjectEmailSignIn,
+	type OwnedProjectEmailSignInOptions,
+} from "./owned-project-email-sign-in";
+import {
+	createOwnedProjectOAuth,
+	ownedProjectOAuthStartInput,
+	type OwnedProjectOAuthOptions,
+} from "./owned-project-oauth";
+import {
+	createOwnedProjectOrganizationHttp,
+	type OwnedProjectOrganizationOptions,
+} from "./owned-project-organization";
+import {
+	createOwnedProjectSecurity,
+	projectSecurityBlockedCode,
+} from "./owned-project-security";
 import type { Project } from "./registry";
 import { consumeProxySessionCheck } from "./session-introspection-admission";
 import { projectOrigin, projectSlug } from "./validation";
@@ -66,6 +83,39 @@ interface OwnedProjectEngineOptions {
 		| "basePath"
 		| "trustedOrigins"
 	>;
+	emailSignIn?: Omit<
+		OwnedProjectEmailSignInOptions,
+		| "database"
+		| "project"
+		| "policy"
+		| "baseURL"
+		| "basePath"
+		| "trustedOrigins"
+		| "completeSignIn"
+	>;
+	oauth?: Omit<
+		OwnedProjectOAuthOptions,
+		| "database"
+		| "project"
+		| "baseURL"
+		| "basePath"
+		| "trustedOrigins"
+		| "signingSecret"
+		| "signUpEnabled"
+		| "requireEmailVerification"
+		| "complete"
+	>;
+	organization?: Pick<OwnedProjectOrganizationOptions, "membershipLimit">;
+	security?: {
+		requireTrustedIP?: boolean;
+		newDevice?: {
+			defer(delivery: () => Promise<void>): void;
+			notify(
+				user: Pick<ProjectUser, "id" | "email" | "name">,
+				context: { ipAddress?: string; userAgent?: string },
+			): Promise<void>;
+		};
+	};
 	passkeys?: Parameters<typeof createOwnedProjectPasskeyHttp>[0]["rp"];
 	recovery?: Omit<
 		Parameters<typeof createOwnedRecoveryHttp>[0],
@@ -102,6 +152,14 @@ function unsupported() {
 		501,
 		"ALLAUTH_AUTH_OPERATION_UNSUPPORTED",
 		"This authentication operation is unavailable in this realm.",
+	);
+}
+
+function securityBlocked() {
+	return failure(
+		429,
+		projectSecurityBlockedCode,
+		"This authentication request is temporarily unavailable. Try again later.",
 	);
 }
 
@@ -188,6 +246,14 @@ export function createOwnedProjectEngine(
 		secureCookies: secure,
 		keys: options.mfaKeys,
 	});
+	const security = createOwnedProjectSecurity({
+		secret: options.signingSecret,
+		trustedIP: options.trustedIP,
+		requireTrustedIP: options.security?.requireTrustedIP,
+	});
+	const newDevice = options.security?.newDevice;
+	const notifications = new WeakMap<Request, () => Promise<void>>();
+	const deniedMfa = Symbol("MFA sign-in denied by project security");
 	const changedMfaOwner = Symbol("MFA account no longer eligible");
 
 	function trustedRequest(
@@ -322,7 +388,7 @@ export function createOwnedProjectEngine(
 			token,
 			userId: user.id,
 			expiresIn: rememberMe || prior ? policy.sessionExpiresInSeconds : 86400,
-			ip: options.trustedIP(request) ?? "",
+			ip: security.trustedIP(request) ?? "",
 			userAgent: request.headers.get("user-agent")?.slice(0, 512) ?? "",
 			activeOrganizationId: prior?.activeOrganizationId,
 			activeTeamId: prior?.activeTeamId,
@@ -340,7 +406,35 @@ export function createOwnedProjectEngine(
 			maxAge,
 		);
 		rememberPreference(headers, rememberMe);
-		return { headers, session, user: projectUserResponse(user) };
+		if (!prior && user.emailVerified) {
+			const name = `${prefix}control_device`;
+			const known = await security.registerDevice(
+				client,
+				request,
+				user.id,
+				tokenFrom(request.headers, name),
+			);
+			writeCookie(headers, name, known.token, 180 * 86400);
+			if (known.notify && newDevice) {
+				const { id, name, email } = user;
+				notifications.set(request, async () => {
+					try {
+						await newDevice.notify(
+							{ id, name, email },
+							{
+								ipAddress: security.trustedIP(request) ?? undefined,
+								userAgent: request.headers.get("user-agent")?.slice(0, 512),
+							},
+						);
+					} catch {
+						await store.transaction((client) =>
+							security.notificationFailed(client, request, id),
+						);
+					}
+				});
+			}
+		}
+		return { headers, session, token, user: projectUserResponse(user) };
 	}
 
 	function mfaContinuation(callback: string): string {
@@ -377,11 +471,9 @@ export function createOwnedProjectEngine(
 		if (!activeUser(user) || user.directoryManaged) return forbidden();
 		if (!verifiedUser(user))
 			return failure(403, "EMAIL_NOT_VERIFIED", "Email not verified");
-		if (
-			policy.supportAccess?.enabled ||
-			!(await store.passwordPolicySupported(client, user.id))
-		)
-			return unsupported();
+		if (policy.supportAccess?.enabled) return unsupported();
+		if (await security.denySession(client, request, user.email))
+			return securityBlocked();
 		if (policy.mfaMode === "required" && !user.twoFactorEnabled)
 			return forbidden();
 		const device = user.twoFactorEnabled
@@ -412,6 +504,7 @@ export function createOwnedProjectEngine(
 		const {
 			headers,
 			session,
+			token,
 			user: value,
 		} = await createSession(client, user, request, rememberMe, path);
 		if (device?.setCookie) headers.append("Set-Cookie", device.setCookie);
@@ -427,6 +520,14 @@ export function createOwnedProjectEngine(
 				headers,
 			);
 		}
+		if (path === "/sign-in/email-otp")
+			return json({ token, user: value }, 200, headers);
+		if (path === "/magic-link/verify")
+			return json(
+				{ token, user: value, session: { ...session, token } },
+				200,
+				headers,
+			);
 		if (path === "/verify-email") {
 			return callback
 				? redirect(headers, callback)
@@ -551,6 +652,12 @@ export function createOwnedProjectEngine(
 			.safeParse(await requestBody(request));
 		if (!body.success)
 			return failure(400, "INVALID_BODY", "Supply a verification code.");
+		const path =
+			method === "totp"
+				? "/two-factor/verify-totp"
+				: "/two-factor/verify-backup-code";
+		if (await store.transaction((client) => security.admit(client, request)))
+			return securityBlocked();
 		const refused = await factorAdmission(request, method);
 		if (refused) return refused;
 		if (await currentSession(request.headers)) {
@@ -558,8 +665,12 @@ export function createOwnedProjectEngine(
 				method,
 				code: body.data.code,
 			});
-			if (result.status === "rejected")
+			if (result.status === "rejected") {
+				await store.transaction((client) =>
+					security.failed(client, request, path),
+				);
 				return failure(result.httpStatus, result.code, result.message);
+			}
 			if (result.status === "rotated") {
 				for (const cookie of result.setCookies)
 					result.value.headers.append("Set-Cookie", cookie);
@@ -588,22 +699,24 @@ export function createOwnedProjectEngine(
 						!verifiedUser(user) ||
 						user.directoryManaged ||
 						!user.twoFactorEnabled ||
-						policy.supportAccess?.enabled ||
-						!(await store.passwordPolicySupported(client, user.id))
+						policy.supportAccess?.enabled
 					)
 						throw changedMfaOwner;
+					if (await security.denySession(client, request, user.email))
+						throw deniedMfa;
 					return createSession(
 						client,
 						user,
 						request,
 						!pending.dontRememberMe,
-						method === "totp"
-							? "/two-factor/verify-totp"
-							: "/two-factor/verify-backup-code",
+						path,
 					);
 				},
 			);
 			if (result.status === "rejected") {
+				await store.transaction((client) =>
+					security.failed(client, request, path),
+				);
 				const headers = new Headers();
 				for (const cookie of result.setCookies)
 					headers.append("Set-Cookie", cookie);
@@ -614,6 +727,7 @@ export function createOwnedProjectEngine(
 				headers.append("Set-Cookie", cookie);
 			return json({ session, user }, 200, headers);
 		} catch (error) {
+			if (error === deniedMfa) return securityBlocked();
 			if (error === changedMfaOwner) return forbidden();
 			throw error;
 		}
@@ -656,21 +770,29 @@ export function createOwnedProjectEngine(
 		if (multiCookies(request.headers).length > 0 || tokenFrom(request.headers))
 			return unsupported();
 
-		const ip = options.trustedIP(request);
-		if (!ip || !isIP(ip)) return forbidden();
+		const login = (
+			"email" in body.data ? body.data.email : body.data.username
+		).toLowerCase();
+		const identity = field === "email" ? { email: login } : { username: login };
+		if (
+			await store.transaction((client) =>
+				security.admit(client, request, identity),
+			)
+		)
+			return securityBlocked();
+
+		const ip = security.trustedIP(request);
+		if (!ip) return forbidden();
 		const bucket = createHmac("sha256", options.signingSecret)
 			.update(`owned-password:v1\0${ip}`)
 			.digest("hex");
-		const admission = await store.transaction(async (client) =>
-			(await store.passwordPolicySupported(client))
-				? consumeProxySessionCheck(
-						client,
-						`owned-password:v1:${bucket}`,
-						passwordLimit,
-					)
-				: null,
+		const admission = await store.transaction((client) =>
+			consumeProxySessionCheck(
+				client,
+				`owned-password:v1:${bucket}`,
+				passwordLimit,
+			),
 		);
-		if (!admission) return unsupported();
 		if (!admission.allowed)
 			return failure(
 				429,
@@ -679,9 +801,6 @@ export function createOwnedProjectEngine(
 				new Headers({ "Retry-After": String(admission.retryAfter) }),
 			);
 
-		const login = (
-			"email" in body.data ? body.data.email : body.data.username
-		).toLowerCase();
 		const credential = await store.credential(login, undefined, field);
 		const hash = credential?.password;
 		if (
@@ -693,9 +812,10 @@ export function createOwnedProjectEngine(
 			}))
 		) {
 			if (!hash) await clerkCompatiblePasswords.hash(body.data.password);
-			await store.transaction((client) =>
-				store.record(client, "auth.sign-in", "failure", path),
-			);
+			await store.transaction(async (client) => {
+				await security.failed(client, request, path, identity);
+				await store.record(client, "auth.sign-in", "failure", path);
+			});
 			return failure(401, invalidCode, invalidMessage);
 		}
 
@@ -706,9 +826,10 @@ export function createOwnedProjectEngine(
 				current.id !== credential.id ||
 				current.password !== hash
 			) {
+				await security.failed(client, request, path, identity);
 				return failure(401, invalidCode, invalidMessage);
 			}
-			return primaryResult(
+			const result = await primaryResult(
 				client,
 				current,
 				request,
@@ -716,6 +837,9 @@ export function createOwnedProjectEngine(
 				path,
 				callback,
 			);
+			if (result.status >= 400 && result.status < 500 && result.status !== 429)
+				await security.failed(client, request, path, identity);
+			return result;
 		});
 	}
 
@@ -862,7 +986,21 @@ export function createOwnedProjectEngine(
 				});
 			},
 			async admit(request, operation) {
-				const ip = options.trustedIP(request);
+				const path = new URL(request.url).pathname.slice(
+					options.basePath.length,
+				);
+				if (
+					path === "/passkey/generate-authenticate-options" ||
+					path === "/passkey/verify-authentication"
+				) {
+					const denied = await store.transaction((client) =>
+						security.admit(client, request, {
+							message: operation === "options",
+						}),
+					);
+					if (denied) return securityBlocked();
+				}
+				const ip = security.trustedIP(request);
 				if (!ip || !isIP(ip)) return forbidden();
 				const key = createHmac("sha256", options.signingSecret)
 					.update(`owned-passkey:v1:${operation}\0${ip}`)
@@ -909,21 +1047,73 @@ export function createOwnedProjectEngine(
 			},
 		});
 
+	const signUp = options.signUp;
 	const signUpHttp =
-		options.signUp &&
+		signUp &&
 		createOwnedSignUpHttp({
-			...options.signUp,
+			...signUp,
 			database: options.database,
 			project: options.project,
 			policy,
 			baseURL: origin,
 			basePath: options.basePath,
 			trustedOrigins: options.trustedOrigins,
+			async admit(request, operation, identity) {
+				if (operation === "sign-up/email") {
+					const denied = await store.transaction((client) =>
+						security.admit(client, request, { email: identity, signup: true }),
+					);
+					if (denied) return securityBlocked();
+				}
+				return signUp.admit(request, operation, identity);
+			},
 		});
+	const emailSignIn = options.emailSignIn;
+	const emailSignInHttp =
+		emailSignIn &&
+		createOwnedProjectEmailSignIn({
+			...emailSignIn,
+			database: options.database,
+			project: options.project,
+			policy,
+			baseURL: origin,
+			basePath: options.basePath,
+			trustedOrigins: options.trustedOrigins,
+			async admit(request, operation, email) {
+				const denied = await store.transaction((client) =>
+					security.admit(client, request, {
+						email,
+						message:
+							operation === "sign-in/magic-link" ||
+							operation === "email-otp/send-verification-otp",
+					}),
+				);
+				return denied
+					? securityBlocked()
+					: emailSignIn.admit(request, operation, email);
+			},
+			async completeSignIn({
+				client,
+				user,
+				request,
+				path,
+				callbackURL: callback,
+			}) {
+				return primaryResult(
+					client,
+					await store.lockUser(client, user.id),
+					request,
+					true,
+					path,
+					callback,
+				);
+			},
+		});
+	const recoveryOptions = options.recovery;
 	const recoveryHttp =
-		options.recovery &&
+		recoveryOptions &&
 		createOwnedRecoveryHttp({
-			...options.recovery,
+			...recoveryOptions,
 			database: options.database,
 			project: options.project,
 			policy,
@@ -931,6 +1121,18 @@ export function createOwnedProjectEngine(
 			baseURL: origin,
 			basePath: options.basePath,
 			trustedOrigins: options.trustedOrigins,
+			async admit(request, operation, email) {
+				if (
+					operation === "request-password-reset" ||
+					operation === "send-verification-email"
+				) {
+					const denied = await store.transaction((client) =>
+						security.admit(client, request, { email, message: true }),
+					);
+					if (denied) return securityBlocked();
+				}
+				return recoveryOptions.admit(request, operation, email);
+			},
 			async completeVerification({
 				client,
 				user,
@@ -950,7 +1152,54 @@ export function createOwnedProjectEngine(
 			},
 		});
 
-	async function dispatch(request: Request) {
+	const oauth =
+		options.oauth &&
+		createOwnedProjectOAuth({
+			...options.oauth,
+			database: options.database,
+			project: options.project,
+			baseURL: origin,
+			basePath: options.basePath,
+			trustedOrigins: options.trustedOrigins,
+			signingSecret: options.signingSecret,
+			signUpEnabled: policy.signUpEnabled,
+			requireEmailVerification: policy.requireEmailVerification,
+			async complete(client, { user, request, provider, destination }) {
+				const result = await primaryResult(
+					client,
+					await store.lockUser(client, user.id),
+					request,
+					true,
+					`/callback/${provider}`,
+					destination,
+				);
+				return result.status === 200
+					? redirect(new Headers(result.headers), destination)
+					: result;
+			},
+		});
+	const organization = createOwnedProjectOrganizationHttp({
+		database: options.database,
+		project: options.project,
+		policy,
+		currentSession,
+		trustedRequest,
+		readBody: requestBody,
+		membershipLimit: options.organization?.membershipLimit,
+		sessionCookies(request, principal) {
+			const headers = new Headers();
+			const remember = !tokenFrom(request.headers, rememberCookie);
+			writeCookie(
+				headers,
+				sessionCookie,
+				principal.token,
+				remember ? policy.sessionExpiresInSeconds : undefined,
+			);
+			return headers;
+		},
+	});
+
+	async function route(request: Request) {
 		const url = new URL(request.url);
 		if (
 			url.origin !== origin ||
@@ -962,11 +1211,57 @@ export function createOwnedProjectEngine(
 		if (recovery) return recovery;
 		const registration = await signUpHttp?.(request);
 		if (registration) return registration;
+		const emailSignIn = await emailSignInHttp?.(request);
+		if (emailSignIn) return emailSignIn;
+		const organizationResponse = await organization(path, request);
+		if (organizationResponse) return organizationResponse;
+		if (oauth && path === "/sign-in/social" && request.method === "POST") {
+			if (!trustedRequest(request.headers, true)) return forbidden();
+			const body = ownedProjectOAuthStartInput.safeParse(
+				await requestBody(request),
+			);
+			if (!body.success)
+				return failure(
+					400,
+					"INVALID_BODY",
+					"Invalid provider sign-in request.",
+				);
+			const denied = await store.transaction((client) =>
+				security.admit(client, request),
+			);
+			if (denied) return securityBlocked();
+			return oauth.start(request, body.data);
+		}
+		if (
+			oauth &&
+			(path === "/callback/allauth" || path === "/callback/google") &&
+			request.method === "GET"
+		) {
+			const denied = await store.transaction((client) =>
+				security.admit(client, request),
+			);
+			if (denied) return securityBlocked();
+			return oauth.callback(
+				request,
+				path === "/callback/allauth" ? "allauth" : "google",
+			);
+		}
 		if (passkeyHttp && path.startsWith("/passkey/")) {
 			if (!trustedRequest(request.headers, request.method !== "GET"))
 				return forbidden();
 			const response = await passkeyHttp(path, request);
-			if (response) return response;
+			if (response) {
+				if (
+					path === "/passkey/verify-authentication" &&
+					response.status >= 400 &&
+					response.status < 500 &&
+					response.status !== 429
+				)
+					await store.transaction((client) =>
+						security.failed(client, request, path),
+					);
+				return response;
+			}
 		}
 		if (request.method === "POST" && path === "/two-factor/enable")
 			return manageMfa(request, "enable");
@@ -1003,7 +1298,17 @@ export function createOwnedProjectEngine(
 	}
 
 	return {
-		dispatch,
+		async dispatch(request) {
+			try {
+				const response = await route(request);
+				const notify = notifications.get(request);
+				if (response.status < 400 && notify && newDevice)
+					newDevice.defer(notify);
+				return response;
+			} finally {
+				notifications.delete(request);
+			}
+		},
 		readSession,
 		listAccountSessions,
 		revokeAccountSession,

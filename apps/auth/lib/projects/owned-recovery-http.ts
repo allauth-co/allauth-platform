@@ -60,7 +60,7 @@ export interface RecoveryHttpOptions {
 		request: Request,
 		operation: RecoveryOperation,
 		normalizedEmail?: string,
-	): Promise<SessionCheckAdmission>;
+	): Promise<SessionCheckAdmission | Response>;
 	/** Schedule the callback after the response without awaiting delivery in the request. */
 	defer(delivery: () => Promise<void>): void;
 	onDeliveryFailure?(
@@ -327,6 +327,7 @@ export function createOwnedRecoveryHttp(options: RecoveryHttpOptions) {
 		normalizedEmail?: string,
 	) {
 		const decision = await options.admit(request, operation, normalizedEmail);
+		if (decision instanceof Response) return decision;
 		return decision.allowed
 			? null
 			: failure(

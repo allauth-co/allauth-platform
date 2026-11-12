@@ -52,7 +52,7 @@ export interface OwnedSignUpOptions {
 		request: Request,
 		operation: SignUpOperation,
 		normalizedIdentity: string,
-	): Promise<SessionCheckAdmission>;
+	): Promise<SessionCheckAdmission | Response>;
 	verification?: SignUpVerification;
 }
 
@@ -279,6 +279,7 @@ export function createOwnedSignUpHttp(options: OwnedSignUpOptions) {
 
 		const address = input.email.toLowerCase();
 		const decision = await options.admit(request, "sign-up/email", address);
+		if (decision instanceof Response) return decision;
 		if (!decision.allowed && decision.retryAfter !== 0)
 			return rateLimited(decision.retryAfter);
 		const now = new Date();
@@ -399,6 +400,7 @@ export function createOwnedSignUpHttp(options: OwnedSignUpOptions) {
 			"is-username-available",
 			normalized,
 		);
+		if (decision instanceof Response) return decision;
 		if (!decision.allowed) return rateLimited(decision.retryAfter);
 		const result = await options.database.query<{ available: boolean }>(
 			`SELECT NOT EXISTS (SELECT 1 FROM "${schema}"."user" WHERE username = $1) AS available`,

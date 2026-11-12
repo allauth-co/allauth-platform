@@ -74,6 +74,8 @@ jobs:
           lib/projects/owned-project-engine.pg.test.ts lib/projects/owned-password-reset.pg.test.ts
           lib/projects/owned-mfa.pg.test.ts lib/projects/owned-mfa-enrollment.pg.test.ts
           lib/projects/owned-recovery-http.pg.test.ts lib/projects/owned-sign-up.pg.test.ts
+          lib/projects/owned-project-email-sign-in.pg.test.ts lib/projects/owned-project-oauth.pg.test.ts
+          lib/projects/owned-project-organization.pg.test.ts lib/control/security.test.ts
           lib/projects/passkey-store.pg.test.ts
       - name: Test billing, platform administration, self-hosting and public pages
         run: >-

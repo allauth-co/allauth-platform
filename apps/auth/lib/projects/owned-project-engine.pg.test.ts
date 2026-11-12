@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { createHmac, randomUUID } from "node:crypto";
+import { createHash, createHmac, randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { mkdtemp, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -15,6 +15,9 @@ import { createAllAuthClient } from "../../sdk/client";
 import { createAllAuthProxy } from "../../sdk/next";
 import { defaultAuthPolicy } from "../auth-policy/policy";
 import { clerkCompatiblePasswords } from "../clerk-password";
+import { createControlSecurity } from "../control/security";
+import { defaultSecurityPolicy, securitySubject } from "../control/security-policy";
+import { readLegacySessionCookie } from "./legacy-session-cookie";
 import { productionTwoFactor } from "../mfa";
 import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
 import { createOwnedEmailVerification } from "./owned-email-verification";
@@ -86,6 +89,14 @@ describe.skipIf(!existsSync(fixturePath))("isolated PostgreSQL owned project eng
 				pool: new Pool({ connectionString: url.toString(), max: 1, options: `-c search_path=${schema}` }),
 			}),
 		});
+		const nativeSecurity = createControlSecurity({
+			database: legacyDatabase,
+			secret: signingSecret,
+			baseURL: origin,
+			ipHeader: "x-real-ip",
+			requireAdmin: async () => { throw new Error("Fixture has no control administrator"); },
+			recordEvent: async () => {},
+		});
 		const { auth } = await getTestInstance({
 			database: { db: legacyDatabase, type: "postgres" },
 			baseURL: origin,
@@ -93,7 +104,7 @@ describe.skipIf(!existsSync(fixturePath))("isolated PostgreSQL owned project eng
 			secret: signingSecret,
 			session: { cookieCache: { enabled: false } },
 			advanced: { cookiePrefix: `allauth_project_${slug}` },
-			plugins: [productionTwoFactor(origin)],
+			plugins: [productionTwoFactor(origin), { id: "fixture-control-security", hooks: nativeSecurity.hooks }],
 			emailAndPassword: { enabled: true, password: clerkCompatiblePasswords },
 			logger: { disabled: true },
 		}, { disableTestUser: true });
@@ -404,14 +415,137 @@ describe.skipIf(!existsSync(fixturePath))("isolated PostgreSQL owned project eng
 		expect((await owner.dispatch(request("/sso/sign-in", { email: "person@example.test" }))).status).toBe(501);
 	});
 
-	it("refuses password sign-in when the realm needs unsupported security policy hooks", async () => {
-		const email = "custom-security@fixture.example";
+	it("keeps failure counters readable when switching in either direction", async () => {
+		const email = "security-counter@fixture.example";
+		const ip = "203.0.113.192";
+		await seed(email);
+		await database.query(`INSERT INTO "${schema}"."allauthSecurityPolicy"(id, policy) VALUES ('default', $1)`, [
+			{ ...defaultSecurityPolicy, maxFailuresPerIp: 3 },
+		]);
+		try {
+			const wrong = { email, password: "incorrect-password" };
+			const ingress = { "x-real-ip": ip };
+			const owner = engine(schema, ip);
+			expect((await nativeRequest(request("/sign-in/email", wrong, ingress))).status).toBe(401);
+			for (const _ of [1, 2])
+				expect((await owner.dispatch(request("/sign-in/email", wrong, ingress))).status).toBe(401);
+			const key = await securitySubject(signingSecret, "fail-ip-identity", `${ip}\0email:${email}`);
+			const counter = await database.query(
+				`SELECT count, "blockedUntil" FROM "${schema}"."allauthSecurityCounter" WHERE key = $1`, [key],
+			);
+			expect(counter.rows[0]).toMatchObject({ count: 3, blockedUntil: expect.any(Date) });
+			for (const handler of [owner.dispatch, nativeRequest]) {
+				const response = await handler(request("/sign-in/email", { email, password }, ingress));
+				expect(response.status).toBe(429);
+				expect(await response.json()).toMatchObject({ code: "ALLAUTH_SECURITY_BLOCKED" });
+				expect(response.headers.getSetCookie()).toEqual([]);
+			}
+		} finally {
+			await database.query(`DELETE FROM "${schema}"."allauthSecurityPolicy" WHERE id = 'default'`);
+		}
+	});
+
+	it("routes email codes through the same MFA and session authority as passwords", async () => {
+		const email = "email-otp-mfa@fixture.example";
+		const id = await seed(email, { mfa: true });
+		const secret = "email-otp-mfa-fixture-secret";
+		const code = "285179";
+		await database.query(
+			`INSERT INTO "${schema}"."twoFactor"(id,"userId",secret,"backupCodes",verified) VALUES ($1,$2,$3,$4,true)`,
+			[randomUUID(), id, await symmetricEncrypt({ key: signingSecret, data: secret }),
+				await symmetricEncrypt({ key: signingSecret, data: '["abcde-fghij"]' })],
+		);
+		await database.query(
+			`INSERT INTO "${schema}"."verification"(id, identifier, value, "expiresAt")
+			 VALUES ($1,$2,$3,statement_timestamp() + interval '5 minutes')`,
+			[randomUUID(), `sign-in-otp-${email}`, `${createHash("sha256").update(code).digest("base64url")}:0`],
+		);
+		const owner = createOwnedProjectEngine({
+			database, project: { slug, schemaName: schema }, baseURL: origin, basePath, trustedOrigins: [],
+			signingSecret, policy: defaultAuthPolicy, trustedIP: () => "203.0.113.197",
+			emailSignIn: {
+				publicLinkBaseURL: `${origin}${basePath}`, callbackURLs: [`${origin}/signed-in`],
+				email: { environment: { EMAIL_FROM: "no-reply@fixture.example", EMAIL: { async send() {} } } },
+				admit: async () => ({ allowed: true, retryAfter: 0 }),
+				defer() {},
+			},
+		});
+		const response = await owner.dispatch(request("/sign-in/email-otp", { email, otp: code }));
+		expect(response.status).toBe(200);
+		expect(await response.json()).toMatchObject({ twoFactorRedirect: true, twoFactorMethods: ["totp"] });
+		const pending = cookies(response);
+		expect(pending).not.toContain(".session_token");
+		expect(await nativeGetSession(new Headers({ cookie: pending }))).toBeNull();
+		const completed = await nativeRequest(request("/two-factor/verify-totp", { code: await nativeTotp(secret) }, { cookie: pending }));
+		expect(completed.status).toBe(200);
+		expect(await (await owner.dispatch(request("/get-session", undefined, { cookie: cookies(completed) }))).json()).toMatchObject({ user: { id } });
+		expect((await owner.dispatch(request("/sign-in/email-otp", { email, otp: code }))).status).toBe(400);
+	});
+
+	it("enforces stored domain and explicit IP rules and records monitor outcomes", async () => {
+		const email = "security-rules@rules.example";
+		const ip = "203.0.113.193";
 		const userId = await seed(email);
-		await database.query(`INSERT INTO "${schema}"."allauthSecurityPolicy"(id, policy) VALUES ('default', '{}')`);
-		const result = await engine(schema, "203.0.113.19").dispatch(request("/sign-in/email", { email, password }));
-		expect(result.status).toBe(501);
-		expect(result.headers.getSetCookie()).toEqual([]);
-		const sessions = await database.query(`SELECT id FROM "${schema}"."session" WHERE "userId" = $1`, [userId]);
-		expect(sessions.rowCount).toBe(0);
+		const ruleId = randomUUID();
+		await database.query(`INSERT INTO "${schema}"."allauthSecurityRule"(id,type,value,reason) VALUES ($1,'ip',$2,'fixture')`, [ruleId, ip]);
+		await database.query(`INSERT INTO "${schema}"."allauthSecurityPolicy"(id, policy) VALUES ('default', $1)`, [
+			{ ...defaultSecurityPolicy, blockedEmailDomains: ["rules.example"] },
+		]);
+		try {
+			const blockedIP = await engine(schema, ip).dispatch(request("/sign-in/email", { email, password }));
+			const blockedDomain = await engine(schema, "203.0.113.194").dispatch(request("/sign-in/email", { email, password }));
+			for (const response of [blockedIP, blockedDomain]) {
+				expect(response.status).toBe(429);
+				expect(await response.json()).toMatchObject({ code: "ALLAUTH_SECURITY_BLOCKED" });
+				expect(response.headers.getSetCookie()).toEqual([]);
+			}
+			const sessions = await database.query(`SELECT id FROM "${schema}"."session" WHERE "userId" = $1`, [userId]);
+			expect(sessions.rowCount).toBe(0);
+			await database.query(`UPDATE "${schema}"."allauthSecurityPolicy" SET policy = $1 WHERE id = 'default'`, [
+				{ ...defaultSecurityPolicy, mode: "monitor", blockedEmailDomains: ["rules.example"] },
+			]);
+			const observed = await engine(schema, ip).dispatch(request("/sign-in/email", { email, password }));
+			expect(observed.status).toBe(200);
+			expect(await nativeGetSession(new Headers({ cookie: cookies(observed) }))).toMatchObject({ user: { id: userId } });
+			const audit = await database.query(
+				`SELECT outcome, metadata FROM "${schema}"."allauthEvent" WHERE "ipAddress" = $1 AND type = 'security.blocked'`, [ip],
+			);
+			expect(audit.rows).toEqual(expect.arrayContaining([
+				{ outcome: "blocked", metadata: { signal: "explicit-rule", ruleId, ruleType: "ip", monitor: false } },
+				{ outcome: "success", metadata: { signal: "explicit-rule", ruleId, ruleType: "ip", monitor: true } },
+				{ outcome: "success", metadata: { signal: "email-domain-policy", monitor: true } },
+			]));
+		} finally {
+			await database.query(`DELETE FROM "${schema}"."allauthSecurityPolicy" WHERE id = 'default'`);
+			await database.query(`DELETE FROM "${schema}"."allauthSecurityRule" WHERE id = $1`, [ruleId]);
+		}
+	});
+
+	it("reuses a native known device and lets the native engine reuse an owned device", async () => {
+		const email = "known-device@fixture.example";
+		const userId = await seed(email);
+		const name = `__Secure-allauth_project_${slug}.control_device`;
+		const ownedIP = "203.0.113.195";
+		const signIn = { email, password };
+		const owned = engine(schema, ownedIP);
+		const native = await nativeRequest(request("/sign-in/email", signIn, { "x-real-ip": ownedIP }));
+		expect(native.status).toBe(200);
+		const legacyDevice = native.headers.getSetCookie().find((value) => value.startsWith(`${name}=`))?.split(";", 1)[0];
+		expect(legacyDevice).toBeDefined();
+		const reused = await owned.dispatch(request("/sign-in/email", signIn, { cookie: legacyDevice! }));
+		expect(reused.status).toBe(200);
+		expect(reused.headers.getSetCookie().find((value) => value.startsWith(`${name}=`))).toContain(legacyDevice);
+		const created = await owned.dispatch(request("/sign-in/email", signIn));
+		expect(created.status).toBe(200);
+		const createdDevice = created.headers.getSetCookie().find((value) => value.startsWith(`${name}=`))?.split(";", 1)[0];
+		expect(createdDevice).toBeDefined();
+		const token = readLegacySessionCookie(new Headers({ cookie: createdDevice! }), name, signingSecret);
+		expect(token).toMatch(/^[a-f\d]{64}$/);
+		const rolledBack = await nativeRequest(request("/sign-in/email", signIn, { "x-real-ip": ownedIP, cookie: createdDevice! }));
+		expect(rolledBack.status).toBe(200);
+		expect(rolledBack.headers.getSetCookie().find((value) => value.startsWith(`${name}=`))).toContain(createdDevice);
+		const devices = await database.query(`SELECT "deviceHash" FROM "${schema}"."allauthKnownDevice" WHERE "userId" = $1`, [userId]);
+		expect(devices.rowCount).toBe(2);
+		expect(devices.rows).toContainEqual({ deviceHash: await securitySubject(signingSecret, "device", token!) });
 	});
 });

@@ -292,24 +292,12 @@ export function createProjectEngineStore(database: Pool, schemaName: string) {
 		);
 	}
 
-	async function passwordPolicySupported(client: PoolClient, userId?: string) {
-		const result = await client.query<{ unsupported: boolean }>(
-			`SELECT (EXISTS (SELECT 1 FROM "allauthSecurityPolicy")
-				OR EXISTS (SELECT 1 FROM "allauthSecurityRule" WHERE "expiresAt" IS NULL OR "expiresAt" > statement_timestamp())
-				OR EXISTS (SELECT 1 FROM "allauthSecurityCounter" WHERE "blockedUntil" > statement_timestamp())
-				OR EXISTS (SELECT 1 FROM "allauthKnownDevice" WHERE "userId" = $1)) AS unsupported`,
-			[userId ?? null],
-		);
-		return result.rows[0]?.unsupported === false;
-	}
-
 	return {
 		credential,
 		createSession,
 		list,
 		lockSession,
 		lockUser,
-		passwordPolicySupported,
 		record,
 		refresh,
 		revoke,
