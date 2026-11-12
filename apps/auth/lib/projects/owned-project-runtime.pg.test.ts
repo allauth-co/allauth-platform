@@ -1,4 +1,4 @@
-import { execFile, fork } from "node:child_process";
+import { execFile, fork, spawn } from "node:child_process";
 import {
 	createHash,
 	createHmac,
@@ -40,6 +40,7 @@ import { deliverPendingWebhooks } from "../control/webhooks";
 import { signEdgeRequest } from "../domains/edge";
 import { googleProviderRepository } from "../project-providers/repository";
 import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
+import { platformWorkspaceId } from "../workspaces/types";
 import { openLegacyMfaRecord } from "./legacy-mfa-record";
 import { readLegacyProjectKeyring } from "./legacy-project-keyring";
 import { signProjectIssuerQuery } from "./owned-project-issuer-authorization-query";
@@ -60,6 +61,7 @@ import {
 	runtimeSamlAuthnRequest,
 	runtimeSamlConfiguration,
 	runtimeSamlEntity,
+	runtimeSamlIssuer,
 	runtimeSamlOrigin,
 	runtimeSamlProvider,
 	runtimeSamlResponse,
@@ -6313,6 +6315,10 @@ describe.skipIf(!existsSync(fixture))(
 					`UPDATE ${scope} SET "domainVerified"=TRUE WHERE id=$1`,
 					[provider.id],
 				);
+				await database.query(
+					`UPDATE public."allauthProject" SET "workspaceId"=$1 WHERE id=$2`,
+					[platformWorkspaceId, alpha.id],
+				);
 				const admission = {
 					projectId: alpha.id,
 					schemaName: alpha.schemaName,
@@ -6340,10 +6346,56 @@ describe.skipIf(!existsSync(fixture))(
 						startRuntimeSaml(writer, direct, acs),
 						startRuntimeSaml(writer, hosted, acs),
 					]);
+				async function inspect(form: URLSearchParams, receiver = acs) {
+					const operator = spawn(
+						process.execPath,
+						[
+							"--import",
+							"tsx",
+							"scripts/rehearsal/verify-project-encrypted-saml.ts",
+							alpha.slug,
+							runtimeSamlProvider,
+						],
+						{
+							cwd: appRoot,
+							env: {
+								...childEnvironment(),
+								DATABASE_URL: databaseURL,
+								ALLAUTH_PROJECT_ENGINE_INTERNAL_ID: alpha.id,
+								ALLAUTH_PROJECT_ENGINE_INTERNAL_PREPARE_REVISION: "0",
+							},
+							timeout: 10_000,
+						},
+					);
+					let output = "";
+					let diagnostics = "";
+					operator.stdout.setEncoding("utf8").on("data", (chunk: string) => {
+						output += chunk;
+					});
+					operator.stderr.setEncoding("utf8").on("data", (chunk: string) => {
+						diagnostics += chunk;
+					});
+					operator.stdin.end(
+						JSON.stringify({
+							receiver,
+							samlResponse: form.get("SAMLResponse"),
+							relayState: form.get("RelayState"),
+						}),
+					);
+					const [code] = await once(operator, "close");
+					return { code, output, diagnostics };
+				}
+				const rejectedEvidence = {
+					code: 1,
+					output: "",
+					diagnostics:
+						"The encrypted SAML preflight sample could not be verified.\n",
+				};
 				const finish = async (
 					writer: Awaited<ReturnType<typeof openProcess>>,
 					pending: Awaited<ReturnType<typeof startRuntimeSaml>>,
 					checkAlternate = false,
+					checkEvidence = false,
 				) => {
 					const form = await runtimeSamlResponse(
 						samlKeys,
@@ -6358,6 +6410,43 @@ describe.skipIf(!existsSync(fixture))(
 								: "http://www.w3.org/2009/xmlenc11#aes128-gcm",
 						},
 					);
+					if (checkEvidence) {
+						if (!pending.transport.host) {
+							expect(
+								await inspect(form, `https://${defaultHost}${callback}`),
+							).toEqual(rejectedEvidence);
+							const cbc = await runtimeSamlResponse(
+								samlKeys,
+								pending.flow,
+								credentials.project.email,
+								{
+									certificate: encryption.certificate,
+									dataAlgorithm: "http://www.w3.org/2001/04/xmlenc#aes256-cbc",
+								},
+							);
+							expect(await inspect(cbc)).toEqual(rejectedEvidence);
+						}
+						const evidence = await inspect(form);
+						expect(evidence.code, evidence.diagnostics).toBe(0);
+						expect(evidence.diagnostics).toBe("");
+						expect(JSON.parse(evidence.output)).toEqual({
+							kind: "observed-encrypted-saml-sample",
+							projectId: alpha.id,
+							schemaName: alpha.schemaName,
+							providerId: runtimeSamlProvider,
+							providerRecordId: provider.id,
+							legacyWriterRevision: 0,
+							receiver: acs,
+							issuer: runtimeSamlIssuer,
+							configurationFingerprint:
+								expect.stringMatching(/^[A-Za-z0-9_-]{43}$/),
+							observedAt: expect.any(String),
+							cipher: pending.transport.host ? "aes256-gcm" : "aes128-gcm",
+							keyTransport: "rsa-oaep-mgf1p",
+							envelopeSigned: false,
+							assertionSigned: true,
+						});
+					}
 					if (checkAlternate) {
 						const alternate = await writer.request(callback, {
 							host: defaultHost,
@@ -6385,7 +6474,11 @@ describe.skipIf(!existsSync(fixture))(
 					expect(await session.json()).toMatchObject({
 						user: credentials.project,
 					});
+					if (checkEvidence)
+						expect(await inspect(form)).toEqual(rejectedEvidence);
 				};
+				for (const pending of await starts(service))
+					await finish(service, pending, false, true);
 				const nativePending = await starts(service);
 				await service.stop();
 				service = undefined;

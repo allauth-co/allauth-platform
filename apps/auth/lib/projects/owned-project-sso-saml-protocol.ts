@@ -590,13 +590,13 @@ function checkEncryptedAssertion(
 	);
 	const dataMethod = child(data, encryptionNS, "EncryptionMethod");
 	const keyMethod = child(key, encryptionNS, "EncryptionMethod");
+	const dataAlgorithm = dataMethod.getAttribute("Algorithm");
 	const keyParameters = Array.from(keyMethod.childNodes).filter(
 		(node) => node.nodeType === 1,
 	);
 	if (
-		![`${encryption11NS}aes128-gcm`, `${encryption11NS}aes256-gcm`].includes(
-			dataMethod.getAttribute("Algorithm") ?? "",
-		) ||
+		(dataAlgorithm !== `${encryption11NS}aes128-gcm` &&
+			dataAlgorithm !== `${encryption11NS}aes256-gcm`) ||
 		keyMethod.getAttribute("Algorithm") !== `${encryptionNS}rsa-oaep-mgf1p` ||
 		keyParameters.length > 1 ||
 		keyParameters.some((node) => {
@@ -611,6 +611,9 @@ function checkEncryptedAssertion(
 		invalid();
 	checkCiphertext(data);
 	checkCiphertext(key);
+	return dataAlgorithm === `${encryption11NS}aes128-gcm`
+		? ("aes128-gcm" as const)
+		: ("aes256-gcm" as const);
 }
 
 async function authenticatedAssertion(
@@ -621,8 +624,10 @@ async function authenticatedAssertion(
 	const initialAssertion = configured.encrypted
 		? undefined
 		: plaintextAssertion(envelope);
-	if (configured.encrypted) {
-		checkEncryptedAssertion(envelope);
+	const cipher = configured.encrypted
+		? checkEncryptedAssertion(envelope)
+		: undefined;
+	if (cipher) {
 		if (
 			envelope.elements.filter((item) => item.localName === "Signature")
 				.length !== children(envelope.response, signatureNS, "Signature").length
@@ -670,7 +675,15 @@ async function authenticatedAssertion(
 		assertion.getAttribute("Version") !== "2.0"
 	)
 		invalid();
-	return { assertion, id };
+	const encryption = cipher
+		? {
+				cipher,
+				keyTransport: "rsa-oaep-mgf1p" as const,
+				envelopeSigned: Boolean(outer),
+				assertionSigned: Boolean(inner.length),
+			}
+		: undefined;
+	return { assertion, id, encryption };
 }
 
 /** Verify the assertion with Samlify before its identity or timing claims are used. */
@@ -686,7 +699,7 @@ export async function verifyOwnedSaml(
 	);
 	const envelope = parseSamlEnvelope(xml);
 	const { response } = envelope;
-	const { assertion, id } = await authenticatedAssertion(
+	const { assertion, id, encryption } = await authenticatedAssertion(
 		xml,
 		envelope,
 		configured,
@@ -781,6 +794,7 @@ export async function verifyOwnedSaml(
 		assertionId: id,
 		issuer,
 		requestId,
+		encryption,
 		replayExpiresAt:
 			Math.min(
 				until ?? Infinity,

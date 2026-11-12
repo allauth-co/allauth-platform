@@ -64,6 +64,16 @@ The records cover sign-in and second-factor requests, provider callbacks, sessio
 
 Deploy the pilot-capable release with the exact project ID and confirm readiness. Before switching, confirm that the preceding deployment has drained and that each running replica uses the pilot-capable release with the same selection. A pilot-capable replica missing an active project selection fails readiness and declines that realm's requests. Check the configuration, signed proxy, default accounts and any active custom domains while the legacy writer is still active. Use the existing project session comparison and collect baseline route metrics for the same project ID.
 
+For encrypted SAML evidence, run the following from a trusted checkout of the exact release with frozen dependencies and private database access. The TypeScript command is available in the source checkout. The standalone Docker and Railway runtime images do not include it. Supply the deployment's auth origin and secret, verified hosting settings, exact internal project ID and prepared legacy revision through the trusted operator environment.
+
+```sh
+pnpm --dir apps/auth exec tsx scripts/rehearsal/verify-project-encrypted-saml.ts PROJECT_SLUG PROVIDER_ID
+```
+
+Pipe one JSON object containing `receiver`, `samlResponse` and `relayState` to stdin from an approved test-account sign-in, while the native response is still pending. The `receiver` is the exact configured ACS URL. The command checks the protected legacy writer and current provider configuration, verifies the signed encrypted response and reads the existing request records without consuming them. Its receipt contains the observed cipher and signature mode, realm and receiver, and a configuration fingerprint. It excludes the assertion, relay state, identity and keys. Let the original callback complete normally through the legacy writer to confirm acceptance.
+
+An IdP administrator must separately confirm the exact application's policy revision and the algorithms and signing settings applied across its configured sign-in paths. Collect representative successful samples for the enabled transports and applicable key and policy variations. A receipt records one observation and grants no admission. The normal runtime continues to refuse candidate selection for encrypted SAML providers.
+
 Run the following commands from the application directory in the release container using the deployment database role.
 
 ```sh
