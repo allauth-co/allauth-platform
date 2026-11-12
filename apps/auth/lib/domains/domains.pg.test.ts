@@ -8,6 +8,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import type { AuthInstance } from "../api";
 import type { AuthEnvironment } from "../configuration";
 import type { ControlPrincipal } from "../control/types";
+import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
 import { requireWorkspacePrincipal } from "../workspaces/authorization";
 import { createProjectDomains, deleteProjectDomains, listProjectDomains, listStoredActiveProjectAccountsHostnames, lookupActiveHostname, verifyProjectDomains } from "./repository";
 import type { DomainDns, HostnameProvider, ProviderHostname, StoredCustomHostname } from "./types";
@@ -69,7 +70,14 @@ describe.skipIf(!existsSync(fixturePath))("actual PostgreSQL domain ownership an
 		const first = await project(alice, "alice-domains"); aliceProject = first.id; aliceWorkspace = first.workspace; bobProject = (await project(bob, "bob-domains")).id;
 	}, 30000);
 	beforeEach(async () => { await pool.query('TRUNCATE public."allauthDomainPair" CASCADE'); registered.clear(); createCalls = 0; removeCalls = 0; findCalls = 0; quotaUsed = 0; failCreate = false; uncertainCreate = false; failRemove = false; partialDelete = false; proofMissing = false; routingWrong = false; sslPending = false; providerMismatch = false; });
-	afterAll(async () => { if (database) await database.destroy(); if (pool) await pool.end(); if (operator) { await operator.query(`DROP DATABASE IF EXISTS "${databaseName}" WITH (FORCE)`); await operator.end(); } });
+	afterAll(async () => {
+		try {
+			await Promise.all([database?.destroy(), pool?.end()]);
+			if (operator) await dropClosedFixtureDatabase(operator, databaseName);
+		} finally {
+			await operator?.end();
+		}
+	});
 	it("reserves both globally unique hostnames atomically and returns the same pair on retry", async () => {
 		const first = await create(); const again = await create(); expect(again.domain.id).toBe(first.domain.id); expect(first.domain.hostnames.map((host) => host.hostname)).toEqual(["accounts.acme-customer.com", "frontend-api.acme-customer.com"]);
 		await expect(createProjectDomains(bob, bobProject, { domain: "acme-customer.com" }, env, deps())).rejects.toMatchObject({ statusCode: 409 });
