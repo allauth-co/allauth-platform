@@ -14,6 +14,7 @@ import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { defaultAuthPolicy } from "../auth-policy/policy";
 import { clerkCompatiblePasswords } from "../clerk-password";
+import { allauthControl } from "../control";
 import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
 import type { OwnedProjectAccountDeletionOptions } from "./owned-project-account-deletion";
 import type { ProjectAccountLinkOptions } from "./owned-project-account-links";
@@ -44,6 +45,7 @@ async function nativeFixture(database: LegacyDatabase, messages: Message[]) {
 				logger: { disabled: true },
 				database: { db: database, type: "postgres", transaction: true },
 				advanced: { cookiePrefix },
+				plugins: [allauthControl({ ipHeader: "x-real-ip" })],
 				emailAndPassword: {
 					enabled: true,
 					autoSignIn: false,
@@ -268,6 +270,47 @@ describe.skipIf(!existsSync(fixturePath))(
 				)
 			).rows[0];
 		}
+
+		it("retains native account deletion request audit outcomes and browser attribution", async () => {
+			const account = await user("deletion-event-request");
+			const ip = "192.0.2.58";
+			const agent = "synthetic-account-deletion-client";
+			const events = async () =>
+				(
+					await database.query(
+						`SELECT id, type, outcome, "actorId", "userId", "targetId", metadata,
+					 "ipAddress", "userAgent" FROM "${schema}"."allauthEvent"
+					 WHERE type='user.deleted' AND metadata->>'path'='/delete-user'
+					 AND "actorId"=$1 ORDER BY outcome,"createdAt",id`,
+						[account.id],
+					)
+				).rows;
+			const capture = async (
+				dispatch: (request: Request) => Promise<Response>,
+			) => {
+				const prior = new Set((await events()).map((event) => event.id));
+				for (const [value, status] of [
+					[password, 200],
+					["synthetic-wrong-password", 400],
+				] as const) {
+					const request = post(
+						"/delete-user",
+						{ callbackURL: destination, password: value },
+						account.cookie,
+					);
+					request.headers.set("x-real-ip", ip);
+					request.headers.set("user-agent", agent);
+					expect((await dispatch(request)).status).toBe(status);
+				}
+				return (await events())
+					.filter((event) => !prior.has(event.id))
+					.map(({ id, ...event }) => event);
+			};
+			const nativeEvents = await capture((request) => native.handler(request));
+			expect(nativeEvents).toHaveLength(2);
+			const engine = owned(ip);
+			expect(await capture(engine.dispatch)).toEqual(nativeEvents);
+		});
 
 		it("finishes native two-step email links, retaining the original session and retiring old mailbox proofs", async () => {
 			const account = await user("old-native-change");

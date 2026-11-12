@@ -3,6 +3,7 @@ import type { PoolClient } from "pg";
 import * as z from "zod";
 import { defaultPasswordPolicy } from "../auth-policy/password";
 import { clerkCompatiblePasswords } from "../clerk-password";
+import type { ControlEventInput } from "../control/types";
 import type {
 	ProjectAccountAuthority,
 	ProjectAccountLinkOptions,
@@ -103,6 +104,9 @@ export async function eraseLockedProjectUser(
 
 export interface OwnedProjectAccountDeletionOptions
 	extends ProjectAccountLinkOptions {
+	auditContext?(
+		request: Request,
+	): Pick<ControlEventInput, "ipAddress" | "userAgent">;
 	/** Resolve the realm's existing avatar erasure and provider grant hooks before SQL deletion. */
 	beforeDelete(input: {
 		request: Request;
@@ -140,6 +144,22 @@ export function createOwnedProjectAccountDeletion(
 		options.database,
 		options.project.schemaName,
 	);
+
+	async function recordDeletionRequest(
+		client: PoolClient,
+		request: Request,
+		userId: string,
+		errorCode?: string,
+	) {
+		await store.recordEvent(client, {
+			type: "user.deleted",
+			outcome: errorCode ? "failure" : "success",
+			actorId: userId,
+			userId,
+			...options.auditContext?.(request),
+			metadata: { path: "/delete-user", ...(errorCode && { errorCode }) },
+		});
+	}
 
 	async function lockAuthority(client: PoolClient, request: Request) {
 		const authority = await options.authority(client, request);
@@ -291,6 +311,8 @@ export function createOwnedProjectAccountDeletion(
 					userId,
 					userId,
 				);
+				if (path === "/delete-user")
+					await recordDeletionRequest(client, request, userId);
 				return { headers };
 			});
 			if (result instanceof Response) return result;
@@ -347,7 +369,11 @@ export function createOwnedProjectAccountDeletion(
 				current.user.id,
 				parsed.data.password,
 			);
-			if (incorrect) return incorrect;
+			if (incorrect) {
+				const { code } = (await incorrect.clone().json()) as { code: string };
+				await recordDeletionRequest(client, request, current.user.id, code);
+				return incorrect;
+			}
 			const token = Array.from(
 				{ length: 32 },
 				() => alphabet[randomInt(alphabet.length)],
@@ -356,6 +382,7 @@ export function createOwnedProjectAccountDeletion(
 				`INSERT INTO "verification"(id,identifier,value,"expiresAt") VALUES ($1,$2,$3,statement_timestamp() + interval '1 day')`,
 				[randomUUID(), `delete-account-${token}`, current.user.id],
 			);
+			await recordDeletionRequest(client, request, current.user.id);
 			return {
 				kind: "delete-account",
 				user: {

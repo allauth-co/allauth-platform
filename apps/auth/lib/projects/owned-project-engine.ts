@@ -1894,6 +1894,7 @@ export function createOwnedProjectEngine(
 		accountLinks?.beforeDelete &&
 		createOwnedProjectAccountDeletion({
 			...accountLinks,
+			auditContext: browserEventContext,
 			beforeDelete: accountLinks.beforeDelete,
 			async revokeSessions(client, request, userId, path) {
 				const { rows } = await client.query<{ token: string }>(
