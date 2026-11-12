@@ -19,6 +19,7 @@ import { emailConfigured } from "../email/send";
 import { freshFeatureSession, isServerTokenRequest } from "../features/helpers";
 import { applicationMfaCallback } from "../mfa-continuation";
 import { oauthBrowserReturnPath } from "../oauth-browser";
+import type { ProjectEmailAliasMap } from "../project-email-alias-config";
 import type { NativePasskeyCapability } from "../project-native-passkeys";
 import type { LegacyMfaKeys } from "./legacy-mfa-record";
 import {
@@ -50,6 +51,7 @@ import {
 	projectBrokerMfaPath,
 } from "./owned-project-broker-mfa-admission";
 import { createOwnedProjectClerkImport } from "./owned-project-clerk-import";
+import { createOwnedProjectEmailAliases } from "./owned-project-email-aliases";
 import { createOwnedProjectEmailChange } from "./owned-project-email-change";
 import type { OwnedProjectEmailSignInOptions } from "./owned-project-email-sign-in";
 import { createOwnedProjectEmailSignIn } from "./owned-project-email-sign-in";
@@ -290,6 +292,7 @@ interface OwnedProjectEngineOptions {
 		| "auditContext"
 		| "completeVerification"
 	>;
+	emailAliases?: ProjectEmailAliasMap;
 	/** Only an already authenticated ingress may supply the client IP. */
 	trustedIP(request: Request): string | null;
 }
@@ -387,6 +390,10 @@ export function createOwnedProjectEngine(
 	const store = createProjectEngineStore(
 		options.database,
 		options.project.schemaName,
+	);
+
+	const emailAliases = createOwnedProjectEmailAliases(
+		options.database, options.project.schemaName, options.emailAliases,
 	);
 
 	const backchannel =
@@ -1214,7 +1221,7 @@ export function createOwnedProjectEngine(
 		const raw = await requestBody(request);
 		const body =
 			field === "email"
-				? emailInput.safeParse(raw)
+				? emailInput.safeParse(emailAliases.normalizeInput(raw))
 				: usernameInput.safeParse(raw);
 		if (!body.success)
 			return failure(
@@ -1228,7 +1235,9 @@ export function createOwnedProjectEngine(
 		const login = (
 			"email" in body.data ? body.data.email : body.data.username
 		).toLowerCase();
-		const identity = field === "email" ? { email: login } : { username: login };
+		const address = field === "email" ? await emailAliases.resolve(login) : { email: login };
+		if (!address) return failure(401, invalidCode, invalidMessage);
+		const identity = field === "email" ? { email: address.email } : { username: login };
 		const recordFailure = (client: PoolClient) =>
 			recordPrimaryFailure(client, request, path, invalidCode);
 		if (
@@ -1258,10 +1267,11 @@ export function createOwnedProjectEngine(
 				new Headers({ "Retry-After": String(admission.retryAfter) }),
 			);
 
-		const credential = await store.credential(login, undefined, field);
+		const credential = await store.credential(address.email, undefined, field);
 		const hash = credential?.password;
 		if (
 			!credential ||
+			(address.userId && credential.id !== address.userId) ||
 			!hash ||
 			!(await clerkCompatiblePasswords.verify({
 				hash,
@@ -1277,9 +1287,11 @@ export function createOwnedProjectEngine(
 		}
 
 		return store.transaction(async (client) => {
-			const current = await store.credential(login, client, field);
+			const bound = address.userId ? await emailAliases.resolve(login, client) : address;
+			const current = bound ? await store.credential(bound.email, client, field) : null;
 			if (
 				!current ||
+				(address.userId && bound?.userId !== address.userId) ||
 				current.id !== credential.id ||
 				current.password !== hash
 			) {
@@ -1810,6 +1822,7 @@ export function createOwnedProjectEngine(
 		signUp &&
 		createOwnedSignUpHttp({
 			...signUp,
+			emailAliases,
 			database: options.database,
 			project: options.project,
 			policy,
@@ -1831,6 +1844,7 @@ export function createOwnedProjectEngine(
 		emailSignIn &&
 		createOwnedProjectEmailSignIn({
 			...emailSignIn,
+			emailAliases,
 			database: options.database,
 			project: options.project,
 			policy,
@@ -1872,6 +1886,7 @@ export function createOwnedProjectEngine(
 		recoveryOptions &&
 		createOwnedRecoveryHttp({
 			...recoveryOptions,
+			emailAliases,
 			database: options.database,
 			project: options.project,
 			policy,

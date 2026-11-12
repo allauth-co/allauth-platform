@@ -203,6 +203,58 @@ describe.skipIf(!existsSync(fixturePath))("isolated PostgreSQL owned project eng
 		return { id, token, cookie: `${cookieName}=${encodeURIComponent(`${token}.${signature}`)}` };
 	}
 
+	it("signs in through a realm alias using the same verified legacy account and cookie", async () => {
+		const primary = "alias-primary@fixture.example";
+		const alternate = "alias-migrated@fixture.example";
+		const id = await seed(primary, { bcrypt: true });
+		const configured = engine(schema, "203.0.113.108", { emailAliases: { [alternate]: id } });
+		const admitted = await configured.dispatch(request("/sign-in/email", {
+			email: `  ${alternate.toUpperCase()}  `, password,
+		}));
+		expect(admitted.status).toBe(200);
+		expect(await admitted.json()).toMatchObject({ user: { id, email: primary } });
+		expect(await nativeGetSession(new Headers({ cookie: cookies(admitted) })))
+			.toMatchObject({ user: { id } });
+		const sibling = engine(otherSchema, "203.0.113.108", { emailAliases: { [alternate]: id } });
+		const unavailable = await sibling.dispatch(request("/sign-in/email", { email: alternate, password }));
+		expect(unavailable.status).toBe(401);
+		expect(cookies(unavailable)).toBe("");
+
+		const replacement = "alias-replacement@fixture.example";
+		await database.query(`UPDATE "${schema}"."user" SET email=$1 WHERE id=$2`, [replacement, id]);
+		const following = await configured.dispatch(request("/sign-in/email", { email: alternate, password }));
+		expect(await following.json()).toMatchObject({ user: { id, email: replacement } });
+		await seed(alternate);
+		const collision = await configured.dispatch(request("/sign-in/email", { email: alternate, password }));
+		expect(collision.status).toBe(401);
+		expect(cookies(collision)).toBe("");
+	});
+
+	it("reserves a verified alias at email signup without minting an account or credential", async () => {
+		const primary = "alias-signup-primary@fixture.example";
+		const alternate = "alias-signup-migrated@fixture.example";
+		const id = await seed(primary);
+		const candidate = engine(schema, "203.0.113.109", {
+			policy: { ...defaultAuthPolicy, requireEmailVerification: false },
+			emailAliases: { [alternate]: id },
+			signUp: { async admit() { return { allowed: true, retryAfter: 0 }; }, async checkPasswordSafety() { return "allowed"; } },
+		});
+		const response = await candidate.dispatch(request("/sign-up/email", {
+			email: alternate, name: "Fixture Duplicate", password,
+		}));
+		expect(response.status).toBe(200);
+		const { token, user } = await response.json() as { token: string | null; user: { id: string; email: string } };
+		expect(token).toBeNull();
+		expect(user.email).toBe(alternate);
+		expect(user.id).not.toBe(id);
+		const stored = await database.query(
+			`SELECT id,email FROM "${schema}"."user" WHERE email=ANY($1::text[]) ORDER BY email`,
+			[[primary, alternate]],
+		);
+		expect(stored.rows).toEqual([{ id, email: primary }]);
+		expect(cookies(response)).toBe("");
+	});
+
 	it("matches configured native realm user reads and permission checks without exposing private fields", async () => {
 		if (!legacyDatabase)
 			throw new Error("The isolated native database was not initialized.");

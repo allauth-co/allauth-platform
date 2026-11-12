@@ -13,6 +13,8 @@ import { clerkCompatiblePasswords } from "../clerk-password";
 import { allauthControl } from "../control";
 import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
 import type { CompleteOwnedEmailVerification } from "./owned-email-verification";
+import type { OwnedProjectEmailAliases } from "./owned-project-email-aliases";
+import { createOwnedProjectEmailAliases } from "./owned-project-email-aliases";
 import { createOwnedProjectEmailCallbackPolicy } from "./owned-project-email-callback";
 import { createOwnedRecoveryHttp } from "./owned-recovery-http";
 
@@ -169,6 +171,7 @@ describe.skipIf(!existsSync(fixturePath))(
 		function fixture(
 			options: {
 				database?: Pool;
+				emailAliases?: OwnedProjectEmailAliases;
 				limited?: boolean;
 				emailUnavailable?: boolean;
 				preserveBrowserContinuation?: boolean;
@@ -179,6 +182,7 @@ describe.skipIf(!existsSync(fixturePath))(
 			const queued: (() => Promise<void>)[] = [];
 			const handler = createOwnedRecoveryHttp({
 				database: options.database ?? database,
+				emailAliases: options.emailAliases,
 				project: { slug: project, schemaName: schema },
 				policy: defaultAuthPolicy,
 				signingSecret,
@@ -314,6 +318,33 @@ describe.skipIf(!existsSync(fixturePath))(
 			await expect(
 				native.auth.api.signInEmail({ body: { email, password: newPassword } }),
 			).resolves.toMatchObject({ user: { id: user.id } });
+		});
+
+		it("delivers alias recovery only to the verified owner and survives native rollback", async () => {
+			const email = "alias-reset-primary@recovery-fixture.example";
+			const alias = "alias-reset-legacy@recovery-fixture.example";
+			const user = await seed(email);
+			await database.query(`UPDATE "${schema}"."user" SET "emailVerified"=TRUE WHERE id=$1`, [user.id]);
+			const recovery = fixture({
+				emailAliases: createOwnedProjectEmailAliases(database, schema, { [alias]: user.id }),
+			});
+			const response = await recovery.handler(post("/request-password-reset", {
+				email: ` ${alias.toUpperCase()} `, redirectTo: resetCallback,
+			}));
+			expect(response?.status).toBe(200);
+			await recovery.flush();
+			expect(recovery.deliveries.map((item) => item.to)).toEqual([email]);
+			const link = mailedLink(recovery.deliveries[0].html);
+			const token = link.pathname.split("/").at(-1)!;
+			const reset = await native.auth.handler(post("/reset-password", { token, newPassword }));
+			expect(reset.status).toBe(200);
+			await expect(native.auth.api.signInEmail({ body: { email, password: newPassword } }))
+				.resolves.toMatchObject({ user: { id: user.id, email } });
+
+			const verification = await recovery.handler(post("/send-verification-email", { email: alias }));
+			expect(verification?.status).toBe(200);
+			await recovery.flush();
+			expect(recovery.deliveries.map((item) => item.to)).toEqual([email]);
 		});
 
 		it("redeems already issued app-proxy reset links in both engines without an email sender", async () => {

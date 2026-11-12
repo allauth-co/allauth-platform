@@ -7,6 +7,7 @@ import type { ApplicationBranding } from "../branding/types";
 import { authenticationEmail } from "../email/authentication";
 import type { EmailEnvironment } from "../email/send";
 import { emailConfigured, sendAuthEmail } from "../email/send";
+import type { OwnedProjectEmailAliases } from "./owned-project-email-aliases";
 import { scheduleOwnedEmailDelivery } from "./owned-project-email-delivery";
 import type { CompleteProjectEmailSignIn } from "./owned-project-email-sign-in-store";
 import { createProjectEmailSignInStore } from "./owned-project-email-sign-in-store";
@@ -47,6 +48,7 @@ export type ProjectEmailSignInOperation =
 
 export interface OwnedProjectEmailSignInOptions {
 	database: Pool;
+	emailAliases?: OwnedProjectEmailAliases;
 	project: Pick<Project, "schemaName" | "slug">;
 	policy: AuthPolicy;
 	baseURL: string;
@@ -271,8 +273,22 @@ export function createOwnedProjectEmailSignIn(
 		);
 	}
 
+	function invalidAlias() {
+		return failure(401, "INVALID_EMAIL_OR_PASSWORD", "Invalid email or password");
+	}
+
+	function resolveEmail(email: string) {
+		const address = email.toLowerCase();
+		return options.emailAliases ? options.emailAliases.resolve(address) : { email: address };
+	}
+
+	async function proofBody(request: Request) {
+		const raw = await readBody(request);
+		return options.emailAliases?.normalizeInput(raw) ?? raw;
+	}
+
 	async function sendMagic(request: Request, caller: string) {
-		const parsed = magicInput.safeParse(await readBody(request));
+		const parsed = magicInput.safeParse(await proofBody(request));
 		if (!parsed.success)
 			return failure(400, "INVALID_BODY", "Supply a valid email address.");
 		const body = parsed.data;
@@ -289,11 +305,12 @@ export function createOwnedProjectEmailSignIn(
 			destination.href,
 		);
 		if (!created || !error) return forbidden();
-		const address = body.email.toLowerCase();
-		const limited = await admission(request, "sign-in/magic-link", address);
+		const identity = await resolveEmail(body.email);
+		if (!identity) return invalidAlias();
+		const limited = await admission(request, "sign-in/magic-link", identity.email);
 		if (limited) return limited;
 		const scheduled = await schedule("sign-in/magic-link", async () => {
-			const token = await store.issueMagic({ email: address, name: body.name });
+			const token = await store.issueMagic({ ...identity, name: body.name });
 			if (!token) return null;
 			const url = new URL(`${linkPath}/magic-link/verify`, linkOrigin);
 			url.searchParams.set("token", token);
@@ -304,7 +321,7 @@ export function createOwnedProjectEmailSignIn(
 				url.searchParams.set("errorCallbackURL", error.href);
 			return () =>
 				sendAuthEmail(options.email.environment, {
-					to: address,
+					to: identity.email,
 					fromName: appName,
 					subject: `Sign in to ${appName}`,
 					react: authenticationEmail({
@@ -321,7 +338,7 @@ export function createOwnedProjectEmailSignIn(
 	}
 
 	async function sendOtp(request: Request) {
-		const parsed = otpSend.safeParse(await readBody(request));
+		const parsed = otpSend.safeParse(await proofBody(request));
 		if (!parsed.success)
 			return failure(
 				400,
@@ -329,21 +346,22 @@ export function createOwnedProjectEmailSignIn(
 				"Supply a valid email address and code purpose.",
 			);
 		if (parsed.data.type !== "sign-in") return unsupported();
-		const address = parsed.data.email.toLowerCase();
+		const identity = await resolveEmail(parsed.data.email);
+		if (!identity) return invalidAlias();
 		const limited = await admission(
 			request,
 			"email-otp/send-verification-otp",
-			address,
+			identity.email,
 		);
 		if (limited) return limited;
 		const scheduled = await schedule(
 			"email-otp/send-verification-otp",
 			async () => {
-				const code = await store.issueOtp(address);
+				const code = await store.issueOtp(identity);
 				if (!code) return null;
 				return () =>
 					sendAuthEmail(options.email.environment, {
-						to: address,
+						to: identity.email,
 						fromName: appName,
 						subject: `Your ${appName} verification code`,
 						react: authenticationEmail({
@@ -413,7 +431,7 @@ export function createOwnedProjectEmailSignIn(
 	}
 
 	async function verifyOtp(request: Request, caller: string) {
-		const input = otpSignIn.safeParse(await readBody(request));
+		const input = otpSignIn.safeParse(await proofBody(request));
 		if (!input.success)
 			return failure(
 				400,
@@ -433,11 +451,12 @@ export function createOwnedProjectEmailSignIn(
 				// Ordinary external profile-image values keep their existing contract.
 			}
 		}
-		const address = email.toLowerCase();
-		const limited = await admission(request, "sign-in/email-otp", address);
+		const identity = await resolveEmail(email);
+		if (!identity) return invalidAlias();
+		const limited = await admission(request, "sign-in/email-otp", identity.email);
 		if (limited) return limited;
 		const result = await store.verifyOtp(
-			{ email: address, name, image },
+			{ ...identity, name, image },
 			otp,
 			request,
 		);

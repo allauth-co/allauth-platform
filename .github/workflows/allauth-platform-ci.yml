@@ -73,7 +73,7 @@ jobs:
       - name: Test authentication and existing SDK compatibility
         run: >-
           pnpm exec vitest run --root apps/auth --config vitest.config.ts
-          lib/configuration-aliases.test.ts lib/clerk-password.test.ts lib/mfa.test.ts sdk/next.test.ts
+          lib/configuration-aliases.test.ts lib/project-email-aliases.test.ts lib/clerk-password.test.ts lib/mfa.test.ts sdk/next.test.ts
           lib/broker-login.test.ts lib/projects/broker-two-factor.test.ts
           lib/domains/hosting.pg.test.ts lib/domains/edge.test.ts lib/domains/gateway.test.ts lib/projects/runtime.test.ts
           lib/projects/session-introspection.test.ts lib/projects/session-introspection.legacy.test.ts

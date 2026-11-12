@@ -7,6 +7,7 @@ import { authPolicySchema } from "../auth-policy/policy";
 import { validAvatarPath } from "../avatars/protocol";
 import { clerkCompatiblePasswords } from "../clerk-password";
 import type { OwnedEmailCallbackPolicy } from "./owned-project-email-callback";
+import type { OwnedProjectEmailAliases } from "./owned-project-email-aliases";
 import { createProjectEngineStore } from "./owned-project-engine-store";
 import type { Project } from "./registry";
 import type { SessionCheckAdmission } from "./session-introspection-admission";
@@ -63,6 +64,7 @@ export function scheduleOwnedSignUpVerification(
 
 export interface OwnedSignUpOptions {
 	database: Pool;
+	emailAliases?: OwnedProjectEmailAliases;
 	project: Pick<Project, "schemaName" | "slug">;
 	baseURL: string;
 	basePath: string;
@@ -223,7 +225,8 @@ export function createOwnedSignUpHttp(options: OwnedSignUpOptions) {
 				"EMAIL_PASSWORD_SIGN_UP_DISABLED",
 				"Email and password sign up is not enabled",
 			);
-		const parsed = signUpInput.safeParse(await readBody(request, true));
+		const raw = await readBody(request, true);
+		const parsed = signUpInput.safeParse(options.emailAliases?.normalizeInput(raw) ?? raw);
 		if (!parsed.success)
 			return failure(
 				400,
@@ -291,6 +294,9 @@ export function createOwnedSignUpHttp(options: OwnedSignUpOptions) {
 			return unavailable();
 
 		const address = input.email.toLowerCase();
+		const reserved = options.emailAliases?.reserved(address);
+		if (reserved && !(await options.emailAliases?.resolve(address)))
+			return failure(401, "INVALID_EMAIL_OR_PASSWORD", "Invalid email or password");
 		const decision = await options.admit(request, "sign-up/email", address);
 		if (decision instanceof Response) return decision;
 		if (!decision.allowed && decision.retryAfter !== 0)
@@ -335,6 +341,7 @@ export function createOwnedSignUpHttp(options: OwnedSignUpOptions) {
 
 		// Hash before the uniqueness gate so the duplicate email takes the same password work.
 		const hashed = await clerkCompatiblePasswords.hash(input.password);
+		if (reserved) return json({ token: null, user });
 		const outcome = await store.transaction(async (client) => {
 			const inserted = await client.query<{ id: string }>(
 				`INSERT INTO "user" (id,name,email,image,"emailVerified","createdAt","updatedAt",role,banned,

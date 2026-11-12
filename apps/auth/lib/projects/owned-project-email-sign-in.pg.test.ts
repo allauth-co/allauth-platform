@@ -8,6 +8,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { defaultAuthPolicy } from "../auth-policy/policy";
 import { clerkCompatiblePasswords } from "../clerk-password";
 import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
+import { createOwnedProjectEmailAliases } from "./owned-project-email-aliases";
 import type { OwnedProjectEmailSignInOptions } from "./owned-project-email-sign-in";
 import { createOwnedProjectEmailSignIn } from "./owned-project-email-sign-in";
 import {
@@ -323,6 +324,43 @@ describe.skipIf(!existsSync(fixturePath))(
 					headers: new Headers({ Origin: appOrigin }),
 				}),
 			).resolves.toMatchObject({ user: { id: user.id } });
+		});
+
+		it("binds alias magic links and codes to the primary mailbox and the same rollback account", async () => {
+			const email = "alias-proof-primary@email-proof-fixture.example";
+			const alias = "alias-proof-legacy@email-proof-fixture.example";
+			const user = await seed(email);
+			const owner = fixture({
+				emailAliases: createOwnedProjectEmailAliases(database, schema, { [alias]: user.id }),
+			});
+			const magic = await owner.handler(post("sign-in/magic-link", { email: alias }));
+			expect(magic?.status).toBe(200);
+			const issued = await owner.handler(post("email-otp/send-verification-otp", {
+				email: `  ${alias.toUpperCase()}  `, type: "sign-in",
+			}));
+			expect(issued?.status).toBe(200);
+			await owner.flush();
+			expect(owner.deliveries.map((item) => item.to)).toEqual([email, email]);
+			const link = new URL(magicLinkFromEmail(owner.deliveries[0].html));
+			const token = link.searchParams.get("token")!;
+			const legacy = await native.auth.api.magicLinkVerify({
+				query: { token }, headers: new Headers({ Origin: appOrigin }),
+			});
+			expect(legacy.user).toMatchObject({ id: user.id, email });
+			const code = otpFromEmail(owner.deliveries[1].html);
+			const verified = await owner.handler(post("sign-in/email-otp", { email: alias, otp: code }));
+			expect(await verified?.json()).toMatchObject({ user: { id: user.id, email } });
+			const legacyReserved = await database.query(
+				`SELECT id FROM "${schema}"."user" WHERE email=$1`, [alias],
+			);
+			expect(legacyReserved.rowCount).toBe(0);
+
+			await seed(alias);
+			const rejected = await owner.handler(post("email-otp/send-verification-otp", {
+				email: alias, type: "sign-in",
+			}));
+			expect(rejected?.status).toBe(401);
+			expect(owner.queued).toHaveLength(0);
 		});
 
 		it("preserves the three-attempt budget on native OTP rows", async () => {

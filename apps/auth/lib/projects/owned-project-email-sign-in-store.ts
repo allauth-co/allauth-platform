@@ -7,6 +7,7 @@ import {
 import type { Pool, PoolClient } from "pg";
 import * as z from "zod";
 import type { AuthPolicy } from "../auth-policy/policy";
+import type { OwnedProjectEmailAliases, ProjectEmailIdentity } from "./owned-project-email-aliases";
 import type { ProjectUser } from "./owned-project-engine-store";
 import { createProjectEngineStore } from "./owned-project-engine-store";
 
@@ -31,8 +32,7 @@ export type CompleteProjectEmailSignIn = (input: {
 	callbackURL?: string;
 }) => Promise<Response>;
 
-interface EmailProof {
-	email: string;
+interface EmailProof extends ProjectEmailIdentity {
 	name?: string;
 	image?: string;
 }
@@ -90,6 +90,7 @@ export function createProjectEmailSignInStore(options: {
 	database: Pool;
 	schemaName: string;
 	policy: AuthPolicy;
+	emailAliases?: OwnedProjectEmailAliases;
 	completeSignIn: CompleteProjectEmailSignIn;
 }) {
 	const store = createProjectEngineStore(options.database, options.schemaName);
@@ -122,7 +123,8 @@ export function createProjectEmailSignInStore(options: {
 	const recipient = `SELECT COALESCE((
 		SELECT NOT (banned IS TRUE OR "directoryManaged" IS TRUE OR "directoryDisabled" IS TRUE
 			OR "isAnonymous" IS TRUE) FROM "user" WHERE email = $1
-	), $2::boolean) AS eligible`;
+			AND ($6::text IS NULL OR (id = $6 AND "emailVerified" IS TRUE))
+	), $6::text IS NULL AND $2::boolean) AS eligible`;
 	const insertProof = `INSERT INTO "verification" (id, identifier, value, "expiresAt")
 		SELECT $3, $4, $5, statement_timestamp() + interval '5 minutes' FROM recipient WHERE eligible`;
 
@@ -141,14 +143,15 @@ export function createProjectEmailSignInStore(options: {
 						email: proof.email,
 						name: proof.name,
 					}),
+					proof.userId ?? null,
 				],
 			);
 			return result.rowCount ? token : null;
 		});
 	}
 
-	async function issueOtp(email: string) {
-		const identifier = otpIdentifier(email);
+	async function issueOtp(identity: ProjectEmailIdentity) {
+		const identifier = otpIdentifier(identity.email);
 		const otp = String(randomInt(1_000_000)).padStart(6, "0");
 		return store.transaction(async (client) => {
 			await lockOtp(client, identifier);
@@ -158,11 +161,12 @@ export function createProjectEmailSignInStore(options: {
 				)
 				${insertProof}`,
 				[
-					email,
+					identity.email,
 					options.policy.signUpEnabled,
 					randomUUID(),
 					identifier,
 					`${hash(otp)}:0`,
+					identity.userId ?? null,
 				],
 			);
 			return result.rowCount ? otp : null;
@@ -253,10 +257,15 @@ export function createProjectEmailSignInStore(options: {
 		path: EmailSignInPath,
 		callbacks?: { existing?: string; created?: string },
 	): Promise<AuthResult> {
-		let user = await lockUserByEmail(client, proof.email);
+		let user = proof.userId
+			? await store.lockUser(client, proof.userId)
+			: await lockUserByEmail(client, proof.email);
+		if (proof.userId && (user?.email !== proof.email || !user.emailVerified))
+			return { status: "blocked" };
 		let created = false;
 		if (!user) {
-			if (!options.policy.signUpEnabled) return { status: "signup-disabled" };
+			if (!options.policy.signUpEnabled || options.emailAliases?.reserved(proof.email))
+				return { status: "signup-disabled" };
 			const newId = randomText(nativeIdAlphabet);
 			const inserted = await client.query<{ id: string }>(
 				`INSERT INTO "user" (id,name,email,image,"emailVerified",role,banned,"twoFactorEnabled",

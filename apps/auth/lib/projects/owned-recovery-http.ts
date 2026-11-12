@@ -16,6 +16,7 @@ import {
 	isLegacyPasswordResetToken,
 } from "./owned-password-reset";
 import type { OwnedEmailCallbackPolicy } from "./owned-project-email-callback";
+import type { OwnedProjectEmailAliases, ProjectEmailIdentity } from "./owned-project-email-aliases";
 import { scheduleOwnedEmailDelivery } from "./owned-project-email-delivery";
 import { createProjectEngineStore } from "./owned-project-engine-store";
 import type { Project } from "./registry";
@@ -44,6 +45,7 @@ export type RecoveryOperation =
 
 export interface RecoveryHttpOptions {
 	database: Pool;
+	emailAliases?: OwnedProjectEmailAliases;
 	project: Pick<Project, "schemaName" | "slug">;
 	policy: AuthPolicy;
 	signingSecret: string;
@@ -253,7 +255,7 @@ export function createOwnedRecoveryHttp(options: RecoveryHttpOptions) {
 
 	async function prepareReset(
 		request: Request,
-		address: string,
+		identity: ProjectEmailIdentity,
 		destination: URL,
 	) {
 		const token = Array.from(
@@ -262,14 +264,15 @@ export function createOwnedRecoveryHttp(options: RecoveryHttpOptions) {
 		).join("");
 		const user = await store.transaction(async (client) => {
 			const result = await client.query<Recipient>(
-				`WITH recipient AS (${recipientQuery} FOR UPDATE),
+				`WITH recipient AS (${recipientQuery}
+					AND ($4::text IS NULL OR (id = $4 AND "emailVerified" IS TRUE)) FOR UPDATE),
 				issued AS (
 					INSERT INTO "verification" (id, identifier, value, "expiresAt")
 					SELECT $2, $3, id, statement_timestamp() + interval '1 hour' FROM recipient
 					RETURNING value
 				)
 				SELECT recipient.* FROM recipient JOIN issued ON issued.value = recipient.id`,
-				[address, randomUUID(), `reset-password:${token}`],
+				[identity.email, randomUUID(), `reset-password:${token}`, identity.userId ?? null],
 			);
 			await store.recordEvent(client, {
 				type: "user.password-reset-requested",
@@ -348,8 +351,9 @@ export function createOwnedRecoveryHttp(options: RecoveryHttpOptions) {
 		operation: "request-password-reset" | "send-verification-email",
 	) {
 		const caller = request.headers.get("origin") ?? undefined;
-		const body = await boundedJson(request);
+		const raw = await boundedJson(request);
 		const isReset = operation === "request-password-reset";
+		const body = isReset ? options.emailAliases?.normalizeInput(raw) ?? raw : raw;
 		const parsed = isReset
 			? resetRequest.safeParse(body)
 			: verifyRequest.safeParse(body);
@@ -369,7 +373,11 @@ export function createOwnedRecoveryHttp(options: RecoveryHttpOptions) {
 		);
 		if (!destination) return forbidden();
 		const address = parsed.data.email.toLowerCase();
-		const limited = await admission(request, operation, address);
+		const identity = isReset && options.emailAliases
+			? await options.emailAliases.resolve(address)
+			: { email: address };
+		if (!identity) return failure(401, "INVALID_EMAIL_OR_PASSWORD", "Invalid email or password");
+		const limited = await admission(request, operation, identity.email);
 		if (limited) return limited;
 		if (
 			!emailConfigured(options.email.environment) ||
@@ -385,7 +393,7 @@ export function createOwnedRecoveryHttp(options: RecoveryHttpOptions) {
 			async () => {
 				if (!isReset)
 					return () => deliverVerification(address, destination.url);
-				const message = await prepareReset(request, address, destination.url);
+				const message = await prepareReset(request, identity, destination.url);
 				return message ? () => deliver(operation, message) : null;
 			},
 			() => options.onDeliveryFailure?.(operation),
