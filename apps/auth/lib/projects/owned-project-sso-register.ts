@@ -16,6 +16,10 @@ import {
 	resolveProjectOidc,
 } from "./owned-project-sso-oidc";
 import {
+	prepareProjectSamlRegistration,
+	projectSamlAcs,
+} from "./owned-project-sso-saml-management";
+import {
 	projectSsoConfigURL,
 	projectSsoOidcInput,
 } from "./owned-project-sso-update";
@@ -103,6 +107,7 @@ export async function prepareProjectSsoRegistration(
 	input: Registration,
 	trustedOrigins: ReadonlySet<string>,
 	fetch: SsoFetch = fetchPublicSsoEndpoint,
+	samlBaseURL?: string,
 ) {
 	if (!supportsProjectSsoDnsIdentifier(input.providerId))
 		return failure(
@@ -112,8 +117,23 @@ export async function prepareProjectSsoRegistration(
 		);
 	if (!projectSsoDomainNames(input.domain))
 		return failure(400, "INVALID_DOMAIN", "Invalid domain");
-	if (!input.oidcConfig || input.samlConfig || input.overrideUserInfo)
-		return unsupportedConfig();
+	if (input.samlConfig) {
+		if (!samlBaseURL || input.oidcConfig || input.overrideUserInfo)
+			return unsupportedConfig();
+		try {
+			return {
+				type: "saml" as const,
+				config: prepareProjectSamlRegistration(
+					input.samlConfig,
+					input.issuer,
+					projectSamlAcs(samlBaseURL, input.providerId),
+				),
+			};
+		} catch {
+			return unsupportedConfig();
+		}
+	}
+	if (!input.oidcConfig || input.overrideUserInfo) return unsupportedConfig();
 	const { skipDiscovery, ...submitted } = input.oidcConfig;
 	const issuer = input.issuer;
 	const oidcConfig = {
@@ -139,9 +159,12 @@ export async function prepareProjectSsoRegistration(
 					"Manual OIDC configuration requires authorization, token, and JWKS endpoints.",
 				);
 			return {
-				...oidcConfig,
-				tokenEndpointAuthentication:
-					submitted.tokenEndpointAuthentication ?? "client_secret_basic",
+				type: "oidc" as const,
+				config: {
+					...oidcConfig,
+					tokenEndpointAuthentication:
+						submitted.tokenEndpointAuthentication ?? "client_secret_basic",
+				},
 			};
 		}
 		const hydrated = await resolveProjectOidc(
@@ -160,16 +183,19 @@ export async function prepareProjectSsoRegistration(
 		);
 		if (hydrated.method === "private_key_jwt") return unsupportedConfig();
 		return {
-			...oidcConfig,
-			authorizationEndpoint:
-				submitted.authorizationEndpoint ??
-				hydrated.metadata.authorization_endpoint,
-			tokenEndpoint:
-				submitted.tokenEndpoint ?? hydrated.metadata.token_endpoint,
-			jwksEndpoint: submitted.jwksEndpoint ?? hydrated.metadata.jwks_uri,
-			userInfoEndpoint:
-				submitted.userInfoEndpoint ?? hydrated.metadata.userinfo_endpoint,
-			tokenEndpointAuthentication: hydrated.method,
+			type: "oidc" as const,
+			config: {
+				...oidcConfig,
+				authorizationEndpoint:
+					submitted.authorizationEndpoint ??
+					hydrated.metadata.authorization_endpoint,
+				tokenEndpoint:
+					submitted.tokenEndpoint ?? hydrated.metadata.token_endpoint,
+				jwksEndpoint: submitted.jwksEndpoint ?? hydrated.metadata.jwks_uri,
+				userInfoEndpoint:
+					submitted.userInfoEndpoint ?? hydrated.metadata.userinfo_endpoint,
+				tokenEndpointAuthentication: hydrated.method,
+			},
 		};
 	} catch {
 		return unsupportedConfig();
@@ -180,7 +206,7 @@ function unsupportedConfig() {
 	return failure(
 		400,
 		"SSO_CONFIGURATION_UNSUPPORTED",
-		"This SSO provider registration requires a supported OIDC configuration.",
+		"This SSO provider registration requires a supported identity configuration.",
 	);
 }
 
@@ -188,7 +214,7 @@ export async function registerProjectSsoProvider(
 	client: PoolClient,
 	userId: string,
 	input: Registration,
-	oidcConfig: Exclude<
+	configuration: Exclude<
 		Awaited<ReturnType<typeof prepareProjectSsoRegistration>>,
 		Response
 	>,
@@ -196,11 +222,22 @@ export async function registerProjectSsoProvider(
 	const id = randomUUID();
 	const organizationId = input.organizationId || null;
 	const { providerId, issuer, domain } = input;
-	const serialized = JSON.stringify(oidcConfig);
+	const serialized = JSON.stringify(configuration.config);
+	const oidcConfig = configuration.type === "oidc" ? serialized : null;
+	const samlConfig = configuration.type === "saml" ? serialized : null;
 	const inserted = await client.query(
 		`INSERT INTO "ssoProvider" (id,"providerId",issuer,domain,"domainVerified","organizationId","userId","oidcConfig","samlConfig")
-		VALUES ($1,$2,$3,$4,FALSE,$5,$6,$7,NULL) ON CONFLICT ("providerId") DO NOTHING RETURNING id`,
-		[id, providerId, issuer, domain, organizationId, userId, serialized],
+		VALUES ($1,$2,$3,$4,FALSE,$5,$6,$7,$8) ON CONFLICT ("providerId") DO NOTHING RETURNING id`,
+		[
+			id,
+			providerId,
+			issuer,
+			domain,
+			organizationId,
+			userId,
+			oidcConfig,
+			samlConfig,
+		],
 	);
 	if (!inserted.rowCount) return providerConflict();
 	const identifier = projectSsoDnsIdentifier(providerId);
@@ -219,8 +256,8 @@ export async function registerProjectSsoProvider(
 		domainVerified: false,
 		organizationId,
 		userId,
-		oidcConfig: serialized,
-		samlConfig: null,
+		oidcConfig,
+		samlConfig,
 		domainVerificationToken,
 	};
 }

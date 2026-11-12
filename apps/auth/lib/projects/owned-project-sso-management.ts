@@ -26,6 +26,10 @@ import {
 	projectSsoRegistrationInput,
 	registerProjectSsoProvider,
 } from "./owned-project-sso-register";
+import {
+	projectSamlAcs,
+	publicSamlRegistration,
+} from "./owned-project-sso-saml-management";
 import { projectSamlServiceMetadata } from "./owned-project-sso-saml-protocol";
 import { ssoProviderId } from "./owned-project-sso-store";
 import {
@@ -240,6 +244,7 @@ export function createOwnedProjectSsoManagement(
 			input,
 			options.trustedOrigins,
 			options.fetch,
+			options.saml ? options.baseURL : undefined,
 		);
 		if (configuration instanceof Response) return configuration;
 		return registerWithAuthority(async (client, actorId) => {
@@ -251,14 +256,22 @@ export function createOwnedProjectSsoManagement(
 			);
 			if (provider instanceof Response) return provider;
 			await auditProviderChange(client, "/sso/register", provider, actorId);
-			const { oidcConfig: _stored, ...rest } = provider;
-			const { clientSecret, ...publicConfig } = configuration;
+			const { oidcConfig: _oidc, samlConfig: _saml, ...rest } = provider;
+			const sameOrigin = request.headers.get("origin") === origin;
+			const { type, config } = configuration;
+			if (type === "saml") {
+				return json({
+					...rest,
+					oidcConfig: null,
+					samlConfig: sameOrigin ? config : publicSamlRegistration(config),
+					redirectURI: `${options.baseURL}/sso/callback/${encodeURIComponent(provider.providerId)}`,
+				});
+			}
+			const { clientSecret, ...publicConfig } = config;
 			return json({
 				...rest,
-				oidcConfig:
-					request.headers.get("origin") === origin
-						? { ...publicConfig, clientSecret }
-						: publicConfig,
+				oidcConfig: sameOrigin ? config : publicConfig,
+				samlConfig: null,
 				redirectURI: `${options.baseURL}/sso/callback/${encodeURIComponent(provider.providerId)}`,
 			});
 		});
@@ -281,7 +294,7 @@ export function createOwnedProjectSsoManagement(
 			);
 		const config = readStoredSsoConfiguration(provider.samlConfig);
 		try {
-			const acs = `${options.baseURL}/sso/saml2/sp/acs/${encodeURIComponent(id.data)}`;
+			const acs = projectSamlAcs(options.baseURL, id.data);
 			return new Response(projectSamlServiceMetadata(config, acs), {
 				headers: {
 					"Content-Type": "application/xml",
@@ -337,6 +350,7 @@ export function createOwnedProjectSsoManagement(
 							client,
 							provider,
 							input.data,
+							options.saml ? options.baseURL : undefined,
 						);
 						if (updated instanceof Response) return updated;
 						await auditProviderChange(client, path, updated, actorId);

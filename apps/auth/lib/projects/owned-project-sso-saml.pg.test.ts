@@ -20,6 +20,7 @@ import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
 import { createOwnedProjectEngine } from "./owned-project-engine";
 import { createProjectEngineStore } from "./owned-project-engine-store";
 import { createOwnedProjectSso } from "./owned-project-sso";
+import { checkProjectSamlConfiguration } from "./owned-project-sso-saml-eligibility";
 import {
 	configureOwnedSaml,
 	verifyOwnedSaml,
@@ -422,6 +423,57 @@ describe.skipIf(!existsSync(fixturePath))(
 			});
 		}
 
+		async function samlAdministrator() {
+			const id = randomUUID();
+			const token = randomUUID();
+			await database.query(
+				`INSERT INTO "${schema}"."user"(id,email,name,"emailVerified",role) VALUES ($1,$2,'SAML Admin',TRUE,'admin')`,
+				[id, `${id}@corp.example`],
+			);
+			await database.query(
+				`INSERT INTO "${schema}"."session"(id,token,"userId","expiresAt","updatedAt") VALUES ($1,$2,$3,now()+interval '1 day',now())`,
+				[randomUUID(), token, id],
+			);
+			const signature = createHmac("sha256", secret)
+				.update(token)
+				.digest("base64");
+			return {
+				id,
+				cookie: `__Secure-${prefix}.session_token=${encodeURIComponent(`${token}.${signature}`)}`,
+			};
+		}
+
+		function managementRequest(
+			path: string,
+			cookie: string,
+			input?: object,
+			requestOrigin = origin,
+		) {
+			return new Request(`${origin}/api/auth/sso/${path}`, {
+				method: input ? "POST" : "GET",
+				headers: {
+					origin: requestOrigin,
+					cookie,
+					...(input ? { "content-type": "application/json" } : {}),
+				},
+				body: input ? JSON.stringify(input) : undefined,
+			});
+		}
+
+		function managementEngine(enabled = true) {
+			return createOwnedProjectEngine({
+				database,
+				project: { schemaName: schema, slug },
+				baseURL: origin,
+				basePath: "/api/auth",
+				trustedOrigins: ["https://saml-application.fixture.example"],
+				signingSecret: secret,
+				policy: defaultAuthPolicy,
+				trustedIP: () => "192.0.2.31",
+				sso: { defaultErrorURL: `${origin}/auth-error`, saml: enabled },
+			});
+		}
+
 		async function assertSession(response: Response) {
 			expect(
 				response.headers.get("location"),
@@ -797,6 +849,307 @@ describe.skipIf(!existsSync(fixturePath))(
 				],
 			);
 			expect((await hosted.dispatch(hostedRequest())).status).toBe(400);
+		});
+
+		it("qualifies only transport-bound plaintext SAML with validated signing material", () => {
+			const samlConfig = configuration();
+			expect(() =>
+				checkProjectSamlConfiguration({ issuer: sp, samlConfig }, acs),
+			).not.toThrow();
+			expect(() =>
+				checkProjectSamlConfiguration(
+					{
+						issuer: sp,
+						samlConfig: {
+							...samlConfig,
+							authnRequestsSigned: true,
+							privateKey: fixtureKeys.privateKey,
+						},
+					},
+					acs,
+				),
+			).not.toThrow();
+			for (const change of [
+				{ issuer },
+				{ cert: "bad-fixture-certificate" },
+				{ authnRequestsSigned: true, privateKey: "invalid fixture key" },
+				{ spMetadata: { isAssertionEncrypted: true } },
+				{ idpInitiatedCallbackUrl: `${origin}/account` },
+			]) {
+				expect(() =>
+					checkProjectSamlConfiguration(
+						{ issuer: sp, samlConfig: { ...samlConfig, ...change } },
+						acs,
+					),
+				).toThrow(
+					"This configured SAML provider is outside the candidate transport.",
+				);
+			}
+			const customMetadata = saml
+				.SPMetadata({
+					entityID: sp,
+					assertionConsumerService: [
+						{
+							Binding: "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST",
+							Location: acs,
+						},
+					],
+					wantAssertionsSigned: true,
+				})
+				.getMetadata();
+			const saved = {
+				issuer: sp,
+				samlConfig: { ...samlConfig, spMetadata: { metadata: customMetadata } },
+			};
+			expect(() => checkProjectSamlConfiguration(saved, acs)).not.toThrow();
+			expect(() =>
+				checkProjectSamlConfiguration(
+					saved,
+					acs.replace("/api/auth", `/api/projects/${slug}/auth`),
+				),
+			).toThrow();
+		});
+
+		it("registers native-readable signed SAML with the existing DNS proof and credential response", async () => {
+			const { cookie } = await samlAdministrator();
+			const ownedEngine = managementEngine();
+			const { issuer: _spEntity, ...samlConfig } = configuration();
+			const input = {
+				providerId: "allauth-registered-saml",
+				issuer: sp,
+				domain: "corp.example",
+				samlConfig: {
+					...samlConfig,
+					authnRequestsSigned: true,
+					privateKey: fixtureKeys.privateKey,
+					signatureAlgorithm: "sha256",
+					digestAlgorithm: "sha256",
+					mapping: { email: "corpEmail", name: "displayName" },
+				},
+			};
+			const disabled = await managementEngine(false).dispatch(
+				managementRequest("register", cookie, input),
+			);
+			expect(disabled.status).toBe(400);
+			const registered = await ownedEngine.dispatch(
+				managementRequest("register", cookie, input),
+			);
+			expect(registered.status, await registered.clone().text()).toBe(200);
+			expect(registered.headers.get("cache-control")).toBe("no-store");
+			const result = (await registered.json()) as {
+				domainVerificationToken: string;
+			};
+			expect(result).toMatchObject({
+				providerId: input.providerId,
+				issuer: sp,
+				domain: input.domain,
+				domainVerified: false,
+				oidcConfig: null,
+				samlConfig: { ...input.samlConfig, issuer: sp },
+				redirectURI: `${origin}/api/auth/sso/callback/${input.providerId}`,
+			});
+			const proof = await native.handler(
+				managementRequest("request-domain-verification", cookie, {
+					providerId: input.providerId,
+				}),
+			);
+			expect(proof.status).toBe(201);
+			expect(await proof.json()).toEqual({
+				domainVerificationToken: result.domainVerificationToken,
+			});
+			const nativeView = await native.handler(
+				managementRequest(
+					`get-provider?providerId=${input.providerId}`,
+					cookie,
+				),
+			);
+			expect(nativeView.status, await nativeView.clone().text()).toBe(200);
+			expect(await nativeView.clone().json()).toEqual(
+				await (
+					await ownedEngine.dispatch(
+						managementRequest(
+							`get-provider?providerId=${input.providerId}`,
+							cookie,
+						),
+					)
+				).json(),
+			);
+			expect(await nativeView.text()).not.toContain("BEGIN PRIVATE KEY");
+			const cross = await ownedEngine.dispatch(
+				managementRequest(
+					"register",
+					cookie,
+					{ ...input, providerId: "saml-cross-origin" },
+					"https://saml-application.fixture.example",
+				),
+			);
+			expect(cross.status, await cross.clone().text()).toBe(200);
+			expect(await cross.text()).not.toContain("BEGIN PRIVATE KEY");
+
+			const nativeId = "native-registered-saml";
+			const idpMetadata = saml
+				.IdPMetadata({
+					entityID: issuer,
+					signingCert: fixtureKeys.certificate,
+					singleSignOnService: [
+						{
+							Binding: "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect",
+							Location: `${idpOrigin}/redirect`,
+						},
+					],
+				})
+				.getMetadata();
+			const nativeRegistration = await native.handler(
+				managementRequest("register", cookie, {
+					...input,
+					providerId: nativeId,
+					samlConfig: {
+						...input.samlConfig,
+						cert: undefined,
+						idpMetadata: { metadata: idpMetadata },
+					},
+				}),
+			);
+			expect(
+				nativeRegistration.status,
+				await nativeRegistration.clone().text(),
+			).toBe(200);
+			const nativeUpdate = await native.handler(
+				managementRequest("update-provider", cookie, {
+					providerId: input.providerId,
+					samlConfig: {
+						identifierFormat:
+							"urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress",
+					},
+				}),
+			);
+			expect(nativeUpdate.status, await nativeUpdate.clone().text()).toBe(200);
+			expect(await nativeUpdate.json()).toEqual(
+				await (
+					await ownedEngine.dispatch(
+						managementRequest(
+							`get-provider?providerId=${input.providerId}`,
+							cookie,
+						),
+					)
+				).json(),
+			);
+			const ownedUpdate = await ownedEngine.dispatch(
+				managementRequest("update-provider", cookie, {
+					providerId: nativeId,
+					domain: "corp.new.example",
+					samlConfig: { mapping: { email: "corpEmail", name: "fullName" } },
+				}),
+			);
+			expect(ownedUpdate.status, await ownedUpdate.clone().text()).toBe(200);
+			expect(await ownedUpdate.clone().json()).toEqual(
+				await (
+					await native.handler(
+						managementRequest(`get-provider?providerId=${nativeId}`, cookie),
+					)
+				).json(),
+			);
+			expect(await ownedUpdate.text()).not.toContain("BEGIN PRIVATE KEY");
+			const freshProof = await native.handler(
+				managementRequest("request-domain-verification", cookie, {
+					providerId: nativeId,
+				}),
+			);
+			expect(await freshProof.json()).not.toEqual({
+				domainVerificationToken: (
+					(await nativeRegistration.json()) as {
+						domainVerificationToken: string;
+					}
+				).domainVerificationToken,
+			});
+		});
+
+		it("guards linked SAML identities, SCIM bindings, and the signed plaintext policy", async () => {
+			const { id, cookie } = await samlAdministrator();
+			const ownedEngine = managementEngine();
+			const idToChange = "saml-managed-guard";
+			const { issuer: _spEntity, ...samlConfig } = configuration();
+			const input = {
+				providerId: idToChange,
+				issuer: sp,
+				domain: "corp.example",
+				samlConfig: {
+					...samlConfig,
+					mapping: { email: "corpEmail", name: "displayName" },
+				},
+			};
+			expect(
+				(
+					await ownedEngine.dispatch(
+						managementRequest("register", cookie, {
+							...input,
+							samlConfig: {
+								...input.samlConfig,
+								spMetadata: { isAssertionEncrypted: true },
+							},
+						}),
+					)
+				).status,
+			).toBe(400);
+			expect(
+				(
+					await ownedEngine.dispatch(
+						managementRequest("register", cookie, {
+							...input,
+							samlConfig: { ...input.samlConfig, signatureAlgorithm: "sha1" },
+						}),
+					)
+				).status,
+			).toBe(400);
+			const registered = await ownedEngine.dispatch(
+				managementRequest("register", cookie, input),
+			);
+			expect(registered.status, await registered.clone().text()).toBe(200);
+			await database.query(
+				`INSERT INTO "${schema}"."account" (id,"accountId","providerId","userId","updatedAt") VALUES ($1,$2,$3,$4,now())`,
+				[randomUUID(), subject, idToChange, id],
+			);
+			const authorityChange = {
+				providerId: idToChange,
+				samlConfig: {
+					idpMetadata: {
+						entityID: "https://different-idp.fixture.example/entity",
+					},
+				},
+			};
+			expect(
+				(
+					await native.handler(
+						managementRequest("update-provider", cookie, authorityChange),
+					)
+				).status,
+			).toBe(409);
+			const linked = await ownedEngine.dispatch(
+				managementRequest("update-provider", cookie, authorityChange),
+			);
+			expect(linked.status, await linked.clone().text()).toBe(409);
+			expect(await linked.json()).toMatchObject({
+				message:
+					"Cannot change SSO provider identity fields while linked accounts exist",
+			});
+			await database.query(
+				`INSERT INTO "${schema}"."allauthDirectory" (id,"providerId","organizationId","connectionId","createdAt") VALUES ($1,$2,$3,$4,now())`,
+				[randomUUID(), idToChange, organization, randomUUID()],
+			);
+			const bound = await ownedEngine.dispatch(
+				managementRequest("update-provider", cookie, authorityChange),
+			);
+			expect(bound.status, await bound.clone().text()).toBe(409);
+			expect(await bound.json()).toMatchObject({
+				code: "SSO_PROVIDER_MUTATION_REJECTED",
+			});
+			const benign = await ownedEngine.dispatch(
+				managementRequest("update-provider", cookie, {
+					providerId: idToChange,
+					samlConfig: { mapping: { email: "corpEmail", name: "fullName" } },
+				}),
+			);
+			expect(benign.status, await benign.clone().text()).toBe(200);
 		});
 
 		it("requires an active directory identity and consumes a valid denied assertion without email fallback", async () => {
