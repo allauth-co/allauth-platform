@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import type { GenericEndpointContext } from "@better-auth/core";
 import {
 	getCurrentAdapter,
@@ -7,63 +6,24 @@ import {
 import type { DBTransactionAdapter } from "@better-auth/core/db/adapter";
 import { createAuthEndpoint } from "better-auth/api";
 import { defaultRoles } from "better-auth/plugins/organization/access";
-import * as z from "zod";
 import type { ControlEventInput, ControlPrincipal } from "../control/types";
 
-const sourceId = z.string().regex(/^[A-Za-z0-9_.:-]{1,160}$/);
-const id = z.string().min(1).max(160);
-export const invitationImportInput = z
-	.object({
-		sourceInstance: sourceId,
-		dryRun: z.boolean().default(true),
-		invitations: z
-			.array(
-				z
-					.object({
-						sourceInvitationId: sourceId,
-						organizationId: id,
-						email: z
-							.email()
-							.max(320)
-							.transform((value) => value.toLowerCase()),
-						role: z.string().regex(/^[a-z][a-z0-9_-]{0,63}$/),
-						inviterId: id,
-						expiresAt: z.iso.datetime({ offset: true }),
-						createdAt: z.iso.datetime({ offset: true }).optional(),
-						sourceUpdatedAt: z.iso.datetime({ offset: true }).optional(),
-					})
-					.strict(),
-			)
-			.min(1)
-			.max(100),
-	})
-	.strict()
-	.superRefine((value, ctx) => {
-		if (
-			new Set(value.invitations.map((row) => row.sourceInvitationId)).size !==
-			value.invitations.length
-		)
-			ctx.addIssue({ code: "custom", message: "Duplicate source invitation." });
-		if (
-			new TextEncoder().encode(JSON.stringify(value)).byteLength >
-			1024 * 1024
-		)
-			ctx.addIssue({
-				code: "custom",
-				message: "Import batches must not exceed 1 MiB.",
-			});
-	});
-type Input = z.output<typeof invitationImportInput>["invitations"][number];
-type Conflict =
-	| "source_changed"
-	| "source_conflict"
-	| "organization_missing"
-	| "invalid_inviter"
-	| "role_missing"
-	| "membership_conflict"
-	| "invitation_conflict"
-	| "expired"
-	| "write_conflict";
+import type {
+	InvitationImportConflict as Conflict,
+	InvitationImportRow as Input,
+	InvitationImportResult,
+	InvitationImportStatus,
+} from "./invitation-import-contract";
+import {
+	invitationImportIdentity,
+	invitationImportInput,
+	invitationImportPath,
+	invitationImportResult,
+	storedInvitationCreatePermission,
+} from "./invitation-import-contract";
+
+export { invitationImportInput } from "./invitation-import-contract";
+
 interface Provenance {
 	id: string;
 	fingerprint: string;
@@ -73,8 +33,6 @@ interface NativeInvitation {
 	id: string;
 	status: string;
 }
-const digest = (value: string) =>
-	createHash("sha256").update(value).digest("hex");
 
 async function mayInvite(
 	adapter: DBTransactionAdapter,
@@ -116,21 +74,8 @@ async function mayInvite(
 				{ field: "role", value: role },
 			],
 		});
-		if (custom) {
-			try {
-				const permission: unknown = JSON.parse(custom.permission);
-				if (
-					permission &&
-					typeof permission === "object" &&
-					"invitation" in permission &&
-					Array.isArray(permission.invitation) &&
-					permission.invitation.includes("create")
-				)
-					return true;
-			} catch {
-				/* Malformed stored permissions never grant authority. */
-			}
-		}
+		if (custom && storedInvitationCreatePermission(custom.permission))
+			return true;
 	}
 	return false;
 }
@@ -208,43 +153,31 @@ export function invitationImportEndpoint(options: {
 	) => Promise<void>;
 }) {
 	return createAuthEndpoint(
-		"/project-admin/import-invitations",
+		invitationImportPath,
 		{ method: "POST", requireHeaders: true, body: invitationImportInput },
 		async (ctx) => {
 			const actor = await options.authorize(ctx);
-			const results: {
-				sourceInvitationId: string;
-				sourceUpdatedAt: string | null;
-				invitationId?: string;
-				status: "created" | "existing" | "would_create" | "conflict";
-				nativeStatus?: string;
-				reason?: Conflict;
-			}[] = [];
+			const results: InvitationImportResult[] = [];
 			const seen = new Set<string>();
 			for (const input of ctx.body.invitations) {
-				const identity = digest(
-					JSON.stringify([
+				const { identity, invitationId, fingerprint } =
+					invitationImportIdentity(
 						options.projectId,
 						ctx.body.sourceInstance,
-						input.sourceInvitationId,
-					]),
-				);
-				const invitationId = `imported_${identity}`;
-				const fingerprint = digest(JSON.stringify(input));
+						input,
+					);
 				const result = (
-					status: "created" | "existing" | "would_create" | "conflict",
+					status: InvitationImportStatus,
 					reason?: Conflict,
 					nativeStatus?: string,
-				) => ({
-					sourceInvitationId: input.sourceInvitationId,
-					sourceUpdatedAt: input.sourceUpdatedAt
-						? new Date(input.sourceUpdatedAt).toISOString()
-						: null,
-					...(status === "conflict" ? {} : { invitationId }),
-					status,
-					...(reason ? { reason } : {}),
-					...(nativeStatus ? { nativeStatus } : {}),
-				});
+				) =>
+					invitationImportResult(
+						input,
+						invitationId,
+						status,
+						reason,
+						nativeStatus,
+					);
 				const process = async () => {
 					const adapter = await getCurrentAdapter(ctx.context.adapter);
 					const provenance = await adapter.findOne<Provenance>({

@@ -48,6 +48,7 @@ import {
 } from "./owned-project-engine-store";
 import type { ProjectGuestProof } from "./owned-project-guest";
 import { createOwnedProjectGuest } from "./owned-project-guest";
+import { createOwnedProjectInvitationImport } from "./owned-project-invitation-import";
 import { createOwnedProjectIssuer } from "./owned-project-issuer";
 import { readSignedProjectIssuerQuery } from "./owned-project-issuer-authorization-query";
 import { ProjectOAuthError } from "./owned-project-issuer-http";
@@ -1881,6 +1882,17 @@ export function createOwnedProjectEngine(
 			basePath: options.basePath,
 			readBody: (request) => requestBody(request, 1024 * 1024),
 		});
+	const invitationImport =
+		options.adminDeletion &&
+		adminProject &&
+		createOwnedProjectInvitationImport({
+			...options.adminDeletion,
+			project: adminProject,
+			store,
+			origin,
+			basePath: options.basePath,
+			readBody: (request) => requestBody(request, 1024 * 1024),
+		});
 
 	const beforeGuestDelete = accountLinks?.beforeDelete;
 	const guest =
@@ -2380,6 +2392,8 @@ export function createOwnedProjectEngine(
 		if (administrative) return administrative;
 		const imported = await clerkImport?.(request, path);
 		if (imported) return imported;
+		const importedInvitations = await invitationImport?.(request, path);
+		if (importedInvitations) return importedInvitations;
 		const issuerResponse = issuer && (await issuer.dispatch(path, request));
 		if (issuerResponse) return issuerResponse;
 		if (
