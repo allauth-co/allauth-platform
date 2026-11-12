@@ -1,6 +1,6 @@
 function unsupported() {
 	return new Error(
-		"This development project has stored Agent Auth outside the candidate scope.",
+		"This project has stored Agent Auth outside the candidate scope.",
 	);
 }
 

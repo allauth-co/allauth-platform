@@ -15,8 +15,8 @@ import {
 	ssoStateSchema,
 } from "./owned-project-sso-store";
 import {
-	internalProjectEngineSelected,
-	internalProjectPreparationRevision,
+	projectEnginePreparationRevision,
+	projectEngineSelected,
 } from "./project-engine-internal-selection";
 import { createProjectEngineWriterLease } from "./project-engine-writer-lease";
 import type { Project } from "./registry";
@@ -42,7 +42,7 @@ function unverified(): never {
 	throw new Error("The encrypted SAML preflight sample could not be verified.");
 }
 
-/** Inspect one pending native response on the protected legacy writer. The receipt cannot select a writer. */
+/** Inspect one pending native response on the enrolled legacy writer without changing its state. */
 export async function verifyProjectEncryptedSamlEvidence(options: {
 	database: Pool;
 	project: Project;
@@ -57,8 +57,8 @@ export async function verifyProjectEncryptedSamlEvidence(options: {
 	if (
 		!providerInput.success ||
 		!parsed.success ||
-		!secret ||
-		!internalProjectEngineSelected(env, project) ||
+		secret.length < 32 ||
+		!projectEngineSelected(env, project) ||
 		database.options.connectionString !== setting(env, "DATABASE_URL")
 	)
 		unverified();
@@ -71,7 +71,8 @@ export async function verifyProjectEncryptedSamlEvidence(options: {
 		selectedProjectId: project.id,
 	});
 	return lease.run("legacy", async ({ revision }) => {
-		if (revision !== internalProjectPreparationRevision(env)) unverified();
+		if (revision !== projectEnginePreparationRevision(env, project))
+			unverified();
 		const transport = createProjectCustomSamlTransport(
 			project,
 			authOrigin(env),

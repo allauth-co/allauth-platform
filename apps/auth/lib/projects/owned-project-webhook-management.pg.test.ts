@@ -4,7 +4,13 @@ import { runWithAdapter } from "@better-auth/core/context";
 import { oauthProvider } from "@better-auth/oauth-provider";
 import { APIError } from "better-auth";
 import { symmetricDecrypt } from "better-auth/crypto";
-import { admin, haveIBeenPwned, jwt, organization } from "better-auth/plugins";
+import {
+	admin,
+	haveIBeenPwned,
+	jwt,
+	multiSession,
+	organization,
+} from "better-auth/plugins";
 import { getTestInstance } from "better-auth/test";
 import { Kysely, PostgresDialect } from "kysely";
 import { Pool } from "pg";
@@ -157,6 +163,7 @@ async function native(
 							featureBoundaries(),
 							haveIBeenPwned({ paths: ["/change-password"] }),
 							authPolicyPlugin(defaultAuthPolicy),
+							multiSession({ maximumSessions: 5 }),
 							organization(),
 							jwt({ disableSettingJwtHeader: true }),
 							oauthProvider({
@@ -633,20 +640,24 @@ describe.skipIf(!existsSync(fixture))(
 				"",
 			);
 			expect(signedIn.status).toBe(200);
+			const name = `__Secure-allauth_project_${alpha.slug}.session_token`;
+			const cookies = signedIn.headers.getSetCookie();
 			const cookie =
-				signedIn.headers
-					.getSetCookie()
-					.find((value) =>
-						value.startsWith(
-							`__Secure-allauth_project_${alpha.slug}.session_token=`,
-						),
-					)
+				cookies
+					.find((value) => value.startsWith(`${name}=`))
 					?.split(";", 1)[0] ?? "";
 			expect(cookie).toBeTruthy();
 			const active = await send("legacy", "/get-session", undefined, cookie);
-			const { session } = (await active.json()) as { session: { id: string } };
+			const { session } = (await active.json()) as {
+				session: { id: string; token: string };
+			};
 			expect(session.id).toBeTruthy();
-			return { cookie, id: session.id };
+			const deviceName = `${name}_multi-${session.token.toLowerCase()}`;
+			const deviceCookie =
+				cookies
+					.find((value) => value.startsWith(`${deviceName}=`))
+					?.split(";", 1)[0] ?? "";
+			return { cookie, id: session.id, token: session.token, deviceCookie };
 		}
 
 		async function signedEvents(
@@ -1533,6 +1544,143 @@ describe.skipIf(!existsSync(fixture))(
 						userId: eventUserId,
 						targetId: "expired-browser",
 						metadata: { path: "/get-session" },
+					},
+				},
+			]);
+			expect(await exercise("owned")).toEqual(native);
+		});
+
+		it("attributes device revocation to the active browser account in the signed session event", async () => {
+			const realm = `"${alpha.schemaName}"`;
+			const path = "/multi-session/revoke";
+			async function exercise(writer: "legacy" | "owned") {
+				const active = await browserSession(userEmail);
+				const target = await browserSession(eventEmail);
+				const sibling = await browserSession(eventEmail);
+				expect(active.deviceCookie).toBeTruthy();
+				expect(target.deviceCookie).toBeTruthy();
+				const clientId = randomUUID();
+				const grants = {
+					access: randomUUID(),
+					online: randomUUID(),
+					offline: randomUUID(),
+					unaffected: randomUUID(),
+				};
+				await database.query(
+					`INSERT INTO ${realm}."oauthClient" (id,"clientId","redirectUris") VALUES ($1,$1,'[]')`,
+					[clientId],
+				);
+				await database.query(
+					`INSERT INTO ${realm}."oauthAccessToken" (id,token,"sessionId","userId","clientId","expiresAt","createdAt",scopes)
+					 VALUES ($4,$4,$1,$2,$3,now()+interval '1 day',now(),'["openid"]')`,
+					[target.id, eventUserId, clientId, grants.access],
+				);
+				await database.query(
+					`INSERT INTO ${realm}."oauthRefreshToken" (id,token,"sessionId","userId","clientId","expiresAt","createdAt",scopes)
+					 VALUES ($4,$4,$1,$2,$3,now()+interval '1 day',now(),'["openid"]'),
+					        ($5,$5,$1,$2,$3,now()+interval '1 day',now(),'["openid","offline_access"]'),
+					        ($6,$6,$7,$2,$3,now()+interval '1 day',now(),'["openid"]')`,
+					[
+						target.id,
+						eventUserId,
+						clientId,
+						grants.online,
+						grants.offline,
+						grants.unaffected,
+						sibling.id,
+					],
+				);
+				const subscription = await endpoint(
+					"legacy",
+					`device-revoke-${writer}`,
+					["session.deleted"],
+				);
+				try {
+					const activeCookies = `${active.cookie}; ${active.deviceCookie}`;
+					const body = { sessionToken: target.token };
+					expect((await send(writer, path, body, activeCookies)).status).toBe(
+						401,
+					);
+					expect(
+						(await send(writer, path, body, target.deviceCookie)).status,
+					).toBe(401);
+					expect(
+						(await deliveries("legacy", subscription.endpoint.id)).total,
+					).toBe(0);
+					const cookies = `${activeCookies}; ${target.deviceCookie}`;
+					for (let attempt = 0; attempt < 2; attempt++) {
+						const response = await send(writer, path, body, cookies);
+						expect(response.status).toBe(200);
+						expect(await response.json()).toEqual({ status: true });
+					}
+					const events = await signedEvents(
+						subscription,
+						[
+							password,
+							userEmail,
+							eventEmail,
+							active.token,
+							target.token,
+							...Object.values(grants),
+						],
+						new Map([[target.id, "device"]]),
+					);
+					const sessions = await database.query<{ id: string; userId: string }>(
+						`SELECT id,"userId" FROM ${realm}.session WHERE id=ANY($1::text[])`,
+						[[active.id, target.id, sibling.id]],
+					);
+					expect(sessions.rows).toHaveLength(2);
+					expect(sessions.rows).toEqual(
+						expect.arrayContaining([
+							{ id: active.id, userId },
+							{ id: sibling.id, userId: eventUserId },
+						]),
+					);
+					const state = await database.query<{
+						id: string;
+						revoked: boolean;
+						sessionId: string | null;
+					}>(
+						`SELECT id, revoked IS NOT NULL AS revoked, "sessionId" FROM ${realm}."oauthAccessToken" WHERE id=$1
+						 UNION ALL SELECT id, revoked IS NOT NULL AS revoked, "sessionId" FROM ${realm}."oauthRefreshToken" WHERE id=ANY($2::text[])`,
+						[grants.access, [grants.online, grants.offline, grants.unaffected]],
+					);
+					expect(state.rows).toHaveLength(4);
+					for (const [kind, id] of Object.entries(grants))
+						expect(state.rows.find((row) => row.id === id)).toEqual({
+							id,
+							revoked: kind === "access" || kind === "online",
+							sessionId: kind === "unaffected" ? sibling.id : null,
+						});
+					return events;
+				} finally {
+					await database.query(
+						`DELETE FROM ${realm}."oauthClient" WHERE id=$1`,
+						[clientId],
+					);
+					await database.query(
+						`DELETE FROM ${realm}.session WHERE id=ANY($1::text[])`,
+						[[active.id, target.id, sibling.id]],
+					);
+					expect(
+						(
+							await send("legacy", `${base}/delete`, {
+								id: subscription.endpoint.id,
+							})
+						).status,
+					).toBe(200);
+				}
+			}
+			const native = await exercise("legacy");
+			expect(native).toEqual([
+				{
+					event: {
+						type: "session.deleted",
+						outcome: "success",
+						actorId: userId,
+						userId: eventUserId,
+						targetId: "device",
+						metadata: { path },
 					},
 				},
 			]);

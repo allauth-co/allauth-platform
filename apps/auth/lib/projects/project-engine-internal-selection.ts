@@ -2,6 +2,10 @@ import { after } from "next/server";
 import {
 	agentReplayApprovalSetting,
 	agentReplayBridgeIdSetting,
+	productionAgentReplayApprovalValue,
+	productionAgentReplayApprovalsSetting,
+	productionAgentReplayBridgeIdsSetting,
+	productionAgentReplayBridgeSelected,
 	verifyAgentReplayDrainEvidence,
 } from "../../scripts/project-agent-replay-evidence.mjs";
 import {
@@ -112,10 +116,29 @@ export function projectAgentReplayBridgeSelected(
 	project: ProjectBinding,
 	env: AuthEnvironment,
 ) {
+	if (protectedInternalProject(project))
+		return setting(env, agentReplayBridgeIdSetting).trim() === project.id;
 	return (
-		protectedInternalProject(project) &&
-		setting(env, agentReplayBridgeIdSetting).trim() === project.id
+		registeredProductionProject(project) &&
+		productionAgentReplayBridgeSelected(
+			setting(env, productionAgentReplayBridgeIdsSetting),
+			project.id,
+		)
 	);
+}
+
+export function projectAgentReplayApprovalValue(
+	project: ProjectBinding,
+	env: AuthEnvironment,
+) {
+	if (protectedInternalProject(project))
+		return setting(env, agentReplayApprovalSetting).trim();
+	return registeredProductionProject(project)
+		? productionAgentReplayApprovalValue(
+				setting(env, productionAgentReplayApprovalsSetting),
+				project.id,
+			)
+		: "";
 }
 
 /** Check the operator's exact revision and drain window, including cached preparation. */
@@ -124,11 +147,9 @@ export function projectAgentReplayApproved(
 	env: AuthEnvironment,
 	writer: { revision: number; preparing: boolean },
 ) {
-	const evidence = setting(env, agentReplayApprovalSetting).trim();
+	const evidence = projectAgentReplayApprovalValue(project, env);
 	if (evidence && !projectAgentReplayBridgeSelected(project, env))
-		throw new Error(
-			"The protected project Agent replay bridge is unavailable.",
-		);
+		throw new Error("The project Agent replay bridge is unavailable.");
 	return evidence
 		? verifyAgentReplayDrainEvidence(
 				evidence,
@@ -147,7 +168,6 @@ export function selectProjectEngine(
 	writer: { revision: number; preparing: boolean },
 ): ProjectEngineBuilder | undefined {
 	if (!projectEnginePreparedForWriter(env, project, writer)) return;
-	const internal = protectedInternalProject(project);
 	return async ({
 		database,
 		project,
@@ -174,11 +194,12 @@ export function selectProjectEngine(
 				: { kind: "direct" },
 			signingSecret,
 			credentialHashSecret,
-			encryptedSamlApproval: internal
-				? readProjectEncryptedSamlApproval(env, project, writer)
-				: undefined,
-			agentReplayApproved:
-				internal && projectAgentReplayApproved(project, env, writer),
+			encryptedSamlApproval: readProjectEncryptedSamlApproval(
+				env,
+				project,
+				writer,
+			),
+			agentReplayApproved: projectAgentReplayApproved(project, env, writer),
 			// The accounts gateway and signed application proxy verify these values before dispatch.
 			trustedIP(request) {
 				if (hosted) return request.headers.get("x-real-ip");

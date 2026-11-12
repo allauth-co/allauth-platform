@@ -4,6 +4,10 @@ import { runWithAdapter } from "@better-auth/core/context";
 import { APIError } from "better-auth";
 import { Pool } from "pg";
 import {
+	productionEncryptedSamlApprovalsSetting,
+	readProjectEngineApprovalValue,
+} from "../../scripts/project-engine-rollout-selection.mjs";
+import {
 	auth,
 	createAuth,
 	getAuthEnvironment,
@@ -69,7 +73,7 @@ import { projectManagement } from "./management-plugin";
 import { projectOriginFingerprint } from "./origins";
 import type { OwnedProjectSCIMConsole } from "./owned-project-scim-console";
 import {
-	internalProjectEngineSelected,
+	projectAgentReplayApprovalValue,
 	projectAgentReplayApproved,
 	projectAgentReplayBridgeSelected,
 	projectEnginePreparationRevision,
@@ -580,12 +584,19 @@ async function withConfiguredProjectEntry<T>(
 				.update(aliasConfiguration)
 				.digest("hex")
 		: "";
-	const internal = owned && writer && internalProjectEngineSelected(env, project);
-	const samlApproval = internal && setting(env, "ALLAUTH_PROJECT_ENGINE_ENCRYPTED_SAML_APPROVAL");
+	const samlApproval =
+		owned &&
+		writer &&
+		(project.environment === "production"
+			? readProjectEngineApprovalValue(
+					setting(env, productionEncryptedSamlApprovalsSetting),
+					project.id,
+				)
+			: setting(env, "ALLAUTH_PROJECT_ENGINE_ENCRYPTED_SAML_APPROVAL").trim());
 	const samlApprovalVersion = samlApproval
 		? createHmac("sha256", setting(env, "ALLAUTH_AUTH_SECRET")).update(samlApproval).digest("hex")
 		: "";
-	const agentApproval = internal && setting(env, "ALLAUTH_PROJECT_ENGINE_AGENT_REPLAY_APPROVAL");
+	const agentApproval = owned && writer && projectAgentReplayApprovalValue(project, env);
 	const agentApprovalVersion = agentApproval
 		? createHmac("sha256", setting(env, "ALLAUTH_AUTH_SECRET")).update(agentApproval).digest("hex")
 		: "";
@@ -766,7 +777,7 @@ export function confirmProjectEngine(
 		// Keep preflight separate from live cache entries. Legacy can
 		// still change configuration until the database commits the switch.
 		const preparing = writer === "legacy" && revision === projectEnginePreparationRevision(env, project);
-		if (preparing && internalProjectEngineSelected(env, project))
+		if (preparing)
 			projectAgentReplayApproved(project, env, { revision, preparing });
 		const useCandidate = preparing || writer === "allauth";
 		const candidate = useCandidate ? selectProjectEngine(project, env, { revision, preparing }) : undefined;

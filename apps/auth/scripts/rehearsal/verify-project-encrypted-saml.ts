@@ -4,6 +4,7 @@ import { Pool } from "pg";
 import { setting } from "../../lib/configuration";
 import { verifyProjectEncryptedSamlEvidence } from "../../lib/projects/owned-project-sso-saml-evidence";
 import { getProject, projectRegistryPool } from "../../lib/projects/registry";
+import { projectEngineIdPattern } from "../project-engine-rollout-selection.mjs";
 
 async function sampleFromStdin(): Promise<unknown> {
 	if (process.stdin.isTTY) throw new Error();
@@ -19,10 +20,18 @@ async function sampleFromStdin(): Promise<unknown> {
 }
 
 async function run() {
-	const [slug, providerId, ...rest] = process.argv.slice(2);
-	if (!slug || !providerId || rest.length) {
+	const args = process.argv.slice(2);
+	const production = args[0] === "--project";
+	const projectId = production ? args[1] : undefined;
+	const [slug, providerId, ...rest] = production ? args.slice(2) : args;
+	if (
+		!slug ||
+		!providerId ||
+		rest.length ||
+		(production && !projectEngineIdPattern.test(projectId ?? ""))
+	) {
 		process.stderr.write(
-			"Pass a project slug and SAML provider ID, with the sample JSON on stdin.\n",
+			"Pass a project slug and SAML provider ID, with the sample JSON on stdin. For production, prefix the arguments with --project PROJECT_ID.\n",
 		);
 		process.exitCode = 1;
 		return;
@@ -40,6 +49,11 @@ async function run() {
 	});
 	try {
 		const project = await getProject(slug, env);
+		if (
+			production !== (project.environment === "production") ||
+			(production && project.id !== projectId)
+		)
+			throw new Error();
 		const evidence = await verifyProjectEncryptedSamlEvidence({
 			database,
 			project,

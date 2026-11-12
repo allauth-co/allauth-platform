@@ -5,12 +5,14 @@ import { createRequire } from "node:module";
 import { setTimeout } from "node:timers/promises";
 import { promisify } from "node:util";
 import { getCookies } from "better-auth/cookies";
-import { createLocalJWKSet, jwtVerify, type JSONWebKeySet } from "jose";
+import type { JSONWebKeySet } from "jose";
+import { createLocalJWKSet, jwtVerify } from "jose";
 import { defaultAuthPolicy } from "../../lib/auth-policy/policy";
 import { clerkCompatiblePasswords } from "../../lib/clerk-password";
 import { signEdgeRequest } from "../../lib/domains/edge";
 import { projectEmailAliasVariable } from "../../lib/project-email-alias-config";
 import { platformWorkspaceId } from "../../lib/workspaces/types";
+import { productionAgentReplayBridgeIdsSetting } from "../project-agent-replay-evidence.mjs";
 import { productionProjectEngineRevisionsSetting } from "../project-engine-rollout-selection.mjs";
 import { createRailwayProjectEngineTransport } from "./railway-project-engine-transport";
 
@@ -776,6 +778,30 @@ try {
 			CLOUDFLARE_ACCOUNT_ID: run,
 			CLOUDFLARE_EMAIL_API_TOKEN: run,
 		};
+		if (unselected) {
+			await start(
+				releaseImage,
+				restored,
+				{ [productionAgentReplayBridgeIdsSetting]: unselected.id },
+				503,
+			);
+			await stop(restored);
+			await start(
+				releaseImage,
+				restored,
+				{ [productionAgentReplayBridgeIdsSetting]: owned.id },
+			);
+			assert.deepEqual(await projectWriter("status"), {
+				writer: "legacy",
+				revision: 0,
+			});
+			expectStatus(
+				await request(`${direct}/not-installed`, { realm: owned }),
+				404,
+				"The registered Agent bridge starts on the legacy writer before candidate selection.",
+			);
+			await stop(restored);
+		}
 		if (!railway) {
 			await start(
 				releaseImage,

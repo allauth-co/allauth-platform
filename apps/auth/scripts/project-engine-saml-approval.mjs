@@ -1,6 +1,10 @@
 import { createHmac, X509Certificate } from "node:crypto";
 import { DOMParser } from "@xmldom/xmldom";
 import * as z from "zod";
+import {
+	productionEncryptedSamlApprovalsSetting,
+	readProjectEngineApprovalValue,
+} from "./project-engine-rollout-selection.mjs";
 
 export const encryptedSamlApprovalSetting =
 	"ALLAUTH_PROJECT_ENGINE_ENCRYPTED_SAML_APPROVAL";
@@ -445,19 +449,20 @@ async function verifyActivationReceiver(client, projectId, approval, env) {
 		throw new Error("The approved encrypted SAML receiver is unavailable.");
 }
 
-/** Recheck the approved SAML row under the protected writer's exclusive admission lock. */
+/** Recheck the approved SAML row under the selected writer's exclusive admission lock. */
 export async function verifyEncryptedSamlActivation(
 	client,
 	projectId,
 	schemaName,
 	revision,
 	env,
+	production = false,
 ) {
 	if (
 		!/^allauth_project_[a-f0-9]{32}$/.test(schemaName) ||
 		schemaName !== `allauth_project_${projectId.replaceAll("-", "")}`
 	)
-		throw new Error("The protected encrypted SAML realm is unavailable.");
+		throw new Error("The project encrypted SAML realm is unavailable.");
 	const { rows } = await client.query(
 		`SELECT id,"providerId",issuer,domain,"domainVerified","organizationId","oidcConfig","samlConfig"
 		 FROM "${schemaName}"."ssoProvider" WHERE "samlConfig" IS NOT NULL FOR SHARE`,
@@ -468,7 +473,12 @@ export async function verifyEncryptedSamlActivation(
 	} catch {
 		throw new Error("The stored project SAML configuration is unavailable.");
 	}
-	const raw = env[encryptedSamlApprovalSetting]?.trim();
+	const raw = production
+		? readProjectEngineApprovalValue(
+				env[productionEncryptedSamlApprovalsSetting],
+				projectId,
+			)
+		: env[encryptedSamlApprovalSetting]?.trim();
 	if (!raw && !encrypted.length) return;
 	if (!raw)
 		throw new Error(

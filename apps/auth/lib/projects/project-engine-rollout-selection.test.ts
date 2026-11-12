@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { readProductionProjectEngineRevisions } from "../../scripts/project-engine-rollout-selection.mjs";
+import {
+	readProductionProjectEngineRevisions,
+	readProjectEngineApprovalValue,
+} from "../../scripts/project-engine-rollout-selection.mjs";
 import { platformWorkspaceId } from "../workspaces/types";
 import {
 	internalProjectEngineIdSetting,
@@ -24,6 +27,31 @@ function binding(id: string) {
 }
 
 describe("project writer rollout selection", () => {
+	it("reads only the exact production project approval from a valid map", () => {
+		const first = { projectId: firstId, revision: 0 };
+		const second = { projectId: secondId, revision: 2 };
+		const raw = JSON.stringify({ [firstId]: first, [secondId]: second });
+		expect(readProjectEngineApprovalValue(raw, firstId)).toBe(
+			JSON.stringify(first),
+		);
+		expect(readProjectEngineApprovalValue(raw, secondId)).toBe(
+			JSON.stringify(second),
+		);
+		expect(readProjectEngineApprovalValue(raw, workspaceId)).toBe("");
+		expect(readProjectEngineApprovalValue(undefined, firstId)).toBe("");
+		for (const invalid of [
+			"{",
+			"[]",
+			"null",
+			JSON.stringify({ [firstId]: first, "project-slug": second }),
+			JSON.stringify({ [firstId]: "receipt" }),
+			JSON.stringify({ [firstId]: [] }),
+		])
+			expect(() => readProjectEngineApprovalValue(invalid, firstId)).toThrow(
+				"production project approvals are invalid",
+			);
+	});
+
 	it("prepares each enrolled production project at its exact configured revision", () => {
 		const first = binding(firstId);
 		const second = binding(secondId);

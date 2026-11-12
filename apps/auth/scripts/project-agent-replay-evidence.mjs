@@ -1,18 +1,46 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
+import {
+	projectEngineIdPattern,
+	readProjectEngineApprovalValue,
+} from "./project-engine-rollout-selection.mjs";
 
 export const agentReplayApprovalSetting =
 	"ALLAUTH_PROJECT_ENGINE_AGENT_REPLAY_APPROVAL";
 export const agentReplayBridgeIdSetting =
 	"ALLAUTH_PROJECT_ENGINE_AGENT_BRIDGE_ID";
+export const productionAgentReplayBridgeIdsSetting =
+	"ALLAUTH_PROJECT_ENGINE_PRODUCTION_AGENT_BRIDGE_IDS";
+export const productionAgentReplayApprovalsSetting =
+	"ALLAUTH_PROJECT_ENGINE_PRODUCTION_AGENT_REPLAY_APPROVALS";
 const kind = "operator-verified-agent-replay-drain-v1";
 const drainWindowMs = 90_000;
 const preparationWindowMs = 15 * 60_000;
 const encoder = new TextEncoder();
 
+/** @param {string | undefined} raw @returns {Set<string>} */
+export function readProductionAgentReplayBridgeIds(raw) {
+	const configured = raw?.trim();
+	if (!configured) return new Set();
+	const ids = new Set();
+	for (const entry of configured.split(",")) {
+		const id = entry.trim();
+		if (!projectEngineIdPattern.test(id) || ids.has(id))
+			throw new Error("The production project Agent bridge IDs are invalid.");
+		ids.add(id);
+	}
+	return ids;
+}
+
+/** @param {string | undefined} raw @param {string} projectId */
+export function productionAgentReplayBridgeSelected(raw, projectId) {
+	return readProductionAgentReplayBridgeIds(raw).has(projectId);
+}
+
+export const productionAgentReplayApprovalValue =
+	readProjectEngineApprovalValue;
+
 function unavailable() {
-	return new Error(
-		"The protected project Agent replay drain evidence is unavailable.",
-	);
+	return new Error("The project Agent replay drain evidence is unavailable.");
 }
 
 /** @param {string} id */
@@ -60,7 +88,7 @@ export function verifyAgentReplayDrainEvidence(
 		if (
 			secret.length < 32 ||
 			raw.length > 2048 ||
-			!/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(id)
+			!projectEngineIdPattern.test(id)
 		)
 			throw unavailable();
 		const evidence = JSON.parse(raw);

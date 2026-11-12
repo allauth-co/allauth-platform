@@ -5,6 +5,10 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import {
+	productionAgentReplayApprovalsSetting,
+	productionAgentReplayBridgeIdsSetting,
+} from "../../scripts/project-agent-replay-evidence.mjs";
 import { productionProjectEngineRevisionsSetting } from "../../scripts/project-engine-rollout-selection.mjs";
 import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
 
@@ -15,6 +19,7 @@ const fixturePath = new URL(
 const service = new URL("../../", import.meta.url);
 const execute = promisify(execFile);
 const legacy = { writer: "legacy", revision: 0 };
+const signingSecret = "disposable-production-writer-fixture-secret";
 
 function project() {
 	const id = randomUUID();
@@ -47,11 +52,15 @@ describe.skipIf(!existsSync(fixturePath))(
 					...process.env,
 					DATABASE_URL: databaseUrl,
 					ALLAUTH_DEPLOYMENT_MODE: "self-hosted",
+					ALLAUTH_AUTH_SECRET: signingSecret,
+					BETTER_AUTH_SECRET: signingSecret,
 					ALLAUTH_PROJECT_ENGINE_INTERNAL_ID: "",
 					ALLAUTH_PROJECT_ENGINE_INTERNAL_PREPARE_REVISION: "",
 					ALLAUTH_PROJECT_ENGINE_AGENT_BRIDGE_ID: "",
 					ALLAUTH_PROJECT_ENGINE_AGENT_REPLAY_APPROVAL: "",
 					ALLAUTH_PROJECT_ENGINE_ENCRYPTED_SAML_APPROVAL: "",
+					[productionAgentReplayApprovalsSetting]: "",
+					[productionAgentReplayBridgeIdsSetting]: "",
 					[productionProjectEngineRevisionsSetting]: "",
 					...env,
 				},
@@ -221,6 +230,50 @@ describe.skipIf(!existsSync(fixturePath))(
 				command([...args, "switch", "legacy", "0", "allauth"], selection),
 			).rejects.toThrow(/Stored Agent state/);
 			await expect(command([...args, "status"])).resolves.toEqual(legacy);
+			await database!.query(
+				`DELETE FROM "${guarded.schema}"."agentHost" WHERE id='fixture-host';
+				 INSERT INTO "${guarded.schema}"."verification" (id,identifier,value,"expiresAt")
+				 VALUES ('fixture-replay','agent-status-jti:fixture','fixture-replay',now()+interval '90 seconds')`,
+			);
+			const bridge = { [productionAgentReplayBridgeIdsSetting]: guarded.id };
+			const drainedAt = new Date(Date.now() - 120_000).toISOString();
+			const evidence = [...args, "agent-replay-evidence", "fixture-deployment"];
+			await expect(
+				command([...evidence, drainedAt.slice(0, -1)], bridge),
+			).rejects.toThrow("observed Agent drain time in UTC");
+			const mismatchedAlias = {
+				BETTER_AUTH_SECRET: `${signingSecret}-different`,
+			};
+			await expect(
+				command([...evidence, drainedAt], { ...bridge, ...mismatchedAlias }),
+			).rejects.toThrow(
+				"ALLAUTH_AUTH_SECRET and BETTER_AUTH_SECRET must match",
+			);
+			const approval = await command([...evidence, drainedAt], bridge);
+			const candidate = {
+				...selection,
+				...bridge,
+				[productionAgentReplayApprovalsSetting]: JSON.stringify({
+					[guarded.id]: approval,
+				}),
+			};
+			const activation = [...args, "switch", "legacy", "0", "allauth"];
+			await expect(
+				command(activation, { ...candidate, ...mismatchedAlias }),
+			).rejects.toThrow(
+				"ALLAUTH_AUTH_SECRET and BETTER_AUTH_SECRET must match",
+			);
+			await expect(command(activation, candidate)).resolves.toEqual({
+				writer: "allauth",
+				revision: 1,
+			});
+			const rollback = [...args, "switch", "allauth", "1", "legacy"];
+			await expect(command(rollback)).rejects.toThrow(
+				"Agent replay bridge is unavailable",
+			);
+			await expect(
+				command(rollback, { ...bridge, ...mismatchedAlias }),
+			).resolves.toEqual({ writer: "legacy", revision: 2 });
 		}, 20_000);
 	},
 );

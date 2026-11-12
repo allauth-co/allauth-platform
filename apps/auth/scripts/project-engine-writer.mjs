@@ -5,6 +5,10 @@ import {
 	agentReplayApprovalSetting,
 	agentReplayBridgeIdSetting,
 	issueAgentReplayDrainEvidence,
+	productionAgentReplayApprovalsSetting,
+	productionAgentReplayApprovalValue,
+	productionAgentReplayBridgeIdsSetting,
+	productionAgentReplayBridgeSelected,
 	verifyAgentReplayDrainEvidence,
 } from "./project-agent-replay-evidence.mjs";
 import { assertStoredProjectAgentAdmission } from "./project-agent-stored-admission.mjs";
@@ -41,7 +45,6 @@ async function projectEngine(args) {
 	const bridgeId = process.env[agentReplayBridgeIdSetting]?.trim() ?? "";
 	const reading = operation === "status" && previous === undefined;
 	const issuingAgentEvidence =
-		!production &&
 		operation === "agent-replay-evidence" &&
 		previous !== undefined &&
 		revision !== undefined &&
@@ -59,7 +62,12 @@ async function projectEngine(args) {
 			);
 		throw new Error("The exact protected internal project ID is required.");
 	}
-	if (issuingAgentEvidence && selectedId && selectedId !== bridgeId)
+	if (
+		!production &&
+		issuingAgentEvidence &&
+		selectedId &&
+		selectedId !== bridgeId
+	)
 		throw new Error(
 			"The protected project Agent replay bridge is unavailable.",
 		);
@@ -96,8 +104,6 @@ async function projectEngine(args) {
 		connectionTimeoutMillis: 10000,
 		options: "-c lock_timeout=10000 -c statement_timeout=20000",
 	});
-	const replaySecret =
-		process.env.ALLAUTH_AUTH_SECRET || process.env.BETTER_AUTH_SECRET || "";
 	try {
 		if (registering) {
 			await pool.query(
@@ -108,19 +114,13 @@ async function projectEngine(args) {
 			return;
 		}
 		if (issuingAgentEvidence) {
-			const current = await readWriter(pool, id, false);
-			if (current?.writer !== "legacy")
-				throw new Error(
-					"Agent drain evidence requires the protected legacy writer.",
-				);
 			console.log(
-				issueAgentReplayDrainEvidence(
-					replaySecret,
+				await issueAgentEvidence(pool, {
 					id,
-					current.revision,
-					previous,
-					Date.parse(revision),
-				),
+					production,
+					deployment: previous,
+					drainedAt: agentDrainTime(revision, production),
+				}),
 			);
 			return;
 		}
@@ -133,7 +133,6 @@ async function projectEngine(args) {
 					next,
 					production,
 					bridgeId,
-					replaySecret,
 				});
 		if (!current)
 			throw new Error(
@@ -164,6 +163,72 @@ async function readWriter(database, id, production) {
 	return current;
 }
 
+function agentDrainTime(value, production) {
+	const timestamp = Date.parse(value);
+	if (
+		production &&
+		(!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/.test(value) ||
+			!Number.isFinite(timestamp) ||
+			new Date(timestamp).toISOString().slice(0, 19) !== value.slice(0, 19))
+	)
+		throw new Error("Supply the observed Agent drain time in UTC.");
+	return timestamp;
+}
+
+function agentReplaySecret() {
+	const { ALLAUTH_AUTH_SECRET: current, BETTER_AUTH_SECRET: legacy } =
+		process.env;
+	if (current !== undefined && legacy !== undefined && current !== legacy)
+		throw new Error(
+			"ALLAUTH_AUTH_SECRET and BETTER_AUTH_SECRET must match when both are set.",
+		);
+	return current ?? legacy ?? "";
+}
+
+async function issueAgentEvidence(
+	pool,
+	{ id, production, deployment, drainedAt },
+) {
+	if (production && !productionAgentBridgeConfigured(id))
+		throw new Error(
+			"The registered production project Agent replay bridge is unavailable.",
+		);
+	const client = await pool.connect();
+	try {
+		await client.query("BEGIN");
+		await client.query(
+			"SELECT pg_advisory_xact_lock(public.allauth_project_engine_admission_key($1))",
+			[id],
+		);
+		const current = await readWriter(client, id, production);
+		if (current?.writer !== "legacy")
+			throw new Error(
+				production
+					? "Agent drain evidence requires the registered production legacy writer."
+					: "Agent drain evidence requires the protected legacy writer.",
+			);
+		if (production)
+			await assertStoredProjectAgentAdmission(
+				client,
+				`allauth_project_${id.replaceAll("-", "")}`,
+			);
+		const evidence = issueAgentReplayDrainEvidence(
+			agentReplaySecret(),
+			id,
+			current.revision,
+			deployment,
+			drainedAt,
+		);
+		await client.query("COMMIT");
+		return evidence;
+	} catch (error) {
+		await client.query("ROLLBACK");
+		throw error;
+	} finally {
+		client.release();
+	}
+}
+
 async function switchProject(pool, options) {
 	const { id, previous, revision, next, production } = options;
 	const client = await pool.connect();
@@ -181,18 +246,17 @@ async function switchProject(pool, options) {
 					: "The protected project writer revision changed.",
 			);
 		const schema = `allauth_project_${id.replaceAll("-", "")}`;
-		if (previous !== next && (!production || next === "allauth"))
-			await verifyAgentSwitch(client, schema, options);
+		if (previous !== next) await verifyAgentSwitch(client, schema, options);
 		if (previous === "legacy" && next === "allauth") {
 			await assertProjectOAuthGrantAdmission(client, schema);
 			await verifyProjectWebhookActivation(client, id, schema);
-			// The protected encrypted SAML approval applies only to the internal pilot.
 			await verifyEncryptedSamlActivation(
 				client,
 				id,
 				schema,
 				revision,
-				production ? {} : process.env,
+				process.env,
+				production,
 			);
 		}
 		const {
@@ -214,28 +278,43 @@ async function switchProject(pool, options) {
 async function verifyAgentSwitch(
 	client,
 	schema,
-	{ id, revision, next, production, bridgeId, replaySecret },
+	{ id, revision, next, production, bridgeId },
 ) {
 	const {
 		rows: [stored],
 	} = await client.query(
-		`SELECT EXISTS (SELECT 1 FROM "${schema}"."agentHost") OR EXISTS (SELECT 1 FROM "${schema}"."approvalRequest") AS agent`,
+		`SELECT EXISTS (SELECT 1 FROM "${schema}"."agentHost")
+		 OR EXISTS (SELECT 1 FROM "${schema}"."approvalRequest")
+		 OR EXISTS (SELECT 1 FROM "${schema}"."verification"
+		  WHERE "expiresAt" > statement_timestamp() AND identifier LIKE ANY
+		   (ARRAY['agent-status-jti:%','host-registration-jti:%','host-agent-key-rotation-jti:%'])) AS agent`,
 	);
-	if (production) {
-		if (stored.agent)
-			throw new Error(
-				"Stored Agent state requires production replay approval before activation.",
-			);
-		return;
-	}
-	const raw = process.env[agentReplayApprovalSetting]?.trim() || "";
+	const raw = production
+		? productionAgentReplayApprovalValue(
+				process.env[productionAgentReplayApprovalsSetting],
+				id,
+			)
+		: process.env[agentReplayApprovalSetting]?.trim() || "";
 	if (!stored.agent && !raw) return;
-	if (bridgeId !== id)
+	if (production && next === "allauth" && !raw)
 		throw new Error(
-			"The protected project Agent replay bridge is unavailable.",
+			"Stored Agent state requires production replay approval before activation.",
+		);
+	if (production ? !productionAgentBridgeConfigured(id) : bridgeId !== id)
+		throw new Error(
+			production
+				? "The registered production project Agent replay bridge is unavailable."
+				: "The protected project Agent replay bridge is unavailable.",
 		);
 	if (next === "allauth") {
-		verifyAgentReplayDrainEvidence(raw, replaySecret, id, revision);
+		verifyAgentReplayDrainEvidence(raw, agentReplaySecret(), id, revision);
 		await assertStoredProjectAgentAdmission(client, schema);
 	}
+}
+
+function productionAgentBridgeConfigured(id) {
+	return productionAgentReplayBridgeSelected(
+		process.env[productionAgentReplayBridgeIdsSetting],
+		id,
+	);
 }

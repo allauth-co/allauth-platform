@@ -1,5 +1,7 @@
 export const productionProjectEngineRevisionsSetting =
 	"ALLAUTH_PROJECT_ENGINE_PRODUCTION_REVISIONS";
+export const productionEncryptedSamlApprovalsSetting =
+	"ALLAUTH_PROJECT_ENGINE_PRODUCTION_SAML_APPROVALS";
 export const projectEngineIdPattern =
 	/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/;
 
@@ -29,4 +31,32 @@ export function readProductionProjectEngineRevisions(raw) {
 			throw invalid();
 	}
 	return new Map(entries);
+}
+
+/** @param {string | undefined} raw @param {string} projectId */
+export function readProjectEngineApprovalValue(raw, projectId) {
+	const configured = raw?.trim();
+	if (!configured) return "";
+	const invalid = () =>
+		new Error("The production project approvals are invalid.");
+	let approvals;
+	try {
+		approvals = JSON.parse(configured);
+	} catch {
+		throw invalid();
+	}
+	if (!approvals || typeof approvals !== "object" || Array.isArray(approvals))
+		throw invalid();
+	for (const [id, approval] of Object.entries(approvals)) {
+		if (
+			!projectEngineIdPattern.test(id) ||
+			!approval ||
+			typeof approval !== "object" ||
+			Array.isArray(approval)
+		)
+			throw invalid();
+	}
+	return Object.hasOwn(approvals, projectId)
+		? JSON.stringify(approvals[projectId])
+		: "";
 }

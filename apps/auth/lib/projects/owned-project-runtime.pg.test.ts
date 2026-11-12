@@ -29,8 +29,11 @@ import {
 	agentReplayApprovalSetting,
 	agentReplayBridgeIdSetting,
 	issueAgentReplayDrainEvidence,
+	productionAgentReplayApprovalsSetting,
+	productionAgentReplayBridgeIdsSetting,
 	verifyAgentReplayDrainEvidence,
 } from "../../scripts/project-agent-replay-evidence.mjs";
+import { productionProjectEngineRevisionsSetting } from "../../scripts/project-engine-rollout-selection.mjs";
 import { defaultAuthPolicy } from "../auth-policy/policy";
 import { lockProjectSettings } from "../auth-policy/serialization";
 import { authPolicyRepository } from "../auth-policy/storage";
@@ -310,10 +313,11 @@ async function openProcess(
 	project: Project,
 	owned:
 		| boolean
-		| { agentReplayApproval?: string; agentBridgeId?: string; legacyAgentBridgeOnly?: boolean; encryptedSamlApproval?: string },
+		| { agentReplayApproval?: string; agentBridgeId?: string; legacyAgentBridgeOnly?: boolean },
 	microsoftProject = project.slug,
 	apple?: AppleFixture,
 	encryptedSamlFixture?: ProjectEncryptedSamlFixtureAdmission,
+	rolloutEnvironment: Partial<NodeJS.ProcessEnv> = {},
 ) {
 	const internal = typeof owned === "object" ? owned : undefined;
 	const child = fork(worker, [], {
@@ -323,8 +327,6 @@ async function openProcess(
 			...(internal
 				? {
 						...(!internal.legacyAgentBridgeOnly ? { ALLAUTH_PROJECT_ENGINE_INTERNAL_ID: project.id } : {}),
-						ALLAUTH_PROJECT_ENGINE_ENCRYPTED_SAML_APPROVAL:
-							internal.encryptedSamlApproval,
 						EMAIL_PROVIDER: "cloudflare",
 						EMAIL_FROM: "agent-restart@runtime.fixture.example",
 						CLOUDFLARE_ACCOUNT_ID: "a".repeat(32),
@@ -335,6 +337,7 @@ async function openProcess(
 						...(internal.agentBridgeId ? { [agentReplayBridgeIdSetting]: internal.agentBridgeId } : {}),
 					}
 				: {}),
+			...rolloutEnvironment,
 		},
 		execArgv: ["--import", "tsx"],
 		stdio: ["ignore", "ignore", "pipe", "ipc"],
@@ -6202,7 +6205,8 @@ describe.skipIf(!existsSync(fixture))(
 			}
 		}, 90_000);
 
-		it("rehearses native-stored GCM configuration and certificate renewal at the verified custom SAML receiver", async () => {
+		it.each(["protected", "production"] as const)("rehearses native-stored GCM configuration and certificate renewal at the verified custom SAML receiver (%s)", async (cohort) => {
+			const production = cohort === "production";
 			const local: { container: string; DATABASE_URL: string } = JSON.parse(
 				readFileSync(fixture, "utf8"),
 			);
@@ -6222,7 +6226,7 @@ describe.skipIf(!existsSync(fixture))(
 			try {
 				await admin.query(`CREATE DATABASE "${name}"`);
 				created = true;
-				const { alpha, samlKeys } = await seed(databaseURL);
+				const { alpha, beta, samlKeys } = await seed(databaseURL);
 				const encryption = await createRuntimeSamlKeys();
 				const renewedCertificate = await renewRuntimeSamlCertificate(
 					encryption.privateKey,
@@ -6373,10 +6377,50 @@ describe.skipIf(!existsSync(fixture))(
 					`UPDATE ${scope} SET "domainVerified"=TRUE WHERE id=$1`,
 					[provider.id],
 				);
-				await database.query(
-					`UPDATE public."allauthProject" SET "workspaceId"=$1 WHERE id=$2`,
-					[platformWorkspaceId, alpha.id],
-				);
+				const writerCli = (args: string[], environment: Partial<NodeJS.ProcessEnv> = {}) =>
+					promisify(execFile)(
+						process.execPath,
+						["scripts/project-engine-writer.mjs", ...args],
+						{
+							cwd: appRoot,
+							env: {
+								...childEnvironment(),
+								DATABASE_URL: databaseURL,
+								...environment,
+							},
+						},
+					);
+				let fencedProject: Project;
+				if (production) {
+					await service.stop();
+					service = undefined;
+					await database.query(
+						`UPDATE public."allauthProject" SET environment='production' WHERE id=$1`,
+						[alpha.id],
+					);
+					await writerCli(["register-production", alpha.id, alpha.workspaceId]);
+					fencedProject = { ...alpha, environment: "production", projectEngineFenced: true };
+					service = await openProcess(databaseURL, fencedProject, false);
+				} else {
+					await database.query(
+						`UPDATE public."allauthProject" SET "workspaceId"=$1 WHERE id=$2`,
+						[platformWorkspaceId, alpha.id],
+					);
+					fencedProject = { ...alpha, workspaceId: platformWorkspaceId };
+				}
+				const rolloutEnvironment = (policy?: object): Partial<NodeJS.ProcessEnv> =>
+					production
+						? {
+								ALLAUTH_PROJECT_ENGINE_PRODUCTION_REVISIONS: JSON.stringify({ [alpha.id]: 0 }),
+								ALLAUTH_PROJECT_ENGINE_PRODUCTION_SAML_APPROVALS:
+									policy && JSON.stringify({ [alpha.id]: policy }),
+							}
+						: {
+								ALLAUTH_PROJECT_ENGINE_INTERNAL_ID: alpha.id,
+								ALLAUTH_PROJECT_ENGINE_INTERNAL_PREPARE_REVISION: "0",
+								ALLAUTH_PROJECT_ENGINE_ENCRYPTED_SAML_APPROVAL:
+									policy && JSON.stringify(policy),
+							};
 				const admission = {
 					projectId: alpha.id,
 					schemaName: alpha.schemaName,
@@ -6404,13 +6448,18 @@ describe.skipIf(!existsSync(fixture))(
 						startRuntimeSaml(writer, direct, acs),
 						startRuntimeSaml(writer, hosted, acs),
 					]);
-				async function inspect(form: URLSearchParams, receiver = acs) {
+				async function inspect(
+					form: URLSearchParams,
+					receiver = acs,
+					projectId: string | null = alpha.id,
+				) {
 					const operator = spawn(
 						process.execPath,
 						[
 							"--import",
 							"tsx",
 							"scripts/rehearsal/verify-project-encrypted-saml.ts",
+							...(production && projectId ? ["--project", projectId] : []),
 							alpha.slug,
 							runtimeSamlProvider,
 						],
@@ -6419,8 +6468,7 @@ describe.skipIf(!existsSync(fixture))(
 							env: {
 								...childEnvironment(),
 								DATABASE_URL: databaseURL,
-								ALLAUTH_PROJECT_ENGINE_INTERNAL_ID: alpha.id,
-								ALLAUTH_PROJECT_ENGINE_INTERNAL_PREPARE_REVISION: "0",
+								...rolloutEnvironment(),
 							},
 							timeout: 10_000,
 						},
@@ -6449,14 +6497,11 @@ describe.skipIf(!existsSync(fixture))(
 					diagnostics:
 						"The encrypted SAML preflight sample could not be verified.\n",
 				};
-				const finish = async (
-					writer: Awaited<ReturnType<typeof openProcess>>,
+				const responseFor = (
 					pending: Awaited<ReturnType<typeof startRuntimeSaml>>,
-					checkAlternate = false,
-					checkEvidence = false,
 					approvedCipher?: string,
-				) => {
-					const form = await runtimeSamlResponse(
+				) =>
+					runtimeSamlResponse(
 						samlKeys,
 						pending.flow,
 						credentials.project.email,
@@ -6471,8 +6516,22 @@ describe.skipIf(!existsSync(fixture))(
 									: "http://www.w3.org/2009/xmlenc11#aes128-gcm"),
 						},
 					);
+				const finish = async (
+					writer: Awaited<ReturnType<typeof openProcess>>,
+					pending: Awaited<ReturnType<typeof startRuntimeSaml>>,
+					{ checkAlternate = false, checkEvidence = false, form }: {
+						checkAlternate?: boolean;
+						checkEvidence?: boolean;
+						form?: URLSearchParams;
+					} = {},
+				) => {
+					form ??= await responseFor(pending);
 					if (checkEvidence) {
 						if (!pending.transport.host) {
+							if (production) {
+								expect(await inspect(form, acs, beta.id)).toEqual(rejectedEvidence);
+								expect(await inspect(form, acs, null)).toEqual(rejectedEvidence);
+							}
 							expect(
 								await inspect(form, `https://${defaultHost}${callback}`),
 							).toEqual(rejectedEvidence);
@@ -6539,85 +6598,86 @@ describe.skipIf(!existsSync(fixture))(
 						expect(await inspect(form)).toEqual(rejectedEvidence);
 				};
 				for (const pending of await starts(service))
-					await finish(service, pending, false, true);
-				const nativePending = await starts(service);
+					await finish(service, pending, { checkEvidence: true });
+				const nativePending = production ? [] : await starts(service);
 				await service.stop();
 				service = undefined;
-				const unsupported =
-					"configured SAML provider outside the candidate scope";
-				await expect(openProcess(databaseURL, alpha, true)).rejects.toThrow(
-					unsupported,
-				);
-				const mismatched = {
-					...provider.samlConfig,
-					spMetadata: {
-						...provider.samlConfig.spMetadata,
-						metadata: runtimeSamlSPMetadata(acs, [
-							encryption.certificate,
-							samlKeys.certificate,
-						]),
-					},
-				};
 				const setConfiguration = (value: object) =>
 					database!.query(`UPDATE ${scope} SET "samlConfig"=$1 WHERE id=$2`, [
 						JSON.stringify(value),
 						provider.id,
 					]);
-				await setConfiguration(mismatched);
-				await expect(
-					openProcess(databaseURL, alpha, true, alpha.slug, undefined, {
-						...admission,
-						configurationDigest: encryptedSamlFixtureConfigurationDigest({
-							...provider,
-							samlConfig: mismatched,
-						}),
-					}),
-				).rejects.toThrow(unsupported);
-				await setConfiguration(provider.samlConfig);
-				service = await openProcess(
-					databaseURL,
-					alpha,
-					true,
-					alpha.slug,
-					undefined,
-					admission,
-				);
-				for (const transport of [direct, hosted]) {
-					const published = await service.request(
-						`${transport.prefix}/sso/saml2/sp/metadata?providerId=${runtimeSamlProvider}`,
-						{ host: transport.host },
+				if (!production) {
+					const unsupported =
+						"configured SAML provider outside the candidate scope";
+					await expect(openProcess(databaseURL, alpha, true)).rejects.toThrow(
+						unsupported,
 					);
-					expect(published.status).toBe(200);
-					expect(await published.text()).toBe(metadata);
+					const mismatched = {
+						...provider.samlConfig,
+						spMetadata: {
+							...provider.samlConfig.spMetadata,
+							metadata: runtimeSamlSPMetadata(acs, [
+								encryption.certificate,
+								samlKeys.certificate,
+							]),
+						},
+					};
+					await setConfiguration(mismatched);
+					await expect(
+						openProcess(databaseURL, alpha, true, alpha.slug, undefined, {
+							...admission,
+							configurationDigest: encryptedSamlFixtureConfigurationDigest({
+								...provider,
+								samlConfig: mismatched,
+							}),
+						}),
+					).rejects.toThrow(unsupported);
+					await setConfiguration(provider.samlConfig);
+					service = await openProcess(
+						databaseURL,
+						alpha,
+						true,
+						alpha.slug,
+						undefined,
+						admission,
+					);
+					for (const transport of [direct, hosted]) {
+						const published = await service.request(
+							`${transport.prefix}/sso/saml2/sp/metadata?providerId=${runtimeSamlProvider}`,
+							{ host: transport.host },
+						);
+						expect(published.status).toBe(200);
+						expect(await published.text()).toBe(metadata);
+					}
+					const view = await service.request(
+						`/api/auth/sso/get-provider?providerId=${runtimeSamlProvider}`,
+						{
+							host: defaultHost,
+							cookie: administrator,
+						},
+					);
+					expect(view.status).toBe(200);
+					const publicRecord = await view.text();
+					for (const privateValue of [
+						"encPrivateKey",
+						"BEGIN ENCRYPTED PRIVATE KEY",
+						passphrase,
+					])
+						expect(publicRecord.includes(privateValue)).toBe(false);
+					for (const pending of nativePending)
+						await finish(service, pending, { checkAlternate: true });
+					const ownedPending = await starts(service);
+					await service.stop();
+					service = undefined;
+					service = await openProcess(databaseURL, alpha, false);
+					for (const pending of ownedPending) await finish(service, pending);
+					await service.stop();
+					service = undefined;
 				}
-				const view = await service.request(
-					`/api/auth/sso/get-provider?providerId=${runtimeSamlProvider}`,
-					{
-						host: defaultHost,
-						cookie: administrator,
-					},
-				);
-				expect(view.status).toBe(200);
-				const publicRecord = await view.text();
-				for (const privateValue of [
-					"encPrivateKey",
-					"BEGIN ENCRYPTED PRIVATE KEY",
-					passphrase,
-				])
-					expect(publicRecord.includes(privateValue)).toBe(false);
-				for (const pending of nativePending)
-					await finish(service, pending, true);
-				const ownedPending = await starts(service);
-				await service.stop();
-				service = undefined;
-				service = await openProcess(databaseURL, alpha, false);
-				for (const pending of ownedPending) await finish(service, pending);
-				await service.stop();
-				service = undefined;
-				const protectedProject = { ...alpha, workspaceId: platformWorkspaceId };
 				const fence = createProjectEngineWriterLease({
 					database,
-					project: protectedProject,
+					project: fencedProject,
 					selectedProjectId: alpha.id,
 				});
 				const approval = {
@@ -6637,16 +6697,21 @@ describe.skipIf(!existsSync(fixture))(
 					),
 					policyRevision: "synthetic-idp-policy-revision",
 					verifiedAt: new Date(Date.now() - 60_000).toISOString(),
-					expiresAt: new Date(Date.now() + 60_000).toISOString(),
+					expiresAt: new Date(Date.now() + 60 * 60_000).toISOString(),
 					profiles: [{ cipher: "aes256-gcm", signatures: "assertion" }],
 				};
 				const expired = {
 					...approval,
 					expiresAt: new Date(Date.now() - 1000).toISOString(),
 				};
-				const openProtected = (policy?: object) =>
-					openProcess(databaseURL, protectedProject, {
-						encryptedSamlApproval: policy && JSON.stringify(policy),
+				const openFenced = (policy?: object, overrides: Partial<NodeJS.ProcessEnv> = {}) =>
+					openProcess(databaseURL, fencedProject, false, fencedProject.slug, undefined, undefined, {
+						EMAIL_PROVIDER: "cloudflare",
+						EMAIL_FROM: "saml-restart@runtime.fixture.example",
+						CLOUDFLARE_ACCOUNT_ID: "a".repeat(32),
+						CLOUDFLARE_EMAIL_API_TOKEN: "synthetic-saml-restart-mail-token",
+						...rolloutEnvironment(policy),
+						...overrides,
 					});
 				const incompatible = {
 					...approval,
@@ -6662,7 +6727,7 @@ describe.skipIf(!existsSync(fixture))(
 					incompatible,
 					sampleReceipt,
 				]) {
-					service = await openProtected(unapproved);
+					service = await openFenced(unapproved);
 					expect((await service.request("/api/health")).status).toBe(503);
 					await service.stop();
 					service = undefined;
@@ -6672,31 +6737,44 @@ describe.skipIf(!existsSync(fixture))(
 					previous = "legacy",
 					revision = "0",
 					next = "allauth",
+					overrides: Partial<NodeJS.ProcessEnv> = {},
 				) =>
-					promisify(execFile)(
-						process.execPath,
+					writerCli(
 						[
-							"scripts/project-engine-writer.mjs",
+							...(production ? ["--project", alpha.id] : []),
 							"switch",
 							previous,
 							revision,
 							next,
 						],
 						{
-							cwd: appRoot,
-							env: {
-								...childEnvironment(),
-								DATABASE_URL: databaseURL,
-								ALLAUTH_PROJECT_ENGINE_INTERNAL_ID: alpha.id,
-								ALLAUTH_PROJECT_ENGINE_INTERNAL_PREPARE_REVISION: "0",
-								ALLAUTH_PROJECT_ENGINE_ENCRYPTED_SAML_APPROVAL:
-									policy && JSON.stringify(policy),
-							},
+							...rolloutEnvironment(policy),
+							...overrides,
 						},
 					);
 				await expect(switchWithCli(undefined)).rejects.toThrow(
 					"requires deployment approval",
 				);
+				if (production) {
+					const foreignApproval = {
+						...approval,
+						projectId: beta.id,
+						schemaName: beta.schemaName,
+					};
+					const foreignSettings = {
+						ALLAUTH_PROJECT_ENGINE_PRODUCTION_SAML_APPROVALS: JSON.stringify({ [beta.id]: foreignApproval }),
+						ALLAUTH_PROJECT_ENGINE_ENCRYPTED_SAML_APPROVAL: JSON.stringify(approval),
+					};
+					service = await openFenced(undefined, foreignSettings);
+					expect((await service.request("/api/health")).status).toBe(503);
+					await service.stop();
+					service = undefined;
+					await expect(switchWithCli(undefined, "legacy", "0", "allauth", foreignSettings)).rejects.toThrow(
+						"requires deployment approval",
+					);
+					await expect(switchWithCli(foreignApproval)).rejects.toThrow();
+					expect(await fence.read()).toEqual({ writer: "legacy", revision: 0 });
+				}
 				await expect(switchWithCli(expired)).rejects.toThrow(
 					"outside its activation window",
 				);
@@ -6772,34 +6850,42 @@ describe.skipIf(!existsSync(fixture))(
 				);
 				await setConfiguration(provider.samlConfig);
 				expect(await fence.read()).toEqual({ writer: "legacy", revision: 0 });
-				service = await openProtected(approval);
+				service = await openFenced(approval);
 				expect((await service.request("/api/health")).status).toBe(200);
 				const proxiedDirect = {
 					...direct,
-					proxy: protectedProject,
-					origin: protectedProject.primaryOrigin,
+					proxy: fencedProject,
+					origin: fencedProject.primaryOrigin,
 				};
-				const protectedStarts = (
+				const fencedStarts = (
 					writer: Awaited<ReturnType<typeof openProcess>>,
 				) =>
 					Promise.all([
 						startRuntimeSaml(writer, proxiedDirect, acs),
 						startRuntimeSaml(writer, hosted, acs),
 					]);
-				const legacyFlows = await protectedStarts(service);
+				const legacyFlows = await fencedStarts(service);
+				const legacyForms = await Promise.all(legacyFlows.map((pending) =>
+					responseFor(pending, algorithmHints.dataEncryptionAlgorithm),
+				));
+				if (production)
+					for (const form of legacyForms) {
+						const evidence = await inspect(form);
+						expect(evidence.code, evidence.diagnostics).toBe(0);
+						expect(JSON.parse(evidence.output)).toMatchObject({
+							projectId: approval.projectId,
+							configurationFingerprint: approval.configurationFingerprint,
+							legacyWriterRevision: approval.legacyWriterRevision,
+							cipher: "aes256-gcm",
+						});
+					}
 				expect(JSON.parse((await switchWithCli(approval)).stdout)).toEqual({
 					writer: "allauth",
 					revision: 1,
 				});
 				expect((await service.request("/api/health")).status).toBe(200);
-				for (const pending of legacyFlows)
-					await finish(
-						service,
-						pending,
-						false,
-						false,
-						algorithmHints.dataEncryptionAlgorithm,
-					);
+				for (const [index, pending] of legacyFlows.entries())
+					await finish(service, pending, { form: legacyForms[index]! });
 				const pending = await startRuntimeSaml(service, hosted, acs);
 				const profileDrift = await runtimeSamlResponse(
 					samlKeys,
@@ -6842,8 +6928,8 @@ describe.skipIf(!existsSync(fixture))(
 				const assertUnavailable = async () => {
 					expect((await service!.request("/api/health")).status).toBe(503);
 					const start = await service!.request(`${directPrefix}/sign-in/sso`, {
-						proxy: protectedProject,
-						origin: protectedProject.primaryOrigin,
+						proxy: fencedProject,
+						origin: fencedProject.primaryOrigin,
 						clientIP: "192.0.2.189",
 						body: {
 							providerId: runtimeSamlProvider,
@@ -6890,31 +6976,39 @@ describe.skipIf(!existsSync(fixture))(
 					[pair, host],
 				);
 				expect((await service.request("/api/health")).status).toBe(200);
-				await finish(
-					service,
-					pending,
-					false,
-					false,
-					algorithmHints.dataEncryptionAlgorithm,
-				);
+				await finish(service, pending, { form: valid });
 				await service.stop();
 				service = undefined;
-				service = await openProtected(expired);
+				service = await openFenced(expired);
 				expect((await service.request("/api/health")).status).toBe(200);
-				const rollbackFlows = await protectedStarts(service);
+				const expiredFlow = await startRuntimeSaml(service, hosted, acs);
+				await finish(service, expiredFlow, {
+					form: await responseFor(expiredFlow, algorithmHints.dataEncryptionAlgorithm),
+				});
+				const rollbackFlows = await fencedStarts(service);
+				const rollbackForms = await Promise.all(rollbackFlows.map((pending) =>
+					responseFor(pending, algorithmHints.dataEncryptionAlgorithm),
+				));
 				expect(
 					JSON.parse(
 						(await switchWithCli(expired, "allauth", "1", "legacy")).stdout,
 					),
 				).toEqual({ writer: "legacy", revision: 2 });
-				for (const pending of rollbackFlows)
-					await finish(
-						service,
-						pending,
-						false,
-						false,
-						algorithmHints.dataEncryptionAlgorithm,
-					);
+				for (const [index, pending] of rollbackFlows.entries())
+					await finish(service, pending, { form: rollbackForms[index]! });
+				if (production) {
+					for (const [index, form] of [...legacyForms, ...rollbackForms].entries()) {
+						const replay = await service.request(callback, {
+							host,
+							clientIP: `192.0.2.${190 + index}`,
+							origin: runtimeSamlOrigin,
+							body: form,
+						});
+						expect(replay.status).toBe(302);
+						expect(replay.headers.get("location")).toContain("error=invalid_saml_response");
+						expect(cookie(replay)).toBe("");
+					}
+				}
 			} finally {
 				try {
 					await service?.stop();
@@ -6929,7 +7023,8 @@ describe.skipIf(!existsSync(fixture))(
 			}
 		}, 180_000);
 
-		it("switches and restores the protected Agent writer with shared replay and verified hosted boundaries", async () => {
+		it.each(["protected", "production"] as const)("switches and restores the %s Agent writer with shared replay and verified hosted boundaries", async (scope) => {
+			const production = scope === "production";
 			const local: { container: string; DATABASE_URL: string } = JSON.parse(
 				readFileSync(fixture, "utf8"),
 			);
@@ -6951,8 +7046,12 @@ describe.skipIf(!existsSync(fixture))(
 			try {
 				await admin.query(`CREATE DATABASE "${name}"`);
 				created = true;
-				const { alpha, beta } = await seed(databaseURL, true);
+				const seeded = await seed(databaseURL, !production);
 				database = new Pool({ connectionString: databaseURL, max: 2 });
+				const productionProject = (project: Project): Project =>
+					production ? { ...project, environment: "production", projectEngineFenced: true } : project;
+				const alpha = productionProject(seeded.alpha);
+				const beta = productionProject(seeded.beta);
 				const writer = createProjectEngineWriterLease({
 					database,
 					project: alpha,
@@ -6972,8 +7071,30 @@ describe.skipIf(!existsSync(fixture))(
 				]);
 				const kid = "runtime-native-agent-host";
 				const publicKey = { ...(await exportJWK(hostKey.publicKey)), kid };
+				const siblingApproval = issueAgentReplayDrainEvidence(
+					platformSecret, beta.id, 0, "fixture-sibling-bridge", Date.now() - 120_000,
+				);
+				function productionAgentEnvironment(
+					approval: string | undefined,
+					bridgeId: string | null,
+					preparedRevision?: string,
+				): Record<string, string> {
+					return {
+						[productionAgentReplayBridgeIdsSetting]: bridgeId ?? "",
+						[productionAgentReplayApprovalsSetting]: JSON.stringify({
+							[beta.id]: JSON.parse(siblingApproval),
+							...(approval ? { [alpha.id]: JSON.parse(approval) } : {}),
+						}),
+						[productionProjectEngineRevisionsSetting]: preparedRevision === undefined
+							? ""
+							: JSON.stringify({ [alpha.id]: Number(preparedRevision) }),
+					};
+				}
 				const start = (agentReplayApproval?: string, agentBridgeId = alpha.id) =>
-					openProcess(databaseURL, alpha, { agentReplayApproval, agentBridgeId });
+					production
+						? openProcess(databaseURL, alpha, { legacyAgentBridgeOnly: true }, alpha.slug, undefined, undefined,
+							productionAgentEnvironment(agentReplayApproval, agentBridgeId, agentReplayApproval ? "0" : undefined))
+						: openProcess(databaseURL, alpha, { agentReplayApproval, agentBridgeId });
 				async function writerCommand(
 					args: string[],
 					approval?: string,
@@ -6983,20 +7104,39 @@ describe.skipIf(!existsSync(fixture))(
 				) {
 					const { stdout } = await promisify(execFile)(
 						process.execPath,
-						["scripts/project-engine-writer.mjs", ...args],
+						["scripts/project-engine-writer.mjs", ...(production ? ["--project", alpha.id] : []), ...args],
 						{
 							cwd: appRoot,
 							env: {
 								...childEnvironment(),
 								DATABASE_URL: databaseURL,
-								...(candidateId ? { ALLAUTH_PROJECT_ENGINE_INTERNAL_ID: candidateId } : {}),
-								ALLAUTH_PROJECT_ENGINE_INTERNAL_PREPARE_REVISION: revision,
-								...(approval ? { [agentReplayApprovalSetting]: approval } : {}),
-								...(bridgeId ? { [agentReplayBridgeIdSetting]: bridgeId } : {}),
+								...(production
+									? productionAgentEnvironment(approval, bridgeId, args[0] === "switch" ? revision : undefined)
+									: {
+										ALLAUTH_PROJECT_ENGINE_INTERNAL_ID: candidateId ?? "",
+										ALLAUTH_PROJECT_ENGINE_INTERNAL_PREPARE_REVISION: revision,
+										[agentReplayApprovalSetting]: approval ?? "",
+										[agentReplayBridgeIdSetting]: bridgeId ?? "",
+									}),
 							},
 						},
 					);
 					return stdout.trim();
+				}
+				const evidenceRequest = [
+					"agent-replay-evidence",
+					"fixture-bridge",
+					new Date(Date.now() - 120_000).toISOString(),
+				];
+				if (production) {
+					await database.query(`UPDATE public."allauthProject" SET environment='production' WHERE id=ANY($1::text[])`, [[alpha.id, beta.id]]);
+					await expect(writerCommand(evidenceRequest)).rejects.toThrow("requires the registered production legacy writer");
+					service = await start();
+					expect((await service.request("/api/health")).status).toBe(503);
+					await service.stop();
+					service = undefined;
+					for (const project of [alpha, beta])
+						await database.query("SELECT public.allauth_register_project_engine_production($1,$2)", [project.id, project.workspaceId]);
 				}
 				service = await openProcess(databaseURL, alpha, false);
 				expect(await writer.read()).toEqual({ writer: "legacy", revision: 0 });
@@ -7098,7 +7238,9 @@ describe.skipIf(!existsSync(fixture))(
 				expect(await agentReplayRows(alpha)).toBe(0);
 				await service.stop();
 				service = undefined;
-				service = await openProcess(databaseURL, alpha, { agentBridgeId: alpha.id, legacyAgentBridgeOnly: true });
+				service = production
+					? await start()
+					: await openProcess(databaseURL, alpha, { agentBridgeId: alpha.id, legacyAgentBridgeOnly: true });
 				expect((await service.request("/api/health")).status).toBe(200);
 				expect(await writer.read()).toEqual({ writer: "legacy", revision: 0 });
 				const siblingHostId = randomUUID();
@@ -7204,10 +7346,15 @@ describe.skipIf(!existsSync(fixture))(
 					[previousAgentId],
 				);
 				expect((await service.request("/api/health")).status).toBe(200);
-				await expect(writerCommand(["switch", "legacy", "0", "allauth"], undefined, "0", null)).rejects.toThrow("Agent replay bridge is unavailable");
+				if (!production)
+					await expect(writerCommand(["switch", "legacy", "0", "allauth"], undefined, "0", null)).rejects.toThrow("Agent replay bridge is unavailable");
 				await expect(
 					writerCommand(["switch", "legacy", "0", "allauth"]),
-				).rejects.toThrow("Agent replay drain evidence is unavailable");
+				).rejects.toThrow(production
+					? "Stored Agent state requires production replay approval before activation."
+					: "Agent replay drain evidence is unavailable");
+				if (production)
+					await expect(writerCommand(["switch", "legacy", "0", "allauth"], siblingApproval)).rejects.toThrow("Agent replay drain evidence is unavailable");
 				await expect(
 					writerCommand([
 						"agent-replay-evidence",
@@ -7215,12 +7362,9 @@ describe.skipIf(!existsSync(fixture))(
 						new Date().toISOString(),
 					]),
 				).rejects.toThrow("Agent replay drain evidence is unavailable");
-				const evidenceRequest = [
-					"agent-replay-evidence",
-					"fixture-bridge",
-					new Date(Date.now() - 120_000).toISOString(),
-				];
-				await expect(writerCommand(evidenceRequest, undefined, "0", null)).rejects.toThrow("exact protected Agent replay bridge ID");
+				await expect(writerCommand(evidenceRequest, undefined, "0", null)).rejects.toThrow(production
+					? "Agent replay bridge is unavailable"
+					: "exact protected Agent replay bridge ID");
 				await expect(writerCommand(evidenceRequest, undefined, "0", beta.id)).rejects.toThrow("Agent replay bridge is unavailable");
 				const approval = await writerCommand(evidenceRequest, undefined, "0", alpha.id, null);
 				await expect(writerCommand(["switch", "legacy", "0", "allauth"], approval, "0", beta.id)).rejects.toThrow("Agent replay bridge is unavailable");
@@ -7265,6 +7409,8 @@ describe.skipIf(!existsSync(fixture))(
 					[pending.hostId],
 				);
 				expect((await service.request("/api/health")).status).toBe(503);
+				if (production)
+					await expect(writerCommand(evidenceRequest)).rejects.toThrow("stored Agent Auth outside the candidate scope");
 				expect(await writer.read()).toEqual({ writer: "legacy", revision: 0 });
 				await database.query(
 					`UPDATE ${schema}."agentHost" SET "defaultCapabilities"='[]' WHERE id=$1`,
@@ -7304,6 +7450,13 @@ describe.skipIf(!existsSync(fixture))(
 						await writerCommand(["switch", "legacy", "0", "allauth"], approval),
 					),
 				).toEqual({ writer: "allauth", revision: 1 });
+				if (production) {
+					const unrelatedStatus = await service.request(`${outside}/agent/status`, {
+						proxy: beta, origin: beta.primaryOrigin, authorization: `Bearer ${siblingProof}`,
+					});
+					expect(unrelatedStatus.status).toBe(200);
+					expect(await agentReplayRows(beta)).toBe(0);
+				}
 				await expect(
 					database.query(
 						`UPDATE ${schema}."verification" SET value=value WHERE false`,
@@ -7596,6 +7749,6 @@ describe.skipIf(!existsSync(fixture))(
 					}
 				}
 			}
-		}, 90_000);
+		}, 180_000);
 	},
 );

@@ -7,6 +7,10 @@ import {
 	internalProjectEngineIdSetting,
 	productionProjectEngineRevisions,
 } from "@/lib/projects/project-engine-internal-selection";
+import {
+	productionAgentReplayBridgeIdsSetting,
+	readProductionAgentReplayBridgeIds,
+} from "@/scripts/project-agent-replay-evidence.mjs";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -49,6 +53,19 @@ export async function GET() {
 		);
 		if (migration.rows[0]?.checksum !== checksum)
 			throw new Error("Schema migration is pending or mismatched");
+		const productionAgentBridges = readProductionAgentReplayBridgeIds(
+			setting({}, productionAgentReplayBridgeIdsSetting),
+		);
+		if (productionAgentBridges.size) {
+			const registered = await pool.query(
+				`SELECT id FROM public."allauthProject" p
+				 WHERE p.id = ANY($1::text[])
+				   AND public.allauth_project_engine_production_allowed(p.id,p."workspaceId",p."schemaName")`,
+				[[...productionAgentBridges]],
+			);
+			if (registered.rowCount !== productionAgentBridges.size)
+				throw new Error("A production project Agent bridge is unregistered.");
+		}
 		const internal = setting({}, internalProjectEngineIdSetting).trim();
 		const production = productionProjectEngineRevisions({});
 		if (internal && production.has(internal))

@@ -1610,6 +1610,8 @@ export function createOwnedProjectEngine(
 			{ tokens: [token] },
 			"/multi-session/revoke",
 			Boolean(backchannel),
+			undefined,
+			current.user.id,
 		);
 		if (!removed) return unsupported();
 		await backchannel?.(removed.targets);
