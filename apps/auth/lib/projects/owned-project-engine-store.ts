@@ -356,7 +356,7 @@ export function createProjectEngineStore(database: Pool, schemaName: string) {
 				ids,
 			]);
 			for (const row of selected.rows)
-				await recordEvent(client, {
+				await recordOwnedProjectEvent(client, {
 					type: "session.deleted",
 					outcome: "success",
 					actorId: path === "/sign-out" ? undefined : (actorId ?? row.userId),
@@ -378,7 +378,7 @@ export function createProjectEngineStore(database: Pool, schemaName: string) {
 		targetId?: string,
 		actorId = userId,
 	) {
-		return recordEvent(client, {
+		return recordOwnedProjectEvent(client, {
 			type,
 			outcome,
 			actorId,
@@ -386,28 +386,6 @@ export function createProjectEngineStore(database: Pool, schemaName: string) {
 			targetId,
 			metadata: { path },
 		});
-	}
-
-	async function recordEvent(client: PoolClient, event: ControlEventInput) {
-		const fields = controlEventAttributes(event);
-		await client.query(
-			`INSERT INTO "allauthEvent" (id, type, outcome, "actorId", "userId", "organizationId", "clientId", "targetId", "ipAddress", "userAgent", "createdAt", metadata)
-			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, COALESCE($11::timestamptz, statement_timestamp()), $12::jsonb)`,
-			[
-				event.id ?? crypto.randomUUID(),
-				event.type.slice(0, 128),
-				event.outcome,
-				fields.actorId ?? null,
-				fields.userId ?? null,
-				fields.organizationId ?? null,
-				fields.clientId ?? null,
-				fields.targetId ?? null,
-				fields.ipAddress ?? null,
-				fields.userAgent ?? null,
-				event.createdAt ?? null,
-				JSON.stringify(sanitizeControlMetadata(event.metadata)),
-			],
-		);
 	}
 
 	return {
@@ -418,10 +396,35 @@ export function createProjectEngineStore(database: Pool, schemaName: string) {
 		lockSession,
 		lockUser,
 		record,
-		recordEvent,
+		recordEvent: recordOwnedProjectEvent,
 		refresh,
 		revoke,
 		session,
 		transaction,
 	};
+}
+
+export async function recordOwnedProjectEvent(
+	client: PoolClient,
+	event: ControlEventInput,
+) {
+	const fields = controlEventAttributes(event);
+	await client.query(
+		`INSERT INTO "allauthEvent" (id, type, outcome, "actorId", "userId", "organizationId", "clientId", "targetId", "ipAddress", "userAgent", "createdAt", metadata)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, COALESCE($11::timestamptz, statement_timestamp()), $12::jsonb)`,
+		[
+			event.id ?? crypto.randomUUID(),
+			event.type.slice(0, 128),
+			event.outcome,
+			fields.actorId ?? null,
+			fields.userId ?? null,
+			fields.organizationId ?? null,
+			fields.clientId ?? null,
+			fields.targetId ?? null,
+			fields.ipAddress ?? null,
+			fields.userAgent ?? null,
+			event.createdAt ?? null,
+			JSON.stringify(sanitizeControlMetadata(event.metadata)),
+		],
+	);
 }

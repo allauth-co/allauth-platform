@@ -199,13 +199,12 @@ export function createOwnedProjectRealmImpersonation(options: {
 					),
 					"YOU_CANNOT_IMPERSONATE_ADMINS",
 				);
-			const current = await realm.createSession(
-				target,
-				actingUser.id,
-				new Date(Date.now() + 15 * 60_000),
-				options.trustedIP(request) ?? "",
-				request.headers.get("user-agent")?.slice(0, 512) ?? "",
-			);
+			const current = await realm.createSession(target, actingUser.id, {
+				expiresAt: new Date(Date.now() + 15 * 60_000),
+				ipAddress: options.trustedIP(request) ?? "",
+				userAgent: request.headers.get("user-agent")?.slice(0, 512) ?? "",
+				path: startPath,
+			});
 			await store.record(
 				client,
 				"session.impersonation-started",

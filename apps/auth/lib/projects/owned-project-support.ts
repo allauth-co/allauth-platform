@@ -691,13 +691,12 @@ export function createOwnedProjectSupportHttp(
 			);
 		const ip = options.trustedIP?.(request) ?? "";
 		const userAgent = request.headers.get("user-agent") ?? "";
-		const target = await realm.createSession(
-			user,
-			actor.user.id,
-			new Date(Date.now() + 15 * 60_000),
-			isIP(ip) ? ip : "",
+		const target = await realm.createSession(user, actor.user.id, {
+			expiresAt: new Date(Date.now() + 15 * 60_000),
+			ipAddress: isIP(ip) ? ip : "",
 			userAgent,
-		);
+			path: "/project-admin/impersonate-user",
+		});
 		await realm.recordEvent(
 			target,
 			userAgent,
@@ -953,13 +952,12 @@ export function createOwnedProjectSupportHttp(
 			return invalid();
 		const proxyIP = request.headers.get("allauth-proxy-ip") ?? "";
 		const userAgent = request.headers.get("user-agent") ?? "";
-		const target = await realm.createSession(
-			user,
-			actor.userId,
+		const target = await realm.createSession(user, actor.userId, {
 			expiresAt,
-			isIP(proxyIP) ? proxyIP : "",
+			ipAddress: isIP(proxyIP) ? proxyIP : "",
 			userAgent,
-		);
+			path: "/sdk/support/application/authorize",
+		});
 		const binding = {
 			...bindingFor(realmActor(actor), target, config),
 			application: {

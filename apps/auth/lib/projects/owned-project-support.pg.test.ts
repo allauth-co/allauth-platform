@@ -21,7 +21,16 @@ import { createAllAuthProxy } from "../../sdk/next";
 import { defaultAuthPolicy } from "../auth-policy/policy";
 import { allauthControl } from "../control";
 import type { ControlPrincipal } from "../control/types";
+import {
+	newWebhookSigningSecret,
+	webhookSignature,
+} from "../control/webhook-contract";
+import {
+	type ControlWebhookEnvelope,
+	deliverPendingWebhooks,
+} from "../control/webhooks";
 import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
+import { sealLegacyMfaRecord } from "./legacy-mfa-record";
 import { readLegacySessionCookie } from "./legacy-session-cookie";
 import { projectManagement } from "./management-plugin";
 import { createOwnedProjectEngine } from "./owned-project-engine";
@@ -241,6 +250,7 @@ describe.skipIf(!existsSync(fixturePath))(
 					for (const migration of [
 						"001-initial-auth.sql",
 						"002-control-plane.sql",
+						"004-webhooks.sql",
 						"005-free-plugins.sql",
 						"016-invitation-import-provenance.sql",
 					])
@@ -644,6 +654,113 @@ describe.skipIf(!existsSync(fixturePath))(
 				)),
 			};
 		}
+
+		it("delivers the same session creation events for console, realm and connected-app support", async () => {
+			const endpoint = randomUUID();
+			const secret = newWebhookSigningSecret();
+			await database.query(
+				`INSERT INTO "${schema}"."allauthWebhookEndpoint" (id,url,"eventTypes","encryptedSecret") VALUES ($1,$2,'["session.created"]',$3)`,
+				[
+					endpoint,
+					"https://support-events.fixture.example/receive",
+					await sealLegacyMfaRecord(secret, { secret: signingSecret }),
+				],
+			);
+			try {
+				const target = await account();
+				const workspaceActor = await session(
+					await account("admin", "public"),
+					"public",
+				);
+				const realmActor = await session(await account("admin"));
+				const expected = new Map<string, { path: string; userId: string }>();
+				for (const writer of [native, ownedEngine()]) {
+					for (const [path, actor] of [
+						["/project-admin/impersonate-user", workspaceActor],
+						["/admin/impersonate-user", realmActor],
+					] as const) {
+						const response = await writer(
+							request(path, {
+								caller: origin,
+								cookie: actor.cookie,
+								signed: false,
+								body: { userId: target.id },
+							}),
+						);
+						expect(response.status).toBe(200);
+						const { session: issued } =
+							(await response.json()) as BrowserSupport;
+						expected.set(issued.id, { path, userId: target.id });
+					}
+					const fixture = await applicationTicket(writer);
+					const path = "/sdk/support/application/authorize";
+					const response = await writer(
+						request(path, {
+							caller: applicationOrigin,
+							cookie: fixture.original.cookie,
+							body: fixture.query,
+						}),
+					);
+					expect(response.status).toBe(200);
+					const { sessionId } = (await response.json()) as {
+						sessionId: string;
+					};
+					expected.set(sessionId, { path, userId: fixture.target.id });
+				}
+				expect(expected.size).toBe(6);
+				const captured: Array<{
+					body: string;
+					headers: Record<string, string>;
+				}> = [];
+				expect(
+					await deliverPendingWebhooks({
+						database: legacyDatabase!,
+						secret: signingSecret,
+						resolver: async () => [{ address: "93.184.216.34", family: 4 }],
+						now: () => new Date(Date.now() + 1_000),
+						maxDeliveries: 20,
+						transport: async ({ body, headers }) => {
+							captured.push({ body, headers });
+							return 204;
+						},
+					}),
+				).toMatchObject({ claimed: 6, delivered: 6 });
+				for (const { body, headers } of captured) {
+					expect(headers["webhook-signature"]).toBe(
+						await webhookSignature(
+							secret,
+							headers["webhook-id"],
+							headers["webhook-timestamp"],
+							body,
+						),
+					);
+					const { id, timestamp, data } = JSON.parse(
+						body,
+					) as ControlWebhookEnvelope;
+					const sessionId = data.event.targetId!;
+					const session = expected.get(sessionId);
+					expect(session).toBeDefined();
+					expect(data).toEqual({
+						event: {
+							id,
+							createdAt: timestamp,
+							type: "session.created",
+							outcome: "success",
+							userId: session?.userId,
+							targetId: sessionId,
+							metadata: { path: session?.path },
+						},
+					});
+					expected.delete(sessionId);
+				}
+				expect(expected.size).toBe(0);
+			} finally {
+				await database.query(
+					`DELETE FROM "${schema}"."allauthWebhookEndpoint" WHERE id=$1`,
+					[endpoint],
+				);
+			}
+		});
 
 		it("reads a native console browser session only for the live platform owner and never refreshes it", async () => {
 			const engine = candidateEngine();

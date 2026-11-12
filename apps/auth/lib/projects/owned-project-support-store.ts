@@ -1,5 +1,6 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import type { PoolClient } from "pg";
+import { recordOwnedProjectEvent } from "./owned-project-engine-store";
 
 export interface SupportSession {
 	id: string;
@@ -67,9 +68,20 @@ export function projectSupportStore(
 	async function createSession(
 		target: SupportTarget,
 		actorId: string,
-		expiresAt: Date,
-		ipAddress: string,
-		userAgent: string,
+		{
+			expiresAt,
+			ipAddress,
+			userAgent,
+			path,
+		}: {
+			expiresAt: Date;
+			ipAddress: string;
+			userAgent: string;
+			path:
+				| "/admin/impersonate-user"
+				| "/project-admin/impersonate-user"
+				| "/sdk/support/application/authorize";
+		},
 	): Promise<SupportSession> {
 		const id = randomUUID();
 		const token = randomBytes(32).toString("base64url");
@@ -78,6 +90,13 @@ export function projectSupportStore(
 			 VALUES ($1, $2, $3, $4, statement_timestamp(), statement_timestamp(), $5, $6, $7)`,
 			[id, token, target.userId, expiresAt, actorId, ipAddress, userAgent],
 		);
+		await recordOwnedProjectEvent(client, {
+			type: "session.created",
+			outcome: "success",
+			userId: target.userId,
+			targetId: id,
+			metadata: { path },
+		});
 		return { ...target, id, token, expiresAt, impersonatedBy: actorId };
 	}
 
