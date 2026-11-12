@@ -19,6 +19,7 @@ import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import type { createAllAuthClient } from "../../sdk/client";
 import { createAllAuthProxy } from "../../sdk/next";
+import { createAuth } from "../auth";
 import { defaultAuthPolicy } from "../auth-policy/policy";
 import { clerkCompatiblePasswords } from "../clerk-password";
 import { allauthControl } from "../control";
@@ -28,6 +29,7 @@ import { readLegacySessionCookie } from "./legacy-session-cookie";
 import { productionTwoFactor } from "../mfa";
 import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
 import { projectManagement } from "./management-plugin";
+import { localizeProjectErrors } from "./project-error-localization";
 import { createOwnedProjectBackchannelLogout } from "./owned-project-backchannel-logout";
 import { createOwnedProjectIssuerKeys } from "./owned-project-issuer-keys";
 import { createOwnedEmailVerification } from "./owned-email-verification";
@@ -97,7 +99,7 @@ describe.skipIf(!existsSync(fixturePath))("isolated PostgreSQL owned project eng
 			for (const name of [schema, otherSchema]) {
 				await client.query(`CREATE SCHEMA "${name}"`);
 				await client.query(`SET search_path TO "${name}"`);
-				for (const migration of ["001-initial-auth.sql", "002-control-plane.sql", "005-free-plugins.sql", "016-invitation-import-provenance.sql"]) {
+				for (const migration of ["001-initial-auth.sql", "002-control-plane.sql", "005-free-plugins.sql", "006-analytics.sql", "016-invitation-import-provenance.sql"]) {
 					await client.query(readFileSync(new URL(`../../migrations/${migration}`, import.meta.url), "utf8"));
 				}
 			}
@@ -200,6 +202,154 @@ describe.skipIf(!existsSync(fixturePath))("isolated PostgreSQL owned project eng
 		const signature = createHmac("sha256", signingSecret).update(token).digest("base64");
 		return { id, token, cookie: `${cookieName}=${encodeURIComponent(`${token}.${signature}`)}` };
 	}
+
+	it("matches configured native realm user reads and permission checks without exposing private fields", async () => {
+		if (!legacyDatabase)
+			throw new Error("The isolated native database was not initialized.");
+		const originalFetch = globalThis.fetch;
+		vi.stubGlobal("fetch", async (input: string | URL | Request) => {
+			const url = new URL(input instanceof Request ? input.url : input);
+			if (
+				url.origin !== origin ||
+				url.pathname !== "/.well-known/openid-configuration"
+			)
+				throw new Error(
+					"The isolated realm read fixture prohibits external HTTP.",
+				);
+			return Response.json({
+				issuer: origin,
+				authorization_endpoint: `${origin}/api/auth/oauth2/authorize`,
+				token_endpoint: `${origin}/api/auth/oauth2/token`,
+				userinfo_endpoint: `${origin}/api/auth/oauth2/userinfo`,
+				jwks_uri: `${origin}/api/auth/jwks`,
+			});
+		});
+		try {
+			const native = createAuth(
+				{ db: legacyDatabase, type: "postgres", transaction: true },
+				{
+					AUTH_RUNTIME: "node",
+					ALLAUTH_AUTH_URL: origin,
+					ALLAUTH_AUTH_SECRET: signingSecret,
+					SCIM_CREDENTIAL_HASH_SECRET: signingSecret,
+				},
+				{
+					name: "Realm administrator fixture",
+					basePath,
+					cookiePrefix: `allauth_project_${slug}`,
+					primaryOrigin: origin,
+					origins: [],
+					broker: { clientId: "fixture", clientSecret: signingSecret },
+					authorizeAdmin: async () => null,
+					management: { id: "fixture-realm-management" },
+				},
+			);
+			const administrator = await seed("realm-reads-admin@fixture.example");
+			const member = await seed("realm-reads-member@fixture.example");
+			const unverified = await seed("realm-reads-unverified@fixture.example", {
+				verified: false,
+			});
+			await database.query(
+				`UPDATE "${schema}"."user" SET role='user,admin' WHERE id=ANY($1::text[])`,
+				[[administrator, unverified]],
+			);
+			await database.query(
+				`UPDATE "${schema}"."user" SET "publicMetadata"='{"visible":true}'::jsonb,
+					"banReason"='fixture explanation',"banExpires"=statement_timestamp() + interval '1 day'
+				 WHERE id=$1`,
+				[member],
+			);
+			const active = await legacySession(administrator, 3600);
+			const memberSession = await legacySession(member, 3600);
+			const unverifiedSession = await legacySession(unverified, 3600);
+			await database.query(
+				`INSERT INTO "${otherSchema}"."user" (id,email,name,"emailVerified",role)
+				 VALUES ($1,'other-realm-admin@fixture.example','Sibling realm administrator',true,'admin')`,
+				[administrator],
+			);
+			const foreign = await legacySession(administrator, 3600, otherSchema);
+			const candidate = localizeProjectErrors(engine(schema, "203.0.113.195"));
+			const compare = async (
+				path: string,
+				body: unknown,
+				cookie: string,
+				headers: HeadersInit = {},
+			) => {
+				const input = () =>
+					request(path, body, {
+						cookie,
+						"x-real-ip": "203.0.113.195",
+						...headers,
+					});
+				const original = await native.handler(input());
+				const replacement = await candidate.dispatch(input());
+				expect(replacement.status).toBe(original.status);
+				const originalBody = await original.text();
+				const replacementBody = await replacement.text();
+				if (!originalBody) {
+					expect(replacementBody).toBe("");
+					return null;
+				}
+				expect(JSON.parse(replacementBody)).toEqual(JSON.parse(originalBody));
+				return JSON.parse(replacementBody) as Record<string, unknown>;
+			};
+			const target = `/admin/get-user?id=${member}`;
+			const result = await compare(target, undefined, active.cookie);
+			expect(result).toMatchObject({
+				id: member,
+				publicMetadata: { visible: true },
+				banReason: "fixture explanation",
+			});
+			expect(result).not.toHaveProperty("privateMetadata");
+			expect(result).not.toHaveProperty("directoryDisabled");
+			expect(result).not.toHaveProperty("directoryManaged");
+			await compare(target, undefined, memberSession.cookie);
+			await compare(target, undefined, unverifiedSession.cookie);
+			await compare(target, undefined, foreign.cookie);
+			await compare(target, undefined, "", {
+				authorization: "Bearer isolated-fixture-proof",
+			});
+			await compare(
+				`/admin/get-user?id=${randomUUID()}`,
+				undefined,
+				active.cookie,
+			);
+			await compare("/admin/get-user", undefined, active.cookie);
+			const permission = "/admin/has-permission";
+			expect(
+				await compare(
+					permission,
+					{ permissions: { user: ["get"], session: ["revoke"] } },
+					active.cookie,
+				),
+			).toEqual({ error: null, success: true });
+			expect(
+				await compare(
+					permission,
+					{ permissions: { user: ["impersonate-admins"] } },
+					active.cookie,
+				),
+			).toEqual({ error: null, success: false });
+			await compare(
+				permission,
+				{ permission: { user: ["get"] } },
+				active.cookie,
+			);
+			expect(
+				await compare(
+					permission,
+					{
+						permissions: { user: ["get"] },
+						role: "admin",
+						userId: administrator,
+					},
+					memberSession.cookie,
+				),
+			).toEqual({ error: null, success: false });
+		} finally {
+			vi.stubGlobal("fetch", originalFetch);
+		}
+	});
 
 	it("preserves nullable username profile updates across both engines", async () => {
 		const id = await seed("profile-username@fixture.example");

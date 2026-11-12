@@ -83,6 +83,8 @@ import { createOwnedProjectOneTimeToken } from "./owned-project-one-time-token";
 import type { OwnedProjectPasswordChangeOptions } from "./owned-project-password-change";
 import { createOwnedProjectPasswordChange } from "./owned-project-password-change";
 import { createOwnedProjectPersonalKeys } from "./owned-project-personal-keys";
+import { createOwnedProjectRealmAdminSessions } from "./owned-project-realm-admin-sessions";
+import { createOwnedProjectRealmAdminRead } from "./owned-project-realm-admin-read";
 import { createOwnedProjectRealmImpersonation } from "./owned-project-realm-impersonation";
 import { createOwnedProjectProfile } from "./owned-project-profile";
 import {
@@ -1516,6 +1518,7 @@ export function createOwnedProjectEngine(
 		current: NonNullable<Awaited<ReturnType<typeof eligibleSession>>>,
 		client: PoolClient,
 		headers: Headers,
+		allowServerToken = true,
 	) {
 		const token = current.token;
 		if (
@@ -1535,7 +1538,7 @@ export function createOwnedProjectEngine(
 				token,
 				policy.sessionExpiresInSeconds,
 			);
-			if (isServerTokenRequest(request.headers)) {
+			if (allowServerToken && isServerTokenRequest(request.headers)) {
 				const value = headers
 					.getSetCookie()[0]
 					?.split(";", 1)[0]
@@ -1987,6 +1990,37 @@ export function createOwnedProjectEngine(
 				return headers;
 			},
 		});
+	async function revokeAdminSessions(
+		client: PoolClient,
+		request: Request,
+		selector: { tokens: string[] } | { userId: string },
+		path: string,
+		actorId: string,
+	) {
+		const removed = await store.revoke(
+			selector,
+			path,
+			Boolean(backchannel),
+			client,
+			actorId,
+		);
+		if (!removed) throw unavailableLogout;
+		if ("userId" in selector) {
+			const { userId } = selector;
+			await client.query('DELETE FROM "oauthAccessToken" WHERE "userId"=$1', [
+				userId,
+			]);
+			await client.query('DELETE FROM "oauthRefreshToken" WHERE "userId"=$1', [
+				userId,
+			]);
+			await client.query(
+				`DELETE FROM "verification" WHERE value=$1
+				 AND (starts_with(identifier,'trust-device-') OR starts_with(identifier,'2fa-'))`,
+				[userId],
+			);
+		}
+		deliverLogoutAfterCommit(client, request, removed.targets);
+	}
 	const adminProject = options.adminDeletion && {
 		id: options.adminDeletion.id,
 		workspaceId: options.adminDeletion.workspaceId,
@@ -2038,29 +2072,8 @@ export function createOwnedProjectEngine(
 			checkPasswordSafety: options.passwordChange?.checkPasswordSafety,
 			blockCreation: (client, request, email) =>
 				security.admit(client, request, { email }),
-			async revoke(client, request, userId, path, actorId) {
-				const removed = await store.revoke(
-					{ userId },
-					path,
-					Boolean(backchannel),
-					client,
-					actorId,
-				);
-				if (!removed) throw unavailableLogout;
-				await client.query('DELETE FROM "oauthAccessToken" WHERE "userId"=$1', [
-					userId,
-				]);
-				await client.query(
-					'DELETE FROM "oauthRefreshToken" WHERE "userId"=$1',
-					[userId],
-				);
-				await client.query(
-					`DELETE FROM "verification" WHERE value=$1
-					 AND (starts_with(identifier,'trust-device-') OR starts_with(identifier,'2fa-'))`,
-					[userId],
-				);
-				deliverLogoutAfterCommit(client, request, removed.targets);
-			},
+			revoke: (client, request, userId, path, actorId) =>
+				revokeAdminSessions(client, request, { userId }, path, actorId),
 		});
 	const clerkImport =
 		options.adminDeletion &&
@@ -2522,6 +2535,19 @@ export function createOwnedProjectEngine(
 		session: sessionCookie,
 		remember: rememberCookie,
 	};
+	const realmAdminSessions = createOwnedProjectRealmAdminSessions({
+		store,
+		readBody: requestBody,
+		checkOrigin: sessionMutationOrigin,
+		readCookie: tokenFrom,
+		clearCookies: clearSessionCookies,
+		readSession: (token, client) => store.session(token, refreshWindow, client),
+		renew: (request, current, client, headers) =>
+			renewAuthorizedSession(request, current, client, headers, false),
+		trustedIP: security.trustedIP,
+		requireMfa: policy.mfaMode === "required",
+		revoke: revokeAdminSessions,
+	});
 	const realmImpersonation = createOwnedProjectRealmImpersonation({
 		store,
 		trustedRequest,
@@ -2578,6 +2604,15 @@ export function createOwnedProjectEngine(
 				platformAdmin: isPlatformAdmin(current.user, current.session),
 			};
 		},
+	});
+
+	const realmAdminRead = createOwnedProjectRealmAdminRead({
+		store,
+		trustedRequest,
+		readBody: requestBody,
+		readSessionToken: tokenFrom,
+		trustedIP: security.trustedIP,
+		requireMfa: policy.mfaMode === "required",
 	});
 
 	const organization = createOwnedProjectOrganizationHttp({
@@ -2696,6 +2731,8 @@ export function createOwnedProjectEngine(
 		}
 		const impersonation = await realmImpersonation.dispatch(path, request);
 		if (impersonation) return impersonation;
+		const realmSessionRevocation = await realmAdminSessions(path, request);
+		if (realmSessionRevocation) return realmSessionRevocation;
 		if (
 			wallet &&
 			request.method === "POST" &&
@@ -2748,6 +2785,8 @@ export function createOwnedProjectEngine(
 				(await personalKeys.dispatch(path, request)) ??
 				new Response(null, { status: 404 })
 			);
+		const realmAdmin = await realmAdminRead(path, request);
+		if (realmAdmin) return realmAdmin;
 		const directoryResponse = await directory?.dispatch(path, request);
 		if (directoryResponse) return directoryResponse;
 		if (path === "/sdk/config" && request.method === "GET") {

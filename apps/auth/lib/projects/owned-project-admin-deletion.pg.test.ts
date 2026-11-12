@@ -1,13 +1,22 @@
 import { createHmac, randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { runWithAdapter } from "@better-auth/core/context";
+import { betterAuth } from "better-auth";
 import { symmetricEncrypt } from "better-auth/crypto";
 import { admin } from "better-auth/plugins";
 import { getTestInstance } from "better-auth/test";
-import { exportJWK, exportPKCS8, generateKeyPair, SignJWT } from "jose";
-import { Kysely, PostgresDialect } from "kysely";
+import {
+	createLocalJWKSet,
+	exportJWK,
+	exportPKCS8,
+	generateKeyPair,
+	jwtVerify,
+	SignJWT,
+} from "jose";
+import { Kysely, PostgresDialect, sql } from "kysely";
 import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { createAuthOptions } from "../auth";
 import { defaultAuthPolicy } from "../auth-policy/policy";
 import { clerkCompatiblePasswords } from "../clerk-password";
 import { allauthControl } from "../control";
@@ -20,6 +29,7 @@ import { projectManagement } from "./management-plugin";
 import type { OwnedProjectAdminDeletionOptions } from "./owned-project-admin-deletion";
 import { createOwnedProjectAppleDeletion } from "./owned-project-apple-deletion";
 import { createOwnedProjectEngine } from "./owned-project-engine";
+import { localizeProjectErrors } from "./project-error-localization";
 
 const fixturePath = new URL(
 	"../../../../.secrets/local-postgres.json",
@@ -31,6 +41,8 @@ const workspacePath = "/project-admin/remove-user";
 const realmPath = "/admin/remove-user";
 const startPath = "/admin/impersonate-user";
 const stopPath = "/admin/stop-impersonating";
+const singleRevocationPath = "/admin/revoke-user-session";
+const bulkRevocationPath = "/admin/revoke-user-sessions";
 const clientIP = "192.0.2.9";
 const userAgent = "AllAuth project administrator fixture";
 const platformSecret = "isolated-root-administrator-deletion-fixture-secret";
@@ -160,6 +172,9 @@ describe.skipIf(!existsSync(fixturePath))(
 		function engine(
 			realm = alpha,
 			beforeDelete: OwnedProjectAdminDeletionOptions["beforeDelete"] = async () => {},
+			backchannelLogout?: Parameters<
+				typeof createOwnedProjectEngine
+			>[0]["backchannelLogout"],
 		) {
 			return createOwnedProjectEngine({
 				database,
@@ -170,6 +185,8 @@ describe.skipIf(!existsSync(fixturePath))(
 				trustedIP: () => clientIP,
 				signingSecret: realm.secret,
 				policy: defaultAuthPolicy,
+				issuer: Boolean(backchannelLogout),
+				backchannelLogout,
 				passwordChange: { checkPasswordSafety: async () => "allowed" },
 				accountLinks: {
 					publicLinkBaseURL: `${origin}${realm.path}`,
@@ -607,6 +624,447 @@ describe.skipIf(!existsSync(fixturePath))(
 					`DELETE FROM ${scope}."allauthWebhookEndpoint" WHERE id=$1`,
 					[endpoint],
 				);
+			}
+		});
+
+		it("interchanges realm administrator session revocation with the production native handler", async () => {
+			await sql
+				.raw(
+					readFileSync(
+						new URL("../../migrations/006-analytics.sql", import.meta.url),
+						"utf8",
+					),
+				)
+				.execute(nativeProjectDatabase);
+			const stockOptions = createAuthOptions(
+				{ db: nativeProjectDatabase, type: "postgres", transaction: true },
+				{
+					ALLAUTH_AUTH_URL: origin,
+					ALLAUTH_AUTH_SECRET: alpha.secret,
+					AUTH_RUNTIME: "node",
+					SCIM_CREDENTIAL_HASH_SECRET:
+						"synthetic-administrator-test-scim-secret",
+				},
+				{
+					name: "Synthetic realm administrator fixture",
+					basePath: alpha.path,
+					cookiePrefix: `allauth_project_${alpha.slug}`,
+					primaryOrigin: origin,
+					origins: [],
+					broker: {
+						clientId: "fixture-broker",
+						clientSecret: "synthetic-broker-secret",
+					},
+					authorizeAdmin: async () => null,
+					management: { id: "realm-admin-fixture" },
+				},
+			);
+			const stock = betterAuth({
+				...stockOptions,
+				advanced: { ...stockOptions.advanced, disableOriginCheck: false },
+				logger: { disabled: true },
+			});
+			const scope = `"${alpha.schemaName}"`;
+			const targetId = "fixture-project-revocation-target";
+			const relyingParty = "realm-admin-revocation-client";
+			await seedUser(alpha.schemaName, targetId);
+			await seedUser(beta.schemaName, targetId);
+			const siblingToken = randomUUID();
+			await database.query(
+				`INSERT INTO "${beta.schemaName}"."session" (id,token,"userId","expiresAt","updatedAt")
+				 VALUES ($1,$2,$3,now()+interval '1 day',now())`,
+				[randomUUID(), siblingToken, targetId],
+			);
+			await database.query(
+				`INSERT INTO ${scope}."oauthClient" (id,"clientId","redirectUris") VALUES ($1,$1,'[]')`,
+				[relyingParty],
+			);
+			const makeSession = async () => {
+				const sessionCookie = await login(native, alpha.path, targetId);
+				const result = await native.api.getSession({
+					headers: new Headers({ cookie: sessionCookie }),
+				});
+				if (!result) throw new Error("Expected a signed fixture session.");
+				return { cookie: sessionCookie, ...result.session };
+			};
+			const seedGrants = async (sessionId: string) => {
+				for (const [table, scopes] of [
+					["oauthAccessToken", ["openid"]],
+					["oauthRefreshToken", ["openid"]],
+					["oauthRefreshToken", ["offline_access", "openid"]],
+				] as const)
+					await database.query(
+						`INSERT INTO ${scope}."${table}" (id,token,"clientId","sessionId","userId","expiresAt","createdAt",scopes)
+						 VALUES ($1,$2,$3,$4,$5,now()+interval '1 hour',now(),$6)`,
+						[
+							randomUUID(),
+							randomUUID(),
+							relyingParty,
+							sessionId,
+							targetId,
+							JSON.stringify(scopes),
+						],
+					);
+			};
+			const grantState = async () =>
+				(
+					await database.query(
+						`SELECT 'access' AS kind, revoked IS NOT NULL AS revoked FROM ${scope}."oauthAccessToken" WHERE "userId"=$1
+				 UNION ALL SELECT CASE WHEN scopes ? 'offline_access' THEN 'offline' ELSE 'online' END,
+				 revoked IS NOT NULL FROM ${scope}."oauthRefreshToken" WHERE "userId"=$1 ORDER BY kind,revoked`,
+						[targetId],
+					)
+				).rows;
+			const eventTypes = [
+				"admin.revoke-user-session",
+				"admin.revoke-user-sessions",
+			];
+			const auditPaths = [singleRevocationPath, bulkRevocationPath];
+			const responseShape = async (response: Response) => {
+				const text = await response.text();
+				return {
+					status: response.status,
+					body: text ? JSON.parse(text) : null,
+					cookies: response.headers.getSetCookie(),
+				};
+			};
+			const guardSnapshot = async (
+				dispatch: (incoming: Request) => Promise<Response>,
+				ordinaryCookie: string,
+				targetToken: string,
+			) => {
+				const snapshots = [];
+				for (const [path, payload] of [
+					[singleRevocationPath, { sessionToken: targetToken }],
+					[bulkRevocationPath, { userId: targetId }],
+				] as const) {
+					for (const proof of [rootCookie, ordinaryCookie])
+						snapshots.push(
+							await responseShape(
+								await dispatch(request(alpha.path + path, proof, payload)),
+							),
+						);
+					const browser = request(alpha.path + path, realmCookie, payload);
+					browser.headers.delete("origin");
+					snapshots.push(await responseShape(await dispatch(browser)));
+					const server = request(alpha.path + path, undefined, payload);
+					server.headers.delete("origin");
+					server.headers.set(
+						"authorization",
+						`Bearer ${realmCookie.split("=", 2)[1]}`,
+					);
+					snapshots.push(await responseShape(await dispatch(server)));
+				}
+				return snapshots;
+			};
+			const assertRevocations = async (
+				dispatch: (incoming: Request) => Promise<Response>,
+				read: (incoming: Request) => Promise<Response>,
+			) => {
+				const target = await makeSession();
+				const remaining = await makeSession();
+				expect(target.id).not.toBe(remaining.id);
+				expect(
+					await (
+						await read(request(alpha.path + "/get-session", remaining.cookie))
+					).json(),
+				).toMatchObject({ session: { id: remaining.id } });
+				await seedGrants(target.id);
+				await seedGrants(remaining.id);
+				const challenges = [
+					"trust-device-fixture",
+					"2fa-fixture",
+					"unrelated-fixture",
+				];
+				for (const identifier of challenges)
+					await database.query(
+						`INSERT INTO ${scope}."verification" (id,identifier,value,"expiresAt") VALUES ($1,$2,$3,now()+interval '1 hour')`,
+						[randomUUID(), identifier, targetId],
+					);
+				const call = (path: string, payload: object) =>
+					dispatch(request(alpha.path + path, realmCookie, payload));
+				const guards = await guardSnapshot(
+					dispatch,
+					remaining.cookie,
+					target.token,
+				);
+				expect(
+					guards.map(({ status }) => status),
+					JSON.stringify(guards),
+				).toEqual([401, 403, 403, 403, 401, 403, 403, 403]);
+				const impersonation = await call(startPath, { userId: targetId });
+				expect(impersonation.status, await impersonation.clone().text()).toBe(
+					200,
+				);
+				const impersonatedCookie = cookie(impersonation);
+				for (const [path, payload] of [
+					[singleRevocationPath, { sessionToken: target.token }],
+					[bulkRevocationPath, { userId: targetId }],
+				] as const) {
+					const blocked = await dispatch(
+						request(alpha.path + path, impersonatedCookie, payload),
+					);
+					expect(await responseShape(blocked)).toEqual({
+						status: 403,
+						body: {
+							message:
+								"Administrative actions are unavailable during impersonation.",
+						},
+						cookies: [],
+					});
+				}
+				await database.query(
+					`UPDATE ${scope}."user" SET "emailVerified"=FALSE WHERE id=$1`,
+					[realmAdmin],
+				);
+				try {
+					for (const [path, payload] of [
+						[singleRevocationPath, { sessionToken: target.token }],
+						[bulkRevocationPath, { userId: targetId }],
+					] as const) {
+						const blocked = await call(path, payload);
+						expect(await responseShape(blocked)).toEqual({
+							status: 403,
+							body: {
+								message:
+									"Administrative actions require a verified email address.",
+							},
+							cookies: [],
+						});
+					}
+				} finally {
+					await database.query(
+						`UPDATE ${scope}."user" SET "emailVerified"=TRUE WHERE id=$1`,
+						[realmAdmin],
+					);
+				}
+				for (const token of [siblingToken, target.token, target.token]) {
+					const single = await call(singleRevocationPath, {
+						sessionToken: token,
+					});
+					expect(await responseShape(single)).toEqual({
+						status: 200,
+						body: { success: true },
+						cookies: [],
+					});
+				}
+				expect(
+					await (
+						await read(request(alpha.path + "/get-session", target.cookie))
+					).json(),
+				).toBeNull();
+				expect(
+					await (
+						await read(request(alpha.path + "/get-session", remaining.cookie))
+					).json(),
+				).toMatchObject({ session: { id: remaining.id } });
+				expect(await grantState()).toEqual([
+					{ kind: "access", revoked: false },
+					{ kind: "access", revoked: true },
+					{ kind: "offline", revoked: false },
+					{ kind: "offline", revoked: false },
+					{ kind: "online", revoked: false },
+					{ kind: "online", revoked: true },
+				]);
+				for (const userId of [targetId, targetId, 1234]) {
+					const bulk = await call(bulkRevocationPath, { userId });
+					expect(await responseShape(bulk)).toEqual({
+						status: 200,
+						body: { success: true },
+						cookies: [],
+					});
+				}
+				expect(
+					await (
+						await read(request(alpha.path + "/get-session", remaining.cookie))
+					).json(),
+				).toBeNull();
+				expect(await grantState()).toEqual([]);
+				expect(
+					(
+						await database.query(
+							`SELECT identifier FROM ${scope}."verification" WHERE value=$1`,
+							[targetId],
+						)
+					).rows,
+				).toEqual([{ identifier: "unrelated-fixture" }]);
+				const events = (
+					await database.query(
+						`SELECT type,outcome,"actorId","userId","targetId","ipAddress","userAgent",metadata
+					 FROM ${scope}."allauthEvent" WHERE type=ANY($1::text[]) ORDER BY type,outcome,"actorId","targetId",metadata`,
+						[eventTypes],
+					)
+				).rows;
+				const audit = (
+					await database.query(
+						`SELECT action,"actorId","targetId" FROM ${scope}."allauthAudit" WHERE action=ANY($1::text[]) ORDER BY action,"targetId"`,
+						[auditPaths],
+					)
+				).rows;
+				await database.query(
+					`DELETE FROM ${scope}."allauthEvent" WHERE type=ANY($1::text[])`,
+					[eventTypes],
+				);
+				await database.query(
+					`DELETE FROM ${scope}."allauthAudit" WHERE action=ANY($1::text[])`,
+					[auditPaths],
+				);
+				await database.query(
+					`DELETE FROM ${scope}."verification" WHERE value=$1`,
+					[targetId],
+				);
+				return { guards, events, audit };
+			};
+			const candidate = localizeProjectErrors(engine());
+			const expected = await assertRevocations(
+				stock.handler,
+				candidate.dispatch,
+			);
+			expect(expected.audit).toHaveLength(6);
+			expect(
+				await assertRevocations(candidate.dispatch, stock.handler),
+			).toEqual(expected);
+			const malformed = () =>
+				request(alpha.path + singleRevocationPath, realmCookie, {
+					sessionToken: 10,
+				});
+			const rejected = await responseShape(await stock.handler(malformed()));
+			expect(rejected).toMatchObject({
+				status: 400,
+				body: { code: "VALIDATION_ERROR" },
+			});
+			const auditCount = async () =>
+				(
+					await database.query(
+						`SELECT id FROM ${scope}."allauthAudit" WHERE action=$1`,
+						[singleRevocationPath],
+					)
+				).rowCount;
+			// Native attributes a successful mutation to a rejected schema request.
+			expect(await auditCount()).toBe(1);
+			expect(
+				await responseShape(await candidate.dispatch(malformed())),
+			).toEqual(rejected);
+			expect(await auditCount()).toBe(1);
+			expect(
+				(
+					await database.query(
+						`SELECT id FROM "${beta.schemaName}"."session" WHERE token=$1`,
+						[siblingToken],
+					)
+				).rowCount,
+			).toBe(1);
+		});
+
+		it("commits realm admin single and bulk revocation before sending signed backchannel logout", async () => {
+			const scope = `"${alpha.schemaName}"`;
+			const targetId = "realm-admin-logout-fixture-target";
+			const clientId = "realm-admin-logout-fixture-client";
+			const logoutURL = "https://realm-admin-rp.fixture.example/logout";
+			await seedUser(alpha.schemaName, targetId);
+			await database.query(
+				`INSERT INTO ${scope}."oauthClient" (id,"clientId","redirectUris","backchannelLogoutUri")
+				 VALUES ($1,$1,'[]',$2)`,
+				[clientId, logoutURL],
+			);
+			const tasks: (() => Promise<void>)[] = [];
+			const delivered: string[] = [];
+			const revokedSessions: string[] = [];
+			const candidate = engine(alpha, undefined, {
+				defer(task) {
+					tasks.push(task);
+				},
+				async post(url, body) {
+					expect(url.href).toBe(logoutURL);
+					for (const id of revokedSessions)
+						expect(
+							(
+								await database.query(
+									`SELECT id FROM ${scope}."session" WHERE id=$1`,
+									[id],
+								)
+							).rowCount,
+						).toBe(0);
+					const jwt = body.get("logout_token");
+					if (!jwt) throw new Error("Expected a signed logout token.");
+					delivered.push(jwt);
+					return 204;
+				},
+			});
+			for (const path of [singleRevocationPath, bulkRevocationPath]) {
+				const signed = await login(native, alpha.path, targetId);
+				const current = await native.api.getSession({
+					headers: new Headers({ cookie: signed }),
+				});
+				if (!current) throw new Error("Expected a live fixture session.");
+				await database.query(
+					`INSERT INTO ${scope}."oauthAccessToken" (id,token,"clientId","sessionId","userId","expiresAt","createdAt",scopes)
+					 VALUES ($1,$2,$3,$4,$5,now()+interval '1 hour',now(),'["openid"]')`,
+					[randomUUID(), randomUUID(), clientId, current.session.id, targetId],
+				);
+				const body =
+					path === singleRevocationPath
+						? { sessionToken: current.session.token }
+						: { userId: targetId };
+				const call = () => request(alpha.path + path, realmCookie, body);
+				const before = (
+					await database.query(
+						`SELECT id FROM ${scope}."allauthAudit" WHERE action=$1`,
+						[path],
+					)
+				).rowCount;
+				expect((await engine().dispatch(call())).status).toBe(501);
+				expect(
+					(
+						await native.api.getSession({
+							headers: new Headers({ cookie: signed }),
+						})
+					)?.session.id,
+				).toBe(current.session.id);
+				expect(
+					(
+						await database.query(
+							`SELECT revoked FROM ${scope}."oauthAccessToken" WHERE "sessionId"=$1`,
+							[current.session.id],
+						)
+					).rows,
+				).toEqual([{ revoked: null }]);
+				expect(
+					(
+						await database.query(
+							`SELECT id FROM ${scope}."allauthAudit" WHERE action=$1`,
+							[path],
+						)
+					).rowCount,
+				).toBe(before);
+				const response = await candidate.dispatch(call());
+				expect(response.status, await response.clone().text()).toBe(200);
+				revokedSessions.push(current.session.id);
+				expect(
+					await native.api.getSession({
+						headers: new Headers({ cookie: signed }),
+					}),
+				).toBeNull();
+				expect(tasks).toHaveLength(1);
+				await tasks.shift()!();
+			}
+			const publicKeys = await candidate.dispatch(
+				request(alpha.path + "/jwks"),
+			);
+			expect(publicKeys.status).toBe(200);
+			const verifyKey = createLocalJWKSet(await publicKeys.json());
+			expect(delivered).toHaveLength(2);
+			for (const [index, jwt] of delivered.entries()) {
+				const { payload } = await jwtVerify(jwt, verifyKey, {
+					issuer: origin + alpha.path,
+					audience: clientId,
+					typ: "logout+jwt",
+				});
+				expect(payload).toMatchObject({
+					sub: targetId,
+					sid: revokedSessions[index],
+					events: { "http://schemas.openid.net/event/backchannel-logout": {} },
+				});
 			}
 		});
 
