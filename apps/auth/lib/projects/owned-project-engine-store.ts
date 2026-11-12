@@ -170,7 +170,7 @@ export function createProjectEngineStore(database: Pool, schemaName: string) {
 	) {
 		// The legacy account table has no unique provider/subject constraint.
 		await client.query(
-			"SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+			"SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", // cspell:ignore xact
 			[`${schema}\n${provider}\n${subject}`],
 		);
 	}
@@ -347,9 +347,15 @@ export function createProjectEngineStore(database: Pool, schemaName: string) {
 			const ids = selected.rows.map((row) => row.id);
 			if (!ids.length) return { ids, targets: [] };
 			if (path === "/sign-out") {
+				// Installed SIWE and SSO use local logout. SAML single logout is disabled.
 				const upstream = await client.query(
-					`SELECT 1 FROM "account" WHERE "providerId" NOT IN ('credential', 'allauth', 'google', 'microsoft', 'apple')
-					 AND "userId" = ANY($1::text[]) LIMIT 1`,
+					`SELECT 1 FROM "account" a
+					 WHERE a."userId" = ANY($1::text[])
+					 AND a."providerId" NOT IN ('credential', 'allauth', 'google', 'microsoft', 'apple', 'siwe')
+					 AND NOT EXISTS (
+						SELECT 1 FROM "ssoProvider" p WHERE p."providerId" = a."providerId"
+						AND (NULLIF(trim(p."oidcConfig"), '') IS NOT NULL OR NULLIF(trim(p."samlConfig"), '') IS NOT NULL)
+					 ) LIMIT 1`,
 					[selected.rows.map((row) => row.userId)],
 				);
 				if (upstream.rowCount) return null;

@@ -48,6 +48,8 @@ import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
 import { projectManagement } from "./management-plugin";
 import { createOwnedProjectEngine } from "./owned-project-engine";
 import { createOwnedProjectPasswordSafety } from "./owned-project-password-safety";
+import { checkProjectOidcConfiguration } from "./owned-project-sso-oidc";
+import { checkProjectSamlConfiguration } from "./owned-project-sso-saml-eligibility";
 import { projectSecret } from "./runtime";
 
 const fixture = new URL(
@@ -1032,6 +1034,296 @@ describe.skipIf(!existsSync(fixture))(
 				JSON.stringify(a).localeCompare(JSON.stringify(b)),
 			);
 		}
+
+		it("signs out users linked to installed SIWE and exact realm SSO providers", async () => {
+			const installed = installedNative();
+			const realm = `"${alpha.schemaName}"`;
+			const otherRealm = `"${beta.schemaName}"`;
+			const path = "/sign-out";
+			const logoutURL = "https://linked-account-signout.fixture.example/logout";
+			const oidcId = "fixture-logout-oidc";
+			const samlId = "fixture-logout-saml";
+			const unknownId = `${oidcId}-other-realm`;
+			const idp = "https://directory.fixture.example";
+			const sp = `${origin}${alpha.path}/sso/saml2/sp/metadata?providerId=${samlId}`;
+			const oidc = {
+				clientId: "fixture-oidc-client",
+				clientSecret: "synthetic-fixture-oidc-secret",
+			};
+			const saml = {
+				issuer: sp,
+				entryPoint: `${idp}/sso`,
+				idpMetadata: { entityID: idp },
+				cert: readFileSync(
+					new URL("../../../../test/fixtures/cert.pem", import.meta.url),
+					"utf8",
+				),
+				wantAssertionsSigned: true,
+			};
+			checkProjectOidcConfiguration({ issuer: idp, oidcConfig: oidc });
+			checkProjectSamlConfiguration(
+				{ issuer: sp, samlConfig: saml },
+				`${origin}${alpha.path}/sso/saml2/sp/acs/${samlId}`,
+			);
+			async function registerProvider(
+				scope: string,
+				providerId: string,
+				user: string,
+				kind: "oidc" | "saml" | "empty",
+			) {
+				await database.query(
+					`INSERT INTO ${scope}."ssoProvider" (id,"providerId",issuer,domain,"domainVerified","userId","oidcConfig","samlConfig")
+					 VALUES ($1,$1,$2,'directory.fixture.example',true,$3,$4,$5)`,
+					[
+						providerId,
+						kind === "saml" ? sp : idp,
+						user,
+						kind === "oidc" ? JSON.stringify(oidc) : null,
+						kind === "saml" ? JSON.stringify(saml) : null,
+					],
+				);
+			}
+			const foreignOwner = randomUUID();
+			await database.query(
+				`INSERT INTO ${otherRealm}."user" (id,name,email,"emailVerified") VALUES ($1,'Fixture',$2,true)`,
+				[foreignOwner, `${foreignOwner}@fixture.example`],
+			);
+			await registerProvider(otherRealm, unknownId, foreignOwner, "oidc");
+			await registerProvider(realm, oidcId, eventUserId, "oidc");
+			await registerProvider(realm, samlId, eventUserId, "saml");
+			await registerProvider(
+				realm,
+				"fixture-empty-provider",
+				eventUserId,
+				"empty",
+			);
+			async function exercise(writer: "legacy" | "owned") {
+				const active = await browserSession(eventEmail);
+				const otherBrowser = await browserSession(eventEmail);
+				const subscription = await endpoint(
+					"legacy",
+					`linked-account-signout-${writer}`,
+					["session.deleted"],
+				);
+				const clientId = randomUUID();
+				const grants = ["access", "online", "offline", "sibling"].map(
+					(kind) => ({ kind, id: randomUUID() }),
+				);
+				const accountIds: string[] = [];
+				const logoutTokens: string[] = [];
+				const recordLogout = async (url: string, body: URLSearchParams) => {
+					expect(url).toBe(logoutURL);
+					expect(
+						(
+							await database.query(
+								`SELECT id FROM ${realm}.session WHERE id=$1`,
+								[active.id],
+							)
+						).rowCount,
+					).toBe(0);
+					const token = body.get("logout_token");
+					if (!token)
+						throw new Error("Expected a signed connected-app logout.");
+					logoutTokens.push(token);
+				};
+				const candidate = createOwnedProjectEngine({
+					database,
+					project: alpha,
+					baseURL: origin,
+					basePath: alpha.path,
+					signingSecret: alpha.secret,
+					policy: defaultAuthPolicy,
+					trustedOrigins: [],
+					trustedIP: () => "192.0.2.139",
+					backchannelLogout: {
+						async post(url, body) {
+							await recordLogout(url.href, body);
+							return 204;
+						},
+					},
+				});
+				const fetch = vi
+					.spyOn(globalThis, "fetch")
+					.mockImplementation(async (input, init) => {
+						if (!(init?.body instanceof URLSearchParams))
+							throw new Error("Unexpected fixture transport.");
+						await recordLogout(String(input), init.body);
+						return new Response(null, { status: 204 });
+					});
+				async function link(
+					providerId: string,
+					subject: string = randomUUID(),
+				) {
+					const id = randomUUID();
+					accountIds.push(id);
+					await database.query(
+						`INSERT INTO ${realm}."account" (id,"providerId","accountId","userId","updatedAt") VALUES ($1,$2,$3,$4,now())`,
+						[id, providerId, subject, eventUserId],
+					);
+					return id;
+				}
+				const dispatch = () => {
+					const input = request(`${alpha.path}${path}`, {}, active.cookie);
+					input.headers.set("x-real-ip", "192.0.2.139");
+					return writer === "legacy"
+						? installed.handler(input)
+						: candidate.dispatch(input);
+				};
+				const grantState = () =>
+					database.query<{
+						id: string;
+						revoked: boolean;
+						sessionId: string | null;
+					}>(
+						`SELECT id,revoked IS NOT NULL AS revoked,"sessionId" FROM ${realm}."oauthAccessToken" WHERE "clientId"=$1 UNION ALL SELECT id,revoked IS NOT NULL AS revoked,"sessionId" FROM ${realm}."oauthRefreshToken" WHERE "clientId"=$1`,
+						[clientId],
+					);
+				try {
+					await link("siwe", "0x0000000000000000000000000000000000000001:1");
+					await link(oidcId);
+					await link(samlId);
+					await database.query(
+						`INSERT INTO ${realm}."oauthClient" (id,"clientId","redirectUris","backchannelLogoutUri") VALUES ($1,$1,'[]',$2)`,
+						[clientId, logoutURL],
+					);
+					for (const { kind, id } of grants) {
+						const table =
+							kind === "access" ? "oauthAccessToken" : "oauthRefreshToken";
+						await database.query(
+							`INSERT INTO ${realm}."${table}" (id,token,"sessionId","userId","clientId","expiresAt","createdAt",scopes) VALUES ($1,$1,$2,$3,$4,now()+interval '1 day',now(),$5)`,
+							[
+								id,
+								kind === "sibling" ? otherBrowser.id : active.id,
+								eventUserId,
+								clientId,
+								JSON.stringify(
+									kind === "offline"
+										? ["openid", "offline_access"]
+										: ["openid"],
+								),
+							],
+						);
+					}
+					if (writer === "legacy") {
+						const slo = await installed.handler(
+							request(
+								`${alpha.path}/sso/saml2/logout/${samlId}`,
+								{},
+								active.cookie,
+							),
+						);
+						expect(slo.status).toBe(400);
+						expect(await slo.json()).toMatchObject({
+							code: "SINGLE_LOGOUT_NOT_ENABLED",
+						});
+					} else {
+						for (const provider of [unknownId, "fixture-empty-provider"]) {
+							const id = await link(provider);
+							expect((await dispatch()).status).toBe(501);
+							const unchanged = await grantState();
+							expect(unchanged.rows).toHaveLength(grants.length);
+							expect(
+								unchanged.rows.every(
+									(grant) => !grant.revoked && grant.sessionId,
+								),
+							).toBe(true);
+							expect(
+								(await deliveries("legacy", subscription.endpoint.id)).total,
+							).toBe(0);
+							expect(logoutTokens).toEqual([]);
+							await database.query(
+								`DELETE FROM ${realm}."account" WHERE id=$1`,
+								[id],
+							);
+						}
+					}
+					const result = await dispatch();
+					expect(result.status).toBe(200);
+					expect(result.headers.has("location")).toBe(false);
+					expect(await result.json()).toEqual({ success: true });
+					const { rows } = await database.query(
+						`SELECT id FROM ${realm}.session WHERE id=ANY($1::text[])`,
+						[[active.id, otherBrowser.id]],
+					);
+					expect(rows).toEqual([{ id: otherBrowser.id }]);
+					const state = await grantState();
+					expect(state.rows).toHaveLength(grants.length);
+					for (const { kind, id } of grants)
+						expect(state.rows.find((grant) => grant.id === id)).toEqual({
+							id,
+							revoked: kind === "access" || kind === "online",
+							sessionId: kind === "sibling" ? otherBrowser.id : null,
+						});
+					expect(logoutTokens).toHaveLength(1);
+					const jwks = await installed.handler(request(`${alpha.path}/jwks`));
+					const { payload } = await jwtVerify(
+						logoutTokens[0]!,
+						createLocalJWKSet(await jwks.json()),
+						{
+							issuer: `${origin}${alpha.path}`,
+							audience: clientId,
+							typ: "logout+jwt",
+						},
+					);
+					expect(payload).toMatchObject({ sub: eventUserId, sid: active.id });
+					return await signedEvents(
+						subscription,
+						[
+							eventEmail,
+							active.token,
+							otherBrowser.token,
+							logoutTokens[0]!,
+							...grants.map(({ id }) => id),
+						],
+						new Map([[active.id, "signed-out"]]),
+					);
+				} finally {
+					fetch.mockRestore();
+					await database.query(
+						`DELETE FROM ${realm}."oauthClient" WHERE id=$1`,
+						[clientId],
+					);
+					await database.query(
+						`DELETE FROM ${realm}."account" WHERE id=ANY($1::text[])`,
+						[accountIds],
+					);
+					await database.query(
+						`DELETE FROM ${realm}.session WHERE id=ANY($1::text[])`,
+						[[active.id, otherBrowser.id]],
+					);
+					expect(
+						(
+							await send("legacy", `${base}/delete`, {
+								id: subscription.endpoint.id,
+							})
+						).status,
+					).toBe(200);
+				}
+			}
+			try {
+				const native = await exercise("legacy");
+				expect(native).toEqual([
+					{
+						event: {
+							type: "session.deleted",
+							outcome: "success",
+							userId: eventUserId,
+							targetId: "signed-out",
+							metadata: { path },
+						},
+					},
+				]);
+				expect(await exercise("owned")).toEqual(native);
+			} finally {
+				await database.query(
+					`DELETE FROM ${realm}."ssoProvider" WHERE "providerId"=ANY($1::text[])`,
+					[[oidcId, samlId, "fixture-empty-provider"]],
+				);
+				await database.query(`DELETE FROM ${otherRealm}."user" WHERE id=$1`, [
+					foreignOwner,
+				]);
+			}
+		});
 
 		it("preserves each management operation and dispatches through the existing signed worker after either writer", async () => {
 			expect((await send("owned", base, undefined, "")).status).toBe(403);
