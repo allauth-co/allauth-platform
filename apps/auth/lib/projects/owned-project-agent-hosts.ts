@@ -32,6 +32,7 @@ import {
 	agentGrantRevokePath,
 	ownedAgentGrantRevokeInput,
 	revokeOwnedAgentGrants,
+	revokeOwnSignedAgentGrants,
 } from "./owned-project-agent-grant-revocation";
 import {
 	agentIntrospectionPath,
@@ -165,18 +166,16 @@ async function revokeBrowserHost(
 		: forbidden(agentHostOwnerRequired);
 }
 
-function hasSignedHostType(request: Request) {
+function signedRevocationType(request: Request) {
 	const token = /^Bearer\s+(\S+)$/i.exec(
 		request.headers.get("authorization") ?? "",
 	)?.[1];
 	try {
-		return Boolean(
-			token &&
-				token.length <= 8192 &&
-				decodeProtectedHeader(token).typ === "host+jwt",
-		);
+		return token && token.length <= 8192
+			? decodeProtectedHeader(token).typ
+			: undefined;
 	} catch {
-		return false;
+		return undefined;
 	}
 }
 
@@ -368,9 +367,19 @@ export function createOwnedProjectAgentHosts(options: BrowserHosts) {
 			);
 		}
 		if (request.headers.has("authorization")) {
+			const signedType =
+				hostRevoke || agentRevoke || grantRevoke
+					? signedRevocationType(request)
+					: undefined;
+			if (grantRevoke && signedType === "agent+jwt") {
+				const body = await options.readBody(request);
+				return options.store.transaction((client) =>
+					revokeOwnSignedAgentGrants(client, request, body),
+				);
+			}
 			if (
 				(hostRevoke || agentRevoke || grantRevoke) &&
-				hasSignedHostType(request)
+				signedType === "host+jwt"
 			) {
 				const body = await options.readBody(request);
 				return options.store.transaction((client) =>

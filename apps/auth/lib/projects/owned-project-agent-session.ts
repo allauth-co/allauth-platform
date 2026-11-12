@@ -9,8 +9,8 @@ import {
 	invalidAgentJWT,
 } from "./owned-project-agent-machine";
 import {
-	authorizeOwnedAgentRead,
-	refreshOwnedAgentRead,
+	authorizeOwnedActiveAgent,
+	refreshOwnedAgentHeartbeat,
 } from "./owned-project-agent-status";
 import type { ProjectUser } from "./owned-project-engine-store";
 
@@ -66,7 +66,7 @@ export async function readOwnedAgentSession(
 		);
 		return host instanceof Response ? host : noAgentSession();
 	}
-	const principal = await authorizeOwnedAgentRead(
+	const principal = await authorizeOwnedActiveAgent(
 		client,
 		request,
 		url,
@@ -111,7 +111,7 @@ export async function readOwnedAgentSession(
 		...grant,
 		constraints: constraints ? parseOwnedAgentStoredJSON(constraints) : null,
 	}));
-	const refreshed = await refreshOwnedAgentRead(client, agent, url.origin);
+	const refreshed = await refreshOwnedAgentHeartbeat(client, agent, url.origin);
 	if (refreshed instanceof Response) return refreshed;
 	return json({
 		type: agent.mode,

@@ -8,8 +8,8 @@ import {
 	decodeAgentMachineJWT,
 } from "./owned-project-agent-machine";
 import {
-	authorizeOwnedAgentRead,
-	refreshOwnedAgentRead,
+	authorizeOwnedActiveAgent,
+	refreshOwnedAgentHeartbeat,
 } from "./owned-project-agent-status";
 
 const listQuery = z.object({
@@ -71,7 +71,7 @@ export async function readOwnedAgentCatalog(
 		);
 		if (host instanceof Response) return authenticationRequired(url.origin);
 	} else {
-		const principal = await authorizeOwnedAgentRead(
+		const principal = await authorizeOwnedActiveAgent(
 			client,
 			request,
 			url,
@@ -80,7 +80,7 @@ export async function readOwnedAgentCatalog(
 		);
 		if (principal instanceof Response)
 			return authenticationRequired(url.origin);
-		const refreshed = await refreshOwnedAgentRead(
+		const refreshed = await refreshOwnedAgentHeartbeat(
 			client,
 			principal.agent,
 			url.origin,

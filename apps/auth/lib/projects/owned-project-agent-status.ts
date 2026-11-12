@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { JWTPayload } from "jose";
 import type { PoolClient } from "pg";
 import { agentHostJSON as json } from "./owned-project-agent-enrollment";
@@ -86,12 +87,25 @@ function inactiveAgent(agent: Agent, now: number, origin: string) {
 		return problem(401, "agent_expired", "Agent session has expired", origin);
 }
 
-function matchesBinding(payload: JWTPayload, request: Request, target: URL) {
+function matchesBinding(
+	payload: JWTPayload,
+	request: Request,
+	target: URL,
+	body?: unknown,
+) {
+	if (
+		payload.htm &&
+		(typeof payload.htm !== "string" ||
+			payload.htm.toUpperCase() !== request.method)
+	)
+		return false;
+	if (payload.htu && payload.htu !== target.origin + target.pathname)
+		return false;
+	if (!payload.ath || body === undefined) return true;
+	const serialized = typeof body === "string" ? body : JSON.stringify(body);
 	return (
-		(!payload.htm ||
-			(typeof payload.htm === "string" &&
-				payload.htm.toUpperCase() === request.method)) &&
-		(!payload.htu || payload.htu === target.origin + target.pathname)
+		typeof serialized === "string" &&
+		payload.ath === createHash("sha256").update(serialized).digest("base64url")
 	);
 }
 
@@ -107,8 +121,8 @@ function invalidStatusQuery() {
 	);
 }
 
-/** Lock and verify an active delegated agent for one of the enabled machine reads. */
-export async function authorizeOwnedAgentRead(
+/** Lock and verify an active delegated agent in the selected realm. */
+export async function authorizeOwnedActiveAgent(
 	client: PoolClient,
 	request: Request,
 	url: URL,
@@ -118,6 +132,7 @@ export async function authorizeOwnedAgentRead(
 		typ,
 		claims,
 	}: Exclude<ReturnType<typeof decodeAgentMachineJWT>, false | null>,
+	body?: unknown,
 ) {
 	if (typ !== "agent+jwt" || !validIdentifier(claims.sub))
 		return invalidJWT(url.origin);
@@ -159,7 +174,7 @@ export async function authorizeOwnedAgentRead(
 		return invalidJWT(url.origin);
 	const inactive = inactiveAgent(agent, Date.now(), url.origin);
 	if (inactive) return inactive;
-	// Signed agent reads share the original status replay namespace.
+	// Signed agent requests share the original status replay namespace.
 	if (
 		!(await consumeAgentMachineReplay(
 			client,
@@ -169,7 +184,7 @@ export async function authorizeOwnedAgentRead(
 		))
 	)
 		return problem(401, "jti_replay", "JWT has already been used", url.origin);
-	if (!matchesBinding(verified, request, url))
+	if (!matchesBinding(verified, request, url, body))
 		return problem(
 			401,
 			"request_binding_mismatch",
@@ -184,7 +199,7 @@ export async function authorizeOwnedAgentRead(
 }
 
 /** Persist the native heartbeat without extending the configured hard lifetime. */
-export async function refreshOwnedAgentRead(
+export async function refreshOwnedAgentHeartbeat(
 	client: PoolClient,
 	agent: Agent,
 	origin: string,
@@ -254,7 +269,7 @@ export async function readOwnedAgentStatus(
 			);
 		return publicAgent(client, agent);
 	}
-	const principal = await authorizeOwnedAgentRead(
+	const principal = await authorizeOwnedActiveAgent(
 		client,
 		request,
 		url,
@@ -263,7 +278,7 @@ export async function readOwnedAgentStatus(
 	);
 	if (principal instanceof Response) return principal;
 	if (ids.length > 1) return invalidStatusQuery();
-	const refreshed = await refreshOwnedAgentRead(
+	const refreshed = await refreshOwnedAgentHeartbeat(
 		client,
 		principal.agent,
 		url.origin,

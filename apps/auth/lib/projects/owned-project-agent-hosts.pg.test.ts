@@ -2074,6 +2074,232 @@ describe.skipIf(!existsSync(fixture))(
 			});
 		});
 
+		it("revokes only the signed agent's own grants under the native body binding and replay contract", async () => {
+			const path = "/agent/revoke-capability";
+			const schema = `"${alpha.schemaName}"`;
+			const seed = async (label: string) => {
+				const machine = await nativeMachine(label, sessionCookie);
+				const read = randomUUID();
+				const other = randomUUID();
+				await database.query(
+					`INSERT INTO ${schema}."agentCapabilityGrant" (id,"agentId",capability,status,"createdAt","updatedAt") VALUES
+					($1,$3,'fixture.read','active',now(),now()),($2,$3,'fixture.other','active',now(),now())`,
+					[read, other, machine.agentId],
+				);
+				return { machine, read, other };
+			};
+			const old = await seed("Native agent grant revocation");
+			const ownedFixture = await seed("Owned agent grant revocation");
+			const body = (agent_id: string, capability = "fixture.read") => ({
+				agent_id,
+				capabilities: [capability],
+			});
+			const sign = async (
+				{ machine }: typeof ownedFixture,
+				input: ReturnType<typeof body>,
+				options: {
+					target?: string;
+					method?: string;
+					audience?: string;
+					bodyHash?: boolean;
+					jti?: boolean;
+				} = {},
+			) => {
+				const proof = new SignJWT({
+					htm: options.method ?? "POST",
+					htu: `${agentAudience}${options.target ?? path}`,
+					...(options.bodyHash === false
+						? {}
+						: {
+								ath: createHash("sha256")
+									.update(JSON.stringify(input))
+									.digest("base64url"),
+							}),
+				})
+					.setProtectedHeader({ alg: "EdDSA", typ: "agent+jwt" })
+					.setIssuer(machine.hostId)
+					.setSubject(machine.agentId)
+					.setAudience(options.audience ?? agentAudience)
+					.setIssuedAt()
+					.setExpirationTime("45s");
+				if (options.jti !== false) proof.setJti(randomUUID());
+				return `Bearer ${await proof.sign(machine.agentKey.privateKey)}`;
+			};
+			const currentBody = body(ownedFixture.machine.agentId);
+			const otherBody = body(ownedFixture.machine.agentId, "fixture.other");
+			for (const option of [{ method: "GET" }, { target: statusPath }]) {
+				const error = await expectSame(
+					path,
+					"",
+					401,
+					currentBody,
+					await sign(ownedFixture, currentBody, option),
+				);
+				expect(error).toMatchObject({ error: "request_binding_mismatch" });
+			}
+			const mismatch = await expectSame(
+				path,
+				"",
+				401,
+				otherBody,
+				await sign(ownedFixture, currentBody),
+			);
+			expect(mismatch).toMatchObject({ error: "request_binding_mismatch" });
+			await expectSame(
+				path,
+				"",
+				401,
+				currentBody,
+				await sign(ownedFixture, currentBody, {
+					audience: "https://elsewhere.fixture.example",
+				}),
+			);
+			await expectSame(
+				path,
+				"",
+				401,
+				currentBody,
+				await sign(ownedFixture, currentBody, { jti: false }),
+			);
+			const foreignBody = body(old.machine.agentId);
+			await expectSame(
+				path,
+				sessionCookie,
+				403,
+				foreignBody,
+				await sign(ownedFixture, foreignBody),
+			);
+			const unknownBody = body(randomUUID());
+			await expectSame(
+				path,
+				"",
+				404,
+				unknownBody,
+				await sign(ownedFixture, unknownBody),
+			);
+			const authorization = await sign(ownedFixture, currentBody);
+			expect(
+				(
+					await outside.dispatch(
+						request(beta, path, "", currentBody, authorization),
+					)
+				).status,
+			).toBe(401);
+			expect(
+				(
+					await disabled.dispatch(
+						request(alpha, path, "", currentBody, authorization),
+					)
+				).status,
+			).toBe(501);
+			const oldBody = body(old.machine.agentId);
+			const nativeProof = await sign(old, oldBody);
+			const previous = await legacy.handler(
+				request(alpha, `${path}?client=fixture`, "", oldBody, nativeProof),
+			);
+			const next = await owned.dispatch(
+				request(
+					alpha,
+					`${path}?client=fixture`,
+					"",
+					currentBody,
+					authorization,
+				),
+			);
+			expect([previous.status, next.status]).toEqual([200, 200]);
+			expect(await previous.json()).toEqual({
+				agent_id: old.machine.agentId,
+				revoked: ["fixture.read"],
+				grant_ids: [old.read],
+			});
+			expect(await next.json()).toEqual({
+				agent_id: ownedFixture.machine.agentId,
+				revoked: ["fixture.read"],
+				grant_ids: [ownedFixture.read],
+			});
+			const [legacyReplay, ownedReplay] = await Promise.all([
+				legacy.handler(request(alpha, path, "", oldBody, nativeProof)),
+				candidate(alpha, true).dispatch(
+					request(alpha, path, "", currentBody, authorization),
+				),
+			]);
+			expect([legacyReplay.status, ownedReplay.status]).toEqual([401, 401]);
+			expect(await ownedReplay.json()).toEqual(await legacyReplay.json());
+			expect(ownedReplay.headers.get("www-authenticate")).toBe(
+				legacyReplay.headers.get("www-authenticate"),
+			);
+			const statusReplay = await owned.dispatch(
+				request(alpha, statusPath, "", undefined, authorization),
+			);
+			expect(statusReplay.status).toBe(401);
+			expect(await statusReplay.json()).toMatchObject({ error: "jti_replay" });
+			const state = await database.query<{
+				capability: string;
+				status: string;
+			}>(
+				`SELECT capability,status FROM ${schema}."agentCapabilityGrant" WHERE "agentId"=$1 ORDER BY capability`,
+				[ownedFixture.machine.agentId],
+			);
+			expect(state.rows).toEqual([
+				{ capability: "fixture.other", status: "active" },
+				{ capability: "fixture.read", status: "revoked" },
+			]);
+			const heartbeat = await database.query<{
+				active: boolean;
+				renewed: boolean;
+			}>(
+				`SELECT status='active' AS active,"lastUsedAt" IS NOT NULL AS renewed FROM ${schema}."agent" WHERE id=$1`,
+				[ownedFixture.machine.agentId],
+			);
+			expect(heartbeat.rows).toEqual([{ active: true, renewed: true }]);
+			const unboundBody = await owned.dispatch(
+				request(
+					alpha,
+					path,
+					"",
+					currentBody,
+					await sign(ownedFixture, currentBody, { bodyHash: false }),
+				),
+			);
+			expect(unboundBody.status).toBe(200);
+			expect(await unboundBody.json()).toEqual({
+				agent_id: ownedFixture.machine.agentId,
+				revoked: [],
+				grant_ids: [],
+			});
+			legacy = await native(nativePool);
+			const resumed = await legacy.handler(
+				request(
+					alpha,
+					path,
+					"",
+					currentBody,
+					await sign(ownedFixture, currentBody, { bodyHash: false }),
+				),
+			);
+			expect(resumed.status).toBe(200);
+			expect(await resumed.json()).toEqual({
+				agent_id: ownedFixture.machine.agentId,
+				revoked: [],
+				grant_ids: [],
+			});
+			const followup = await legacy.handler(
+				request(
+					alpha,
+					path,
+					"",
+					otherBody,
+					await sign(ownedFixture, otherBody),
+				),
+			);
+			expect(followup.status).toBe(200);
+			expect(await followup.json()).toEqual({
+				agent_id: ownedFixture.machine.agentId,
+				revoked: ["fixture.other"],
+				grant_ids: [ownedFixture.other],
+			});
+		});
+
 		it("updates the fresh browser owner's host and replaces its inline key under the stable ID across writers", async () => {
 			const path = "/host/update";
 			const host = await nativeMachineHost("Browser key update", ownerCookie);
