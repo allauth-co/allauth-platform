@@ -4,6 +4,7 @@ import { createAuthEndpoint, createAuthMiddleware, getAuthoritativeSessionFromCt
 import * as z from "zod";
 import { isPlatformAdmin, rolesInclude } from "../configuration";
 import { controlResponseFailure, isPrimaryAuthenticationPath, mutationEventType, recordControlEvent, writeControlEvent } from "./events";
+import { controlEventsQuery, controlIdentifier, controlSessionsQuery } from "./read-input";
 import { controlRetentionDays, pruneControlEvents, queryControlEvents, queryControlOverview, queryControlSessions } from "./queries";
 import { createControlSecurity } from "./security";
 import { createControlWebhooks } from "./webhooks";
@@ -15,6 +16,7 @@ export type * from "./types";
 export type * from "./analytics-types";
 export { writeControlEvent, recordControlEvent } from "./events";
 export { pruneControlEvents } from "./queries";
+export { controlEventsQuery } from "./read-input";
 
 declare module "@better-auth/core" {
 	interface BetterAuthPluginRegistry<AuthOptions, Options> {
@@ -49,15 +51,6 @@ export function requireControlOrigin(ctx: GenericEndpointContext): void {
 	if (origin !== expected || ctx.headers?.get("sec-fetch-site") === "cross-site") throw new APIError("FORBIDDEN", { message: "Control changes require a same-origin request." });
 }
 
-const identifier = z.string().trim().min(1).max(160);
-const pagination = { limit: z.coerce.number().int().min(1).max(100).default(25), offset: z.coerce.number().int().min(0).max(100000).default(0) };
-export const controlEventsQuery = z.object({
-	scope: z.enum(["admin", "organization", "user"]).default("user"), organizationId: identifier.optional(), userId: identifier.optional(),
-	type: z.string().max(128).regex(/^[a-zA-Z0-9./_-]+$/).optional(), outcome: z.enum(["success", "failure", "blocked"]).optional(),
-	from: z.iso.datetime({ offset: true }).optional(), to: z.iso.datetime({ offset: true }).optional(), q: z.string().trim().min(1).max(128).optional(), ...pagination,
-}).strict().refine((value) => !value.from || !value.to || new Date(value.from) <= new Date(value.to), { message: "The start date must precede the end date." }).prefault({});
-
-const controlSessionsQuery = z.object({ userId: identifier.optional(), q: z.string().trim().min(1).max(128).optional(), ...pagination }).strict().prefault({});
 const noCache = (ctx: GenericEndpointContext) => { ctx.setHeader("cache-control", "no-store"); ctx.setHeader("pragma", "no-cache"); };
 const object = (value: unknown) => value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
 const field = (value: Record<string, unknown> | undefined, key: string) => typeof value?.[key] === "string" ? value[key] as string : undefined;
@@ -105,7 +98,7 @@ export function allauthControl(options: AllauthControlOptions = {}) {
 			noCache(ctx); await requireAdmin(ctx);
 			return ctx.json(await queryControlSessions(ctx.context.adapter, options.database, ctx.query));
 		}),
-		controlRevokeSession: createAuthEndpoint("/control/revoke-session", { method: "POST", requireHeaders: true, body: z.object({ id: identifier }).strict() }, async (ctx) => {
+		controlRevokeSession: createAuthEndpoint("/control/revoke-session", { method: "POST", requireHeaders: true, body: z.object({ id: controlIdentifier }).strict() }, async (ctx) => {
 			noCache(ctx); const current = await requireAdmin(ctx); requireControlOrigin(ctx);
 			const target = await ctx.context.adapter.findOne<{ id: string; userId: string; token: string }>({ model: "session", where: [{ field: "id", value: ctx.body.id }], select: ["id", "userId", "token"] });
 			if (!target) throw new APIError("NOT_FOUND", { message: "This session no longer exists." });

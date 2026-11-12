@@ -26,6 +26,7 @@ import { defaultAuthPolicy } from "../auth-policy/policy";
 import { authPolicyRepository } from "../auth-policy/storage";
 import { clerkCompatiblePasswords } from "../clerk-password";
 import { defaultSecurityPolicy } from "../control/security-policy";
+import type { SecurityRule } from "../control/security-management";
 import type { ControlPrincipal } from "../control/types";
 import { signEdgeRequest } from "../domains/edge";
 import { googleProviderRepository } from "../project-providers/repository";
@@ -215,6 +216,19 @@ async function expectProjectApplicationWriteDirections(
 				"Use the project's own verified administrator session to manage native OAuth clients.",
 		});
 	}
+}
+
+async function runtimeSecurity(
+	service: Awaited<ReturnType<typeof openProcess>>,
+	path: string,
+	options: Parameters<Awaited<ReturnType<typeof openProcess>>["request"]>[1],
+	status = 200,
+): Promise<unknown> {
+	const response = await service.request(path, options);
+	expect(response.status, await response.clone().text()).toBe(status);
+	expect(response.headers.get("cache-control")).toBe("no-store");
+	expect(response.headers.get("pragma")).toBe("no-cache");
+	return response.json();
 }
 
 async function openProcess(
@@ -1172,6 +1186,69 @@ describe.skipIf(!existsSync(fixture))(
 				});
 				expect(rootLogin.status).toBe(200);
 				const rootCookie = cookie(rootLogin);
+				const securityPath = `${alphaPath}/control/security`;
+				const workspaceSession = { cookie: rootCookie };
+				const nativePolicy = {
+					...defaultSecurityPolicy,
+					maxFailuresPerIp: 25,
+					newDeviceNotifications: false,
+				};
+				expect(
+					await runtimeSecurity(service, `${securityPath}/update`, {
+						...workspaceSession,
+						body: { policy: nativePolicy },
+					}),
+				).toEqual({ policy: nativePolicy });
+				const { rule: nativeRule } = (await runtimeSecurity(
+					service,
+					`${securityPath}/rules/add`,
+					{
+						...workspaceSession,
+						body: {
+							type: "email-domain",
+							value: "Fixture-Restricted.Example",
+							reason: "Temporary fixture rule",
+						},
+					},
+				)) as { rule: SecurityRule };
+				expect(nativeRule).toMatchObject({
+					id: expect.any(String),
+					value: "fixture-restricted.example",
+					type: "email-domain",
+				});
+				const nativeSecurityDenied = await runtimeSecurity(
+					service,
+					securityPath,
+					{},
+					403,
+				);
+				const nativeSecurityValidation = await runtimeSecurity(
+					service,
+					`${securityPath}/update`,
+					{ ...workspaceSession, body: {} },
+					400,
+				);
+				const invalidRule = {
+					type: "ip",
+					value: "invalid-ip",
+					reason: "Invalid fixture input",
+				};
+				const nativeRuleValidation = await runtimeSecurity(
+					service,
+					`${securityPath}/rules/add`,
+					{ ...workspaceSession, body: invalidRule },
+					400,
+				);
+				const nativeSecurityOrigin = await runtimeSecurity(
+					service,
+					`${securityPath}/rules/add`,
+					{
+						...workspaceSession,
+						origin: alpha.primaryOrigin,
+						body: invalidRule,
+					},
+					403,
+				);
 				const nativeApplications = await runtimeApplicationCatalog(
 					service,
 					alpha,
@@ -1409,6 +1486,275 @@ describe.skipIf(!existsSync(fixture))(
 				created.push(restored);
 
 				service = await open(restored, true);
+				expect(
+					await runtimeSecurity(service, securityPath, workspaceSession),
+				).toMatchObject({
+					policy: nativePolicy,
+					rules: [nativeRule],
+					stats: { activeRules: 1 },
+					capabilities: {
+						credentialStuffing: true,
+						velocity: true,
+						blockRules: true,
+						botChallenge: false,
+						impossibleTravel: false,
+						breachedPasswords: false,
+					},
+				});
+				expect(await runtimeSecurity(service, securityPath, {}, 403)).toEqual(
+					nativeSecurityDenied,
+				);
+				expect(
+					await runtimeSecurity(
+						service,
+						securityPath,
+						{ cookie: realmAdminCookie },
+						403,
+					),
+				).toEqual(nativeSecurityDenied);
+				expect(
+					await runtimeSecurity(
+						service,
+						`${securityPath}/update`,
+						{
+							cookie: realmAdminCookie,
+							body: { policy: { ...nativePolicy, maxFailuresPerIp: 12 } },
+						},
+						403,
+					),
+				).toEqual(nativeSecurityDenied);
+				expect(
+					await runtimeSecurity(
+						service,
+						securityPath,
+						{ ...workspaceSession, authorization: "Bearer fixture" },
+						403,
+					),
+				).toEqual(nativeSecurityDenied);
+				expect(
+					await runtimeSecurity(
+						service,
+						"/api/auth/control/security",
+						{ ...workspaceSession, host: alphaHost },
+						403,
+					),
+				).toEqual(nativeSecurityDenied);
+				expect(
+					await runtimeSecurity(
+						service,
+						`${securityPath}/update`,
+						{ ...workspaceSession, body: {} },
+						400,
+					),
+				).toEqual(nativeSecurityValidation);
+				expect(
+					await runtimeSecurity(
+						service,
+						`${securityPath}/rules/add`,
+						{ ...workspaceSession, body: invalidRule },
+						400,
+					),
+				).toEqual(nativeRuleValidation);
+				expect(
+					await runtimeSecurity(
+						service,
+						`${securityPath}/rules/add`,
+						{
+							...workspaceSession,
+							origin: alpha.primaryOrigin,
+							body: invalidRule,
+						},
+						403,
+					),
+				).toEqual(nativeSecurityOrigin);
+				const securityDB = new Pool({
+					connectionString: url(restored),
+					max: 1,
+				});
+				const securityHook = randomUUID();
+				const retainedSecurityPolicy = {
+					...nativePolicy,
+					maxFailuresPerIp: 33,
+					blockedEmailDomains: ["fixture-denied.example"],
+				};
+				let retainedSecurityRule: SecurityRule | undefined;
+				try {
+					const schema = `"${alpha.schemaName}"`;
+					await securityDB.query(
+						`INSERT INTO ${schema}."allauthWebhookEndpoint"
+						 (id,url,"eventTypes","encryptedSecret") VALUES ($1,'https://delivery.invalid','["security.*"]','synthetic-fixture-secret')`,
+						[securityHook],
+					);
+					expect(
+						await runtimeSecurity(service, `${securityPath}/update`, {
+							...workspaceSession,
+							body: {
+								policy: {
+									...retainedSecurityPolicy,
+									blockedEmailDomains: [
+										"Fixture-Denied.Example",
+										"fixture-denied.example",
+									],
+								},
+							},
+						}),
+					).toEqual({ policy: retainedSecurityPolicy });
+					const ownedRuleInput = {
+						type: "ip",
+						value: "2001:0DB8::0040",
+						reason: "  Fixture IPv6 rule  ",
+					};
+					const { rule } = (await runtimeSecurity(
+						service,
+						`${securityPath}/rules/add`,
+						{
+							...workspaceSession,
+							body: ownedRuleInput,
+						},
+					)) as { rule: SecurityRule };
+					expect(rule).toMatchObject({
+						id: expect.any(String),
+						value: "2001:db8::40",
+						reason: "Fixture IPv6 rule",
+						type: "ip",
+					});
+					const { rule: updatedRule } = (await runtimeSecurity(
+						service,
+						`${securityPath}/rules/add`,
+						{
+							...workspaceSession,
+							body: {
+								...ownedRuleInput,
+								value: "2001:db8::40",
+								reason: "Updated fixture IPv6 rule",
+							},
+						},
+					)) as { rule: SecurityRule };
+					retainedSecurityRule = updatedRule;
+					expect(updatedRule).toEqual({
+						...rule,
+						reason: "Updated fixture IPv6 rule",
+					});
+					expect(
+						await runtimeSecurity(service, `${securityPath}/rules/remove`, {
+							...workspaceSession,
+							body: { id: nativeRule.id },
+						}),
+					).toEqual({ success: true });
+					const blocked = await service.request(`${alphaPath}/sign-in/email`, {
+						body: {
+							email: "account@fixture-denied.example",
+							password: credentials.password,
+						},
+					});
+					expect(blocked.status).toBe(429);
+					expect(await blocked.json()).toMatchObject({
+						code: "ALLAUTH_SECURITY_BLOCKED",
+					});
+					expect(
+						await runtimeSecurity(service, securityPath, workspaceSession),
+					).toMatchObject({
+						policy: retainedSecurityPolicy,
+						rules: [updatedRule],
+						stats: { activeRules: 1, blockedRequests: 1 },
+					});
+					expect(
+						await runtimeSecurity(
+							service,
+							`${betaPath}/control/security`,
+							workspaceSession,
+						),
+					).toMatchObject({
+						policy: {
+							maxFailuresPerIp: defaultSecurityPolicy.maxFailuresPerIp,
+						},
+						rules: [],
+					});
+					const events = await securityDB.query(
+						`SELECT type,outcome,"actorId","targetId",metadata FROM ${schema}."allauthEvent"
+						 WHERE type IN ('security.policy.updated','security.rule.added','security.rule.removed','security.blocked')
+						 ORDER BY "createdAt",id`,
+					);
+					const nativeUpdate = events.rows.find(
+						(row) => row.type === "security.policy.updated",
+					);
+					expect(nativeUpdate).toMatchObject({
+						actorId: credentials.platform.id,
+						metadata: {
+							fields: expect.arrayContaining([
+								"maxFailuresPerIp",
+								"logRetentionDays",
+							]),
+						},
+					});
+					const { rows: deliveries } = await securityDB.query(
+						`SELECT "eventType",status,payload FROM ${schema}."allauthWebhookDelivery" WHERE "endpointId"=$1`,
+						[securityHook],
+					);
+					expect(deliveries).toHaveLength(5);
+					expect(deliveries).toEqual(
+						expect.arrayContaining([
+							expect.objectContaining({
+								eventType: "security.policy.updated",
+								status: "pending",
+								payload: expect.objectContaining({
+									data: {
+										event: expect.objectContaining({
+											actorId: credentials.platform.id,
+											metadata: nativeUpdate?.metadata,
+										}),
+									},
+								}),
+							}),
+							expect.objectContaining({
+								eventType: "security.rule.added",
+								payload: expect.objectContaining({
+									data: {
+										event: expect.objectContaining({
+											targetId: rule.id,
+											metadata: { ruleType: "ip" },
+										}),
+									},
+								}),
+							}),
+							expect.objectContaining({
+								eventType: "security.rule.removed",
+								payload: expect.objectContaining({
+									data: {
+										event: expect.objectContaining({
+											targetId: nativeRule.id,
+											metadata: {},
+										}),
+									},
+								}),
+							}),
+							expect.objectContaining({
+								eventType: "security.blocked",
+								payload: expect.objectContaining({
+									data: {
+										event: expect.objectContaining({
+											outcome: "blocked",
+											metadata: {
+												signal: "email-domain-policy",
+												monitor: false,
+											},
+										}),
+									},
+								}),
+							}),
+						]),
+					);
+					expect(JSON.stringify(deliveries)).not.toContain(
+						"fixture-denied.example",
+					);
+				} finally {
+					await securityDB
+						.query(
+							`DELETE FROM "${alpha.schemaName}"."allauthWebhookEndpoint" WHERE id=$1`,
+							[securityHook],
+						)
+						.finally(() => securityDB.end());
+				}
 				expect(
 					await runtimeApplicationCatalog(service, alpha, rootCookie),
 				).toEqual(nativeApplications);
@@ -3826,6 +4172,33 @@ describe.skipIf(!existsSync(fixture))(
 				service = undefined;
 
 				service = await open(restored, false);
+				expect(
+					await runtimeSecurity(service, securityPath, workspaceSession),
+				).toMatchObject({
+					policy: retainedSecurityPolicy,
+					rules: [retainedSecurityRule],
+				});
+				expect(
+					await runtimeSecurity(service, `${securityPath}/rules/remove`, {
+						...workspaceSession,
+						body: { id: retainedSecurityRule?.id },
+					}),
+				).toEqual({ success: true });
+				const nativeBlocked = await service.request(
+					"/api/auth/sign-in/email",
+					{
+						host: alphaHost,
+						clientIP: "192.0.2.119",
+						body: {
+							email: "account@fixture-denied.example",
+							password: credentials.password,
+						},
+					},
+				);
+				expect(nativeBlocked.status).toBe(429);
+				expect(await nativeBlocked.json()).toMatchObject({
+					code: "ALLAUTH_SECURITY_BLOCKED",
+				});
 				expect(
 					await runtimeApplicationCatalog(service, alpha, rootCookie),
 				).toEqual(nativeApplications);

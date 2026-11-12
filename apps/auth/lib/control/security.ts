@@ -2,15 +2,14 @@ import type { GenericEndpointContext, HookEndpointContext, ValidateUserInfoSourc
 import type { User } from "@better-auth/core/db";
 import { APIError } from "better-auth";
 import { createAuthEndpoint, createAuthMiddleware } from "better-auth/api";
-import { sql } from "kysely";
-import * as z from "zod";
+import { CompiledQuery, sql } from "kysely";
 import { controlResponseFailure } from "./events";
+import { controlSecurityManagementRepository, invalidSecurityRuleMessage, securityRuleAddInput, securityRuleRemoveInput, securityUpdateInput } from "./security-management";
 import { canonicalDomain, canonicalIP, defaultSecurityPolicy, securityPolicySchema, securitySubject, type SecurityPolicy } from "./security-policy";
 import type { ControlDatabase, ControlEventInput, ControlPrincipal } from "./types";
 
 export { canonicalDomain, canonicalIP, defaultSecurityPolicy, securityPolicySchema, securitySubject, type SecurityPolicy } from "./security-policy";
-
-export interface SecurityRule { id: string; type: "ip" | "email-domain"; value: string; reason: string; expiresAt?: string; createdAt: string }
+export type { SecurityRule } from "./security-management";
 interface CounterRow { count: number; blockedUntil: Date | null; windowStartedAt: Date }
 type SecurityContext = GenericEndpointContext & { context: HookEndpointContext["context"] };
 export interface ControlSecurityOptions {
@@ -57,15 +56,11 @@ export function createControlSecurity(options: ControlSecurityOptions) {
 		const result = await sql<{ policy: unknown }>`SELECT "policy" FROM "allauthSecurityPolicy" WHERE "id" = 'default'`.execute(database);
 		return result.rows[0] ? securityPolicySchema.parse(result.rows[0].policy) : { ...defaultSecurityPolicy, blockedEmailDomains: [] };
 	};
-	const updatePolicy = async (input: unknown) => {
-		const policy = securityPolicySchema.parse(input);
-		policy.blockedEmailDomains = [...new Set(policy.blockedEmailDomains)];
-		await sql`INSERT INTO "allauthSecurityPolicy" ("id", "policy", "updatedAt") VALUES ('default', ${JSON.stringify(policy)}::jsonb, ${now()}) ON CONFLICT ("id") DO UPDATE SET "policy" = EXCLUDED."policy", "updatedAt" = EXCLUDED."updatedAt"`.execute(database);
-		return policy;
-	};
+	const management = controlSecurityManagementRepository({
+		query: (text, values) => database.executeQuery(CompiledQuery.raw(text, values)),
+	}, now);
+	const { updatePolicy } = management;
 	const trustedIP = (ctx: GenericEndpointContext) => canonicalIP(ctx.headers?.get(options.ipHeader));
-	const activeRules = async () => (await sql<{ id: string; type: "ip" | "email-domain"; value: string; reason: string; expiresAt: Date | null; createdAt: Date }>`SELECT "id", "type", "value", "reason", "expiresAt", "createdAt" FROM "allauthSecurityRule" WHERE "expiresAt" IS NULL OR "expiresAt" > ${now()} ORDER BY "createdAt" DESC LIMIT 500`.execute(database)).rows;
-	const publicRule = (rule: Awaited<ReturnType<typeof activeRules>>[number]): SecurityRule => ({ id: rule.id, type: rule.type, value: rule.value, reason: rule.reason, ...(rule.expiresAt ? { expiresAt: rule.expiresAt.toISOString() } : {}), createdAt: rule.createdAt.toISOString() });
 	const counter = async (scope: string, subject: string, windowSeconds: number, max: number, blockSeconds: number) => {
 		const key = await securitySubject(options.secret, scope, subject);
 		const current = now();
@@ -180,28 +175,25 @@ export function createControlSecurity(options: ControlSecurityOptions) {
 			ctx.setHeader("cache-control", "no-store");
 			ctx.setHeader("pragma", "no-cache");
 			await options.requireAdmin(ctx);
-			const [policy, rules, stats] = await Promise.all([getPolicy(), activeRules(), sql<{ blockedRequests: string; last24hFailures: string }>`SELECT COUNT(*) FILTER (WHERE "type" = 'security.blocked' AND "outcome" = 'blocked') AS "blockedRequests", COUNT(*) FILTER (WHERE "type" = 'security.sign-in-failed') AS "last24hFailures" FROM "allauthEvent" WHERE "createdAt" >= ${new Date(now().getTime() - 86400_000)}`.execute(database)]);
 			const breachProtection = ctx.context.getPlugin("have-i-been-pwned");
-			return ctx.json({ policy, rules: rules.map(publicRule), stats: { blockedRequests: Number(stats.rows[0]?.blockedRequests || 0), last24hFailures: Number(stats.rows[0]?.last24hFailures || 0), activeRules: rules.length }, capabilities: { credentialStuffing: true, velocity: true, blockRules: true, newDeviceNotifications: Boolean(options.notifyNewDevice), botChallenge: false, impossibleTravel: false, breachedPasswords: Boolean(breachProtection && breachProtection.options?.enabled !== false) } });
+			return ctx.json(await management.report({ newDeviceNotifications: Boolean(options.notifyNewDevice), breachedPasswords: Boolean(breachProtection && breachProtection.options?.enabled !== false) }));
 		}),
-		controlSecurityUpdate: createAuthEndpoint("/control/security/update", { method: "POST", requireHeaders: true, body: z.object({ policy: securityPolicySchema }).strict() }, async (ctx) => {
+		controlSecurityUpdate: createAuthEndpoint("/control/security/update", { method: "POST", requireHeaders: true, body: securityUpdateInput }, async (ctx) => {
 			const principal = await requireWrite(ctx);
 			const policy = await updatePolicy(ctx.body.policy);
 			await options.recordEvent(ctx, { type: "security.policy.updated", outcome: "success", actorId: principal.user.id, metadata: { fields: Object.keys(policy) } });
 			return ctx.json({ policy });
 		}),
-		controlSecurityRulesAdd: createAuthEndpoint("/control/security/rules/add", { method: "POST", requireHeaders: true, body: z.object({ type: z.enum(["ip", "email-domain"]), value: z.string().min(1).max(253), reason: z.string().trim().min(1).max(200), expiresAt: z.iso.datetime({ offset: true }).optional() }).strict() }, async (ctx) => {
+		controlSecurityRulesAdd: createAuthEndpoint("/control/security/rules/add", { method: "POST", requireHeaders: true, body: securityRuleAddInput }, async (ctx) => {
 			const principal = await requireWrite(ctx);
-			const value = ctx.body.type === "ip" ? canonicalIP(ctx.body.value) : canonicalDomain(ctx.body.value);
-			const expiresAt = ctx.body.expiresAt ? new Date(ctx.body.expiresAt) : null;
-			if (!value || (expiresAt && (expiresAt <= now() || expiresAt.getTime() > now().getTime() + 365 * 86400_000))) throw new APIError("BAD_REQUEST", { message: "Supply a valid IP or email domain and an optional expiry within one year." });
-			const result = await sql<Awaited<ReturnType<typeof activeRules>>[number]>`INSERT INTO "allauthSecurityRule" ("id", "type", "value", "reason", "expiresAt", "createdAt") VALUES (${crypto.randomUUID()}, ${ctx.body.type}, ${value}, ${ctx.body.reason}, ${expiresAt}, ${now()}) ON CONFLICT ("type", "value") DO UPDATE SET "reason" = EXCLUDED."reason", "expiresAt" = EXCLUDED."expiresAt" RETURNING *`.execute(database);
-			await options.recordEvent(ctx, { type: "security.rule.added", outcome: "success", actorId: principal.user.id, targetId: result.rows[0].id, metadata: { ruleType: ctx.body.type } });
-			return ctx.json({ rule: publicRule(result.rows[0]) });
+			const rule = await management.addRule(ctx.body);
+			if (!rule) throw new APIError("BAD_REQUEST", { message: invalidSecurityRuleMessage });
+			await options.recordEvent(ctx, { type: "security.rule.added", outcome: "success", actorId: principal.user.id, targetId: rule.id, metadata: { ruleType: ctx.body.type } });
+			return ctx.json({ rule });
 		}),
-		controlSecurityRulesRemove: createAuthEndpoint("/control/security/rules/remove", { method: "POST", requireHeaders: true, body: z.object({ id: z.string().uuid() }).strict() }, async (ctx) => {
+		controlSecurityRulesRemove: createAuthEndpoint("/control/security/rules/remove", { method: "POST", requireHeaders: true, body: securityRuleRemoveInput }, async (ctx) => {
 			const principal = await requireWrite(ctx);
-			await sql`DELETE FROM "allauthSecurityRule" WHERE "id" = ${ctx.body.id}`.execute(database);
+			await management.removeRule(ctx.body.id);
 			await options.recordEvent(ctx, { type: "security.rule.removed", outcome: "success", actorId: principal.user.id, targetId: ctx.body.id });
 			return ctx.json({ success: true });
 		}),

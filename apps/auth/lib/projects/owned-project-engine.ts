@@ -29,6 +29,7 @@ import type { ProjectAccountLinkOptions } from "./owned-project-account-links";
 import type { OwnedProjectAdminDeletionOptions } from "./owned-project-admin-deletion";
 import { createOwnedProjectAdminDeletion } from "./owned-project-admin-deletion";
 import { createOwnedProjectAdminUsers } from "./owned-project-admin-users";
+import { createOwnedProjectControlRead } from "./owned-project-control-read";
 import { createOwnedProjectAgentHosts } from "./owned-project-agent-hosts";
 import type { ProjectBackchannelTarget } from "./owned-project-backchannel-logout";
 import { createOwnedProjectBackchannelLogout } from "./owned-project-backchannel-logout";
@@ -86,6 +87,7 @@ import {
 	createOwnedProjectSecurity,
 	projectSecurityBlockedCode,
 } from "./owned-project-security";
+import { createOwnedProjectSecurityManagement } from "./owned-project-security-management";
 import { createOwnedProjectServiceDirectory } from "./owned-project-service-directory";
 import type { OwnedProjectSsoOptions } from "./owned-project-sso";
 import {
@@ -244,6 +246,7 @@ interface OwnedProjectEngineOptions {
 	brokerTwoFactor?: AuthorizeProjectBrokerMfa;
 	security?: {
 		requireTrustedIP?: boolean;
+		management?: boolean;
 		newDevice?: {
 			defer(delivery: () => Promise<void>): void;
 			notify(
@@ -2011,6 +2014,20 @@ export function createOwnedProjectEngine(
 			basePath: options.basePath,
 			readBody: (request) => requestBody(request, 1024 * 1024),
 		});
+	const controlRead = options.adminDeletion && adminProject &&
+		createOwnedProjectControlRead({
+			...options.adminDeletion,
+			database: options.database,
+			project: adminProject,
+			origin,
+			basePath: options.basePath,
+			trustedIP: options.trustedIP,
+			async readProjectSession(headers) {
+				if (!trustedRequest(headers, false)) return null;
+				const current = await currentSession(headers);
+				return current ? { id: current.session.id, userId: current.user.id } : null;
+			},
+		});
 	const webhookManagement =
 		options.webhookManagement &&
 		options.adminDeletion &&
@@ -2025,6 +2042,20 @@ export function createOwnedProjectEngine(
 			signingSecret: options.signingSecret,
 			trustedIP: options.trustedIP,
 			readBody: requestBody,
+		});
+	const securityManagement =
+		options.security?.management &&
+		options.adminDeletion &&
+		adminProject &&
+		createOwnedProjectSecurityManagement({
+			...options.adminDeletion,
+			project: adminProject,
+			store,
+			origin,
+			basePath: options.basePath,
+			trustedIP: options.trustedIP,
+			readBody: requestBody,
+			newDeviceNotifications: Boolean(options.security.newDevice),
 		});
 
 	const beforeGuestDelete = accountLinks?.beforeDelete;
@@ -2599,8 +2630,13 @@ export function createOwnedProjectEngine(
 		if (imported) return imported;
 		const importedInvitations = await invitationImport?.(request, path);
 		if (importedInvitations) return importedInvitations;
+		const control = await controlRead?.(request, path);
+		if (control) return control;
 		const webhook = await webhookManagement?.(request, path);
 		if (webhook) return webhook;
+		const securityResult =
+			securityManagement && (await securityManagement(request, path));
+		if (securityResult) return securityResult;
 		const agentHost = agentHosts && (await agentHosts(path, request));
 		if (agentHost) return agentHost;
 		const issuerResponse = issuer && (await issuer.dispatch(path, request));

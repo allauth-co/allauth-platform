@@ -3,7 +3,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { runWithAdapter } from "@better-auth/core/context";
 import { APIError } from "better-auth";
 import { symmetricDecrypt } from "better-auth/crypto";
-import { admin } from "better-auth/plugins";
+import { admin, organization } from "better-auth/plugins";
 import { getTestInstance } from "better-auth/test";
 import { Kysely, PostgresDialect } from "kysely";
 import { Pool } from "pg";
@@ -51,6 +51,7 @@ const migrations = [
 	"002-control-plane",
 	"004-webhooks",
 	"005-free-plugins",
+	"006-analytics",
 ];
 
 function realm(slug: string, workspaceId = randomUUID()) {
@@ -102,7 +103,10 @@ async function native(
 	realm?: typeof alpha,
 	readRoot?: (headers: Headers) => Promise<ControlPrincipal | null>,
 ) {
-	const control = allauthControl({ ipHeader: "x-real-ip" });
+	const control = allauthControl({
+		ipHeader: "x-real-ip",
+		...(realm && readRoot ? { database, authorizeAdmin: readRoot } : {}),
+	});
 	const webhooks =
 		realm &&
 		createControlWebhooks({
@@ -130,6 +134,7 @@ async function native(
 			emailAndPassword: { enabled: true, password: clerkCompatiblePasswords },
 			plugins: [
 				admin(),
+				...(realm ? [organization()] : []),
 				{
 					...control,
 					endpoints: { ...control.endpoints, ...webhooks?.endpoints },
@@ -336,6 +341,94 @@ describe.skipIf(!existsSync(fixture))(
 				? legacy.handler(input)
 				: owned.dispatch(input);
 		}
+		it("preserves workspace, self and organization access to the project control read routes", async () => {
+			const signedIn = await legacy.handler(
+				request(`${alpha.path}/sign-in/email`, {
+					email: userEmail,
+					password,
+				}),
+			);
+			expect(signedIn.status).toBe(200);
+			const projectCookie = signedIn.headers
+				.getSetCookie()
+				.map((cookie) => cookie.split(";", 1)[0])
+				.join("; ");
+			const organizationId = "fixture-control-read-organization";
+			const eventId = "fixture-control-read-event";
+			await database.query(
+				`INSERT INTO "${alpha.schemaName}".organization (id,name,slug,"createdAt")
+				 VALUES ($1,'Control read fixture','control-read-fixture',now())`,
+				[organizationId],
+			);
+			await database.query(
+				`INSERT INTO "${alpha.schemaName}".member (id,"organizationId","userId",role,"createdAt")
+				 VALUES ($1,$2,$3,'owner',now()),($4,$2,$5,'member',now())`,
+				[randomUUID(), organizationId, userId, randomUUID(), eventUserId],
+			);
+			await database.query(
+				`INSERT INTO "${alpha.schemaName}"."allauthEvent"(id,type,outcome,"userId","organizationId","createdAt",metadata)
+				 VALUES ($1,'fixture.control-read','success',$2,$3,now(),'{"path":"/fixture"}')`,
+				[eventId, userId, organizationId],
+			);
+			const catalog = [
+				["/control/overview", rootCookie],
+				[`/control/sessions?userId=${userId}`, rootCookie],
+				["/control/events?scope=admin&type=fixture.control-read", rootCookie],
+				["/control/events?type=fixture.control-read", projectCookie],
+				[
+					`/control/logs?scope=organization&organizationId=${organizationId}&q=fixture.control-read`,
+					projectCookie,
+				],
+				[`/control/logs/detail?id=${eventId}`, projectCookie],
+			] as const;
+			for (const [path, cookie] of catalog) {
+				const nativeResult = await send("legacy", path, undefined, cookie);
+				const ownedResult = await send("owned", path, undefined, cookie);
+				expect(nativeResult.status, await nativeResult.clone().text()).toBe(
+					200,
+				);
+				expect(ownedResult.status, await ownedResult.clone().text()).toBe(200);
+				expect(ownedResult.headers.get("cache-control")).toBe("no-store");
+				const body = await ownedResult.text();
+				expect(JSON.parse(body)).toEqual(await nativeResult.json());
+				expect(body).not.toContain('"token"');
+			}
+
+			for (const [path, cookie, expected] of [
+				["/control/overview", projectCookie, 403],
+				[`/control/events?userId=${eventUserId}`, projectCookie, 403],
+				[
+					`/control/logs/detail?id=${eventId}&organizationId=${organizationId}`,
+					projectCookie,
+					400,
+				],
+				["/control/logs/detail?id=missing-fixture-event", projectCookie, 404],
+				["/control/events?type=fixture.control-read", "", 401],
+			] as const) {
+				expect((await send("legacy", path, undefined, cookie)).status).toBe(
+					expected,
+				);
+				expect((await send("owned", path, undefined, cookie)).status).toBe(
+					expected,
+				);
+			}
+			expect(
+				(
+					await other.dispatch(
+						request(`${beta.path}/control/overview`, undefined, rootCookie),
+					)
+				).status,
+			).toBe(403);
+			await database.query(
+				`UPDATE "${alpha.schemaName}".member SET role='member' WHERE "organizationId"=$1 AND "userId"=$2`,
+				[organizationId, userId],
+			);
+			for (const writer of ["legacy", "owned"] as const)
+				expect(
+					(await send(writer, catalog[4][0], undefined, projectCookie)).status,
+				).toBe(403);
+		});
+
 		async function endpoint(
 			engine: "legacy" | "owned",
 			label: string,

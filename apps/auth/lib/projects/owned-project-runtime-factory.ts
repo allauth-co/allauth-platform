@@ -640,6 +640,7 @@ export async function createOwnedProjectRuntimeCandidate(options: Options) {
 		},
 		security: {
 			requireTrustedIP: true,
+			management: true,
 			newDevice: {
 				defer,
 				async notify(user, device) {
