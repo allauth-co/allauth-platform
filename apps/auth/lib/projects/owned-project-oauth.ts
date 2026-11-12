@@ -52,6 +52,10 @@ import {
 	microsoftIssuer,
 	microsoftMetadata,
 } from "./owned-project-provider-tokens";
+import {
+	projectSecurityBlockedCode,
+	projectSecurityBlockedMessage,
+} from "./owned-project-security";
 
 export { projectOAuthProvider } from "./owned-project-oauth-store";
 
@@ -66,6 +70,20 @@ const trustedSigningAlgorithms = [
 	"EdDSA",
 	"Ed25519",
 ];
+
+async function isStoredAccountPolicyDenial(response: Response) {
+	if (response.status !== 429) return false;
+	const payload: unknown = await response
+		.clone()
+		.json()
+		.catch(() => null);
+	return Boolean(
+		payload &&
+			typeof payload === "object" &&
+			"code" in payload &&
+			payload.code === projectSecurityBlockedCode,
+	);
+}
 const originControls = /[\\\u0000-\u0020\u007f]/;
 // Match the existing social start/link URL contract while keeping protocol inputs server-owned.
 const reservedAuthorizationParams = new Set([
@@ -1454,7 +1472,23 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 					registered: account.registered,
 					transport: "browser",
 				});
-				if (response.status >= 400) throw rejected;
+				if (response.status >= 400) {
+					// The native session gate follows token rotation for a verified, already-linked profile.
+					if (
+						options.denyBrowserProfile &&
+						account.existingBinding &&
+						identity.email &&
+						identity.email.toLowerCase() !== account.user.email.toLowerCase() &&
+						(await isStoredAccountPolicyDenial(response))
+					)
+						return errorRedirect(
+							projectSecurityBlockedCode,
+							flow ?? undefined,
+							false,
+							projectSecurityBlockedMessage,
+						);
+					throw rejected;
+				}
 				return response;
 			});
 			return navigation(response, expireState);

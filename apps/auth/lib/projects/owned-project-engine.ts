@@ -97,6 +97,7 @@ import { createOwnedProjectSCIMUserWrites } from "./owned-project-scim-user-writ
 import {
 	createOwnedProjectSecurity,
 	projectSecurityBlockedCode,
+	projectSecurityBlockedMessage,
 } from "./owned-project-security";
 import { createOwnedProjectSecurityManagement } from "./owned-project-security-management";
 import { createOwnedProjectServiceDirectory } from "./owned-project-service-directory";
@@ -316,11 +317,7 @@ function unsupported() {
 }
 
 function securityBlocked() {
-	return failure(
-		429,
-		projectSecurityBlockedCode,
-		"This authentication request is temporarily unavailable. Try again later.",
-	);
+	return failure(429, projectSecurityBlockedCode, projectSecurityBlockedMessage);
 }
 
 function forbidden() {

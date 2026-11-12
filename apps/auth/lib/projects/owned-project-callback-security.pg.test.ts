@@ -1,7 +1,7 @@
 import { createHash, createHmac, randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { betterAuth } from "better-auth";
-import { symmetricEncrypt } from "better-auth/crypto";
+import { symmetricDecrypt, symmetricEncrypt } from "better-auth/crypto";
 import { exportJWK, generateKeyPair, SignJWT } from "jose";
 import { Kysely, PostgresDialect } from "kysely";
 import { Pool } from "pg";
@@ -165,7 +165,7 @@ describe.skipIf(!existsSync(fixturePath))(
 			}
 		});
 
-		it("preserves native linked and signup domain denials after verifying a Google callback", async () => {
+		it("preserves native profile and stored-account domain denials after verifying a Google callback", async () => {
 			const endpoint = randomUUID();
 			const signingSecret = newWebhookSigningSecret();
 			const domain = "provider-denied.fixture.example";
@@ -173,6 +173,7 @@ describe.skipIf(!existsSync(fixturePath))(
 			const linkedSubject = "fixture-denied-google-linked-subject";
 			const signupSubject = "fixture-denied-google-signup-subject";
 			const storedEmail = "fixture-allowed-existing@fixture.example";
+			const blockedStoredEmail = `stored@${domain}`;
 			const callbackIP = "192.0.2.177";
 			const ruleId = randomUUID();
 			await database.query(
@@ -252,16 +253,28 @@ describe.skipIf(!existsSync(fixturePath))(
 			const observed = async () =>
 				(
 					await database.query<{ id: string; event: object }>(
-					`SELECT id,(payload->'data'->'event') - ARRAY['id','createdAt'] AS event FROM ${scope}."allauthWebhookDelivery" WHERE "endpointId"=$1`,
+						`SELECT id,(payload->'data'->'event') - ARRAY['id','createdAt'] AS event FROM ${scope}."allauthWebhookDelivery" WHERE "endpointId"=$1`,
 						[endpoint],
 					)
 				).rows;
+			const failureKey = await securitySubject(secret, "fail-ip", callbackIP);
+			const countFailures = async () =>
+				(
+					await database.query<{ count: number }>(
+						`SELECT count FROM ${scope}."allauthSecurityCounter" WHERE key=$1`,
+						[failureKey],
+					)
+				).rows[0]?.count ?? 0;
 			async function exercise(
 				dispatch: Dispatch,
 				subject: string,
-				mode: "linked" | "signup",
+				mode: "linked" | "signup" | "stored",
 			) {
-				const email = `${mode}@${domain}`;
+				const email =
+					mode === "stored"
+						? "allowed-provider-profile@fixture.example"
+						: `${mode}@${domain}`;
+				const failures = await countFailures();
 				const code = randomUUID();
 				const started = await dispatch(
 					new Request(target("/sign-in/social"), {
@@ -322,10 +335,19 @@ describe.skipIf(!existsSync(fixturePath))(
 				).toBe(false);
 				const destination = new URL(response.headers.get("location")!);
 				expect(destination.pathname).toBe("/auth-error");
-				expect(Object.fromEntries(destination.searchParams)).toEqual({
-					error: "validation_failed",
-					error_description: "User validation failed",
-				});
+				expect(Object.fromEntries(destination.searchParams)).toEqual(
+					mode === "stored"
+						? {
+								error: "ALLAUTH_SECURITY_BLOCKED",
+								error_description:
+									"This authentication request is temporarily unavailable. Try again later.",
+							}
+						: {
+								error: "validation_failed",
+								error_description: "User validation failed",
+							},
+				);
+				expect(await countFailures()).toBe(failures + 1);
 				expect(
 					(await database.query(`SELECT id FROM ${scope}."session"`)).rowCount,
 				).toBe(0);
@@ -345,21 +367,37 @@ describe.skipIf(!existsSync(fixturePath))(
 						)
 					).rowCount,
 				).toBe(0);
-				const grants = await database.query(
+				const grants = await database.query<{
+					accessToken: string;
+					refreshToken: string;
+					idToken: string;
+				}>(
 					`SELECT "accessToken","refreshToken","idToken" FROM ${scope}."account" WHERE "providerId"='google' AND "accountId"=$1`,
 					[subject],
 				);
-				expect(grants.rows).toEqual(
-					mode === "linked"
-						? [
-								{
-									accessToken: "synthetic-existing-access",
-									refreshToken: "synthetic-existing-refresh",
-									idToken: "synthetic-existing-id",
-								},
-							]
-						: [],
-				);
+				if (mode === "stored") {
+					const [grant] = grants.rows;
+					if (!grant) throw new Error("Expected the stored provider account.");
+					expect(grants.rows).toHaveLength(1);
+					expect(
+						await symmetricDecrypt({ key: secret, data: grant.accessToken }),
+					).toBe("synthetic-new-provider-access");
+					expect(
+						await symmetricDecrypt({ key: secret, data: grant.refreshToken }),
+					).toBe("synthetic-new-provider-refresh");
+					expect(grant.idToken).toBe(token);
+				} else
+					expect(grants.rows).toEqual(
+						mode === "linked"
+							? [
+									{
+										accessToken: "synthetic-existing-access",
+										refreshToken: "synthetic-existing-refresh",
+										idToken: "synthetic-existing-id",
+									},
+								]
+							: [],
+					);
 				const events = (await observed())
 					.filter(({ id }) => !before.has(id))
 					.map(({ event }) => event);
@@ -367,6 +405,7 @@ describe.skipIf(!existsSync(fixturePath))(
 				for (const privateValue of [
 					email,
 					storedEmail,
+					blockedStoredEmail,
 					subject,
 					token,
 					state,
@@ -410,6 +449,28 @@ describe.skipIf(!existsSync(fixturePath))(
 						baseline,
 					);
 				}
+				await database.query(
+					`UPDATE ${scope}."user" SET email=$2 WHERE id=$1`,
+					[owner, blockedStoredEmail],
+				);
+				const stored = await exercise(stock.handler, linkedSubject, "stored");
+				expect(stored).toEqual(expect.arrayContaining([blocked, failure]));
+				expect(stored).toHaveLength(2);
+				await database.query(
+					`UPDATE ${scope}."account" SET "accessToken"='synthetic-existing-access',"refreshToken"='synthetic-existing-refresh',"idToken"='synthetic-existing-id' WHERE "providerId"='google' AND "accountId"=$1`,
+					[linkedSubject],
+				);
+				expect(
+					await exercise(candidate.dispatch, linkedSubject, "stored"),
+				).toEqual(stored);
+				expect(
+					(
+						await database.query(
+							`SELECT id,email FROM ${scope}."user" WHERE id=$1`,
+							[owner],
+						)
+					).rows,
+				).toEqual([{ id: owner, email: blockedStoredEmail }]);
 				expect(
 					(
 						await database.query(

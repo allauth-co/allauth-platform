@@ -16,6 +16,8 @@ import {
 type SecurityDatabase = Pick<PoolClient, "query">;
 
 export const projectSecurityBlockedCode = "ALLAUTH_SECURITY_BLOCKED";
+export const projectSecurityBlockedMessage =
+	"This authentication request is temporarily unavailable. Try again later.";
 
 interface RequestIdentity {
 	email?: string;

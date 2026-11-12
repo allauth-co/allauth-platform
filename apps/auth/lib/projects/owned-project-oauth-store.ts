@@ -44,7 +44,7 @@ type LinkAuthority = NonNullable<ProjectOAuthState["link"]> & {
 };
 
 type Binding =
-	| { user: ProjectUser; registered: boolean }
+	| { user: ProjectUser; registered: boolean; existingBinding: boolean }
 	| {
 			error:
 				| "SOCIAL_ACCOUNT_ALREADY_LINKED"
@@ -378,7 +378,7 @@ export function createProjectOAuthStore(
 				accountId,
 			);
 		}
-		return { user, registered };
+		return { user, registered, existingBinding: Boolean(account) };
 	}
 
 	return { issue, consume, bind, transaction: realm.transaction };
