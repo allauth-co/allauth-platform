@@ -5642,7 +5642,7 @@ describe.skipIf(!existsSync(fixture))(
 					await changed.end();
 				}
 				await expect(open(restored, true)).rejects.toThrow(
-					"stored features outside the candidate scope",
+					"stored OAuth client grants are outside the candidate scope",
 				);
 			} finally {
 				try {

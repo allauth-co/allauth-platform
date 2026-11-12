@@ -8,6 +8,7 @@ import {
 	verifyAgentReplayDrainEvidence,
 } from "./project-agent-replay-evidence.mjs";
 import { assertStoredProjectAgentAdmission } from "./project-agent-stored-admission.mjs";
+import { assertProjectOAuthGrantAdmission } from "./project-engine-oauth-grant-admission.mjs";
 import { verifyEncryptedSamlActivation } from "./project-engine-saml-approval.mjs";
 import { verifyProjectWebhookActivation } from "./project-engine-webhook-admission.mjs";
 
@@ -137,6 +138,7 @@ async function switchProtectedProject(pool, id, previous, revision, next, bridge
 			}
 		}
 		if (next === "allauth") {
+			await assertProjectOAuthGrantAdmission(client, schema);
 			await verifyProjectWebhookActivation(client, id, schema);
 			await verifyEncryptedSamlActivation(client, id, schema, revision, process.env);
 		}

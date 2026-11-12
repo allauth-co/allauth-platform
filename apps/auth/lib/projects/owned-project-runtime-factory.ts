@@ -1,4 +1,5 @@
 import type { Pool } from "pg";
+import { assertProjectOAuthGrantAdmission } from "../../scripts/project-engine-oauth-grant-admission.mjs";
 import { withAuth, withAuthEngine } from "../auth";
 import type { AuthEngine } from "../auth-engine";
 import type { AuthPolicy } from "../auth-policy/policy";
@@ -350,10 +351,7 @@ async function readSupportedProviders(
 		   a.id = 'clerk_social_' || encode(sha256(convert_to('[' || to_json(a."providerId")::text ||
 		    ',' || to_json(a."accountId")::text || ']', 'UTF8')), 'hex')
 		  ), FALSE)
-		 ) OR
-		 EXISTS (SELECT 1 FROM "${schema}"."oauthClient" WHERE "grantTypes" IS NOT NULL AND (
-		  jsonb_typeof("grantTypes") <> 'array' OR NOT "grantTypes" <@ '["authorization_code","refresh_token","urn:ietf:params:oauth:grant-type:device_code"]'::jsonb
-		 ))
+		 )
 		) AS incompatible`,
 		[providers, ownedAvatarSelected(env, project.id), project.id, agentHosts],
 	);
@@ -361,6 +359,7 @@ async function readSupportedProviders(
 		throw new Error(
 			"This development project has stored features outside the candidate scope.",
 		);
+	await assertProjectOAuthGrantAdmission(database, schema);
 	if (agentHosts) await assertOwnedProjectAgentAdmission(database, schema);
 	await assertOwnedProjectWebhookAdmission(database, schema, options.policy);
 	return { google, microsoft, apple, agentHosts };

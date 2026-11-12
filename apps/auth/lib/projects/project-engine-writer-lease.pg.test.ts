@@ -18,6 +18,7 @@ import { exportJWK, generateKeyPair, SignJWT } from "jose";
 import { Kysely, PostgresDialect } from "kysely";
 import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { assertProjectOAuthGrantAdmission } from "../../scripts/project-engine-oauth-grant-admission.mjs";
 import { extraServerPlugins } from "../features/server";
 import { defaultAuthPolicy } from "../auth-policy/policy";
 import { authPolicyRepository } from "../auth-policy/storage";
@@ -74,6 +75,7 @@ describe.skipIf(!existsSync(fixturePath))(
 		const heartbeatRealm = realm();
 		const upgrade = realm();
 		const webhookActivation = realm();
+		const oauthActivation = realm();
 		const production = realm("production");
 		const externalWorkspace = randomUUID();
 		const external = realm("development", externalWorkspace);
@@ -163,6 +165,7 @@ describe.skipIf(!existsSync(fixturePath))(
 					heartbeatRealm,
 					upgrade,
 					webhookActivation,
+					oauthActivation,
 					production,
 					external,
 				].entries()) {
@@ -235,6 +238,25 @@ describe.skipIf(!existsSync(fixturePath))(
 			);
 		}
 
+		async function writerCommand(project: Binding, ...args: string[]) {
+			const script = fileURLToPath(
+				new URL("../../scripts/project-engine-writer.mjs", import.meta.url),
+			);
+			const { stdout } = await execute(process.execPath, [script, ...args], {
+				cwd: new URL("../../", import.meta.url),
+				env: {
+					...process.env,
+					DATABASE_URL: url,
+					ALLAUTH_PROJECT_ENGINE_INTERNAL_ID: project.id,
+					ALLAUTH_PROJECT_ENGINE_INTERNAL_PREPARE_REVISION: "0",
+					ALLAUTH_PROJECT_ENGINE_AGENT_BRIDGE_ID: "",
+					ALLAUTH_PROJECT_ENGINE_AGENT_REPLAY_APPROVAL: "",
+					ALLAUTH_PROJECT_ENGINE_ENCRYPTED_SAML_APPROVAL: "",
+				},
+			});
+			return JSON.parse(stdout) as ProjectEngineWriterState;
+		}
+
 		it("checks webhook policy again under the operator's activation lock", async () => {
 			const project = webhookActivation;
 			await seedWebhook(writerPool(project));
@@ -250,44 +272,59 @@ describe.skipIf(!existsSync(fixturePath))(
 				eligible,
 			);
 
-			const script = fileURLToPath(
-				new URL("../../scripts/project-engine-writer.mjs", import.meta.url),
-			);
-			const writerCommand = (...args: string[]) =>
-				execute(process.execPath, [script, ...args], {
-					cwd: new URL("../../", import.meta.url),
-					env: {
-						...process.env,
-						DATABASE_URL: url,
-						ALLAUTH_PROJECT_ENGINE_INTERNAL_ID: project.id,
-						ALLAUTH_PROJECT_ENGINE_INTERNAL_PREPARE_REVISION: "0",
-						ALLAUTH_PROJECT_ENGINE_AGENT_BRIDGE_ID: "",
-						ALLAUTH_PROJECT_ENGINE_AGENT_REPLAY_APPROVAL: "",
-						ALLAUTH_PROJECT_ENGINE_ENCRYPTED_SAML_APPROVAL: "",
-					},
-				});
-
 			await policy.update(project.id, 1, defaultAuthPolicy, "fixture");
 			await expect(
-				writerCommand("switch", "legacy", "0", "allauth"),
+				writerCommand(project, "switch", "legacy", "0", "allauth"),
 			).rejects.toThrow(/configured webhooks/);
 			await expect(fence(project).read()).resolves.toEqual(legacy);
 			await policy.update(project.id, 2, eligible, "fixture");
-			expect(
-				JSON.parse(
-					(await writerCommand("switch", "legacy", "0", "allauth")).stdout,
-				),
-			).toEqual({
+			await expect(
+				writerCommand(project, "switch", "legacy", "0", "allauth"),
+			).resolves.toEqual({
 				writer: "allauth",
 				revision: 1,
 			});
-			expect(
-				JSON.parse(
-					(await writerCommand("switch", "allauth", "1", "legacy")).stdout,
-				),
-			).toEqual({
+			await expect(
+				writerCommand(project, "switch", "allauth", "1", "legacy"),
+			).resolves.toEqual({
 				writer: "legacy",
 				revision: 2,
+			});
+		});
+
+		it("checks stored OAuth grants again under the operator's activation lock", async () => {
+			const project = oauthActivation;
+			const native = writerPool(project, legacy);
+			const clientId = "fixture-connected-app";
+			await native.query(
+				`INSERT INTO "oauthClient"(id,"clientId","redirectUris","grantTypes")
+				 VALUES ($1,$1,'["https://writer.fixture.example/callback"]','["authorization_code","refresh_token"]')`,
+				[clientId],
+			);
+			await assertProjectOAuthGrantAdmission(database, project.schemaName);
+			await expect(fence(project).read()).resolves.toEqual(legacy);
+
+			await fence(project).run("legacy", () =>
+				native.query(
+					`UPDATE "oauthClient" SET "grantTypes"='["authorization_code","client_credentials"]' WHERE "clientId"=$1`,
+					[clientId],
+				),
+			);
+			await expect(
+				writerCommand(project, "switch", "legacy", "0", "allauth"),
+			).rejects.toThrow(/OAuth client grants/);
+			await expect(fence(project).read()).resolves.toEqual(legacy);
+
+			await fence(project).run("legacy", () =>
+				native.query(
+					`UPDATE "oauthClient" SET "grantTypes"='["authorization_code","refresh_token"]' WHERE "clientId"=$1`,
+					[clientId],
+				),
+			);
+			await writerCommand(project, "switch", "legacy", "0", "allauth");
+			await expect(fence(project).read()).resolves.toEqual({
+				writer: "allauth",
+				revision: 1,
 			});
 		});
 

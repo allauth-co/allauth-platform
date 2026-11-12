@@ -71,6 +71,7 @@ COPY --from=build-input --chown=node:node /app/apps/auth/public ./public
 COPY --from=build-input --chown=node:node /app/apps/auth/migrations ./migrations
 COPY --from=build-input --chown=node:node /app/apps/auth/scripts/database.mjs ./scripts/database.mjs
 COPY --from=build-input --chown=node:node /app/apps/auth/scripts/project-engine-writer.mjs ./scripts/project-engine-writer.mjs
+COPY --from=build-input --chown=node:node /app/apps/auth/scripts/project-engine-oauth-grant-admission.mjs ./scripts/project-engine-oauth-grant-admission.mjs
 COPY --from=build-input --chown=node:node /app/apps/auth/scripts/project-engine-saml-approval.mjs ./scripts/project-engine-saml-approval.mjs
 COPY --from=build-input --chown=node:node /app/apps/auth/scripts/project-engine-webhook-admission.mjs ./scripts/project-engine-webhook-admission.mjs
 COPY --from=build-input --chown=node:node /app/apps/auth/scripts/project-agent-replay-evidence.mjs ./scripts/project-agent-replay-evidence.mjs
