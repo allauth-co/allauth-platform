@@ -132,9 +132,16 @@ export function createProjectEngineWriterLease(options: Options) {
 			protected: boolean;
 			writer: string;
 			revision: number;
+			webhookGuardReady: boolean;
 		}>(
 			`SELECT p.id, p."schemaName", p."workspaceId", p.environment, w.protected,
-			 COALESCE(f.writer,'legacy') AS writer, COALESCE(f.revision,0) AS revision
+			 COALESCE(f.writer,'legacy') AS writer, COALESCE(f.revision,0) AS revision,
+			 CASE WHEN f.writer='allauth' THEN EXISTS (
+			   SELECT 1 FROM pg_catalog.pg_trigger t
+			   WHERE t.tgrelid=pg_catalog.to_regclass(pg_catalog.format('%I.%I',p."schemaName",'allauthWebhookEndpoint'))
+			     AND t.tgname='allauth_project_engine_writer' AND t.tgenabled IN ('O','A')
+			     AND t.tgfoid=pg_catalog.to_regprocedure('public.allauth_guard_project_engine_write()')
+			 ) ELSE TRUE END AS "webhookGuardReady"
 			 FROM public."allauthProject" p
 			 JOIN public."allauthWorkspace" w ON w.id=p."workspaceId"
 			 LEFT JOIN public."allauthProjectEngineWriter" f ON f."projectId"=p.id
@@ -151,6 +158,11 @@ export function createProjectEngineWriterLease(options: Options) {
 			binding.protected !== true
 		)
 			throw scopeFailure();
+		if (!binding.webhookGuardReady)
+			throw failure(
+				"ALLAUTH_PROJECT_WRITER_GUARD_MISSING",
+				"The active project writer is missing its webhook endpoint guard.",
+			);
 		return state.parse({ writer: binding.writer, revision: binding.revision });
 	}
 

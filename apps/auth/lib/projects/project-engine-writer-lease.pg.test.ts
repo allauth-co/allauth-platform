@@ -1,6 +1,17 @@
 import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import {
+	copyFileSync,
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	rmSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
@@ -18,6 +29,7 @@ const fixturePath = new URL(
 );
 const execute = promisify(execFile);
 const modeFile = "019-project-engine-writer.sql";
+const webhookModeFile = "020-project-webhook-writer.sql";
 const legacy: ProjectEngineWriterState = { writer: "legacy", revision: 0 };
 const scopeError = { code: "ALLAUTH_PROJECT_WRITER_SCOPE_FORBIDDEN" };
 const mismatch = { code: "ALLAUTH_PROJECT_WRITER_MISMATCH" };
@@ -52,6 +64,7 @@ describe.skipIf(!existsSync(fixturePath))(
 		const alpha = realm();
 		const beta = realm();
 		const gamma = realm();
+		const upgrade = realm();
 		const production = realm("production");
 		const externalWorkspace = randomUUID();
 		const external = realm("development", externalWorkspace);
@@ -75,15 +88,26 @@ describe.skipIf(!existsSync(fixturePath))(
 			return createdPool;
 		}
 
-		async function migrate() {
-			await execute(process.execPath, ["scripts/database.mjs", "migrate"], {
-				cwd: new URL("../../", import.meta.url),
+		async function migrate(
+			cwd: string | URL = new URL("../../", import.meta.url),
+		) {
+			const script = fileURLToPath(
+				new URL("../../scripts/database.mjs", import.meta.url),
+			);
+			await execute(process.execPath, [script, "migrate"], {
+				cwd,
 				env: {
 					...process.env,
 					DATABASE_URL: url,
 					ALLAUTH_DEPLOYMENT_MODE: "self-hosted",
 				},
 			});
+		}
+
+		async function seedWebhook(connection: Pool) {
+			await connection.query(
+				`INSERT INTO "allauthWebhookEndpoint"(id,url,"eventTypes","encryptedSecret") VALUES ('fixture-endpoint','https://webhook.fixture.example/events','["mfa.*"]','fixture-encrypted-secret')`,
+			);
 		}
 
 		beforeAll(async () => {
@@ -107,30 +131,59 @@ describe.skipIf(!existsSync(fixturePath))(
 			database = pool("allauth-writer-fixture-observer");
 			leases = pool("allauth-writer-fixture-leases");
 			operator = pool("allauth-writer-fixture-operator");
-			await migrate();
-			await database.query(
-				`INSERT INTO public."allauthWorkspace"(id,name,slug,protected) VALUES ($1,'External','writer-external',false)`,
-				[externalWorkspace],
-			);
-			for (const [index, project] of [
-				alpha,
-				beta,
-				gamma,
-				production,
-				external,
-			].entries()) {
-				await database.query(`CREATE SCHEMA "${project.schemaName}"`);
+			const priorRelease = mkdtempSync(join(tmpdir(), "allauth-writer-019-"));
+			try {
+				const priorMigrations = join(priorRelease, "migrations");
+				const migrations = new URL("../../migrations/", import.meta.url);
+				mkdirSync(priorMigrations);
+				for (const name of readdirSync(migrations))
+					if (name.endsWith(".sql") && name <= modeFile)
+						copyFileSync(
+							new URL(name, migrations),
+							join(priorMigrations, name),
+						);
+				await migrate(priorRelease);
 				await database.query(
-					`INSERT INTO public."allauthProject" (id,name,slug,"schemaName","primaryOrigin","brokerClientId","brokerSecret","proxyVersion","createdBy","applicationId",environment,"workspaceId") VALUES ($1,'Writer fixture',$2,$3,'https://writer.fixture.example','fixture','fixture',$4,'fixture',$1,$5,$6)`,
-					[
-						project.id,
-						`writer-fixture-${index}`,
-						project.schemaName,
-						randomUUID(),
-						project.environment,
-						project.workspaceId,
-					],
+					`INSERT INTO public."allauthWorkspace"(id,name,slug,protected) VALUES ($1,'External','writer-external',false)`,
+					[externalWorkspace],
 				);
+				for (const [index, project] of [
+					alpha,
+					beta,
+					gamma,
+					upgrade,
+					production,
+					external,
+				].entries()) {
+					await database.query(`CREATE SCHEMA "${project.schemaName}"`);
+					await database.query(
+						`INSERT INTO public."allauthProject" (id,name,slug,"schemaName","primaryOrigin","brokerClientId","brokerSecret","proxyVersion","createdBy","applicationId",environment,"workspaceId") VALUES ($1,'Writer fixture',$2,$3,'https://writer.fixture.example','fixture','fixture',$4,'fixture',$1,$5,$6)`,
+						[
+							project.id,
+							`writer-fixture-${index}`,
+							project.schemaName,
+							randomUUID(),
+							project.environment,
+							project.workspaceId,
+						],
+					);
+				}
+				await migrate(priorRelease);
+				const old = writerPool(upgrade);
+				await seedWebhook(old);
+				await expect(fence(upgrade).switch(legacy, "allauth")).resolves.toEqual(
+					{ writer: "allauth", revision: 1 },
+				);
+				const guard = await database.query<{ exists: boolean }>(
+					`SELECT EXISTS (SELECT 1 FROM pg_trigger WHERE tgrelid=to_regclass($1) AND tgname='allauth_project_engine_writer') AS exists`,
+					[`${upgrade.schemaName}."allauthWebhookEndpoint"`],
+				);
+				expect(guard.rows).toEqual([{ exists: false }]);
+				await expect(fence(upgrade).read()).rejects.toMatchObject({
+					code: "ALLAUTH_PROJECT_WRITER_GUARD_MISSING",
+				});
+			} finally {
+				rmSync(priorRelease, { recursive: true, force: true });
 			}
 			await migrate();
 		}, 20_000);
@@ -204,19 +257,19 @@ describe.skipIf(!existsSync(fixturePath))(
 		}
 
 		it("applies a checksum-tracked public migration and keeps untouched realms on legacy", async () => {
-			const checksum = createHash("sha256")
-				.update(
-					readFileSync(
-						new URL(`../../migrations/${modeFile}`, import.meta.url),
-					),
-				)
-				.digest("hex");
-			for (const namespace of ["public", alpha.schemaName]) {
-				const applied = await database.query<{ checksum: string }>(
-					`SELECT checksum FROM "${namespace}"."allauthMigrations" WHERE name=$1`,
-					[modeFile],
-				);
-				expect(applied.rows).toEqual([{ checksum }]);
+			for (const file of [modeFile, webhookModeFile]) {
+				const checksum = createHash("sha256")
+					.update(
+						readFileSync(new URL(`../../migrations/${file}`, import.meta.url)),
+					)
+					.digest("hex");
+				for (const namespace of ["public", alpha.schemaName]) {
+					const applied = await database.query<{ checksum: string }>(
+						`SELECT checksum FROM "${namespace}"."allauthMigrations" WHERE name=$1`,
+						[file],
+					);
+					expect(applied.rows).toEqual([{ checksum }]);
+				}
 			}
 			const localTable = await database.query<{ exists: boolean }>(
 				"SELECT to_regclass($1) IS NOT NULL AS exists",
@@ -230,6 +283,44 @@ describe.skipIf(!existsSync(fixturePath))(
 			await expect(
 				fence(alpha).run("allauth", async () => {}),
 			).rejects.toMatchObject(mismatch);
+		});
+
+		it("upgrades the endpoint fence on an already active realm and keeps the delivery worker independent", async () => {
+			const native = writerPool(upgrade);
+			const owned = { writer: "allauth", revision: 1 } as const;
+			const current = writerPool(upgrade, owned);
+			const rotate = `UPDATE "allauthWebhookEndpoint" SET "encryptedSecret"='fixture-rotated-secret' WHERE id='fixture-endpoint'`;
+			await expect(native.query(rotate)).rejects.toMatchObject(staleWrite);
+			await expect(
+				writerPool(upgrade, owned, alpha.id).query(rotate),
+			).rejects.toMatchObject(staleWrite);
+			await expect(current.query(rotate)).resolves.toMatchObject({
+				rowCount: 1,
+			});
+			await native.query(
+				`INSERT INTO "allauthWebhookDelivery" (id,"endpointId","eventId","eventType",payload) VALUES ('fixture-delivery','fixture-endpoint','fixture-event','mfa.verified','{}')`,
+			);
+			await expect(
+				native.query(
+					`UPDATE "allauthWebhookDelivery" SET status='delivered' WHERE id='fixture-delivery'`,
+				),
+			).resolves.toMatchObject({ rowCount: 1 });
+			const rollback = await fence(upgrade).switch(owned, "legacy");
+			expect(rollback).toEqual({ writer: "legacy", revision: 2 });
+			const remove = `DELETE FROM "allauthWebhookEndpoint" WHERE id='fixture-endpoint'`;
+			await expect(current.query(remove)).rejects.toMatchObject(staleWrite);
+			const saved = await native.query(
+				`SELECT "encryptedSecret","eventTypes" FROM "allauthWebhookEndpoint" WHERE id='fixture-endpoint'`,
+			);
+			expect(saved.rows).toEqual([
+				{ encryptedSecret: "fixture-rotated-secret", eventTypes: ["mfa.*"] },
+			]);
+			await expect(
+				writerPool(upgrade, rollback).query(remove),
+			).resolves.toMatchObject({ rowCount: 1 });
+			await expect(
+				native.query(`SELECT id FROM "allauthWebhookDelivery"`),
+			).resolves.toMatchObject({ rowCount: 0 });
 		});
 
 		it("rejects wrong-realm, production, unprotected and missing registry bindings", async () => {
@@ -298,6 +389,7 @@ describe.skipIf(!existsSync(fixturePath))(
 					`DELETE FROM "member" WHERE id='fixture-member'`,
 					`DELETE FROM "scimManagedCredential" WHERE id='fixture-credential'`,
 					`DELETE FROM "allauthSecurityCounter" WHERE key='fixture-counter'`,
+					`DELETE FROM "allauthWebhookEndpoint" WHERE id='fixture-endpoint'`,
 				])
 					await expect(old.query(query)).rejects.toMatchObject(staleWrite);
 				await expect(
@@ -308,6 +400,7 @@ describe.skipIf(!existsSync(fixturePath))(
 					staleWrite,
 				);
 				const current = writerPool(alpha, owned);
+				await seedWebhook(current);
 				await expect(current.query(updateAccount)).resolves.toMatchObject({
 					rowCount: 1,
 				});

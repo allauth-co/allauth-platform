@@ -241,9 +241,11 @@ it("rejects readiness when either verified transport loses the exact internal re
 		environment: "development",
 	};
 	const selected = { ...environment, ALLAUTH_PROJECT_ENGINE_INTERNAL_ID: id };
-	const database = {
-		query: vi.fn(async () => ({ rows: [{ slug: internal.slug }] })),
-	} as unknown as Pick<Pool, "query">;
+	const query = vi.fn(async () => ({ rows: [{ slug: internal.slug, webhookGuardInstalled: true }] }));
+	const database = { query } as unknown as Pick<Pool, "query">;
+	query.mockResolvedValueOnce({ rows: [{ slug: internal.slug, webhookGuardInstalled: false }] });
+	await expect(verifyInternalProjectEngineReadiness(database, selected))
+		.rejects.toThrow("The project webhook writer migration is unavailable.");
 	const hostname = "fixture-app-accounts.allauth.co";
 	fixture.getProject.mockReset().mockResolvedValue(internal);
 	fixture.resolveHostedBinding.mockResolvedValueOnce({
