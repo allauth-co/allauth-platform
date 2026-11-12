@@ -1,11 +1,12 @@
 import { execFile } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHmac, randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { runWithAdapter } from "@better-auth/core/context";
 import { hash } from "bcryptjs";
 import { APIError } from "better-auth";
+import { symmetricEncrypt } from "better-auth/crypto";
 import { admin } from "better-auth/plugins";
 import { getTestInstance } from "better-auth/test";
 import { Kysely, PostgresDialect } from "kysely";
@@ -15,7 +16,10 @@ import { defaultAuthPolicy } from "../auth-policy/policy";
 import { clerkCompatiblePasswords } from "../clerk-password";
 import type { AuthEnvironment } from "../configuration";
 import { allauthControl } from "../control";
-import type { ControlPrincipal } from "../control/types";
+import type { ControlDatabase, ControlPrincipal } from "../control/types";
+import { newWebhookSigningSecret } from "../control/webhook-contract";
+import type { ControlWebhookEnvelope } from "../control/webhooks";
+import { deliverPendingWebhooks } from "../control/webhooks";
 import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
 import { createWorkspace } from "../workspaces/repository";
 import { projectManagement } from "./management-plugin";
@@ -594,6 +598,147 @@ describe.skipIf(!existsSync(fixturePath))(
 				[rootId],
 			);
 			expect((await send("owned", candidateBody)).status).toBe(403);
+		});
+
+		it("delivers the same signed Clerk import event and bounded request User-Agent through both HTTP writers", async () => {
+			const signedIn = await root.handler(
+				request("/api/auth/sign-in/email", { email: rootEmail, password }),
+			);
+			expect(signedIn.status).toBe(200);
+			const session = signedIn.headers
+				.getSetCookie()
+				.map((entry) => entry.split(";", 1)[0])
+				.join("; ");
+			const scopedStorage = (await legacy.$context).options.database;
+			if (
+				!scopedStorage ||
+				typeof scopedStorage !== "object" ||
+				!("db" in scopedStorage)
+			)
+				throw new Error(
+					"The isolated Clerk project database is required for delivery.",
+				);
+			const scope = `"${project.schemaName}"`;
+			const endpoint = randomUUID();
+			const signingSecret = newWebhookSigningSecret();
+			const secret = projectSecret(env, project.id);
+			const destinationURL = "https://clerk-webhook.fixture.example/events";
+			const userAgent = `Clerk migration fixture ${"a".repeat(512)}`;
+			const expectedUserAgent = userAgent.slice(0, 512);
+			await database.query(
+				`INSERT INTO ${scope}."allauthWebhookEndpoint" (id,url,"eventTypes","encryptedSecret") VALUES ($1,$2,'["admin.*"]',$3)`,
+				[
+					endpoint,
+					destinationURL,
+					await symmetricEncrypt({ key: secret, data: signingSecret }),
+				],
+			);
+			try {
+				const imported = new Map<string, ReturnType<typeof importUser>>();
+				for (const [writer, dispatch, rollback] of [
+					["native", legacy.handler, owned.dispatch],
+					["allauth", owned.dispatch, legacy.handler],
+				] as const) {
+					const user = importUser(
+						`signed-clerk-${writer}`,
+						passwordHash,
+						`signed-clerk-provider-${writer}`,
+					);
+					const makeRequest = () => {
+						const incoming = request(
+							path + ownedClerkImportPath,
+							{ sourceInstance, dryRun: false, users: [user] },
+							session,
+						);
+						incoming.headers.set("user-agent", userAgent);
+						return incoming;
+					};
+					const response = await dispatch(makeRequest());
+					expect(response.status).toBe(200);
+					const result = (await response.json()) as {
+						created: number;
+						users: { userId: string }[];
+					};
+					expect(result.created).toBe(1);
+					const id = result.users[0]!.userId;
+					imported.set(id, user);
+					const replay = await rollback(makeRequest());
+					expect(replay.status).toBe(200);
+					expect(await replay.json()).toMatchObject({
+						existing: 1,
+						users: [{ userId: id, status: "existing" }],
+					});
+				}
+				const delivered: { body: string; headers: Record<string, string> }[] =
+					[];
+				expect(
+					await deliverPendingWebhooks({
+						database: scopedStorage.db as ControlDatabase,
+						secret,
+						resolver: async () => [{ address: "93.184.216.34", family: 4 }],
+						now: () => new Date(Date.now() + 2_000),
+						async transport({ destination, body, headers }) {
+							expect(destination.url.href).toBe(destinationURL);
+							delivered.push({ body, headers });
+							return 204;
+						},
+					}),
+				).toEqual({ claimed: 2, delivered: 2, retried: 0, failed: 0 });
+				for (const { body, headers } of delivered) {
+					const hmac = createHmac(
+						"sha256",
+						Buffer.from(signingSecret.slice(6), "base64"),
+					)
+						.update(
+							`${headers["webhook-id"]}.${headers["webhook-timestamp"]}.${body}`,
+						)
+						.digest("base64");
+					expect(headers["webhook-signature"]).toBe(`v1,${hmac}`);
+					const envelope = JSON.parse(body) as ControlWebhookEnvelope;
+					const { id, createdAt, userId } = envelope.data.event;
+					const user = imported.get(userId!);
+					expect(user).toBeDefined();
+					expect(envelope).toEqual({
+						id,
+						timestamp: createdAt,
+						type: "admin.clerk-import",
+						data: {
+							event: {
+								id,
+								createdAt,
+								type: "admin.clerk-import",
+								outcome: "success",
+								actorId: rootId,
+								userId,
+								targetId: userId,
+								userAgent: expectedUserAgent,
+								metadata: {
+									path: ownedClerkImportPath,
+									signal: "clerk-import",
+									version: 1,
+								},
+							},
+						},
+					});
+					for (const sensitive of [
+						password,
+						passwordHash,
+						signingSecret,
+						session,
+						sourceInstance,
+						user!.email,
+						user!.socialAccounts[0]!.subject,
+					])
+						expect(body).not.toContain(sensitive);
+					imported.delete(userId!);
+				}
+				expect(imported.size).toBe(0);
+			} finally {
+				await database.query(
+					`DELETE FROM ${scope}."allauthWebhookEndpoint" WHERE id=$1`,
+					[endpoint],
+				);
+			}
 		});
 	},
 );

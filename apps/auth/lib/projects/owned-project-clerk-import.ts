@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import type { PoolClient } from "pg";
 import type { ControlPrincipal } from "../control/types";
 import type {
@@ -78,7 +77,6 @@ async function writeUser(
 	userId: string,
 	sourceInstance: string,
 	fingerprint: string,
-	actorId: string,
 ) {
 	const now = new Date();
 	const createdAt = user.createdAt ? new Date(user.createdAt) : now;
@@ -135,12 +133,6 @@ async function writeUser(
 			[id, account.subject, account.provider, userId, createdAt, updatedAt],
 		);
 	}
-	await client.query(
-		`INSERT INTO "allauthEvent" (id,type,outcome,"actorId","userId","targetId","createdAt",metadata)
-		 VALUES ($1,'admin.clerk-import','success',$2,$3,$3,statement_timestamp(),
-		  jsonb_build_object('path',$4::text,'signal','clerk-import','version',1))`,
-		[randomUUID(), actorId, userId, ownedClerkImportPath],
-	);
 }
 
 const forbidden = () =>
@@ -193,6 +185,7 @@ export function createOwnedProjectClerkImport(options: {
 			);
 
 		const { dryRun, sourceInstance, users } = parsed.data;
+		const userAgent = request.headers.get("user-agent") ?? undefined;
 		const results: ImportResult[] = [];
 		const seenEmails = new Set<string>();
 		const seenProviders = new Set<string>();
@@ -258,14 +251,20 @@ export function createOwnedProjectClerkImport(options: {
 							? result("existing")
 							: result("conflict", status);
 					if (dryRun) return result("would_create");
-					await writeUser(
-						client,
-						user,
+					await writeUser(client, user, userId, sourceInstance, fingerprint);
+					await store.recordEvent(client, {
+						type: "admin.clerk-import",
+						outcome: "success",
+						actorId: actor.user.id,
 						userId,
-						sourceInstance,
-						fingerprint,
-						actor.user.id,
-					);
+						targetId: userId,
+						userAgent,
+						metadata: {
+							path: ownedClerkImportPath,
+							signal: "clerk-import",
+							version: 1,
+						},
+					});
 					return result("created");
 				});
 			} catch {
