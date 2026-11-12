@@ -79,6 +79,16 @@ export function hostedSdkReturnPath(value: string | undefined) {
 	return "/account";
 }
 
+/** Preserve the hosted success URL and the legacy verifier's extra error URL decode. */
+export function hostedMagicLinkCallbacks(destination: string, origin: string) {
+	const error = new URL("/auth-error", origin);
+	error.searchParams.set("callbackUrl", destination);
+	return {
+		callbackURL: new URL(destination, origin).href,
+		errorCallbackURL: error.href.replaceAll("%", "%25"),
+	};
+}
+
 function hostedOAuthRequest(
 	view: HostedSdkView,
 	params: HostedSdkSearchParams,

@@ -13,6 +13,7 @@ import {
 	organization,
 } from "better-auth/plugins";
 import { getTestInstance } from "better-auth/test";
+import { createLocalJWKSet, jwtVerify } from "jose";
 import { Kysely, PostgresDialect } from "kysely";
 import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
@@ -220,6 +221,40 @@ describe.skipIf(!existsSync(fixture))(
 		let rotatedAuthSigningKey: ReturnType<typeof createOwnedProjectEngine>;
 		let rootCookie: string;
 		let created = false;
+
+		function installedNative(
+			policy = defaultAuthPolicy,
+			authorizeAdmin = readRoot,
+		) {
+			const options = createAuthOptions(
+				{ db: projectDatabase, type: "postgres", transaction: true },
+				{
+					ALLAUTH_AUTH_URL: origin,
+					ALLAUTH_AUTH_SECRET: alpha.secret,
+					AUTH_RUNTIME: "node",
+					SCIM_CREDENTIAL_HASH_SECRET: "synthetic-webhook-mutation-fixture-key",
+					EMAIL_PROVIDER: "cloudflare",
+					CLOUDFLARE_ACCOUNT_ID: "",
+					CLOUDFLARE_EMAIL_API_TOKEN: "",
+				},
+				{
+					name: "Webhook project fixture",
+					basePath: alpha.path,
+					cookiePrefix: `allauth_project_${alpha.slug}`,
+					primaryOrigin: origin,
+					publicOrigin: origin,
+					origins: [],
+					broker: {
+						clientId: "fixture-broker",
+						clientSecret: "synthetic-broker-secret",
+					},
+					authorizeAdmin,
+					management: { id: "webhook-project-fixture" },
+				},
+				policy,
+			);
+			return betterAuth({ ...options, logger: { disabled: true } });
+		}
 
 		async function readRoot(
 			headers: Headers,
@@ -612,6 +647,266 @@ describe.skipIf(!existsSync(fixture))(
 				);
 				await database.query(`DELETE FROM ${realm}.verification WHERE id=$1`, [
 					grantId,
+				]);
+			}
+		});
+
+		it("preserves signed console revocation and logout for the selected session's connected apps", async () => {
+			const path = "/control/revoke-session";
+			const realm = `"${alpha.schemaName}"`;
+			const logoutURL = "https://console-logout.fixture.example/backchannel";
+			const hasWorkspaceAuthority = async (headers: Headers) => {
+				const actor = await readRoot(headers);
+				if (!actor) return null;
+				const membership = await database.query(
+					`SELECT 1 FROM public."allauthWorkspaceMember" WHERE "workspaceId"=$1 AND "userId"=$2 AND role='owner'`,
+					[alpha.workspaceId, actor.user.id],
+				);
+				return membership.rowCount ? actor : null;
+			};
+			const installed = installedNative(
+				defaultAuthPolicy,
+				hasWorkspaceAuthority,
+			);
+			async function exercise(writer: "legacy" | "owned") {
+				const target = await browserSession(eventEmail);
+				const sibling = await browserSession(eventEmail);
+				const foreign = await browserSession(userEmail);
+				const clientId = randomUUID();
+				const siblingClientId = randomUUID();
+				const delivered: string[] = [];
+				const grants = [
+					{
+						sessionId: target.id,
+						userId: eventUserId,
+						clientId,
+						scopes: ["openid"],
+						table: "oauthAccessToken",
+					},
+					{
+						sessionId: target.id,
+						userId: eventUserId,
+						clientId,
+						scopes: ["openid"],
+						table: "oauthRefreshToken",
+					},
+					{
+						sessionId: target.id,
+						userId: eventUserId,
+						clientId,
+						scopes: ["openid", "offline_access"],
+						table: "oauthRefreshToken",
+					},
+					{
+						sessionId: sibling.id,
+						userId: eventUserId,
+						clientId: siblingClientId,
+						scopes: ["openid", "offline_access"],
+						table: "oauthRefreshToken",
+					},
+					{
+						sessionId: foreign.id,
+						userId,
+						clientId,
+						scopes: ["openid", "offline_access"],
+						table: "oauthRefreshToken",
+					},
+				];
+				const subscription = await endpoint(
+					"legacy",
+					`console-revoke-${writer}`,
+					["session.deleted"],
+				);
+				const verifyDelivery = async (url: string, body: URLSearchParams) => {
+					expect(url).toBe(logoutURL);
+					expect(
+						(
+							await database.query(
+								`SELECT id FROM ${realm}.session WHERE id=$1`,
+								[target.id],
+							)
+						).rowCount,
+					).toBe(0);
+					const token = body.get("logout_token");
+					if (!token)
+						throw new Error("Expected a signed connected-app logout.");
+					delivered.push(token);
+				};
+				const candidate = createOwnedProjectEngine({
+					database,
+					project: alpha,
+					baseURL: origin,
+					basePath: alpha.path,
+					signingSecret: alpha.secret,
+					policy: defaultAuthPolicy,
+					trustedOrigins: [],
+					trustedIP: () => "192.0.2.127",
+					adminDeletion: {
+						id: alpha.id,
+						workspaceId: alpha.workspaceId,
+						platformOrigin: origin,
+						readWorkspacePrincipal: readRoot,
+					},
+					backchannelLogout: {
+						async post(url, body) {
+							await verifyDelivery(url.href, body);
+							return 204;
+						},
+					},
+				});
+				const fetch = vi
+					.spyOn(globalThis, "fetch")
+					.mockImplementation(async (input, init) => {
+						if (!(init?.body instanceof URLSearchParams))
+							throw new Error("Unexpected fixture transport.");
+						await verifyDelivery(String(input), init.body);
+						return new Response(null, { status: 204 });
+					});
+				const revoke = (cookie = rootCookie) => {
+					const input = request(
+						`${alpha.path}${path}`,
+						{ id: target.id },
+						cookie,
+					);
+					input.headers.set("x-real-ip", "192.0.2.127");
+					return writer === "legacy"
+						? installed.handler(input)
+						: candidate.dispatch(input);
+				};
+				const grantOwners = async () =>
+					(
+						await database.query<{ userId: string }>(
+							`SELECT "userId" FROM ${realm}."oauthAccessToken" WHERE "clientId"=$1
+					 UNION ALL SELECT "userId" FROM ${realm}."oauthRefreshToken" WHERE "clientId"=ANY($2::text[])`,
+							[clientId, [clientId, siblingClientId]],
+						)
+					).rows.map((row) => row.userId);
+				try {
+					for (const id of [clientId, siblingClientId])
+						await database.query(
+							`INSERT INTO ${realm}."oauthClient" (id,"clientId","redirectUris","backchannelLogoutUri") VALUES ($1,$1,'[]',$2)`,
+							[id, logoutURL],
+						);
+					for (const grant of grants)
+						await database.query(
+							`INSERT INTO ${realm}."${grant.table}" (id,token,"sessionId","userId","clientId","expiresAt","createdAt",scopes) VALUES ($1,$1,$2,$3,$4,now()+interval '1 day',now(),$5)`,
+							[
+								randomUUID(),
+								grant.sessionId,
+								grant.userId,
+								grant.clientId,
+								JSON.stringify(grant.scopes),
+							],
+						);
+					expect((await revoke(foreign.cookie)).status).toBe(403);
+					await database.query(
+						`UPDATE public."allauthWorkspaceMember" SET role='member' WHERE "workspaceId"=$1 AND "userId"=$2`,
+						[alpha.workspaceId, rootId],
+					);
+					expect((await revoke()).status).toBe(403);
+					expect(await grantOwners()).toHaveLength(grants.length);
+					expect(
+						(await deliveries("legacy", subscription.endpoint.id)).total,
+					).toBe(0);
+					expect(delivered).toEqual([]);
+					await database.query(
+						`UPDATE public."allauthWorkspaceMember" SET role='owner' WHERE "workspaceId"=$1 AND "userId"=$2`,
+						[alpha.workspaceId, rootId],
+					);
+					if (writer === "owned") {
+						const withoutTransport = await send("owned", path, {
+							id: target.id,
+						});
+						expect(withoutTransport.status).toBe(501);
+						expect(await grantOwners()).toHaveLength(grants.length);
+						expect(
+							(await deliveries("legacy", subscription.endpoint.id)).total,
+						).toBe(0);
+					}
+					const revoked = await revoke();
+					expect(revoked.status).toBe(200);
+					expect(await revoked.json()).toEqual({ success: true });
+					expect(await grantOwners()).toEqual([userId]);
+					const { rows } = await database.query<{ id: string }>(
+						`SELECT id FROM ${realm}.session WHERE id=ANY($1::text[]) ORDER BY id`,
+						[[target.id, sibling.id, foreign.id]],
+					);
+					expect(rows.map(({ id }) => id)).toEqual(
+						[sibling.id, foreign.id].sort(),
+					);
+					expect((await revoke()).status).toBe(404);
+					expect(delivered).toHaveLength(1);
+					const jwks = await installed.handler(request(`${alpha.path}/jwks`));
+					const { payload } = await jwtVerify(
+						delivered[0]!,
+						createLocalJWKSet(await jwks.json()),
+						{
+							issuer: `${origin}${alpha.path}`,
+							audience: clientId,
+							typ: "logout+jwt",
+						},
+					);
+					expect(payload).toMatchObject({ sub: eventUserId, sid: target.id });
+					return await signedEvents(
+						subscription,
+						[
+							eventEmail,
+							target.token,
+							sibling.token,
+							foreign.token,
+							delivered[0]!,
+						],
+						new Map([[target.id, "selected"]]),
+					);
+				} finally {
+					fetch.mockRestore();
+					await database.query(
+						`UPDATE public."allauthWorkspaceMember" SET role='owner' WHERE "workspaceId"=$1 AND "userId"=$2`,
+						[alpha.workspaceId, rootId],
+					);
+					await database.query(
+						`DELETE FROM ${realm}."oauthClient" WHERE id=ANY($1::text[])`,
+						[[clientId, siblingClientId]],
+					);
+					await database.query(
+						`DELETE FROM ${realm}.session WHERE id=ANY($1::text[])`,
+						[[target.id, sibling.id, foreign.id]],
+					);
+					expect(
+						(
+							await send("legacy", `${base}/delete`, {
+								id: subscription.endpoint.id,
+							})
+						).status,
+					).toBe(200);
+				}
+			}
+			const secondOwner = randomUUID();
+			await database.query(
+				`INSERT INTO public."user" (id,name,email,"emailVerified") VALUES ($1,'Second fixture owner',$2,true)`,
+				[secondOwner, `${secondOwner}@fixture.example`],
+			);
+			await database.query(
+				`INSERT INTO public."allauthWorkspaceMember" (id,"workspaceId","userId",role) VALUES ($1,$2,$3,'owner')`,
+				[randomUUID(), alpha.workspaceId, secondOwner],
+			);
+			try {
+				const native = await exercise("legacy");
+				expect(native).toEqual([
+					{
+						event: {
+							type: "session.deleted",
+							outcome: "success",
+							userId: eventUserId,
+							targetId: "selected",
+							metadata: { path },
+						},
+					},
+				]);
+				expect(await exercise("owned")).toEqual(native);
+			} finally {
+				await database.query(`DELETE FROM public."user" WHERE id=$1`, [
+					secondOwner,
 				]);
 			}
 		});
@@ -1576,11 +1871,26 @@ describe.skipIf(!existsSync(fixture))(
 		});
 
 		it.each([
-			true,
-			false,
-		])("delivers the native session deletion on password sign-in with active browser cookie %s", async (hasActiveCookie) => {
-			const path = "/sign-in/email";
+			["email", true, "192.0.2.123"],
+			["email", false, "192.0.2.124"],
+			["username", true, "192.0.2.125"],
+			["username", false, "192.0.2.126"],
+		] as const)("delivers the native session deletion on %s sign-in with active browser cookie %s", async (identifier, hasActiveCookie, ip) => {
+			const path = `/sign-in/${identifier}`;
 			const schema = `"${alpha.schemaName}"`;
+			const foreignSchema = `"${beta.schemaName}"`;
+			const installed = installedNative();
+			const candidate = createOwnedProjectEngine({
+				database,
+				project: alpha,
+				baseURL: origin,
+				basePath: alpha.path,
+				signingSecret: alpha.secret,
+				policy: defaultAuthPolicy,
+				trustedOrigins: [],
+				trustedIP: () => ip,
+			});
+			const username = "fixture_webhook_event_user";
 			async function exercise(writer: "legacy" | "owned") {
 				const active = await browserSession(userEmail);
 				const previous = await browserSession(eventEmail);
@@ -1589,19 +1899,60 @@ describe.skipIf(!existsSync(fixture))(
 				expect(previous.deviceCookie).toBeTruthy();
 				const subscription = await endpoint(
 					"legacy",
-					`re-sign-in-${hasActiveCookie}-${writer}`,
+					`re-sign-in-${identifier}-${hasActiveCookie}-${writer}`,
 					["session.deleted"],
+				);
+				const clientId = randomUUID();
+				const foreignOwner = randomUUID();
+				const grants = ["access", "online", "offline", "unrelated"].map(
+					(kind) => ({ kind, id: randomUUID() }),
 				);
 				const sessionIds = [active.id, previous.id, otherBrowser.id];
 				try {
+					await database.query(
+						`INSERT INTO ${foreignSchema}."user" (id,name,email,"emailVerified") VALUES ($1,'Fixture',$2,true)`,
+						[foreignOwner, eventEmail],
+					);
+					await database.query(
+						`INSERT INTO ${foreignSchema}.session (id,token,"userId","expiresAt","updatedAt") VALUES ($1,$2,$3,now()+interval '1 day',now())`,
+						[previous.id, previous.token, foreignOwner],
+					);
+					await database.query(
+						`INSERT INTO ${schema}."oauthClient" (id,"clientId","redirectUris") VALUES ($1,$1,'[]')`,
+						[clientId],
+					);
+					for (const { kind, id } of grants) {
+						const table =
+							kind === "access" ? "oauthAccessToken" : "oauthRefreshToken";
+						await database.query(
+							`INSERT INTO ${schema}."${table}" (id,token,"sessionId","userId","clientId","expiresAt","createdAt",scopes) VALUES ($1,$1,$2,$3,$4,now()+interval '1 day',now(),$5)`,
+							[
+								id,
+								kind === "unrelated" ? otherBrowser.id : previous.id,
+								eventUserId,
+								clientId,
+								JSON.stringify(
+									kind === "offline"
+										? ["openid", "offline_access"]
+										: ["openid"],
+								),
+							],
+						);
+					}
 					const incoming = [active.deviceCookie, previous.deviceCookie];
 					if (hasActiveCookie) incoming.unshift(active.cookie);
-					const signedIn = await send(
-						writer,
-						path,
-						{ email: eventEmail, password },
+					const input = request(
+						`${alpha.path}${path}`,
+						{
+							[identifier]: identifier === "email" ? eventEmail : username,
+							password,
+						},
 						incoming.join("; "),
 					);
+					input.headers.set("x-real-ip", ip);
+					const signedIn = await (writer === "legacy"
+						? installed.handler(input)
+						: candidate.dispatch(input));
 					expect(signedIn.status).toBe(200);
 					const cookies = signedIn.headers.getSetCookie();
 					const primaryName = active.cookie.split("=", 1)[0];
@@ -1635,6 +1986,30 @@ describe.skipIf(!existsSync(fixture))(
 					expect(rows.map(({ id }) => id)).toEqual(
 						[active.id, otherBrowser.id, replacement.id].sort(),
 					);
+					expect(
+						(
+							await database.query(
+								`SELECT id FROM ${foreignSchema}.session WHERE id=$1 AND token=$2`,
+								[previous.id, previous.token],
+							)
+						).rows,
+					).toEqual([{ id: previous.id }]);
+					const grantState = await database.query<{
+						id: string;
+						revoked: boolean;
+						sessionId: string | null;
+					}>(
+						`SELECT id,revoked IS NOT NULL AS revoked,"sessionId" FROM ${schema}."oauthAccessToken" WHERE "clientId"=$1
+						 UNION ALL SELECT id,revoked IS NOT NULL AS revoked,"sessionId" FROM ${schema}."oauthRefreshToken" WHERE "clientId"=$1`,
+						[clientId],
+					);
+					expect(grantState.rows).toHaveLength(grants.length);
+					for (const { kind, id } of grants)
+						expect(grantState.rows.find((row) => row.id === id)).toEqual({
+							id,
+							revoked: kind === "access" || kind === "online",
+							sessionId: kind === "unrelated" ? otherBrowser.id : null,
+						});
 					return await signedEvents(
 						subscription,
 						[
@@ -1645,10 +2020,19 @@ describe.skipIf(!existsSync(fixture))(
 							previous.token,
 							otherBrowser.token,
 							replacement.token,
+							...grants.map(({ id }) => id),
 						],
 						new Map([[previous.id, "replaced-device"]]),
 					);
 				} finally {
+					await database.query(
+						`DELETE FROM ${foreignSchema}."user" WHERE id=$1`,
+						[foreignOwner],
+					);
+					await database.query(
+						`DELETE FROM ${schema}."oauthClient" WHERE id=$1`,
+						[clientId],
+					);
 					await database.query(
 						`DELETE FROM ${schema}.session WHERE id=ANY($1::text[])`,
 						[sessionIds],
@@ -1662,57 +2046,40 @@ describe.skipIf(!existsSync(fixture))(
 					).toBe(200);
 				}
 			}
-			const native = await exercise("legacy");
-			expect(native).toEqual([
-				{
-					event: {
-						type: "session.deleted",
-						outcome: "success",
-						...(hasActiveCookie ? { actorId: userId } : {}),
-						userId: eventUserId,
-						targetId: "replaced-device",
-						metadata: { path },
+			if (identifier === "username")
+				await database.query(
+					`UPDATE ${schema}."user" SET username=$2 WHERE id=$1`,
+					[eventUserId, username],
+				);
+			try {
+				const native = await exercise("legacy");
+				expect(native).toEqual([
+					{
+						event: {
+							type: "session.deleted",
+							outcome: "success",
+							...(hasActiveCookie ? { actorId: userId } : {}),
+							userId: eventUserId,
+							targetId: "replaced-device",
+							metadata: { path },
+						},
 					},
-				},
-			]);
-			expect(await exercise("owned")).toEqual(native);
+				]);
+				expect(await exercise("owned")).toEqual(native);
+			} finally {
+				if (identifier === "username")
+					await database.query(
+						`UPDATE ${schema}."user" SET username=NULL WHERE id=$1`,
+						[eventUserId],
+					);
+			}
 		});
 
 		it("delivers the native guest deletion events on sign-in to an existing account", async () => {
 			const path = "/sign-in/email";
 			const ip = "192.0.2.122";
 			const policy = { ...defaultAuthPolicy, requireEmailVerification: false };
-			const legacyOptions = createAuthOptions(
-				{ db: projectDatabase, type: "postgres", transaction: true },
-				{
-					ALLAUTH_AUTH_URL: origin,
-					ALLAUTH_AUTH_SECRET: alpha.secret,
-					AUTH_RUNTIME: "node",
-					SCIM_CREDENTIAL_HASH_SECRET: "synthetic-guest-upgrade-fixture-key",
-					EMAIL_PROVIDER: "cloudflare",
-					CLOUDFLARE_ACCOUNT_ID: "",
-					CLOUDFLARE_EMAIL_API_TOKEN: "",
-				},
-				{
-					name: "Webhook guest fixture",
-					basePath: alpha.path,
-					cookiePrefix: `allauth_project_${alpha.slug}`,
-					primaryOrigin: origin,
-					publicOrigin: origin,
-					origins: [],
-					broker: {
-						clientId: "fixture-broker",
-						clientSecret: "synthetic-broker-secret",
-					},
-					authorizeAdmin: readRoot,
-					management: { id: "guest-upgrade-fixture" },
-				},
-				policy,
-			);
-			const installed = betterAuth({
-				...legacyOptions,
-				logger: { disabled: true },
-			});
+			const installed = installedNative(policy);
 			const candidate = createOwnedProjectEngine({
 				database,
 				project: alpha,

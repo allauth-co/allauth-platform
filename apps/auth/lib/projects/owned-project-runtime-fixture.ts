@@ -14,6 +14,7 @@ import { PATCH as consoleUserMetadata } from "../../app/api/admin/users/[userId]
 import { GET as consoleUser } from "../../app/api/admin/users/[userId]/route";
 import { GET as consoleUsers } from "../../app/api/admin/users/route";
 import * as hosted from "../../app/api/auth/[...all]/route";
+import * as hostedSdk from "../../app/api/auth/hosted-ui/[...all]/route";
 import { GET as config } from "../../app/api/config/route";
 import { GET as health } from "../../app/api/health/route";
 import { POST as rotateDirectory } from "../../app/api/organizations/[organizationId]/scim/[connectionId]/rotate/route";
@@ -23,6 +24,7 @@ import { GET as brokerLogin } from "../../app/oauth/login/route";
 import { authOrigin } from "../configuration";
 import { resolveHostedBinding } from "../domains/hosting";
 import { readProjectAppleProvider } from "../project-providers/apple";
+import { legacyProjectPlatformAuthority } from "./legacy-project-platform-authority";
 import { createOwnedProjectRuntimeCandidate } from "./owned-project-runtime-factory";
 import { runtimeProviderFixtureFetch } from "./owned-project-runtime-provider-fixture";
 import type { ProjectEncryptedSamlFixtureAdmission } from "./owned-project-sso-saml-fixture-admission";
@@ -171,6 +173,10 @@ async function dispatch(request: Request) {
 		if (request.method === "POST") return projectAuth.POST(request, context);
 		if (request.method === "PATCH") return projectAuth.PATCH(request, context);
 	}
+	if (path.startsWith("/api/auth/hosted-ui/")) {
+		if (request.method === "GET") return hostedSdk.GET(request);
+		if (request.method === "POST") return hostedSdk.POST(request);
+	}
 	if (path.startsWith("/api/auth/")) {
 		if (request.method === "GET") return hosted.GET(request);
 		if (request.method === "POST") return hosted.POST(request);
@@ -263,6 +269,7 @@ async function boot(selection: ProjectRuntimeFixtureBoot) {
 					project,
 					policy,
 					env,
+					platformAuthority: legacyProjectPlatformAuthority,
 					transport:
 						basePath === "/api/auth"
 							? { kind: "hosted", origin: baseURL }

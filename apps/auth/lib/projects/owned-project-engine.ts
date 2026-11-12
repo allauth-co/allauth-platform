@@ -755,7 +755,7 @@ export function createOwnedProjectEngine(
 		}
 		if (owned.length) {
 			let actorId: string | null | undefined;
-			if (path === "/sign-in/email") {
+			if (path === "/sign-in/email" || path === "/sign-in/username") {
 				// The legacy anonymous-session hook reads the incoming browser session before multi-session cleanup.
 				const browserToken = tokenFrom(request.headers);
 				const browser = browserToken
@@ -2689,6 +2689,7 @@ export function createOwnedProjectEngine(
 			basePath: options.basePath,
 			trustedIP: options.trustedIP,
 			readBody: requestBody,
+			backchannelLogout: backchannel,
 			async readProjectSession(headers) {
 				if (!trustedRequest(headers, false)) return null;
 				const current = await currentSession(headers);

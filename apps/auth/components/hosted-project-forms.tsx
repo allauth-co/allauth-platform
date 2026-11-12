@@ -2,6 +2,7 @@
 
 import { useEffect, useId, useRef, useState } from "react";
 import type { CSSProperties, FormEvent, ReactNode } from "react";
+import { hostedMagicLinkCallbacks } from "@/lib/domains/hosted-sdk-policy";
 import { brandForeground, brandLinkColor } from "@/sdk/branding";
 import { appCallback, authError, proxyBasePath } from "@/sdk/helpers";
 import { useAllAuth, withAuthReturnTo } from "@/sdk/react";
@@ -285,12 +286,7 @@ export function HostedProjectEmail({
 			const result = isLink
 				? await request("sign-in/magic-link", {
 						email: email.trim(),
-						callbackURL: appCallback(destination, window.location.origin),
-						// The legacy verifier decodes the parsed error URL once more.
-						errorCallbackURL: appCallback(
-							`/auth-error?${new URLSearchParams({ callbackUrl: destination })}`,
-							window.location.origin,
-						).replaceAll("%", "%25"),
+						...hostedMagicLinkCallbacks(destination, window.location.origin),
 					})
 				: await request("email-otp/send-verification-otp", {
 						email: email.trim(),

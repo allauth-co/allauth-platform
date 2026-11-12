@@ -179,6 +179,9 @@ export function selectProjectEngine(
 		const { createOwnedProjectRuntimeCandidate } = await import(
 			"./owned-project-runtime-factory"
 		);
+		const { legacyProjectPlatformAuthority } = await import(
+			"./legacy-project-platform-authority"
+		);
 		const { readProjectEncryptedSamlApproval } = await import(
 			"./owned-project-sso-saml-approval"
 		);
@@ -188,6 +191,7 @@ export function selectProjectEngine(
 			project,
 			policy,
 			env,
+			platformAuthority: legacyProjectPlatformAuthority,
 			transport: hosted
 				? { kind: "hosted", origin: baseURL }
 				: { kind: "direct" },

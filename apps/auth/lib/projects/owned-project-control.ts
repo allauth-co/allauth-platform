@@ -32,7 +32,11 @@ import {
 	accountLinkJson,
 } from "./owned-project-account-links";
 import { lockOwnedProjectWorkspaceAdministrator } from "./owned-project-admin-authority";
-import { createProjectEngineStore } from "./owned-project-engine-store";
+import type { ProjectBackchannelTarget } from "./owned-project-backchannel-logout";
+import {
+	createProjectEngineStore,
+	projectBackchannelTargetsSql,
+} from "./owned-project-engine-store";
 import { admitOwnedProjectNativeRoute } from "./owned-project-native-admission";
 import type { Project } from "./registry";
 import { checkedProjectSchema } from "./validation";
@@ -63,6 +67,9 @@ export function createOwnedProjectControl(options: {
 	readBody(request: Request): Promise<unknown>;
 	readWorkspacePrincipal(headers: Headers): Promise<ControlPrincipal | null>;
 	readProjectSession(headers: Headers): Promise<ProjectControlSession | null>;
+	backchannelLogout?(
+		targets: readonly ProjectBackchannelTarget[],
+	): Promise<void>;
 }) {
 	const { project } = options;
 	const schema = checkedProjectSchema(project.schemaName);
@@ -145,6 +152,7 @@ export function createOwnedProjectControl(options: {
 		request: Request,
 		principal: ControlPrincipal,
 		id: string,
+		logoutTargets: ProjectBackchannelTarget[],
 	) {
 		const absent = () =>
 			accountLinkError(404, "NOT_FOUND", "This session no longer exists.");
@@ -160,6 +168,21 @@ export function createOwnedProjectControl(options: {
 				transaction,
 			);
 		if (!user.rows.length) return absent();
+		const locked =
+			await sql`SELECT id FROM session WHERE id=${id} AND "userId"=${userId} FOR UPDATE`.execute(
+				transaction,
+			);
+		if (!locked.rows.length) return absent();
+		const { rows: targets } =
+			await transaction.executeQuery<ProjectBackchannelTarget>(
+				CompiledQuery.raw(projectBackchannelTargetsSql, [[id]]),
+			);
+		if (targets.length && !options.backchannelLogout)
+			return accountLinkError(
+				501,
+				"ALLAUTH_AUTH_OPERATION_UNSUPPORTED",
+				"This authentication operation is unavailable in this realm.",
+			);
 		const removed =
 			await sql`DELETE FROM session WHERE id=${id} AND "userId"=${userId}
 			RETURNING id`.execute(transaction);
@@ -186,6 +209,7 @@ export function createOwnedProjectControl(options: {
 			        ${ipAddress ?? null},${userAgent ?? null},statement_timestamp(),'{}'::jsonb)`.execute(
 			transaction,
 		);
+		logoutTargets.push(...targets);
 		return accountLinkJson({ success: true });
 	}
 
@@ -258,75 +282,86 @@ export function createOwnedProjectControl(options: {
 				return accountLinkError(401, "UNAUTHORIZED", "Sign in to continue.");
 		}
 
-		return database.transaction().execute(async (transaction) => {
-			await sql`SET LOCAL search_path TO ${sql.id(schema)}`.execute(
-				transaction,
-			);
-			if (workspacePrincipal) {
-				if (
-					!(await lockOwnedProjectWorkspaceAdministrator(
-						{
-							query: (text, values) =>
-								transaction.executeQuery(CompiledQuery.raw(text, values)),
-						},
-						project,
-						workspacePrincipal,
-					))
-				)
-					return forbidden();
-				if (target?.success)
-					return revokeSession(
-						transaction,
-						request,
-						workspacePrincipal,
-						target.data.id,
-					);
-			} else if (projectSession) {
-				const denied = await checkProjectScope(
+		const logoutTargets: ProjectBackchannelTarget[] = [];
+		const response = await database
+			.transaction()
+			.execute(async (transaction) => {
+				await sql`SET LOCAL search_path TO ${sql.id(schema)}`.execute(
 					transaction,
-					projectSession,
-					filters,
 				);
-				if (denied) return denied;
-			}
+				if (workspacePrincipal) {
+					if (
+						!(await lockOwnedProjectWorkspaceAdministrator(
+							{
+								query: (text, values) =>
+									transaction.executeQuery(CompiledQuery.raw(text, values)),
+							},
+							project,
+							workspacePrincipal,
+						))
+					)
+						return forbidden();
+					if (target?.success)
+						return revokeSession(
+							transaction,
+							request,
+							workspacePrincipal,
+							target.data.id,
+							logoutTargets,
+						);
+				} else if (projectSession) {
+					const denied = await checkProjectScope(
+						transaction,
+						projectSession,
+						filters,
+					);
+					if (denied) return denied;
+				}
 
-			if (path === "/control/sessions")
-				return accountLinkJson(
-					await queryControlSessions(undefined, transaction, filters),
-				);
-			const {
-				rows: [policy],
-			} = await sql<{ policy: unknown }>`
+				if (path === "/control/sessions")
+					return accountLinkJson(
+						await queryControlSessions(undefined, transaction, filters),
+					);
+				const {
+					rows: [policy],
+				} = await sql<{ policy: unknown }>`
 				SELECT policy FROM "allauthSecurityPolicy" WHERE id='default'
 			`.execute(transaction);
-			const retention = policy
-				? securityPolicySchema.parse(policy.policy).logRetentionDays
-				: defaultSecurityPolicy.logRetentionDays;
-			if (path === "/control/overview")
-				return accountLinkJson(
-					await queryControlOverview(undefined, transaction, retention),
-				);
-			if (path === "/control/events")
-				return accountLinkJson(
-					await queryControlEvents(undefined, transaction, filters, retention),
-				);
-			const detail = path === "/control/logs/detail";
-			const logs = await queryControlLogs(
-				undefined,
-				transaction,
-				detail
-					? { ...parsed?.data, ...filters, limit: 1, offset: 0 }
-					: { ...parsed?.data, ...filters },
-				retention,
-			);
-			if (!detail) return accountLinkJson(logs);
-			return logs.events[0]
-				? accountLinkJson({ event: logs.events[0] })
-				: accountLinkError(
-						404,
-						"NOT_FOUND",
-						"This log entry is unavailable in this scope or outside retention.",
+				const retention = policy
+					? securityPolicySchema.parse(policy.policy).logRetentionDays
+					: defaultSecurityPolicy.logRetentionDays;
+				if (path === "/control/overview")
+					return accountLinkJson(
+						await queryControlOverview(undefined, transaction, retention),
 					);
-		});
+				if (path === "/control/events")
+					return accountLinkJson(
+						await queryControlEvents(
+							undefined,
+							transaction,
+							filters,
+							retention,
+						),
+					);
+				const detail = path === "/control/logs/detail";
+				const logs = await queryControlLogs(
+					undefined,
+					transaction,
+					detail
+						? { ...parsed?.data, ...filters, limit: 1, offset: 0 }
+						: { ...parsed?.data, ...filters },
+					retention,
+				);
+				if (!detail) return accountLinkJson(logs);
+				return logs.events[0]
+					? accountLinkJson({ event: logs.events[0] })
+					: accountLinkError(
+							404,
+							"NOT_FOUND",
+							"This log entry is unavailable in this scope or outside retention.",
+						);
+			});
+		await options.backchannelLogout?.(logoutTargets);
+		return response;
 	};
 }

@@ -4,9 +4,11 @@ import type { AuthPolicy } from "../auth-policy/policy";
 import { authPolicySchema } from "../auth-policy/policy";
 import { validAvatarPath } from "../avatars/protocol";
 import type { ApplicationBranding } from "../branding/types";
+import { hostedMagicLinkCallbacks } from "../domains/hosted-sdk-policy";
 import { authenticationEmail } from "../email/authentication";
 import type { EmailEnvironment } from "../email/send";
 import { emailConfigured, sendAuthEmail } from "../email/send";
+import type { OwnedEmailCallbackPolicy } from "./owned-project-email-callback";
 import type { OwnedProjectEmailAliases } from "./owned-project-email-aliases";
 import { scheduleOwnedEmailDelivery } from "./owned-project-email-delivery";
 import type { ProjectEmailOtpVerificationOperation } from "./owned-project-email-otp-verification";
@@ -26,6 +28,10 @@ const magicInput = z.object({
 	newUserCallbackURL: callback,
 	errorCallbackURL: callback,
 });
+type MagicCallbackInput = Pick<
+	z.infer<typeof magicInput>,
+	"callbackURL" | "newUserCallbackURL" | "errorCallbackURL"
+>;
 const otpSend = z.object({
 	email,
 	type: z.enum([
@@ -59,6 +65,7 @@ export interface OwnedProjectEmailSignInOptions {
 	publicLinkBaseURL: string;
 	trustedOrigins: readonly string[];
 	callbackURLs: readonly string[];
+	hostedCallbackPolicy?: OwnedEmailCallbackPolicy;
 	email: { environment: EmailEnvironment; branding?: ApplicationBranding };
 	/** Meter trusted ingress before any challenge mutation or delivery. */
 	admit(
@@ -197,6 +204,70 @@ export function createOwnedProjectEmailSignIn(
 		return url && approved.includes(url.href) ? url : null;
 	}
 
+	function selectHostedMagicCallbacks(
+		input: MagicCallbackInput,
+		phase: "issue" | "consume",
+	) {
+		if (
+			!options.hostedCallbackPolicy ||
+			options.basePath !== "/api/auth" ||
+			!input.callbackURL ||
+			!input.errorCallbackURL ||
+			input.newUserCallbackURL !== undefined ||
+			input.callbackURL.startsWith("//") ||
+			/[\\\u0000-\u0020\u007f]/.test(input.callbackURL)
+		)
+			return null;
+		try {
+			const target = new URL(input.callbackURL, origin);
+			const checked = options.hostedCallbackPolicy(target, "verification", phase);
+			if (!checked) return null;
+			const error = normalizeURL(
+				decodeURIComponent(input.errorCallbackURL),
+				origin,
+			);
+			if (error?.origin !== origin || error.pathname !== "/auth-error")
+				return null;
+			// The standard form uses a bare error URL. The hosted form carries the
+			// same checked destination in both callback fields.
+			const wire = error.search
+				? hostedMagicLinkCallbacks(`${target.pathname}${target.search}${target.hash}`, origin)
+				: { callbackURL: target.href, errorCallbackURL: error.href };
+			if (error.search && input.errorCallbackURL !== wire.errorCallbackURL)
+				return null;
+			if (checked.expiredContinuation && error.search)
+				error.searchParams.set("callbackUrl", checked.url.pathname);
+			return { destination: checked.url, created: checked.url, error, wire };
+		} catch {
+			return null;
+		}
+	}
+
+	function magicCallbacks(
+		input: MagicCallbackInput,
+		caller: string,
+		phase: "issue" | "consume",
+	) {
+		const hosted = selectHostedMagicCallbacks(input, phase);
+		if (hosted) return hosted;
+		const destination = selectCallback(input.callbackURL, caller);
+		if (!destination) return null;
+		const created = selectCallback(
+			input.newUserCallbackURL,
+			caller,
+			destination.href,
+		);
+		const error = selectCallback(input.errorCallbackURL, caller, destination.href);
+		return created && error
+			? {
+					destination,
+					created,
+					error,
+					wire: { callbackURL: destination.href, errorCallbackURL: error.href },
+				}
+			: null;
+	}
+
 	async function schedule(
 		operation: "sign-in/magic-link" | "email-otp/send-verification-otp",
 		prepare: () => Promise<(() => Promise<void>) | null>,
@@ -258,19 +329,8 @@ export function createOwnedProjectEmailSignIn(
 		if (!parsed.success)
 			return failure(400, "INVALID_BODY", "Supply a valid email address.");
 		const body = parsed.data;
-		const destination = selectCallback(body.callbackURL, caller);
-		if (!destination) return forbidden();
-		const created = selectCallback(
-			body.newUserCallbackURL,
-			caller,
-			destination.href,
-		);
-		const error = selectCallback(
-			body.errorCallbackURL,
-			caller,
-			destination.href,
-		);
-		if (!created || !error) return forbidden();
+		const callbacks = magicCallbacks(body, caller, "issue");
+		if (!callbacks) return forbidden();
 		const identity = await resolveEmail(body.email);
 		if (!identity) return invalidAlias();
 		const limited = await admission(request, "sign-in/magic-link", identity.email);
@@ -280,11 +340,11 @@ export function createOwnedProjectEmailSignIn(
 			if (!token) return null;
 			const url = new URL(`${linkPath}/magic-link/verify`, linkOrigin);
 			url.searchParams.set("token", token);
-			url.searchParams.set("callbackURL", destination.href);
+			url.searchParams.set("callbackURL", callbacks.wire.callbackURL);
 			if (body.newUserCallbackURL)
-				url.searchParams.set("newUserCallbackURL", created.href);
+				url.searchParams.set("newUserCallbackURL", callbacks.created.href);
 			if (body.errorCallbackURL)
-				url.searchParams.set("errorCallbackURL", error.href);
+				url.searchParams.set("errorCallbackURL", callbacks.wire.errorCallbackURL);
 			return () =>
 				sendAuthEmail(options.email.environment, {
 					to: identity.email,
@@ -356,19 +416,13 @@ export function createOwnedProjectEmailSignIn(
 		const callbackURL = url.searchParams.get("callbackURL") ?? undefined;
 		const newUserCallback =
 			url.searchParams.get("newUserCallbackURL") ?? undefined;
-		const destination = selectCallback(callbackURL, linkOrigin);
-		if (!destination) return forbidden();
-		const created = selectCallback(
-			newUserCallback,
-			linkOrigin,
-			destination.href,
-		);
-		const error = selectCallback(
-			url.searchParams.get("errorCallbackURL") ?? undefined,
-			linkOrigin,
-			destination.href,
-		);
-		if (!created || !error) return forbidden();
+		const callbacks = magicCallbacks({
+			callbackURL,
+			newUserCallbackURL: newUserCallback,
+			errorCallbackURL: url.searchParams.get("errorCallbackURL") ?? undefined,
+		}, linkOrigin, "consume");
+		if (!callbacks) return forbidden();
+		const { destination, created, error } = callbacks;
 		const limited = await admission(request, "magic-link/verify");
 		if (limited) return limited;
 		const token = url.searchParams.get("token") ?? "";

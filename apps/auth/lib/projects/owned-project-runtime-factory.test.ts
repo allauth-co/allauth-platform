@@ -36,6 +36,10 @@ describe("internal candidate feature admission", () => {
 					database,
 					project,
 					policy: defaultAuthPolicy,
+					platformAuthority: {
+						readPrincipal: async () => null,
+						verifyBrokerFactor: async () => new Response(null, { status: 403 }),
+					},
 					env: {
 						ALLAUTH_AUTH_URL: "https://platform.alias-fixture.example",
 						EMAIL_PROVIDER: "resend",

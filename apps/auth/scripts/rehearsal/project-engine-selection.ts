@@ -3,6 +3,7 @@ import { APIError } from "better-auth";
 import { after } from "next/server";
 import type { AuthEnvironment } from "@/lib/configuration";
 import { setting } from "@/lib/configuration";
+import { legacyProjectPlatformAuthority } from "@/lib/projects/legacy-project-platform-authority";
 import { createOwnedProjectRuntimeCandidate } from "@/lib/projects/owned-project-runtime-factory";
 import type { Project } from "@/lib/projects/registry";
 import { projectRegistryPool } from "@/lib/projects/registry";
@@ -89,6 +90,7 @@ export async function selectRehearsalProjectEngine(
 			project,
 			policy,
 			env: environment,
+			platformAuthority: legacyProjectPlatformAuthority,
 			transport: hosted
 				? { kind: "hosted", origin: baseURL }
 				: { kind: "direct" },

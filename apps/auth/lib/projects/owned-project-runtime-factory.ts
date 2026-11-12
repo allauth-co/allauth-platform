@@ -1,6 +1,5 @@
 import type { Pool } from "pg";
 import { assertProjectOAuthGrantAdmission } from "../../scripts/project-engine-oauth-grant-admission.mjs";
-import { withAuth, withAuthEngine } from "../auth";
 import type { AuthEngine } from "../auth-engine";
 import type { AuthPolicy } from "../auth-policy/policy";
 import { readAuthPolicy } from "../auth-policy/storage";
@@ -53,11 +52,11 @@ import {
 } from "../project-providers/repository";
 import { projectAdministrator } from "../workspaces/authorization";
 import { backendCredentialRepository } from "./backend-credentials";
-import { projectBrokerTwoFactor } from "./broker-two-factor";
 import { readLegacyProjectKeyring } from "./legacy-project-keyring";
 import { assertOwnedProjectAgentAdmission } from "./owned-project-agent-admission";
 import { createOwnedEmailVerification } from "./owned-email-verification";
 import { createOwnedProjectAppleDeletion } from "./owned-project-apple-deletion";
+import type { ProjectBrokerFactor } from "./owned-project-broker-mfa";
 import { createOwnedProjectApplicationConsole } from "./owned-project-application-console";
 import { createOwnedProjectEmailCallbackPolicy } from "./owned-project-email-callback";
 import { createOwnedProjectEngine } from "./owned-project-engine";
@@ -96,11 +95,22 @@ import { checkedProjectSchema, projectOrigin, projectSlug } from "./validation";
 
 type EngineOptions = Parameters<typeof createOwnedProjectEngine>[0];
 type TrustedTransport = { kind: "direct" } | { kind: "hosted"; origin: string };
+export interface ProjectPlatformAuthority {
+	readPrincipal: AuthEngine["readPrincipal"];
+	verifyBrokerFactor(
+		request: Request,
+		project: Project,
+		platformOrigin: string,
+		factor: ProjectBrokerFactor,
+	): Promise<Response>;
+}
+
 type Options = {
 	database: Pool;
 	project: Project;
 	policy: AuthPolicy;
 	env: AuthEnvironment;
+	platformAuthority: ProjectPlatformAuthority;
 	/** Routing has already verified the project and the hosted binding when present. */
 	transport: TrustedTransport;
 	signingSecret: string;
@@ -368,7 +378,7 @@ async function readSupportedProviders(
 }
 
 function projectSupport(options: Options, platformOrigin: string) {
-	const { project, env } = options;
+	const { project, env, platformAuthority } = options;
 	async function currentBinding() {
 		const current = await getProject(project.slug, env);
 		return current.id === project.id &&
@@ -405,9 +415,7 @@ function projectSupport(options: Options, platformOrigin: string) {
 		async authorizePlatformRequest(request) {
 			const current = await currentBinding();
 			if (!current || request.headers.has("authorization")) return null;
-			const principal = await withAuthEngine((root) =>
-				root.readPrincipal(request.headers),
-			);
+			const principal = await platformAuthority.readPrincipal(request.headers);
 			return projectAdministrator(current, principal, env);
 		},
 		async authorizeStoredActor(principal) {
@@ -600,7 +608,7 @@ export async function createOwnedProjectRuntimeCandidate(options: Options) {
 		configured: apple,
 	});
 	const readWorkspacePrincipal = (headers: Headers) =>
-		withAuthEngine((root) => root.readPrincipal(headers));
+		options.platformAuthority.readPrincipal(headers);
 	const manageOrganizationConsole = createOwnedProjectOrganizationConsole({
 		database,
 		project,
@@ -711,8 +719,8 @@ export async function createOwnedProjectRuntimeCandidate(options: Options) {
 			return {
 				request: verified,
 				verify: (factor) =>
-					withAuth((root) =>
-						projectBrokerTwoFactor(verified, current, root, platform, factor),
+					options.platformAuthority.verifyBrokerFactor(
+						verified, current, platform, factor,
 					),
 			};
 		},
@@ -771,6 +779,7 @@ export async function createOwnedProjectRuntimeCandidate(options: Options) {
 		emailSignIn: {
 			publicLinkBaseURL: linkBase,
 			callbackURLs: [...callbackURLs, `${browserOrigin}/sign-in`],
+			...(hosted && { hostedCallbackPolicy: callbackPolicy }),
 			email,
 			admit,
 			defer,

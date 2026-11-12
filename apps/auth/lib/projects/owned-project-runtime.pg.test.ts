@@ -389,6 +389,7 @@ async function openProcess(
 			async request(
 				path: string,
 				options: {
+					accept?: string;
 					cookie?: string;
 					body?: Record<string, unknown> | URLSearchParams;
 					host?: string;
@@ -403,6 +404,7 @@ async function openProcess(
 					? `https://${options.host}`
 					: platformOrigin;
 				const headers = new Headers({ origin: options.origin ?? origin });
+				if (options.accept) headers.set("accept", options.accept);
 				if (options.cookie) headers.set("cookie", options.cookie);
 				if (options.authorization)
 					headers.set("authorization", options.authorization);
@@ -2043,6 +2045,32 @@ describe.skipIf(!existsSync(fixture))(
 					`/api/admin/users?project=${project.slug}&search=${credentials.project.id}&limit=1`;
 				const userPath = (project: Project, metadata = false) =>
 					`/api/admin/users/${credentials.project.id}${metadata ? "/metadata" : ""}?project=${project.slug}`;
+				const consoleUserErrors = async (
+					writer: Awaited<ReturnType<typeof openProcess>>,
+				) => {
+					const requests = await Promise.all([
+						writer.request(usersPath(alpha)),
+						writer.request(
+							`/api/admin/users/missing-console-user?project=${alpha.slug}`,
+							{ cookie: rootCookie },
+						),
+						writer.request("/api/admin/users?project=missing-console-project", {
+							cookie: rootCookie,
+						}),
+						writer.request(userPath(alpha, true), {
+							cookie: rootCookie,
+							origin: alpha.primaryOrigin,
+							method: "PATCH",
+							body: { publicMetadata: {} },
+						}),
+					]);
+					return Promise.all(
+						requests.map(async (response) => ({
+							status: response.status,
+							body: await response.json(),
+						})),
+					);
+				};
 				const nativePublicMetadata = { consoleLabel: "legacy writer" };
 				const ownedPublicMetadata = { consoleLabel: "AllAuth writer" };
 				const ownedPrivateMetadata = {
@@ -2380,6 +2408,13 @@ describe.skipIf(!existsSync(fixture))(
 						})
 					).status,
 				).toBe(200);
+				const nativeConsoleUserErrors = await consoleUserErrors(service);
+				expect(nativeConsoleUserErrors).toEqual([
+					{ status: 401, body: { error: "The request is not permitted." } },
+					{ status: 404, body: { error: "The request is not permitted." } },
+					{ status: 404, body: { error: "Project not found." } },
+					{ status: 403, body: { error: "A same-origin request is required." } },
+				]);
 				const nativeDirectKey = await runtimeCreateApiKey(
 					service,
 					{ prefix: alphaPath, cookie: legacyCookie },
@@ -2965,6 +3000,7 @@ describe.skipIf(!existsSync(fixture))(
 				const userDirectory = await service.request(usersPath(alpha), {
 					cookie: rootCookie,
 				});
+				expect(await consoleUserErrors(service)).toEqual(nativeConsoleUserErrors);
 				expect(userDirectory.status, await userDirectory.clone().text()).toBe(
 					200,
 				);
@@ -5968,6 +6004,117 @@ describe.skipIf(!existsSync(fixture))(
 				}
 			}
 		}, 90_000);
+
+		it("delivers hosted magic links with exact returns across verified accounts domains and rollback", async () => {
+			const local: { container: string; DATABASE_URL: string } = JSON.parse(
+				readFileSync(fixture, "utf8"),
+			);
+			const base = new URL(local.DATABASE_URL);
+			if (local.container !== "allauth-production-test-20261007" ||
+				base.hostname !== "127.0.0.1" || base.port !== "55445")
+				throw new Error("Hosted magic links require the isolated PostgreSQL fixture.");
+			const admin = new Pool({ connectionString: base.href, max: 1 });
+			const name = `allauth_hosted_${randomUUID().replaceAll("-", "")}`;
+			const databaseURL = new URL(`/${name}`, base).href;
+			let created = false;
+			let database: Pool | undefined;
+			let service: Awaited<ReturnType<typeof openProcess>> | undefined;
+			try {
+				await admin.query(`CREATE DATABASE "${name}"`);
+				created = true;
+				const { alpha } = await seed(databaseURL);
+				database = new Pool({ connectionString: databaseURL, max: 1 });
+				const managedHost = `${alpha.slug}-accounts.allauth.co`;
+				const domain = "runtime-hosted-magic-link-fixture.net";
+				const customHost = `accounts.${domain}`;
+				const pair = randomUUID();
+				await database.query(
+					`INSERT INTO public."allauthDomainPair" (id,"projectId",domain) VALUES ($1,$2,$3)`,
+					[pair, alpha.id, domain],
+				);
+				await database.query(
+					`INSERT INTO public."allauthCustomHostname"
+					 (id,"pairId","projectId",kind,hostname,"proofToken","ownershipVerifiedAt","providerStatus","sslStatus","routingVerifiedAt")
+					 VALUES ($1,$2,$3,'accounts',$4,'fixture-domain-proof',now(),'active','active',now()),
+					        ($5,$2,$3,'frontend-api',$6,'fixture-domain-proof',now(),'active','active',now())`,
+					[randomUUID(), pair, alpha.id, customHost, randomUUID(), `api.${domain}`],
+				);
+				const rollout = {
+					ALLAUTH_PROJECT_HOSTED_UI_PROJECT_IDS: alpha.id,
+					EMAIL_FROM: "magic-links@runtime.fixture.example",
+				};
+				service = await openProcess(databaseURL, alpha, true, alpha.slug, undefined, undefined, rollout);
+				async function issue(host: string, destination: string, email: string, standard = false) {
+					const origin = `https://${host}`;
+					const error = new URL("/auth-error", origin);
+					if (!standard) error.searchParams.set("callbackUrl", destination);
+					const previous = service!.mail.length;
+					const path = standard ? "/api/auth/sign-in/magic-link" : "/api/auth/hosted-ui/sign-in/magic-link";
+					const response = await service!.request(path, {
+						host,
+						accept: "application/json",
+						body: {
+							email,
+							callbackURL: new URL(destination, origin).href,
+							errorCallbackURL: error.href.replaceAll("%", "%25"),
+						},
+					});
+					expect(response.status, await response.clone().text()).toBe(200);
+					return vi.waitFor(() => {
+						const mail = service!.mail.slice(previous).find(({ to, subject }) => to === email && subject.startsWith("Sign in to "));
+						const link = mail?.text.match(/https:\/\/[^\s<>\]]+\/magic-link\/verify\?[^\s<>\]]+/)?.[0];
+						expect(link).toBeDefined();
+						const url = new URL(link!);
+						expect(url.origin).toBe(origin);
+						return url;
+					});
+				}
+				const managed = await issue(managedHost, "/console", credentials.project.email);
+				const customDestination = "/account/security?intent=one%2Btwo#sessions";
+				const custom = await issue(customHost, customDestination, credentials.realmAdmin.email);
+				const fallback = await issue(customHost, "/console", credentials.project.email, true);
+				const standard = await service.request(fallback.pathname + fallback.search, { host: customHost });
+				expect(standard.status).toBe(302);
+				expect(standard.headers.get("location")).toBe(`https://${customHost}/console`);
+				const changed = new URL(managed);
+				changed.searchParams.set("callbackURL", `https://${customHost}/console`);
+				expect((await service.request(changed.pathname + changed.search, { host: managedHost })).status).toBe(403);
+				const verified = await service.request(managed.pathname + managed.search, { host: managedHost });
+				expect(verified.status).toBe(302);
+				expect(verified.headers.get("location")).toBe(`https://${managedHost}/console`);
+				expect(cookie(verified)).toContain(".session_token=");
+				const replay = await service.request(managed.pathname + managed.search, { host: managedHost });
+				const error = new URL(replay.headers.get("location")!);
+				expect(error.pathname).toBe("/auth-error");
+				expect(error.searchParams.get("callbackUrl")).toBe("/console");
+				expect(error.searchParams.get("error")).toBe("INVALID_TOKEN");
+				const signedQuery = fixtureAuthorizationQuery();
+				signedQuery.set("state", "one+two&three");
+				const signedDestination = `/oauth2/continue?${signProjectIssuerQuery(signedQuery, versionedSigningSecret)}`;
+				const authorization = await issue(customHost, signedDestination, credentials.project.email);
+				const continued = await service.request(authorization.pathname + authorization.search, { host: customHost });
+				expect(continued.status).toBe(302);
+				expect(continued.headers.get("location")).toBe(`https://${customHost}${signedDestination}`);
+				await service.stop();
+				service = undefined;
+				service = await openProcess(databaseURL, alpha, false, alpha.slug, undefined, undefined, rollout);
+				const rolledBack = await service.request(custom.pathname + custom.search, { host: customHost });
+				expect(rolledBack.status).toBe(302);
+				expect(rolledBack.headers.get("location")).toBe(`https://${customHost}${customDestination}`);
+				expect(cookie(rolledBack)).toContain(".session_token=");
+			} finally {
+				try {
+					await service?.stop();
+				} finally {
+					try {
+						await database?.end();
+						if (created) await dropClosedFixtureDatabase(admin, name);
+					} finally {
+						await admin.end();
+					}
+				}
+			}
+		}, 60_000);
 
 		it("preserves signed custom SAML metadata at its exact verified accounts receiver across process restarts", async () => {
 			const local: { container: string; DATABASE_URL: string } = JSON.parse(

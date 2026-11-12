@@ -7,6 +7,16 @@ import type { ControlEventInput } from "../control/types";
 import type { ProjectBackchannelTarget } from "./owned-project-backchannel-logout";
 import { checkedProjectSchema } from "./validation";
 
+export const projectBackchannelTargetsSql = `SELECT s.id AS "sessionId", s."userId", c."clientId", c."backchannelLogoutUri" AS url
+	FROM (
+		SELECT "sessionId", "clientId" FROM "oauthRefreshToken" WHERE "sessionId" = ANY($1::text[])
+		UNION
+		SELECT "sessionId", "clientId" FROM "oauthAccessToken" WHERE "sessionId" = ANY($1::text[])
+	) affected
+	JOIN "session" s ON s.id = affected."sessionId"
+	JOIN "oauthClient" c ON c."clientId" = affected."clientId"
+	WHERE c.disabled IS DISTINCT FROM true AND NULLIF(c."backchannelLogoutUri", '') IS NOT NULL`;
+
 export interface ProjectUser {
 	id: string;
 	name: string;
@@ -346,15 +356,7 @@ export function createProjectEngineStore(database: Pool, schemaName: string) {
 			}
 			// Capture targets before session deletion clears the grant foreign keys.
 			const { rows: targets } = await client.query<ProjectBackchannelTarget>(
-				`SELECT s.id AS "sessionId", s."userId", c."clientId", c."backchannelLogoutUri" AS url
-				 FROM (
-					SELECT "sessionId", "clientId" FROM "oauthRefreshToken" WHERE "sessionId" = ANY($1::text[])
-					UNION
-					SELECT "sessionId", "clientId" FROM "oauthAccessToken" WHERE "sessionId" = ANY($1::text[])
-				 ) affected
-				 JOIN "session" s ON s.id = affected."sessionId"
-				 JOIN "oauthClient" c ON c."clientId" = affected."clientId"
-				 WHERE c.disabled IS DISTINCT FROM true AND NULLIF(c."backchannelLogoutUri", '') IS NOT NULL`,
+				projectBackchannelTargetsSql,
 				[ids],
 			);
 			if (targets.length && !canDeliverBackchannel) return null;

@@ -651,6 +651,20 @@ it.each([
 	expect(navigate).toHaveBeenCalledExactlyOnceWith(destination);
 });
 
+it("preserves the checked magic-link return and the legacy error callback encoding", async () => {
+	const requests = hostedRequests(() => Response.json({ status: true }));
+	const returned = "/account/security?intent=one%2Btwo#sessions";
+	const origin = "https://accounts.customer.example";
+	const container = await renderHostedAuth("magicLink", returned);
+	await enter(container, "email", "fixture@customer.example");
+	await submit(container);
+	const body = requests.mock.lastCall?.[1];
+	expect(body?.callbackURL).toBe(`${origin}${returned}`);
+	const error = new URL(decodeURIComponent(String(body?.errorCallbackURL)));
+	expect(error.pathname).toBe("/auth-error");
+	expect(error.searchParams.get("callbackUrl")).toBe(returned);
+});
+
 it("preserves the enterprise email in the password fallback when no provider is found", async () => {
 	const requests = hostedRequests(() => Response.json({}, { status: 404 }));
 	const container = await renderHostedAuth("enterpriseSignIn");

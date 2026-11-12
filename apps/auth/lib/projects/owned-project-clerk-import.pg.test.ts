@@ -20,6 +20,7 @@ import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
 import { createWorkspace } from "../workspaces/repository";
 import { projectManagement } from "./management-plugin";
 import { ownedClerkImportPath } from "./owned-project-clerk-import";
+import { legacyProjectPlatformAuthority } from "./legacy-project-platform-authority";
 import { createOwnedProjectEngine } from "./owned-project-engine";
 import { createOwnedProjectRuntimeCandidate } from "./owned-project-runtime-factory";
 import type { Project } from "./registry";
@@ -455,6 +456,7 @@ describe.skipIf(!existsSync(fixturePath))(
 					project,
 					env,
 					policy: defaultAuthPolicy,
+					platformAuthority: legacyProjectPlatformAuthority,
 					transport: { kind: "direct" },
 					signingSecret: projectSecret(env, project.id),
 					credentialHashSecret: "disposable-clerk-fixture-scoped-scim-secret",
