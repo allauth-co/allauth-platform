@@ -1065,6 +1065,269 @@ describe.skipIf(!existsSync(fixturePath))("project passkey PostgreSQL interopera
 		}
 	});
 
+	it("restores an anonymous passkey owner's existing application role and verification state", async () => {
+		if (!pool || !nativeDatabase)
+			throw new Error("Missing PostgreSQL fixture.");
+		const { auth } = await legacyFixture(nativeDatabase, true);
+		const policy = { ...defaultAuthPolicy, requireEmailVerification: false };
+		const candidate = ownedHttpFixture(pool, policy);
+		const sibling = createOwnedProjectEngine({
+			database: pool,
+			project: { slug: "passkey-sibling-fixture", schemaName: other },
+			baseURL: origin,
+			basePath: "/api/auth",
+			trustedOrigins: [],
+			signingSecret: `${fixtureSecret}-sibling`,
+			policy,
+			trustedIP: (request) => request.headers.get("x-real-ip"),
+		});
+		const native = (request: Request) => auth.handler(request);
+		const owned = (request: Request) => candidate.dispatch(request);
+		function send(
+			dispatch: typeof native,
+			path: string,
+			cookie = "",
+			body?: object,
+		) {
+			return dispatch(
+				new Request(`${origin}/api/auth/${path}`, {
+					method: body ? "POST" : "GET",
+					headers: {
+						origin,
+						cookie,
+						"x-real-ip": "192.0.2.106",
+						...(body ? { "content-type": "application/json" } : {}),
+					},
+					body: body ? JSON.stringify(body) : undefined,
+				}),
+			);
+		}
+		function cookieFrom(response: Response, kind: string) {
+			return (
+				response.headers
+					.getSetCookie()
+					.find(
+						(value) =>
+							value.includes(`.${kind}=`) && !value.includes("Max-Age=0"),
+					)
+					?.split(";", 1)[0] ?? ""
+			);
+		}
+		const bootstrap = await send(native, "sign-up/email", "", {
+			name: "Passkey fixture administrator",
+			email: "passkey-admin@passkey-storage.fixture.example",
+			password: fixturePassword,
+		});
+		expect(bootstrap.status).toBe(200);
+		const { user: administrator } = (await bootstrap.json()) as {
+			user: { id: string };
+		};
+		const adminCookie = cookieFrom(bootstrap, "session_token");
+		await pool.query(
+			`UPDATE "${primary}"."user" SET role='admin',"emailVerified"=true WHERE id=$1`,
+			[administrator.id],
+		);
+		const guest = await send(native, "sign-in/anonymous", "", {});
+		expect(guest.status).toBe(200);
+		const { user } = (await guest.json()) as {
+			user: { id: string; email: string };
+		};
+		// The production anonymous plugin supplies the initial application role.
+		await pool.query(
+			`UPDATE "${primary}"."user" SET role='guest' WHERE id=$1`,
+			[user.id],
+		);
+		const guestCookie = cookieFrom(guest, "session_token");
+		const proof = virtualCredential();
+		const registration = await send(
+			native,
+			"passkey/generate-register-options",
+			guestCookie,
+		);
+		expect(registration.status).toBe(200);
+		const { challenge } = (await registration.json()) as {
+			challenge: string;
+		};
+		const registered = await send(
+			native,
+			"passkey/verify-registration",
+			`${guestCookie}; ${cookieFrom(registration, "better-auth-passkey")}`,
+			{ response: proof.registration(challenge) },
+		);
+		expect(registered.status).toBe(200);
+		const organizationId = randomUUID();
+		await pool.query(
+			`INSERT INTO "${primary}"."organization" (id, name, slug, "createdAt") VALUES ($1, 'Existing workspace', 'passkey-organization', now())`,
+			[organizationId],
+		);
+		await pool.query(
+			`INSERT INTO "${primary}"."member" (id,"organizationId","userId",role,"createdAt") VALUES ($1,$2,$3,'owner',now())`,
+			[randomUUID(), organizationId, administrator.id],
+		);
+		await pool.query(
+			`INSERT INTO "${other}"."user" (id,name,email,"emailVerified",role) VALUES ($1,'Sibling account',$2,true,'admin')`,
+			[user.id, user.email],
+		);
+		async function authenticate(dispatch: typeof native, counter: number) {
+			const start = await send(
+				dispatch,
+				"passkey/generate-authenticate-options",
+			);
+			expect(start.status).toBe(200);
+			const { challenge } = (await start.json()) as { challenge: string };
+			return send(
+				dispatch,
+				"passkey/verify-authentication",
+				cookieFrom(start, "better-auth-passkey"),
+				{
+					response: proof.assertion(challenge, counter),
+				},
+			);
+		}
+		const roleChanged = await send(native, "admin/set-role", adminCookie, {
+			userId: user.id,
+			role: "user",
+		});
+		expect(roleChanged.status).toBe(200);
+		let counter = 0;
+		let restoredCookie = "";
+		for (const emailVerified of [false, true]) {
+			if (emailVerified) {
+				const verified = await send(
+					native,
+					"admin/update-user",
+					adminCookie,
+					{ userId: user.id, data: { emailVerified: true } },
+				);
+				expect(verified.status).toBe(200);
+			}
+			const identity = {
+				id: user.id,
+				email: user.email,
+				role: "user",
+				isAnonymous: true,
+				emailVerified,
+			};
+			for (const [writer, reader] of [
+				[native, owned],
+				[owned, native],
+			] as const) {
+				const restored = await authenticate(writer, ++counter);
+				expect(
+					restored.status,
+					`${writer === native ? "Native" : "Owned"} passkey assertion`,
+				).toBe(200);
+				expect(await restored.json()).toMatchObject({
+					user: identity,
+					session: { userId: user.id },
+				});
+				const cookie = cookieFrom(restored, "session_token");
+				expect(cookie).toBeTruthy();
+				restoredCookie = cookie;
+				const session = await send(reader, "get-session", cookie);
+				expect(await session.json()).toMatchObject({
+					user: identity,
+					session: { userId: user.id },
+				});
+				const deniedAdmin = await send(owned, "admin/list-users", cookie);
+				expect(deniedAdmin.status).toBe(403);
+				const deniedOrganization = await send(
+					owned,
+					"organization/set-active",
+					cookie,
+					{ organizationId },
+				);
+				expect(deniedOrganization.status).toBe(403);
+				const deniedSibling = await send(
+					(request) => sibling.dispatch(request),
+					"get-session",
+					cookie,
+				);
+				expect(await deniedSibling.json()).toBeNull();
+			}
+		}
+		const enabled = await send(
+			owned,
+			"two-factor/enable",
+			restoredCookie,
+			{},
+		);
+		expect(enabled.status).toBe(200);
+		const { backupCodes } = (await enabled.json()) as {
+			backupCodes: string[];
+		};
+		const {
+			rows: [factor],
+		} = await pool.query<{ secret: string }>(
+			`SELECT secret FROM "${primary}"."twoFactor" WHERE "userId"=$1`,
+			[user.id],
+		);
+		if (!factor) throw new Error("Missing fixture MFA secret.");
+		const secret = await symmetricDecrypt({
+			key: fixtureSecret,
+			data: factor.secret,
+		});
+		const { code } = await auth.api.generateTOTP({ body: { secret } });
+		const enrollment = await send(
+			owned,
+			"two-factor/verify-totp",
+			restoredCookie,
+			{ code },
+		);
+		expect(enrollment.status).toBe(200);
+		for (const [writer, reader, backupCode] of [
+			[native, owned, backupCodes[0]],
+			[owned, native, backupCodes[1]],
+		] as const) {
+			const pending = await authenticate(writer, ++counter);
+			expect(pending.status).toBe(200);
+			expect(await pending.json()).toEqual({
+				twoFactorRedirect: true,
+				twoFactorMethods: ["totp"],
+			});
+			expect(cookieFrom(pending, "session_token")).toBe("");
+			const completed = await send(
+				reader,
+				"two-factor/verify-backup-code",
+				cookieFrom(pending, "two_factor"),
+				{ code: backupCode },
+			);
+			expect(completed.status).toBe(200);
+			expect(await completed.json()).toMatchObject({
+				user: {
+					id: user.id,
+					role: "user",
+					emailVerified: true,
+					isAnonymous: true,
+				},
+			});
+		}
+		const stored = await pool.query(
+			`SELECT role,"isAnonymous","emailVerified", (SELECT count(*)::int FROM "${primary}"."member" WHERE "userId"=$1) AS memberships,
+		 (SELECT count(*)::int FROM "${primary}"."account" WHERE "userId"=$1) AS accounts
+		 FROM "${primary}"."user" WHERE id=$1`,
+			[user.id],
+		);
+		expect(stored.rows).toEqual([
+			{
+				role: "user",
+				isAnonymous: true,
+				emailVerified: true,
+				memberships: 0,
+				accounts: 0,
+			},
+		]);
+		const privileged = await send(native, "admin/set-role", adminCookie, {
+			userId: user.id,
+			role: "admin",
+		});
+		expect(privileged.status).toBe(200);
+		const denied = await authenticate(owned, counter + 1);
+		expect(denied.status).toBe(401);
+		expect(cookieFrom(denied, "session_token")).toBe("");
+		expect((await store.findCredential(proof.id))?.counter).toBe(counter);
+	});
+
 	it("reads the exact native row format and preserves owner-scoped rename and delete", async () => {
 		const adapter = (await legacy.auth.$context).adapter;
 		const created = await adapter.create<Omit<StoredProjectPasskey, "id">, StoredProjectPasskey>({

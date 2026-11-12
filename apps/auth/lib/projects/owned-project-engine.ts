@@ -868,11 +868,13 @@ export function createOwnedProjectEngine(
 			wallet?: { address: string; chainId: number };
 		},
 	): Promise<Response> {
-		const passkeyPath =
-			path === "/passkey/verify-registration" ||
-			path === "/passkey/verify-authentication";
 		if (
-			(!activeUser(user) && !(passkeyPath && passkeyGuestUser(user))) ||
+			(!activeUser(user) &&
+				!(
+					path === "/passkey/verify-authentication" &&
+					passkeyGuestSignInUser(user)
+				) &&
+				!(path === "/passkey/verify-registration" && passkeyGuestUser(user))) ||
 			(user.directoryManaged && !providerProof?.managed)
 		)
 			return forbidden();
@@ -1179,7 +1181,7 @@ export function createOwnedProjectEngine(
 				async (client, pending) => {
 					const user = await store.lockUser(client, pending.userId);
 					if (
-						(!activeUser(user) && !passkeyGuestUser(user)) ||
+						(!activeUser(user) && !passkeyGuestSignInUser(user)) ||
 						(policy.mfaMode === "required" && !user.emailVerified) ||
 						!user.twoFactorEnabled ||
 						missingSupportAdapter
@@ -1763,18 +1765,27 @@ export function createOwnedProjectEngine(
 			},
 		});
 
-	function passkeyGuestUser(
+	// An existing passkey proves the current owner, including ordinary roles or
+	// verification flags assigned by a realm administrator after enrollment.
+	function passkeyGuestSignInUser(
 		user: ProjectUser | null,
-	): user is ProjectUser & { isAnonymous: true; role: "guest" } {
+	): user is ProjectUser & { isAnonymous: true; role: "guest" | "user" } {
 		return Boolean(
 			user?.isAnonymous === true &&
-				user.role === "guest" &&
+				(user.role === "guest" || user.role === "user") &&
 				!user.banned &&
 				!user.directoryManaged &&
 				!user.directoryDisabled &&
-				!user.emailVerified &&
 				policy.mfaMode === "optional" &&
 				!policy.requireEmailVerification,
+		);
+	}
+
+	function passkeyGuestUser(
+		user: ProjectUser | null,
+	): user is ProjectUser & { isAnonymous: true; role: "guest" } {
+		return (
+			passkeyGuestSignInUser(user) && user.role === "guest" && !user.emailVerified
 		);
 	}
 
@@ -1855,7 +1866,11 @@ export function createOwnedProjectEngine(
 			async completeSignIn(request, userId, record) {
 				return store.transaction(async (client) => {
 					const user = await store.lockUser(client, userId);
-					if (!passkeyOwner(user) || user.directoryManaged)
+					if (
+						(!activeUser(user) && !passkeyGuestSignInUser(user)) ||
+						!verifiedUser(user) ||
+						user.directoryManaged
+					)
 						return null;
 					if (
 						user.isAnonymous &&
