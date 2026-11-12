@@ -10,11 +10,11 @@ import {
 	accountLinkJson,
 } from "./owned-project-account-links";
 import type { OwnedProjectEmailAliases } from "./owned-project-email-aliases";
-import {
-	checkpointOwnedProjectWrites,
-	type createProjectEngineStore,
-	type ProjectUser,
+import type {
+	createProjectEngineStore,
+	ProjectUser,
 } from "./owned-project-engine-store";
+import { checkpointOwnedProjectWrites } from "./owned-project-engine-store";
 
 const nonceInput = z.strictObject({});
 const verifyInput = z.strictObject({
@@ -58,6 +58,7 @@ export function createOwnedProjectWallet(options: {
 	signUpEnabled: boolean;
 	emailAliases?: Pick<OwnedProjectEmailAliases, "reserved">;
 	readBody(request: Request): Promise<unknown>;
+	cleanupExpiredPrimary?(request: Request): Promise<void>;
 	admit(
 		client: PoolClient,
 		request: Request,
@@ -92,6 +93,7 @@ export function createOwnedProjectWallet(options: {
 		signup: WalletSignup,
 	) {
 		const { address, chainId } = wallet;
+		// cspell:ignore xact
 		await client.query(
 			"SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
 			[`${options.schemaName}\nwallet\n${address.toLowerCase()}`],
@@ -331,6 +333,7 @@ export function createOwnedProjectWallet(options: {
 			options.admit(client, request, { kind: "verification", email }),
 		);
 		if (blocked) return blocked;
+		await options.cleanupExpiredPrimary?.(request);
 		const response = await verifyProof(request, input.data);
 		if (response.status >= 400 && response.status < 500)
 			await store.transaction((client) =>

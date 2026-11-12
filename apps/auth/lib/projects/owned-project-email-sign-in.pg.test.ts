@@ -689,19 +689,22 @@ describe.skipIf(!existsSync(fixturePath))(
 		});
 
 		it.each([
-			["magic-link", true, false, "192.0.2.130"],
-			["magic-link", false, false, "192.0.2.131"],
-			["email-otp", true, false, "192.0.2.132"],
-			["email-otp", false, false, "192.0.2.133"],
-			["magic-link", true, true, "192.0.2.134"],
-			["email-otp", true, true, "192.0.2.135"],
-		] as const)("delivers native %s session deletion with active browser cookie %s and unverified owner %s", async (method, activeCookie, promote, ip) => {
+			["magic-link", "active", false, "192.0.2.130"],
+			["magic-link", "absent", false, "192.0.2.131"],
+			["email-otp", "active", false, "192.0.2.132"],
+			["email-otp", "absent", false, "192.0.2.133"],
+			["magic-link", "active", true, "192.0.2.134"],
+			["email-otp", "active", true, "192.0.2.135"],
+			["magic-link", "expired", false, "192.0.2.136"],
+			["email-otp", "expired", false, "192.0.2.137"],
+		] as const)("delivers native %s session deletion with %s browser cookie and unverified owner %s", async (method, browserCookie, promote, ip) => {
 			if (!nativeDatabase) throw new Error("Missing fixture database.");
 			const webhookDatabase = nativeDatabase;
 			const realm = `"${schema}"`;
 			const foreignRealm = `"${foreignSchema}"`;
 			const path =
 				method === "magic-link" ? "/magic-link/verify" : "/sign-in/email-otp";
+			const expired = browserCookie === "expired";
 			const policy = {
 				...defaultAuthPolicy,
 				requireEmailVerification: !promote,
@@ -797,10 +800,19 @@ describe.skipIf(!existsSync(fixturePath))(
 				const endpointId = randomUUID();
 				const webhookSecret = newWebhookSigningSecret();
 				const clientId = randomUUID();
-				const grants = ["access", "online", "offline", "sibling"].map(
-					(kind) => ({ kind, id: randomUUID() }),
-				);
+				const grants = [
+					"access",
+					"online",
+					"offline",
+					"sibling",
+					...(expired ? ["browser-online", "browser-offline"] : []),
+				].map((kind) => ({ kind, id: randomUUID() }));
 				try {
+					if (expired)
+						await database.query(
+							`UPDATE ${realm}.session SET "expiresAt"=statement_timestamp()-interval '1 minute' WHERE id=$1`,
+							[active.id],
+						);
 					await database.query(
 						`INSERT INTO ${realm}."allauthWebhookEndpoint" (id,url,"eventTypes","encryptedSecret") VALUES ($1,$2,'["session.deleted"]',$3)`,
 						[
@@ -819,15 +831,20 @@ describe.skipIf(!existsSync(fixturePath))(
 					for (const { kind, id } of grants) {
 						const table =
 							kind === "access" ? "oauthAccessToken" : "oauthRefreshToken";
+						const browserGrant = kind.startsWith("browser-");
 						await database.query(
 							`INSERT INTO ${realm}."${table}" (id,token,"sessionId","userId","clientId","expiresAt","createdAt",scopes) VALUES ($1,$1,$2,$3,$4,now()+interval '1 day',now(),$5)`,
 							[
 								id,
-								kind === "sibling" ? sibling.id : previous.id,
-								owner.id,
+								browserGrant
+									? active.id
+									: kind === "sibling"
+										? sibling.id
+										: previous.id,
+								browserGrant ? browser.id : owner.id,
 								clientId,
 								JSON.stringify(
-									kind === "offline"
+									kind.endsWith("offline")
 										? ["openid", "offline_access"]
 										: ["openid"],
 								),
@@ -888,7 +905,11 @@ describe.skipIf(!existsSync(fixturePath))(
 					const incoming = withBrowser(
 						completion,
 						clientIP,
-						[activeCookie ? active.primary : "", active.device, previous.device]
+						[
+							browserCookie === "absent" ? "" : active.primary,
+							active.device,
+							previous.device,
+						]
 							.filter(Boolean)
 							.join("; "),
 					);
@@ -898,15 +919,25 @@ describe.skipIf(!existsSync(fixturePath))(
 					expect(completed.status).toBe(method === "magic-link" ? 302 : 200);
 					if (method === "magic-link")
 						expect(location(completed).href).toBe(destination);
-					const replacement = await installed.api.getSession({
-						headers: new Headers({ cookie: setCookie(completed, sessionName) }),
-					});
-					if (!replacement)
-						throw new Error("Expected a native-readable session.");
-					expect(replacement.user).toMatchObject({
-						id: owner.id,
-						emailVerified: true,
-					});
+					const {
+						rows: [replacement],
+					} = await database.query<{ id: string; token: string }>(
+						`SELECT id, token FROM ${realm}.session WHERE "userId"=$1 AND id<>ALL($2::text[])`,
+						[owner.id, [previous.id, sibling.id]],
+					);
+					if (!replacement) throw new Error("Expected a replacement session.");
+					const primary = setCookie(completed, sessionName);
+					if (writer === "legacy" && expired)
+						expect(primary === `${sessionName}=`).toBe(true);
+					else
+						expect(
+							await installed.api.getSession({
+								headers: new Headers({ cookie: primary }),
+							}),
+						).toMatchObject({
+							session: { id: replacement.id },
+							user: { id: owner.id, emailVerified: true },
+						});
 					expect(
 						completed.headers
 							.getSetCookie()
@@ -927,9 +958,9 @@ describe.skipIf(!existsSync(fixturePath))(
 					);
 					expect(sessions.rows.map(({ id }) => id)).toEqual(
 						[
-							active.id,
+							...(!expired ? [active.id] : []),
 							...(!promote ? [sibling.id] : []),
-							replacement.session.id,
+							replacement.id,
 						].sort(),
 					);
 					if (promote)
@@ -959,7 +990,7 @@ describe.skipIf(!existsSync(fixturePath))(
 								id,
 								revoked:
 									kind === "access" ||
-									kind === "online" ||
+									kind.endsWith("online") ||
 									(promote && kind === "sibling"),
 								sessionId: kind === "sibling" && !promote ? sibling.id : null,
 							});
@@ -1003,7 +1034,7 @@ describe.skipIf(!existsSync(fixturePath))(
 								active.token,
 								previous.token,
 								sibling.token,
-								replacement.session.token,
+								replacement.token,
 								proofToken,
 								...grants.map(({ id }) => id),
 							])
@@ -1012,7 +1043,7 @@ describe.skipIf(!existsSync(fixturePath))(
 							return 204;
 						},
 					});
-					const expectedCount = promote ? 2 : 1;
+					const expectedCount = 1 + Number(promote) + Number(expired);
 					expect(state).toMatchObject({
 						claimed: expectedCount,
 						delivered: expectedCount,
@@ -1028,13 +1059,17 @@ describe.skipIf(!existsSync(fixturePath))(
 								targetId,
 								...event
 							}) => {
-								expect(userId).toBe(owner.id);
+								expect(userId).toBe(
+									targetId === active.id ? browser.id : owner.id,
+								);
 								const target =
-									targetId === previous.id
-										? "previous"
-										: targetId === sibling.id
-											? "sibling"
-											: "other";
+									targetId === active.id
+										? "expired-browser"
+										: targetId === previous.id
+											? "previous"
+											: targetId === sibling.id
+												? "sibling"
+												: "other";
 								const actor =
 									actorId === undefined
 										? undefined
@@ -1070,11 +1105,19 @@ describe.skipIf(!existsSync(fixturePath))(
 			}
 			const expected = await exercise("legacy", ip);
 			expect(expected).toEqual(
-				(promote ? ["previous", "sibling"] : ["previous"]).map((target) => ({
+				[
+					...(expired ? ["expired-browser"] : []),
+					"previous",
+					...(promote ? ["sibling"] : []),
+				].map((target) => ({
 					type: "session.deleted",
 					outcome: "success",
 					target,
-					actor: activeCookie && !promote ? "browser" : undefined,
+					actor:
+						target === "expired-browser" ||
+						(browserCookie === "active" && !promote)
+							? "browser"
+							: undefined,
 					metadata: { path },
 				})),
 			);

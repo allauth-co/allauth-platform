@@ -105,7 +105,10 @@ import { createOwnedProjectPersonalKeys } from "./owned-project-personal-keys";
 import { createOwnedProjectRealmAdminMutations } from "./owned-project-realm-admin-mutations";
 import { createOwnedProjectRealmAdminRead } from "./owned-project-realm-admin-read";
 import { createOwnedProjectRealmImpersonation } from "./owned-project-realm-impersonation";
-import { createOwnedProjectProfile } from "./owned-project-profile";
+import {
+	createOwnedProjectProfile,
+	ownedProjectProfileBody,
+} from "./owned-project-profile";
 import {
 	createOwnedProjectSCIMDiscovery,
 	ownedSCIMError,
@@ -254,6 +257,7 @@ interface OwnedProjectEngineOptions {
 		| "requireEmailVerification"
 		| "reservedEmail"
 		| "authorizeLinkedAccounts"
+		| "missingBrowserSessionHeaders"
 		| "auditContext"
 		| "passwordSignIn"
 		| "passkeySignIn"
@@ -275,6 +279,7 @@ interface OwnedProjectEngineOptions {
 		| "emailAliases"
 		| "denyProviderProfile"
 		| "prepareProviderSignup"
+		| "cleanupExpiredPrimary"
 		| "complete"
 	>;
 	scim?: { credentialHashSecret: string };
@@ -502,6 +507,15 @@ export function createOwnedProjectEngine(
 				},
 			},
 			readSession: (request, client) => currentSession(request.headers, client),
+			async readAuthorizationSession(request, client, responseHeaders) {
+				const current = await readBrowserRouteSession(
+					client,
+					request,
+					"/oauth2/authorize",
+					responseHeaders,
+				);
+				return ordinarySession(current?.token ?? null, current);
+			},
 			async readManagementUser(client, request, write) {
 				const bearer = serverSessionBearer(request.headers);
 				if (!bearer && !trustedRequest(request.headers, write)) return null;
@@ -789,10 +803,24 @@ export function createOwnedProjectEngine(
 		const eventMetadata = primaryAuditMetadata(path);
 		const headers = new Headers();
 		const existing = multiSessionTokens(request.headers);
+		const mfaPolicyReadsBrowser =
+			eventMetadata.path === "/sso/callback/:providerId" ||
+			eventMetadata.path === "/sso/saml2/sp/acs/:providerId" ||
+			path === "/siwe/verify";
+		const readsIncomingBrowser =
+			path === "/sign-in/email" ||
+			path === "/sign-in/username" ||
+			path === "/sign-in/social" ||
+			eventMetadata.path === "/callback/:id" ||
+			path === "/verify-email" ||
+			path === "/email-otp/verify-email" ||
+			path === "/magic-link/verify" ||
+			path === "/sign-in/email-otp" ||
+			path === "/passkey/verify-authentication";
 		const owned = [];
 		if (!prior) {
 			const signedPrimary =
-				path === "/sign-in/email" || path === "/sign-in/username"
+				readsIncomingBrowser && path !== "/sign-in/social"
 					? tokenFrom(request.headers)
 					: null;
 			if (signedPrimary) {
@@ -832,29 +860,15 @@ export function createOwnedProjectEngine(
 			}
 		}
 		if (owned.length) {
-			const enterpriseCallback =
-				eventMetadata.path === "/sso/callback/:providerId" ||
-				eventMetadata.path === "/sso/saml2/sp/acs/:providerId";
 			let actorId: string | null | undefined;
 			if (
 				path === "/two-factor/verify-totp" ||
 				path === "/two-factor/verify-backup-code" ||
-				(enterpriseCallback && policy.mfaMode !== "required")
+				(mfaPolicyReadsBrowser && policy.mfaMode !== "required")
 			) {
-				// Pending MFA and optional enterprise callbacks leave the browser actor unset.
+				// Pending MFA and these optional-MFA flows leave the browser actor unset.
 				actorId = null;
-			} else if (
-				enterpriseCallback ||
-				path === "/sign-in/email" ||
-				path === "/sign-in/username" ||
-				path === "/sign-in/social" ||
-				eventMetadata.path === "/callback/:id" ||
-				path === "/verify-email" ||
-				path === "/email-otp/verify-email" ||
-				path === "/magic-link/verify" ||
-				path === "/sign-in/email-otp" ||
-				path === "/passkey/verify-authentication"
-			) {
+			} else if (mfaPolicyReadsBrowser || readsIncomingBrowser) {
 				// The legacy policy or anonymous hook reads the incoming browser session before cleanup.
 				const browserToken = tokenFrom(request.headers);
 				const browser = browserToken
@@ -1310,7 +1324,13 @@ export function createOwnedProjectEngine(
 			return failure(400, "INVALID_BODY", "Supply a verification code.");
 		if (await store.transaction((client) => security.admit(client, request)))
 			return securityBlocked();
-		if (await currentSession(request.headers)) {
+		const browserHeaders = new Headers();
+		const browser = tokenFrom(request.headers)
+			? await store.transaction((client) =>
+					readBrowserRouteSession(client, request, path, browserHeaders),
+				)
+			: null;
+		if (browser && ordinarySession(browser.token, browser)) {
 			const result = await mfaEnrollment.verify(request, {
 				method,
 				code: body.data.code,
@@ -1369,21 +1389,34 @@ export function createOwnedProjectEngine(
 					await security.failed(client, request, path);
 					await recordPrimaryFailure(client, request, path, result.code);
 				});
-				const headers = new Headers();
 				for (const cookie of result.setCookies)
-					headers.append("Set-Cookie", cookie);
-				return failure(result.httpStatus, result.code, result.message, headers);
+					browserHeaders.append("Set-Cookie", cookie);
+				return failure(
+					result.httpStatus,
+					result.code,
+					result.message,
+					browserHeaders,
+				);
 			}
 			if ("verifiedUser" in result.session)
-				return json({ user: result.session.verifiedUser });
+				return json({ user: result.session.verifiedUser }, 200, browserHeaders);
 			const { session, user, headers } = result.session;
-			for (const cookie of result.setCookies)
+			// Expire the old primary before writing the newly authenticated session.
+			const cookies = new Set([
+				...browserHeaders.getSetCookie(),
+				...headers.getSetCookie(),
+				...result.setCookies,
+			]);
+			headers.delete("Set-Cookie");
+			for (const cookie of cookies)
 				headers.append("Set-Cookie", cookie);
 			return json({ session, user }, 200, headers);
 		} catch (error) {
-			if (error === deniedMfa) return securityBlocked();
-			if (error === changedMfaOwner) return forbidden();
-			throw error;
+			if (error !== deniedMfa && error !== changedMfaOwner) throw error;
+			const response = error === deniedMfa ? securityBlocked() : forbidden();
+			for (const cookie of browserHeaders.getSetCookie())
+				response.headers.append("Set-Cookie", cookie);
+			return response;
 		}
 	}
 
@@ -1616,13 +1649,25 @@ export function createOwnedProjectEngine(
 			: null;
 	}
 
+	async function cleanupExpiredBrowserSession(request: Request, path: string) {
+		const token = tokenFrom(request.headers);
+		if (!token) return;
+		await store.transaction(async (client) => {
+			const observed = await store.session(token, refreshWindow, client, {
+				includeExpired: true,
+			});
+			if (observed?.expired)
+				await cleanupExpiredSession(client, request, token, path);
+		});
+	}
+
 	async function readBrowserRouteSession(
 		client: PoolClient,
 		request: Request,
 		path: string,
 		headers: Headers,
+		token = tokenFrom(request.headers),
 	) {
-		const token = tokenFrom(request.headers);
 		if (!token) return null;
 		const row = await store.session(token, refreshWindow, client, {
 			includeExpired: true,
@@ -1635,6 +1680,22 @@ export function createOwnedProjectEngine(
 			return null;
 		}
 		return { token, ...observed };
+	}
+
+	async function missingBrowserSessionHeaders(request: Request, path: string) {
+		const token = tokenFrom(request.headers);
+		if (!token) return null;
+		return store.transaction(async (client) => {
+			const headers = new Headers({ "cache-control": "no-store" });
+			const current = await readBrowserRouteSession(
+				client,
+				request,
+				path,
+				headers,
+				token,
+			);
+			return current ? null : headers;
+		});
 	}
 
 	async function readSession(request: Request) {
@@ -3120,6 +3181,10 @@ export function createOwnedProjectEngine(
 			signingOrigin: options.walletOrigin,
 			signUpEnabled: policy.signUpEnabled,
 			readBody: requestBody,
+			cleanupExpiredPrimary:
+				policy.mfaMode === "required"
+					? (request) => cleanupExpiredBrowserSession(request, "/siwe/verify")
+					: undefined,
 			denyProvisioning: security.denyStandaloneSignup,
 			async admit(client, request, operation) {
 				const identity =
@@ -3183,6 +3248,7 @@ export function createOwnedProjectEngine(
 			requireEmailVerification: policy.requireEmailVerification,
 			passwordSignIn: policy.emailAndPasswordEnabled,
 			passkeySignIn: Boolean(options.passkeys),
+			missingBrowserSessionHeaders,
 			async otherLinkedSignIn(_client, user) {
 				return Boolean(
 					user.emailVerified &&
@@ -3350,6 +3416,8 @@ export function createOwnedProjectEngine(
 			denyProviderProfile: security.denyProvisioning,
 			prepareProviderSignup: security.prepareProviderSignup,
 			encryptedSamlApproval: options.sso?.encryptedSamlApproval,
+			cleanupExpiredPrimary:
+				policy.mfaMode === "required" ? cleanupExpiredBrowserSession : undefined,
 			async complete(
 				client,
 				{ user, request, providerId, destination, managed, protocol },
@@ -3969,6 +4037,7 @@ export function createOwnedProjectEngine(
 				security.admit(client, request),
 			);
 			if (denied) return securityBlocked();
+			await cleanupExpiredBrowserSession(request, path);
 			return oauth.start(request, body.data);
 		}
 		if (oauth && path.startsWith("/callback/")) {
@@ -3992,6 +4061,11 @@ export function createOwnedProjectEngine(
 		if (passkeyHttp && path.startsWith("/passkey/")) {
 			if (!trustedRequest(request.headers, request.method !== "GET"))
 				return forbidden();
+			if (path === "/passkey/list-user-passkeys" && request.method === "GET") {
+				const headers = await missingBrowserSessionHeaders(request, path);
+				if (headers)
+					return failure(401, "UNAUTHORIZED", "Unauthorized", headers);
+			}
 			const response = await passkeyHttp(path, request);
 			if (response) return response;
 		}
@@ -4028,16 +4102,80 @@ export function createOwnedProjectEngine(
 			return passwordChange.change(request, await requestBody(request));
 		}
 		if (request.method === "POST" && path === "/update-user") {
-			if (!trustedRequest(request.headers, true)) return forbidden();
-			const current = await currentSession(request.headers);
+			const direct = options.basePath === `/api/projects/${slug}/auth`;
+			const authorization = request.headers.has("authorization");
+			const cookie = request.headers.has("cookie");
+			if (direct) {
+				const deniedOrigin = sessionMutationOrigin(request);
+				if (deniedOrigin) return deniedOrigin;
+				if (authorization && cookie) return forbidden();
+			} else if (!trustedRequest(request.headers, true)) return forbidden();
+			const token = authorization
+				? providerSessionBearer(request)
+				: tokenFrom(request.headers);
+			const serverTokenResponse = direct && isServerTokenRequest(request.headers);
+			const limited = await store.transaction((client) =>
+				admitOwnedProjectNativeRoute(client, options.trustedIP(request), path, {
+					max: 100,
+					windowMs: 60_000,
+				}),
+			);
+			if (limited) return limited;
+			const input = request.body ? await requestBody(request) : undefined;
+			if (input === undefined)
+				return failure(400, "INVALID_BODY", "Invalid profile.");
+			const parsed = ownedProjectProfileBody.safeParse(input);
+			const eventContext = browserEventContext(request);
+			if (!parsed.success) {
+				await store.transaction((client) =>
+					store.recordEvent(client, {
+						type: "user.updated",
+						outcome: "failure",
+						...eventContext,
+						metadata: { path, errorCode: "VALIDATION_ERROR" },
+					}),
+				);
+				return json(
+					{
+						code: "VALIDATION_ERROR",
+						message: "Validation error",
+						originalMessage: parsed.error.issues
+							.map(({ message }) => `[body] ${message}`)
+							.join("; "),
+					},
+					400,
+				);
+			}
+			const headers = new Headers();
+			const current = await store.transaction(async (client) => {
+				const observed = await readBrowserRouteSession(
+					client,
+					request,
+					path,
+					headers,
+					token,
+				);
+				const session = ordinarySession(observed?.token ?? null, observed);
+				if (session)
+					await renewAuthorizedSession(
+						request,
+						session,
+						client,
+						headers,
+						serverTokenResponse,
+					);
+				return session;
+			});
+			const renewedBearer = headers.get("set-auth-token");
+			if (renewedBearer)
+				headers.set("set-auth-token", decodeURIComponent(renewedBearer));
 			const result = await updateProfile(
-				current ? await requestBody(request) : undefined,
+				parsed.data,
 				current && { userId: current.user.id, token: current.token },
-				browserEventContext(request),
+				eventContext,
 			);
 			if (result.status !== 200)
-				return failure(result.status, result.code, result.message);
-			const headers = new Headers();
+				return failure(result.status, result.code, result.message, headers);
 			writeCookie(
 				headers,
 				sessionCookie,
@@ -4046,6 +4184,17 @@ export function createOwnedProjectEngine(
 					? undefined
 					: policy.sessionExpiresInSeconds,
 			);
+			if (serverTokenResponse) {
+				const signed = headers
+					.getSetCookie()
+					.at(-1)
+					?.split(";", 1)[0]
+					?.slice(sessionCookie.length + 1);
+				if (signed) {
+					headers.set("set-auth-token", decodeURIComponent(signed));
+					headers.set("access-control-expose-headers", "set-auth-token");
+				}
+			}
 			return json({ status: true }, 200, headers);
 		}
 		if (request.method === "POST" && path === "/sign-in/email")

@@ -101,6 +101,10 @@ export const ownedProjectSsoInput = z.strictObject({
 });
 export type OwnedProjectSsoInput = z.infer<typeof ownedProjectSsoInput>;
 
+export type ProjectEnterpriseCallbackPath =
+	| "/sso/callback/:providerId"
+	| "/sso/saml2/sp/acs/:providerId";
+
 export interface OwnedProjectSsoOptions extends ProjectSsoAdmission {
 	database: Pool;
 	project: Pick<Project, "schemaName" | "slug">;
@@ -117,6 +121,11 @@ export interface OwnedProjectSsoOptions extends ProjectSsoAdmission {
 	customSamlTransport?: ProjectCustomSamlTransport;
 	encryptedSamlFixture?: ProjectEncryptedSamlFixtureAdmission;
 	encryptedSamlApproval?: ProjectEncryptedSamlApproval;
+	/** Observe the admitted browser's expired primary before consuming the provider proof. */
+	cleanupExpiredPrimary?(
+		request: Request,
+		path: ProjectEnterpriseCallbackPath,
+	): Promise<void>;
 	/** Session/MFA admission runs on the same client as the exact account and directory binding. */
 	complete(
 		client: PoolClient,
@@ -217,6 +226,7 @@ export function createOwnedProjectSso(options: OwnedProjectSsoOptions) {
 			defaultError,
 			store,
 			allowedReturn: (value) => allowedReturn(value, origin, origins),
+			cleanupExpiredPrimary: options.cleanupExpiredPrimary,
 			complete: options.complete,
 			profilePolicy: options,
 		});
@@ -609,6 +619,7 @@ export function createOwnedProjectSso(options: OwnedProjectSsoOptions) {
 			!ssoProviderId.safeParse(providerId).success
 		)
 			return failure("invalid_request");
+		await options.cleanupExpiredPrimary?.(request, "/sso/callback/:providerId");
 		const states = url.searchParams.getAll("state");
 		const state = states.length === 1 ? states[0] : undefined;
 		if (

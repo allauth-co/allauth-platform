@@ -1047,11 +1047,14 @@ describe.skipIf(!existsSync(fixturePath))(
 				userId: managed,
 				browserUserId: decoy,
 				owned: managementEngine(true, policy).dispatch,
-				async prepare(dispatch, ip) {
+				async prepare(dispatch, ip, rejected) {
 					const request = startRequest();
 					request.headers.set("x-real-ip", ip);
 					const state = await pending(await dispatch(request));
-					return callback(signedResponse(state.requestId).encoded, state.relay);
+					return callback(
+						signedResponse(state.requestId, { expired: rejected }).encoded,
+						state.relay,
+					);
 				},
 			});
 		});

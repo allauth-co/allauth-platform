@@ -4,6 +4,7 @@ import {
 	oauthProvider,
 	verifyOAuthQueryParams,
 } from "@better-auth/oauth-provider";
+import { symmetricEncrypt } from "better-auth/crypto";
 import { jwt, organization } from "better-auth/plugins";
 import { getTestInstance } from "better-auth/test";
 import { decodeJwt, exportJWK, generateKeyPair, SignJWT } from "jose";
@@ -12,6 +13,10 @@ import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { defaultAuthPolicy } from "../auth-policy/policy";
 import { isPlatformAdmin } from "../configuration";
+import { allauthControl } from "../control";
+import { newWebhookSigningSecret } from "../control/webhook-contract";
+import type { ControlWebhookEnvelope } from "../control/webhook-delivery";
+import { deliverPendingWebhooks, webhookSignature } from "../control/webhooks";
 import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
 import { readLegacySessionCookie } from "./legacy-session-cookie";
 import { createOwnedProjectEngine } from "./owned-project-engine";
@@ -113,6 +118,7 @@ describe.skipIf(!existsSync(fixture))(
 				for (const migration of [
 					"001-initial-auth.sql",
 					"002-control-plane.sql",
+					"004-webhooks.sql",
 					"005-free-plugins.sql",
 				]) {
 					await client.query(
@@ -151,6 +157,7 @@ describe.skipIf(!existsSync(fixture))(
 					},
 					logger: { disabled: true },
 					plugins: [
+						allauthControl(),
 						organization(),
 						jwt({ jwt: { issuer }, jwks: { keyPairConfig: { alg: "RS256" } } }),
 						oauthProvider({
@@ -248,6 +255,7 @@ describe.skipIf(!existsSync(fixture))(
 				.digest("base64");
 			return {
 				id,
+				token,
 				userId,
 				cookie: `${cookieName}=${encodeURIComponent(`${token}.${signature}`)}`,
 			};
@@ -310,6 +318,259 @@ describe.skipIf(!existsSync(fixture))(
 				issuer: true,
 			});
 		}
+
+		it.each([
+			{ mode: "browser redirect", silent: false, form: false, json: false },
+			{ mode: "silent app redirect", silent: true, form: true, json: false },
+			{ mode: "silent JSON response", silent: true, form: false, json: true },
+		])("cleans expired browser authority after validating the client for $mode", async ({
+			silent,
+			form,
+			json,
+		}) => {
+			const realm = `"${schema}"`;
+			const clientId = await registration(
+				[callback],
+				["openid", "profile", "email", "offline_access"],
+				true,
+			);
+			const destination = "https://issuer-expiry-hook.fixture.example/events";
+			const engine = managementEngine();
+			for (const [writer, dispatch] of [
+				["legacy", legacy],
+				["AllAuth", engine.dispatch],
+			] as const) {
+				const expired = await browser();
+				const other = await browser(expired.userId);
+				await database.query(
+					`UPDATE ${realm}.session SET "expiresAt"=now()-interval '1 minute' WHERE id=$1`,
+					[expired.id],
+				);
+				const endpoint = randomUUID();
+				const signingKey = newWebhookSigningSecret();
+				await database.query(
+					`INSERT INTO ${realm}."allauthWebhookEndpoint" (id,url,"eventTypes","encryptedSecret") VALUES ($1,$2,'["session.deleted"]',$3)`,
+					[
+						endpoint,
+						destination,
+						await symmetricEncrypt({ key: secret, data: signingKey }),
+					],
+				);
+				try {
+					const grants = [
+						{
+							table: "oauthAccessToken",
+							target: expired.id,
+							scopes: ["openid"],
+							revoked: true,
+							sessionId: null,
+						},
+						{
+							table: "oauthRefreshToken",
+							target: expired.id,
+							scopes: ["openid"],
+							revoked: true,
+							sessionId: null,
+						},
+						{
+							table: "oauthRefreshToken",
+							target: expired.id,
+							scopes: ["openid", "offline_access"],
+							revoked: false,
+							sessionId: null,
+						},
+						{
+							table: "oauthRefreshToken",
+							target: other.id,
+							scopes: ["openid"],
+							revoked: false,
+							sessionId: other.id,
+						},
+					].map((grant) => ({ ...grant, id: randomUUID() }));
+					for (const { table, target, scopes, id } of grants)
+						await database.query(
+							`INSERT INTO ${realm}."${table}" (id,token,"sessionId","userId","clientId","expiresAt","createdAt",scopes) VALUES ($1,$1,$2,$3,$4,now()+interval '1 hour',now(),$5)`,
+							[id, target, expired.userId, clientId, JSON.stringify(scopes)],
+						);
+					function authorize(params: URLSearchParams) {
+						const input = request("/oauth2/authorize", {
+							cookie: expired.cookie,
+							...(form ? { body: params } : { query: params }),
+						});
+						if (json) input.headers.set("accept", "application/json");
+						return input;
+					}
+					const rows = () =>
+						database.query<{ id: string }>(
+							`SELECT id FROM ${realm}.session WHERE id=ANY($1::text[])`,
+							[[expired.id, other.id]],
+						);
+					for (const invalid of [
+						query(randomUUID()),
+						query(clientId, {
+							redirect_uri: "https://unregistered.fixture.example/callback",
+						}),
+					]) {
+						const response = await dispatch(authorize(invalid));
+						expect(response.headers.getSetCookie(), writer).toEqual([]);
+						expect(
+							new Set((await rows()).rows.map(({ id }) => id)),
+							writer,
+						).toEqual(new Set([expired.id, other.id]));
+					}
+					const params = query(clientId, silent ? { prompt: "none" } : {});
+					const response = await dispatch(authorize(params));
+					expect(response.status, writer).toBe(json ? 200 : 302);
+					const redirect = await resultURL(response);
+					if (silent) {
+						expect(redirect.origin + redirect.pathname).toBe(
+							new URL(callback).origin + new URL(callback).pathname,
+						);
+						expect(Object.fromEntries(redirect.searchParams)).toMatchObject({
+							flow: "fixture",
+							error: "login_required",
+							iss: issuer,
+							state: params.get("state"),
+						});
+						expect(redirect.searchParams.has("code")).toBe(false);
+					} else {
+						expect(redirect.origin + redirect.pathname).toBe(
+							`${origin}/sign-in`,
+						);
+						expect(
+							await verifyOAuthQueryParams(
+								redirect.searchParams.toString(),
+								secret,
+							),
+						).toBe(true);
+						for (const [name, value] of params)
+							expect(redirect.searchParams.get(name)).toBe(value);
+					}
+					const cleared = response.headers
+						.getSetCookie()
+						.filter((value) => value.includes("Max-Age=0"))
+						.map((value) => value.split("=", 1)[0]);
+					expect(new Set(cleared), writer).toEqual(
+						new Set([
+							cookieName,
+							cookieName.replace("session_token", "session_data"),
+							cookieName.replace("session_token", "dont_remember"),
+						]),
+					);
+					expect((await rows()).rows, writer).toEqual([{ id: other.id }]);
+					for (const { table, id, revoked, sessionId } of grants)
+						expect(
+							(
+								await database.query(
+									`SELECT revoked IS NOT NULL AS revoked,"sessionId" FROM ${realm}."${table}" WHERE id=$1`,
+									[id],
+								)
+							).rows,
+							writer,
+						).toEqual([{ revoked, sessionId }]);
+					const envelopes: ControlWebhookEnvelope[] = [];
+					expect(
+						await deliverPendingWebhooks({
+							database: legacyDatabase,
+							secret,
+							now: () => new Date(Date.now() + 2_000),
+							resolver: async () => [{ address: "93.184.216.34", family: 4 }],
+							async transport({ destination: target, headers, body }) {
+								expect(target.url.href).toBe(destination);
+								expect(headers["webhook-signature"]).toBe(
+									await webhookSignature(
+										signingKey,
+										headers["webhook-id"]!,
+										headers["webhook-timestamp"]!,
+										body,
+									),
+								);
+								for (const value of [
+									expired.token,
+									other.token,
+									signingKey,
+									...grants.map(({ id }) => id),
+								])
+									expect(body).not.toContain(value);
+								envelopes.push(JSON.parse(body) as ControlWebhookEnvelope);
+								return 204;
+							},
+						}),
+					).toEqual({ claimed: 1, delivered: 1, failed: 0, retried: 0 });
+					const { id, createdAt } = envelopes[0]!.data.event;
+					expect(envelopes, writer).toEqual([
+						{
+							id,
+							timestamp: createdAt,
+							type: "session.deleted",
+							data: {
+								event: {
+									id,
+									createdAt,
+									type: "session.deleted",
+									outcome: "success",
+									actorId: expired.userId,
+									userId: expired.userId,
+									targetId: expired.id,
+									metadata: { path: "/oauth2/authorize" },
+								},
+							},
+						},
+					]);
+					if (!silent) {
+						const continued = await resultURL(
+							await dispatch(
+								request("/oauth2/continue", {
+									cookie: other.cookie,
+									body: {
+										selected: true,
+										oauth_query: redirect.searchParams.toString(),
+									},
+								}),
+							),
+						);
+						expect(continued.origin + continued.pathname).toBe(
+							new URL(callback).origin + new URL(callback).pathname,
+						);
+						expect(Object.fromEntries(continued.searchParams)).toMatchObject({
+							flow: "fixture",
+							iss: issuer,
+							state: params.get("state"),
+						});
+						const code = continued.searchParams.get("code");
+						expect(code).toBeTruthy();
+						const redeemed = await dispatch(
+							request("/oauth2/token", {
+								body: new URLSearchParams({
+									grant_type: "authorization_code",
+									client_id: clientId,
+									code: code!,
+									redirect_uri: callback,
+									code_verifier: verifier,
+								}),
+							}),
+						);
+						expect(redeemed.status, writer).toBe(200);
+						const tokens = (await redeemed.json()) as {
+							id_token: string;
+							access_token: string;
+						};
+						expect(tokens.access_token).toBeTruthy();
+						expect(decodeJwt(tokens.id_token)).toMatchObject({
+							iss: issuer,
+							aud: clientId,
+							sub: other.userId,
+							nonce: "fixture-nonce",
+						});
+					}
+				} finally {
+					await database.query(
+						`DELETE FROM ${realm}."allauthWebhookEndpoint" WHERE id=$1`,
+						[endpoint],
+					);
+				}
+			}
+		});
 
 		it("preserves ownership and stored updates for connected-app consent management", async () => {
 			const engine = managementEngine();

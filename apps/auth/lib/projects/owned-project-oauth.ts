@@ -227,6 +227,10 @@ export interface OwnedProjectOAuthOptions {
 		},
 	): Promise<Response>;
 	authorizeLinkedAccounts?: AuthorizeLinkedAccounts;
+	missingBrowserSessionHeaders?(
+		request: Request,
+		path: "/list-accounts" | "/account-info",
+	): Promise<Headers | null>;
 	auditContext?(
 		request: Request,
 	): Pick<ControlEventInput, "ipAddress" | "userAgent">;
@@ -991,6 +995,16 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 				"This authentication request is not permitted.",
 				403,
 			);
+		const headers = await options.missingBrowserSessionHeaders?.(
+			request,
+			"/list-accounts",
+		);
+		if (headers)
+			return publicJSON(
+				{ code: "UNAUTHORIZED", message: "Unauthorized" },
+				401,
+				headers,
+			);
 		const result = await linked.list(request, browserToken(request));
 		return result.status === "rejected"
 			? rejectedResponse(result)
@@ -1387,6 +1401,11 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 			)
 		)
 			return publicFailure("INVALID_QUERY", "Select a linked account.", 400);
+		const headers = await options.missingBrowserSessionHeaders?.(
+			request,
+			"/account-info",
+		);
+		if (headers) return new Response(null, { status: 401, headers });
 		const token = browserToken(request);
 		const loaded = await linked.info(request, token, accountId);
 		if (loaded.status === "rejected") return rejectedResponse(loaded);

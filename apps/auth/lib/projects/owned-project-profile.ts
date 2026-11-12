@@ -6,6 +6,8 @@ import type { ControlEventInput } from "../control/types";
 import type { createProjectEngineStore } from "./owned-project-engine-store";
 import { ownedProjectUsernameError } from "./owned-sign-up";
 
+export const ownedProjectProfileBody = z.record(z.string(), z.unknown());
+
 const profile = z.looseObject({
 	email: z.unknown().optional(),
 	name: z.string().optional(),

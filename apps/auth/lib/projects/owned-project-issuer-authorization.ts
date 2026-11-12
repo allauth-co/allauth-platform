@@ -79,6 +79,12 @@ export interface OwnedProjectIssuerAuthorizationOptions {
 		request: Request,
 		client: PoolClient,
 	): Promise<ProjectIssuerBrowserSession | null>;
+	/** Initial authorization may remove an expired browser session after validating the client and request. */
+	readAuthorizationSession?(
+		request: Request,
+		client: PoolClient,
+		responseHeaders: Headers,
+	): Promise<ProjectIssuerBrowserSession | null>;
 	/** Separate fresh console authority for the initial GET of a trusted client. */
 	readConsoleOAuthSession?(
 		request: Request,
@@ -251,8 +257,15 @@ export function createOwnedProjectIssuerAuthorization(
 			);
 	}
 
-	async function liveSession(request: Request, client: PoolClient) {
-		const session = await options.readSession(request, client);
+	async function liveSession(
+		request: Request,
+		client: PoolClient,
+		authorizationHeaders?: Headers,
+	) {
+		const session =
+			authorizationHeaders && options.readAuthorizationSession
+				? await options.readAuthorizationSession(request, client, authorizationHeaders)
+				: await options.readSession(request, client);
 		return session?.user.id &&
 			session.user.id === session.session.userId &&
 			!session.session.impersonatedBy &&
@@ -436,7 +449,8 @@ export function createOwnedProjectIssuerAuthorization(
 		input: URLSearchParams,
 		signed?: SignedQuery,
 	) {
-		return store.transaction(async (client) => {
+		const authorizationHeaders = signed ? undefined : new Headers();
+		const response = await store.transaction(async (client) => {
 			let target: string | undefined;
 			const asJSON = Boolean(signed);
 			try {
@@ -463,7 +477,7 @@ export function createOwnedProjectIssuerAuthorization(
 						asJSON,
 					);
 				await assertResources(client, registration, query);
-				const ordinary = await liveSession(request, client);
+				const ordinary = await liveSession(request, client, authorizationHeaders);
 				const consoleSession =
 					!ordinary &&
 					!signed &&
@@ -583,6 +597,9 @@ export function createOwnedProjectIssuerAuthorization(
 				throw error;
 			}
 		});
+		for (const cookie of authorizationHeaders?.getSetCookie() ?? [])
+			response.headers.append("Set-Cookie", cookie);
+		return response;
 	}
 
 	async function consent(

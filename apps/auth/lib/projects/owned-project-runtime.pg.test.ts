@@ -7433,10 +7433,11 @@ describe.skipIf(!existsSync(fixture))(
 				const cookieName = `__Secure-allauth_project_${alpha.slug}.session_token`;
 				const url = `https://${alpha.slug}.webhook.fixture.example/events`;
 				const projectKey = projectSecret(childEnvironment(), alpha.id);
-				let nextIP = 191;
+				let nextIP = 131;
 				const clientIP = () => `192.0.2.${nextIP++}`;
-				async function start() {
+				async function start(rejectExpiredToken = false) {
 					if (appleIssuerKeys) {
+						const now = Math.floor(Date.now() / 1000);
 						const token = await new SignJWT({
 							email: runtimeFixtureApple.email,
 							email_verified: true,
@@ -7448,8 +7449,8 @@ describe.skipIf(!existsSync(fixture))(
 							.setIssuer(runtimeFixtureAppleOrigin)
 							.setAudience(runtimeFixtureApple.appBundleIdentifier)
 							.setSubject(runtimeFixtureApple.subject)
-							.setIssuedAt()
-							.setExpirationTime("5m")
+							.setIssuedAt(rejectExpiredToken ? now - 600 : now)
+							.setExpirationTime(rejectExpiredToken ? now - 120 : now + 300)
 							.sign(appleIssuerKeys.privateKey);
 						return (cookie = "") =>
 							service!.request(`${authPath}/sign-in/social`, {
@@ -7502,7 +7503,7 @@ describe.skipIf(!existsSync(fixture))(
 					if (!device) throw new Error("Missing fixture saved device.");
 					return { ...session, user, token: stored.token, primary, device };
 				}
-				async function signedIn(response: Response) {
+				async function assertSignIn(response: Response) {
 					expect(response.status, await response.clone().text()).toBe(
 						direct ? 200 : 302,
 					);
@@ -7513,11 +7514,12 @@ describe.skipIf(!existsSync(fixture))(
 						});
 					else
 						expect(response.headers.get("location")).toBe(`${origin}/account`);
-					return browser(response);
 				}
 				async function providerSignIn() {
 					const complete = await start();
-					return signedIn(await complete());
+					const response = await complete();
+					await assertSignIn(response);
+					return browser(response);
 				}
 				for (const owned of [false, true]) {
 					service = await openProcess(
@@ -7527,7 +7529,19 @@ describe.skipIf(!existsSync(fixture))(
 						alpha.slug,
 						appleFixture,
 					);
-					for (const hasBrowser of [true, false]) {
+					for (const primaryState of [
+						...(direct ? ["expired-rejected" as const] : []),
+						"active",
+						"absent",
+						"expired-other",
+						"expired-owner",
+					] as const) {
+						const rejectedProvider = primaryState === "expired-rejected";
+						const expiredOther =
+							primaryState === "expired-other" || rejectedProvider;
+						const expiredOwner = primaryState === "expired-owner";
+						const expiredPrimary = expiredOther || expiredOwner;
+						const label = `${owned ? "AllAuth" : "legacy"} ${eventPath} with ${primaryState} primary`;
 						const previous = await providerSignIn();
 						const unrelated = await providerSignIn();
 						expect(previous.user).toMatchObject({
@@ -7545,7 +7559,20 @@ describe.skipIf(!existsSync(fixture))(
 							}),
 						);
 						expect(active.user.id).toBe(credentials.project.id);
-						const attempt = await start();
+						const attempt = await start(rejectedProvider);
+						if (expiredPrimary)
+							await database.query(
+								`UPDATE ${realm}.session SET "expiresAt"=now()-interval '1 minute' WHERE id=$1`,
+								[expiredOther ? active.id : previous.id],
+							);
+						const before = expiredPrimary
+							? (
+									await database.query<{ id: string }>(
+										`SELECT id FROM ${realm}.session WHERE "userId"=$1`,
+										[previous.user.id],
+									)
+								).rows.map(({ id }) => id)
+							: [];
 						const endpoint = randomUUID();
 						const signingKey = newWebhookSigningSecret();
 						const encrypted = await symmetricEncrypt({
@@ -7558,18 +7585,26 @@ describe.skipIf(!existsSync(fixture))(
 								`INSERT INTO ${schema}."allauthWebhookEndpoint" (id,url,"eventTypes","encryptedSecret") VALUES ($1,$2,'["session.deleted"]',$3)`,
 								[endpoint, url, encrypted],
 							);
-						await database.query(
-							`INSERT INTO ${sibling}.session (id,token,"userId","expiresAt","updatedAt") VALUES ($1,$2,$3,now()+interval '1 day',now())`,
-							[previous.id, previous.token, credentials.project.id],
-						);
+						for (const { id, token } of [
+							previous,
+							...(expiredOther ? [active] : []),
+						])
+							await database.query(
+								`INSERT INTO ${sibling}.session (id,token,"userId","expiresAt","updatedAt") VALUES ($1,$2,$3,now()+interval '1 day',now())`,
+								[id, token, credentials.project.id],
+							);
 						const client = randomUUID();
 						await database.query(
 							`INSERT INTO ${realm}."oauthClient" (id,"clientId","redirectUris") VALUES ($1,$1,'[]')`,
 							[client],
 						);
-						const grants = ["access", "online", "offline", "unrelated"].map(
-							(kind) => ({ kind, id: randomUUID() }),
-						);
+						const grants = [
+							"access",
+							"online",
+							"offline",
+							"unrelated",
+							...(expiredOther ? ["primary-online", "primary-offline"] : []),
+						].map((kind) => ({ kind, id: randomUUID() }));
 						for (const { kind, id } of grants) {
 							const table =
 								kind === "access" ? "oauthAccessToken" : "oauthRefreshToken";
@@ -7578,11 +7613,17 @@ describe.skipIf(!existsSync(fixture))(
 							 VALUES ($1,$1,$2,$3,$4,now()+interval '1 day',now(),$5)`,
 								[
 									id,
-									kind === "unrelated" ? unrelated.id : previous.id,
-									previous.user.id,
+									kind.startsWith("primary-")
+										? active.id
+										: kind === "unrelated"
+											? unrelated.id
+											: previous.id,
+									kind.startsWith("primary-")
+										? active.user.id
+										: previous.user.id,
 									client,
 									JSON.stringify(
-										kind === "offline"
+										kind.endsWith("offline")
 											? ["openid", "offline_access"]
 											: ["openid"],
 									),
@@ -7593,32 +7634,100 @@ describe.skipIf(!existsSync(fixture))(
 							[
 								previous.device,
 								active.device,
-								...(hasBrowser ? [active.primary] : []),
+								...(primaryState === "absent"
+									? []
+									: [expiredOwner ? previous.primary : active.primary]),
 							].join("; "),
 						);
-						const replacement = await signedIn(response);
-						expect(replacement.user.id).toBe(previous.user.id);
+						if (rejectedProvider) {
+							expect(response.status, await response.clone().text()).toBe(401);
+							expect(await response.clone().json()).toMatchObject({
+								code: "INVALID_TOKEN",
+							});
+						} else await assertSignIn(response);
+						const primaryCookie = response.headers
+							.getSetCookie()
+							.filter((value) => value.startsWith(`${cookieName}=`))
+							.at(-1);
+						const clearsPrimary = Boolean(
+							primaryCookie?.startsWith(`${cookieName}=;`) &&
+								primaryCookie.includes("Max-Age=0"),
+						);
+						let replacement: { id: string; token: string } | undefined;
+						if (rejectedProvider) {
+							expect(response.headers.getSetCookie(), label).toEqual([]);
+							const { rows } = await database.query(
+								`SELECT id FROM ${realm}.session WHERE "userId"=$1 AND NOT id=ANY($2::text[])`,
+								[previous.user.id, before],
+							);
+							expect(rows).toEqual([]);
+						} else if (clearsPrimary && expiredPrimary) {
+							const { rows } = await database.query<{
+								id: string;
+								token: string;
+							}>(
+								`SELECT id,token FROM ${realm}.session WHERE "userId"=$1 AND NOT id=ANY($2::text[])`,
+								[previous.user.id, before],
+							);
+							expect(rows).toHaveLength(1);
+							replacement = rows[0]!;
+							expect(cookie(response)).toContain(
+								`${cookieName}_multi-${replacement.token.toLowerCase()}=`,
+							);
+						} else {
+							const current = await browser(response);
+							expect(current.user.id).toBe(previous.user.id);
+							replacement = current;
+						}
+						// The native late read can overwrite the new primary cookie. The candidate keeps the replacement active.
+						expect(clearsPrimary, label).toBe(
+							expiredPrimary && !owned && !rejectedProvider,
+						);
 						const expired = response.headers
 							.getSetCookie()
 							.find((value) =>
 								value.startsWith(`${previous.device.split("=", 1)[0]}=;`),
 							);
-						expect(expired).toContain("Max-Age=0");
+						if (expiredOwner || rejectedProvider)
+							expect(expired).toBeUndefined();
+						else expect(expired).toContain("Max-Age=0");
+						expect(
+							response.headers
+								.getSetCookie()
+								.some((value) =>
+									value.startsWith(`${active.device.split("=", 1)[0]}=`),
+								),
+						).toBe(false);
 						const { rows: sessions } = await database.query<{ id: string }>(
 							`SELECT id FROM ${realm}.session WHERE id=ANY($1::text[])`,
-							[[previous.id, active.id, unrelated.id, replacement.id]],
+							[
+								[
+									previous.id,
+									active.id,
+									unrelated.id,
+									...(replacement ? [replacement.id] : []),
+								],
+							],
 						);
-						expect(new Set(sessions.map(({ id }) => id))).toEqual(
-							new Set([active.id, unrelated.id, replacement.id]),
+						expect(new Set(sessions.map(({ id }) => id)), label).toEqual(
+							new Set([
+								...(expiredOther ? [] : [active.id]),
+								unrelated.id,
+								...(replacement ? [replacement.id] : [previous.id]),
+							]),
 						);
-						expect(
-							(
-								await database.query(
-									`SELECT "userId" FROM ${sibling}.session WHERE id=$1 AND token=$2`,
-									[previous.id, previous.token],
-								)
-							).rows,
-						).toEqual([{ userId: credentials.project.id }]);
+						for (const { id, token } of [
+							previous,
+							...(expiredOther ? [active] : []),
+						])
+							expect(
+								(
+									await database.query(
+										`SELECT "userId" FROM ${sibling}.session WHERE id=$1 AND token=$2`,
+										[id, token],
+									)
+								).rows,
+							).toEqual([{ userId: credentials.project.id }]);
 						expect(
 							(
 								await database.query(
@@ -7636,8 +7745,16 @@ describe.skipIf(!existsSync(fixture))(
 						for (const { kind, id } of grants)
 							expect(grantState.find((grant) => grant.id === id)).toEqual({
 								id,
-								revoked: kind === "access" || kind === "online",
-								sessionId: kind === "unrelated" ? unrelated.id : null,
+								revoked:
+									kind === "primary-online" ||
+									(!rejectedProvider &&
+										(kind === "access" || kind === "online")),
+								sessionId:
+									kind === "unrelated"
+										? unrelated.id
+										: rejectedProvider && !kind.startsWith("primary-")
+											? previous.id
+											: null,
 							});
 						const delivered: ControlWebhookEnvelope[] = [];
 						expect(
@@ -7660,7 +7777,7 @@ describe.skipIf(!existsSync(fixture))(
 										previous.token,
 										active.token,
 										unrelated.token,
-										replacement.token,
+										...(replacement ? [replacement.token] : []),
 										signingKey,
 									])
 										expect(body).not.toContain(value);
@@ -7668,30 +7785,55 @@ describe.skipIf(!existsSync(fixture))(
 									return 204;
 								},
 							}),
-						).toEqual({ claimed: 1, delivered: 1, failed: 0, retried: 0 });
-						const { id, createdAt } = delivered[0]!.data.event;
-						expect(
-							delivered,
-							`${owned ? "AllAuth" : "legacy"} ${eventPath} with ${hasBrowser ? "an active browser" : "only saved devices"}`,
-						).toEqual([
-							{
-								id,
-								type: "session.deleted",
-								timestamp: createdAt,
-								data: {
-									event: {
-										id,
-										createdAt,
-										type: "session.deleted",
-										outcome: "success",
-										...(hasBrowser ? { actorId: active.user.id } : {}),
-										userId: previous.user.id,
-										targetId: previous.id,
-										metadata: { path: eventPath },
-									},
-								},
+						).toEqual({
+							claimed: expiredOther && !rejectedProvider ? 2 : 1,
+							delivered: expiredOther && !rejectedProvider ? 2 : 1,
+							failed: 0,
+							retried: 0,
+						});
+						const expectEvent = (
+							targetId: string,
+							userId: string,
+							actorId?: string,
+						) => ({
+							type: "session.deleted",
+							outcome: "success",
+							...(actorId ? { actorId } : {}),
+							userId,
+							targetId,
+							metadata: { path: eventPath },
+						});
+						const events = delivered.map(
+							({ id, type, timestamp, data: { event } }) => {
+								expect({ id, type, timestamp }).toEqual({
+									id: event.id,
+									type: event.type,
+									timestamp: event.createdAt,
+								});
+								const { id: _id, createdAt: _time, ...value } = event;
+								return value;
 							},
-						]);
+						);
+						expect(events, label).toEqual(
+							expect.arrayContaining([
+								...(rejectedProvider
+									? []
+									: [
+											expectEvent(
+												previous.id,
+												previous.user.id,
+												expiredOwner
+													? previous.user.id
+													: primaryState === "active"
+														? active.user.id
+														: undefined,
+											),
+										]),
+								...(expiredOther
+									? [expectEvent(active.id, active.user.id, active.user.id)]
+									: []),
+							]),
+						);
 						for (const schema of [realm, sibling])
 							await database.query(
 								`DELETE FROM ${schema}."allauthWebhookEndpoint" WHERE id=$1`,
@@ -7720,37 +7862,48 @@ describe.skipIf(!existsSync(fixture))(
 			{
 				flow: "email verification with active browser",
 				route: "verify-email",
-				hasBrowser: true,
+				primary: "active",
 			},
 			{
 				flow: "email verification with saved device only",
 				route: "verify-email",
-				hasBrowser: false,
+				primary: "absent",
+			},
+			{
+				flow: "email verification with expired browser",
+				route: "verify-email",
+				primary: "expired",
 			},
 			{
 				flow: "email OTP verification with active browser",
 				route: "email-otp/verify-email",
-				hasBrowser: true,
+				primary: "active",
 			},
 			{
 				flow: "email OTP verification with saved device only",
 				route: "email-otp/verify-email",
-				hasBrowser: false,
+				primary: "absent",
+			},
+			{
+				flow: "email OTP verification with expired browser",
+				route: "email-otp/verify-email",
+				primary: "expired",
 			},
 			{
 				flow: "pending recovery-code MFA completion",
 				route: "two-factor/verify-backup-code",
-				hasBrowser: false,
+				primary: "absent",
 			},
 			{
 				flow: "pending authenticator-code MFA completion",
 				route: "two-factor/verify-totp",
-				hasBrowser: false,
+				primary: "absent",
 			},
 		])("matches signed saved-device cleanup after $flow", async ({
 			route,
-			hasBrowser,
+			primary,
 		}) => {
+			const expired = primary === "expired";
 			const local: { container: string; DATABASE_URL: string } = JSON.parse(
 				readFileSync(fixture, "utf8"),
 			);
@@ -7858,10 +8011,15 @@ describe.skipIf(!existsSync(fixture))(
 					const actor = await browser(
 						await login(credentials.realmAdmin.email),
 					);
+					if (expired)
+						await database.query(
+							`UPDATE ${realm}.session SET "expiresAt"=statement_timestamp()-interval '1 minute' WHERE id=$1`,
+							[actor.id],
+						);
 					const devices = [
 						previous.device,
 						actor.device,
-						...(hasBrowser ? [actor.primary] : []),
+						...(primary !== "absent" ? [actor.primary] : []),
 					];
 					const isMfa = route.startsWith("two-factor/");
 					let complete: () => Promise<Response>;
@@ -7969,11 +8127,34 @@ describe.skipIf(!existsSync(fixture))(
 							await symmetricEncrypt({ key: projectKey, data: signingKey }),
 						],
 					);
+					const before = await database.query<{ id: string }>(
+						`SELECT id FROM ${realm}.session WHERE "userId"=$1`,
+						[previous.userId],
+					);
 					const response = await complete();
 					expect(response.status, await response.clone().text()).toBe(
 						route === "verify-email" ? 302 : 200,
 					);
-					const replacement = await browser(response);
+					const fresh = response.headers
+						.getSetCookie()
+						.some(
+							(value) =>
+								value.startsWith(`${cookieName}=`) &&
+								!value.startsWith(`${cookieName}=;`),
+						);
+					let replacement: { id: string; userId: string; token: string };
+					if (owned || !expired || fresh) replacement = await browser(response);
+					else {
+						expect(response.headers.getSetCookie()).toContainEqual(
+							expect.stringContaining(`${cookieName}=;`),
+						);
+						const { rows } = await database.query<typeof replacement>(
+							`SELECT id,"userId",token FROM ${realm}.session WHERE "userId"=$1 AND id<>ALL($2::text[])`,
+							[previous.userId, before.rows.map(({ id }) => id)],
+						);
+						expect(rows).toHaveLength(1);
+						replacement = rows[0]!;
+					}
 					expect(replacement.userId).toBe(previous.userId);
 					const previousDevice = previous.device.split("=", 1)[0];
 					expect(
@@ -7986,7 +8167,11 @@ describe.skipIf(!existsSync(fixture))(
 						[[previous.id, actor.id, unrelated.id, replacement.id]],
 					);
 					expect(new Set(rows.map(({ id }) => id))).toEqual(
-						new Set([actor.id, unrelated.id, replacement.id]),
+						new Set([
+							...(!expired ? [actor.id] : []),
+							unrelated.id,
+							replacement.id,
+						]),
 					);
 					const delivered: ControlWebhookEnvelope[] = [];
 					expect(
@@ -8007,17 +8192,36 @@ describe.skipIf(!existsSync(fixture))(
 								);
 								expect(body).not.toContain(previous.token);
 								expect(body).not.toContain(replacement.token);
+								expect(body).not.toContain(actor.token);
 								delivered.push(JSON.parse(body) as ControlWebhookEnvelope);
 								return 204;
 							},
 						}),
-					).toEqual({ claimed: 1, delivered: 1, failed: 0, retried: 0 });
-					const { id, createdAt } = delivered[0]!.data.event;
-					expect(
-						delivered,
-						owned ? "AllAuth verification" : "legacy verification",
-					).toEqual([
+					).toEqual({
+						claimed: expired ? 2 : 1,
+						delivered: expired ? 2 : 1,
+						failed: 0,
+						retried: 0,
+					});
+					const deletions = [
 						{
+							target: previous,
+							actorId: primary === "active" ? actor.userId : undefined,
+						},
+						...(expired ? [{ target: actor, actorId: actor.userId }] : []),
+					];
+					expect(delivered).toHaveLength(deletions.length);
+					for (const { target, actorId } of deletions) {
+						const envelope = delivered.find(
+							({ data }) => data.event.targetId === target.id,
+						);
+						if (!envelope)
+							throw new Error("Missing signed verification deletion event.");
+						const { id, createdAt } = envelope.data.event;
+						expect(
+							envelope,
+							owned ? "AllAuth verification" : "legacy verification",
+						).toEqual({
 							id,
 							type: "session.deleted",
 							timestamp: createdAt,
@@ -8027,14 +8231,14 @@ describe.skipIf(!existsSync(fixture))(
 									createdAt,
 									type: "session.deleted",
 									outcome: "success",
-									...(hasBrowser ? { actorId: actor.userId } : {}),
-									userId: previous.userId,
-									targetId: previous.id,
+									...(actorId ? { actorId } : {}),
+									userId: target.userId,
+									targetId: target.id,
 									metadata: { path: `/${route}` },
 								},
 							},
-						},
-					]);
+						});
+					}
 					await database.query(
 						`DELETE FROM ${realm}."allauthWebhookEndpoint" WHERE id=$1`,
 						[endpoint],

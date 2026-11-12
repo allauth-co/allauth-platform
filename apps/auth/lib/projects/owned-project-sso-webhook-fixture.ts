@@ -42,7 +42,7 @@ export async function checkEnterpriseSavedDeviceWebhook(options: {
 	userId: string;
 	browserUserId: string;
 	owned: Dispatch;
-	prepare(dispatch: Dispatch, ip: string): Promise<Request>;
+	prepare(dispatch: Dispatch, ip: string, rejected?: boolean): Promise<Request>;
 }) {
 	const {
 		database,
@@ -196,17 +196,76 @@ export async function checkEnterpriseSavedDeviceWebhook(options: {
 		}
 
 		let nextIP = 141;
+		const scenarios =
+			policy.mfaMode === "required"
+				? ([
+						"active",
+						"absent",
+						"expired-other",
+						"expired-owner",
+						"rejected",
+						...(callbackPath === "/sso/saml2/sp/acs/:providerId"
+							? (["malformed-ingress"] as const)
+							: []),
+					] as const)
+				: (["active", "absent"] as const);
 		for (const [writer, dispatch, start] of [
 			["native", native.handler, owned],
 			["owned", owned, native.handler],
 		] as const) {
-			for (const withBrowser of [true, false]) {
+			for (const scenario of scenarios) {
+				const malformed = scenario === "malformed-ingress";
+				const rejected = scenario === "rejected" || malformed;
 				const previous = await savedSession(userId);
 				const unrelated = await savedSession(userId);
 				const browser = await savedSession(browserUserId);
 				expect((await browserSession(browser.primary))?.user.id).toBe(
 					browserUserId,
 				);
+				const expired =
+					scenario === "expired-owner"
+						? { ...previous, userId }
+						: scenario === "expired-other" || rejected
+							? { ...browser, userId: browserUserId }
+							: undefined;
+				if (expired)
+					await database.query(
+						`UPDATE "${schema}"."session" SET "expiresAt"=now()-interval '1 minute' WHERE id=$1`,
+						[expired.id],
+					);
+				const expiredRemoved = malformed ? undefined : expired;
+				const clientId = expired && randomUUID();
+				const grants = expired
+					? ["access", "online", "offline"].map((kind) => ({
+							id: randomUUID(),
+							kind,
+						}))
+					: [];
+				if (expired && clientId) {
+					await database.query(
+						`INSERT INTO "${schema}"."oauthClient"(id,"clientId","redirectUris") VALUES ($1,$1,'[]')`,
+						[clientId],
+					);
+					for (const { id, kind } of grants) {
+						const table =
+							kind === "access" ? "oauthAccessToken" : "oauthRefreshToken";
+						await database.query(
+							`INSERT INTO "${schema}"."${table}"(id,token,"clientId","userId","sessionId","expiresAt","createdAt",scopes)
+							 VALUES ($1,$1,$2,$3,$4,now()+interval '1 hour',now(),$5)`,
+							[
+								id,
+								clientId,
+								expired.userId,
+								expired.id,
+								JSON.stringify(
+									kind === "offline"
+										? ["openid", "offline_access"]
+										: ["openid"],
+								),
+							],
+						);
+					}
+				}
 				const endpoint = randomUUID();
 				const url = "https://enterprise-webhook.fixture.example/events";
 				const signingKey = newWebhookSigningSecret();
@@ -220,7 +279,16 @@ export async function checkEnterpriseSavedDeviceWebhook(options: {
 				);
 				try {
 					const ip = `192.0.2.${nextIP++}`;
-					const request = await prepare(start, ip);
+					const pending = await prepare(start, ip, scenario === "rejected");
+					const request = malformed
+						? new Request(pending.url, {
+								method: "POST",
+								headers: pending.headers,
+								body: "{",
+							})
+						: pending;
+					if (malformed)
+						request.headers.set("content-type", "application/json");
 					request.headers.set("x-real-ip", ip);
 					request.headers.set(
 						"cookie",
@@ -229,42 +297,112 @@ export async function checkEnterpriseSavedDeviceWebhook(options: {
 							previous.device,
 							browser.device,
 							trustedDevice,
-							...(withBrowser ? [browser.primary] : []),
+							expired?.primary ??
+								(scenario === "active" ? browser.primary : undefined),
 						]
 							.filter(Boolean)
 							.join("; "),
 					);
 					const response = await dispatch(request);
-					expect(
-						response.headers.get("location"),
-						await response.clone().text(),
-					).toBe(destination);
+					const location = response.headers.get("location");
 					const cookies = response.headers.getSetCookie();
-					const primary = cookies
-						.find((value) => value.startsWith(`${primaryName}=`))
-						?.split(";", 1)[0];
-					expect(primary).toBeTruthy();
-					expect(await browserSession(primary!)).toMatchObject({
-						user: { id: userId },
-					});
-					if (policy.mfaMode === "required") {
-						const rotated = cookieValue(response, trustName);
-						expect(rotated).toBeTruthy();
-						expect(rotated).not.toBe(trustedDevice);
-						trustedDevice = rotated;
+					const primary = cookieValue(response, primaryName);
+					if (expired)
+						expect(
+							cookies.some((value) => value.startsWith(`${primaryName}=;`)),
+						).toBe(false);
+					if (rejected) {
+						if (malformed) expect(response.status).toBe(400);
+						else if (callbackPath === "/sso/callback/:providerId") {
+							expect(response.status).toBe(302);
+							expect(new URL(location!).searchParams.get("error")).toBe(
+								"access_denied",
+							);
+						} else if (response.status === 302) {
+							expect(new URL(location!).searchParams.has("error")).toBe(true);
+						} else {
+							expect(response.status).toBe(400);
+							expect(await response.json()).toMatchObject({
+								code: "INVALID_SAML_RESPONSE",
+							});
+						}
+						expect(primary).toBeUndefined();
+						expect(cookieValue(response, trustName)).toBeUndefined();
+					} else {
+						expect(location, await response.clone().text()).toBe(destination);
+						expect(primary).toBeTruthy();
+						expect(await browserSession(primary!)).toMatchObject({
+							user: { id: userId },
+						});
+						if (policy.mfaMode === "required") {
+							const rotated = cookieValue(response, trustName);
+							expect(rotated).toBeTruthy();
+							expect(rotated).not.toBe(trustedDevice);
+							trustedDevice = rotated;
+						}
 					}
 					expect(
-						cookies.find((value) =>
-							value.startsWith(`${previous.deviceName}=;`),
+						cookies.some(
+							(value) =>
+								value.startsWith(`${previous.deviceName}=;`) &&
+								value.includes("Max-Age=0"),
 						),
-					).toContain("Max-Age=0");
-					expect(await browserSession(previous.primary)).toBeNull();
-					expect((await browserSession(unrelated.primary))?.user.id).toBe(
-						userId,
+					).toBe(!rejected && expired?.id !== previous.id);
+					const stored = await database.query<{ id: string }>(
+						`SELECT id FROM "${schema}"."session" WHERE id=ANY($1::text[])`,
+						[[previous.id, unrelated.id, browser.id]],
 					);
-					expect((await browserSession(browser.primary))?.user.id).toBe(
-						browserUserId,
+					expect(
+						new Set(stored.rows.map(({ id }) => id)),
+						`${writer} ${scenario} session rows`,
+					).toEqual(
+						new Set([
+							unrelated.id,
+							...(rejected ? [previous.id] : []),
+							...(expiredRemoved?.id !== browser.id ? [browser.id] : []),
+						]),
 					);
+					if (expired && clientId) {
+						const { rows } = await database.query<{
+							id: string;
+							revoked: boolean;
+							sessionId: string | null;
+						}>(
+							`SELECT id,revoked IS NOT NULL AS revoked,"sessionId" FROM "${schema}"."oauthAccessToken" WHERE "clientId"=$1
+							 UNION ALL SELECT id,revoked IS NOT NULL AS revoked,"sessionId" FROM "${schema}"."oauthRefreshToken" WHERE "clientId"=$1`,
+							[clientId],
+						);
+						expect(rows).toHaveLength(grants.length);
+						for (const { id, kind } of grants)
+							expect(rows.find((row) => row.id === id)).toEqual({
+								id,
+								revoked: Boolean(expiredRemoved && kind !== "offline"),
+								sessionId: expiredRemoved ? null : expired.id,
+							});
+					}
+					const expectedEvents = [
+						...(expiredRemoved
+							? [
+									{
+										userId: expiredRemoved.userId,
+										targetId: expiredRemoved.id,
+										actorId: expiredRemoved.userId,
+									},
+								]
+							: []),
+						...(!rejected && expired?.id !== previous.id
+							? [
+									{
+										userId,
+										targetId: previous.id,
+										actorId:
+											policy.mfaMode === "required" && scenario === "active"
+												? browserUserId
+												: undefined,
+									},
+								]
+							: []),
+					];
 					const events: ControlWebhookEnvelope[] = [];
 					expect(
 						await deliverPendingWebhooks({
@@ -293,13 +431,21 @@ export async function checkEnterpriseSavedDeviceWebhook(options: {
 								return 204;
 							},
 						}),
-					).toEqual({ claimed: 1, delivered: 1, failed: 0, retried: 0 });
-					const { id, createdAt } = events[0]!.data.event;
-					expect(
-						events,
-						`${writer} enterprise callback with ${withBrowser ? "an active browser" : "only saved devices"}`,
-					).toEqual([
-						{
+					).toEqual({
+						claimed: expectedEvents.length,
+						delivered: expectedEvents.length,
+						failed: 0,
+						retried: 0,
+					});
+					for (const expected of expectedEvents) {
+						const envelope = events.find(
+							({ data }) => data.event.targetId === expected.targetId,
+						);
+						const { id, createdAt } = envelope!.data.event;
+						expect(
+							envelope,
+							`${writer} enterprise callback ${scenario}`,
+						).toEqual({
 							id,
 							type: "session.deleted",
 							timestamp: createdAt,
@@ -309,21 +455,24 @@ export async function checkEnterpriseSavedDeviceWebhook(options: {
 									createdAt,
 									type: "session.deleted",
 									outcome: "success",
-									...(policy.mfaMode === "required" && withBrowser
-										? { actorId: browserUserId }
-										: {}),
-									userId,
-									targetId: previous.id,
+									...(expected.actorId ? { actorId: expected.actorId } : {}),
+									userId: expected.userId,
+									targetId: expected.targetId,
 									metadata: { path: callbackPath },
 								},
 							},
-						},
-					]);
+						});
+					}
 				} finally {
 					await database.query(
 						`DELETE FROM "${schema}"."allauthWebhookEndpoint" WHERE id=$1`,
 						[endpoint],
 					);
+					if (clientId)
+						await database.query(
+							`DELETE FROM "${schema}"."oauthClient" WHERE id=$1`,
+							[clientId],
+						);
 				}
 			}
 		}

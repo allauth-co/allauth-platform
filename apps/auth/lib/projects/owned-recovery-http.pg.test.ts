@@ -1239,11 +1239,49 @@ describe.skipIf(!existsSync(fixturePath))(
 					["native", installed.handler],
 					["owned", owned.dispatch],
 				] as const) {
+					const former = await seed(
+						`expired-${writer}-${requireEmailVerification}@verification.fixture.example`,
+					);
+					await database.query(
+						`UPDATE "${schema}"."user" SET "emailVerified"=TRUE WHERE id=$1`,
+						[former.id],
+					);
+					const login = post("/sign-in/email", {
+						email: former.email,
+						password: oldPassword,
+					});
+					const ip = `192.0.2.${106 + (requireEmailVerification ? 0 : 2) + (writer === "native" ? 0 : 1)}`;
+					login.headers.set("x-real-ip", ip);
+					const signedIn = await dispatch(login);
+					expect(signedIn.status).toBe(200);
+					const primary = signedIn.headers
+						.getSetCookie()
+						.find(
+							(value) =>
+								value.includes(".session_token=") && !value.includes("Max-Age=0"),
+						)
+						?.split(";", 1)[0];
+					expect(primary).toBeTruthy();
+					const session = await dispatch(
+						new Request(`${origin}${basePath}/get-session`, {
+							headers: { cookie: primary!, "x-real-ip": ip },
+						}),
+					);
+					expect(session.status).toBe(200);
+					const active = (await session.json()) as {
+						user: { id: string };
+						session: { id: string };
+					};
+					expect(active.user.id).toBe(former.id);
+					await database.query(
+						`UPDATE "${schema}"."session" SET "expiresAt"=now()-interval '1 minute' WHERE id=$1`,
+						[active.session.id],
+					);
 					const endpointId = randomUUID();
 					const recipient = "https://verification-hook.fixture.example/events";
 					const signing = newWebhookSigningSecret();
 					await database.query(
-						`INSERT INTO "${schema}"."allauthWebhookEndpoint" (id,url,"eventTypes","encryptedSecret") VALUES ($1,$2,'["user.created","user.email-verified"]',$3)`,
+						`INSERT INTO "${schema}"."allauthWebhookEndpoint" (id,url,"eventTypes","encryptedSecret") VALUES ($1,$2,'["user.created","user.email-verified","session.deleted"]',$3)`,
 						[
 							endpointId,
 							recipient,
@@ -1261,6 +1299,7 @@ describe.skipIf(!existsSync(fixturePath))(
 						});
 						signup.headers.set("x-real-ip", "192.0.2.104");
 						signup.headers.set("user-agent", "Fixture signup");
+						signup.headers.set("cookie", primary!);
 						const registered = await dispatch(signup);
 						expect(registered.status, `${writer} signup`).toBe(200);
 						expect(registered.headers.getSetCookie()).toEqual([]);
@@ -1270,6 +1309,22 @@ describe.skipIf(!existsSync(fixturePath))(
 						};
 						expect(token).toBeNull();
 						expect(user).toMatchObject({ email, name, emailVerified: false });
+						expect(
+							(
+								await database.query(
+									`SELECT id,"expiresAt"<now() AS expired FROM "${schema}"."session" WHERE "userId"=ANY($1::text[])`,
+									[[former.id, user.id]],
+								)
+							).rows,
+						).toEqual([{ id: active.session.id, expired: true }]);
+						expect(
+							(
+								await database.query(
+									`SELECT "eventType" FROM "${schema}"."allauthWebhookDelivery" WHERE "endpointId"=$1`,
+									[endpointId],
+								)
+							).rows,
+						).toEqual([{ eventType: "user.created" }]);
 						if (!requireEmailVerification) {
 							expect(links).toHaveLength(0);
 							expect(queued).toHaveLength(0);

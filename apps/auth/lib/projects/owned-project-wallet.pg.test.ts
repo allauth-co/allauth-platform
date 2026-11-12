@@ -1,5 +1,7 @@
-import { randomBytes, randomUUID } from "node:crypto";
+import { createHmac, randomBytes, randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
+import { betterAuth } from "better-auth";
+import { symmetricEncrypt } from "better-auth/crypto";
 import { siwe } from "better-auth/plugins";
 import { getTestInstance } from "better-auth/test";
 import { Kysely, PostgresDialect } from "kysely";
@@ -8,14 +10,22 @@ import { verifyMessage } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { createSiweMessage, parseSiweMessage } from "viem/siwe";
 import { describe, expect, it } from "vitest";
+import { createAuthOptions } from "../auth";
+import type { AuthPolicy } from "../auth-policy/policy";
 import { defaultAuthPolicy } from "../auth-policy/policy";
+import { clerkCompatiblePasswords } from "../clerk-password";
 import { allauthControl } from "../control";
 import {
 	defaultSecurityPolicy,
 	securitySubject,
 } from "../control/security-policy";
+import { newWebhookSigningSecret } from "../control/webhook-contract";
+import type { ControlWebhookEnvelope } from "../control/webhook-delivery";
+import { deliverPendingWebhooks, webhookSignature } from "../control/webhooks";
 import { projectEmailAliases } from "../project-email-aliases";
 import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
+import { sealLegacyMfaRecord } from "./legacy-mfa-record";
+import { readLegacySessionCookie } from "./legacy-session-cookie";
 import { createOwnedProjectEngine } from "./owned-project-engine";
 
 const fixturePath = new URL(
@@ -40,6 +50,7 @@ function request(path: string, body: object, ip = "203.0.113.49") {
 }
 
 type Dispatch = (request: Request) => Promise<Response>;
+type WalletDatabase = Kysely<Record<string, Record<string, unknown>>>;
 
 type Signer = ReturnType<typeof privateKeyToAccount>;
 async function proof(
@@ -67,7 +78,12 @@ async function proof(
 }
 
 async function withWalletFixture(
-	run: (database: Pool, writers: [Dispatch, Dispatch]) => Promise<void>,
+	run: (
+		database: Pool,
+		writers: [Dispatch, Dispatch],
+		legacy: WalletDatabase,
+	) => Promise<void>,
+	productionPolicy?: AuthPolicy,
 ) {
 	const fixture: { container: string; DATABASE_URL: string } = JSON.parse(
 		readFileSync(fixturePath, "utf8"),
@@ -83,7 +99,7 @@ async function withWalletFixture(
 	const name = `allauth_hosted_${randomUUID().replaceAll("-", "")}`;
 	const schema = `allauth_project_${randomUUID().replaceAll("-", "")}`;
 	let database: Pool | undefined;
-	let legacy: Kysely<Record<string, Record<string, unknown>>> | undefined;
+	let legacy: WalletDatabase | undefined;
 	let created = false;
 	try {
 		await admin.query(`CREATE DATABASE "${name}"`);
@@ -98,6 +114,7 @@ async function withWalletFixture(
 		for (const file of [
 			"001-initial-auth.sql",
 			"002-control-plane.sql",
+			"004-webhooks.sql",
 			"005-free-plugins.sql",
 			"006-analytics.sql",
 		])
@@ -121,41 +138,73 @@ async function withWalletFixture(
 			[owner, canonicalEmail, "claimed-wallet-email-owner", claimed],
 		);
 		const aliases = { [alias]: owner, [claimed]: owner };
-		const { auth } = await getTestInstance(
-			{
-				baseURL: origin,
-				basePath,
-				secret,
-				database: { db: legacy, type: "postgres", transaction: true },
-				advanced: { cookiePrefix: `allauth_project_${slug}` },
-				plugins: [
-					allauthControl({
-						database: legacy,
-						baseURL: origin,
-						secret,
-						ipHeader: "x-real-ip",
-						requireTrustedIP: true,
-					}),
-					projectEmailAliases({
-						project: slug,
-						readConfiguration: () => JSON.stringify(aliases),
-					}),
-					siwe({
-						domain: new URL(origin).host,
-						anonymous: false,
-						getNonce: async () => randomBytes(16).toString("hex"),
-						verifyMessage: ({ address, message, signature }) =>
-							verifyMessage({
-								address: address as `0x${string}`,
-								message,
-								signature: signature as `0x${string}`,
-							}),
-					}),
-				],
-				logger: { disabled: true },
-			},
-			{ disableTestUser: true },
-		);
+		const native = productionPolicy
+			? betterAuth({
+					...createAuthOptions(
+						{ db: legacy, type: "postgres", transaction: true },
+						{
+							ALLAUTH_AUTH_URL: origin,
+							ALLAUTH_AUTH_SECRET: secret,
+							AUTH_RUNTIME: "node",
+							SCIM_CREDENTIAL_HASH_SECRET:
+								"synthetic-wallet-fixture-scim-credential-key",
+						},
+						{
+							name: "Wallet session fixture",
+							slug,
+							basePath,
+							cookiePrefix: `allauth_project_${slug}`,
+							primaryOrigin: origin,
+							publicOrigin: origin,
+							origins: [],
+							broker: {
+								clientId: "wallet-fixture-broker",
+								clientSecret: "synthetic-broker-client-key",
+							},
+							authorizeAdmin: async () => null,
+							management: { id: "wallet-session-fixture" },
+						},
+						productionPolicy,
+					),
+					logger: { disabled: true },
+				})
+			: (
+					await getTestInstance(
+						{
+							baseURL: origin,
+							basePath,
+							secret,
+							database: { db: legacy, type: "postgres", transaction: true },
+							advanced: { cookiePrefix: `allauth_project_${slug}` },
+							plugins: [
+								allauthControl({
+									database: legacy,
+									baseURL: origin,
+									secret,
+									ipHeader: "x-real-ip",
+									requireTrustedIP: true,
+								}),
+								projectEmailAliases({
+									project: slug,
+									readConfiguration: () => JSON.stringify(aliases),
+								}),
+								siwe({
+									domain: new URL(origin).host,
+									anonymous: false,
+									getNonce: async () => randomBytes(16).toString("hex"),
+									verifyMessage: ({ address, message, signature }) =>
+										verifyMessage({
+											address: address as `0x${string}`,
+											message,
+											signature: signature as `0x${string}`,
+										}),
+								}),
+							],
+							logger: { disabled: true },
+						},
+						{ disableTestUser: true },
+					)
+				).auth;
 		const engine = createOwnedProjectEngine({
 			database,
 			project: { schemaName: schema, slug },
@@ -164,11 +213,11 @@ async function withWalletFixture(
 			signingSecret: secret,
 			trustedOrigins: [],
 			trustedIP: (request) => request.headers.get("x-real-ip"),
-			policy: defaultAuthPolicy,
+			policy: productionPolicy ?? defaultAuthPolicy,
 			walletOrigin: origin,
 			emailAliases: aliases,
 		});
-		await run(database, [auth.handler, engine.dispatch]);
+		await run(database, [native.handler, engine.dispatch], legacy);
 	} finally {
 		try {
 			await Promise.all([database?.end(), legacy?.destroy()]);
@@ -182,6 +231,282 @@ async function withWalletFixture(
 describe.skipIf(!existsSync(fixturePath))(
 	"isolated PostgreSQL wallet account policy",
 	() => {
+		it.each([
+			"optional",
+			"required",
+		] as const)("preserves the signed saved-device SIWE actor with %s MFA", async (mfaMode) => {
+			const required = mfaMode === "required";
+			const policy = {
+				...defaultAuthPolicy,
+				mfaMode,
+				signUpEnabled: !required,
+			};
+			await withWalletFixture(async (database, writers, legacy) => {
+				const signer = privateKeyToAccount(generatePrivateKey());
+				const walletOwner = randomUUID();
+				const walletEmail = "wallet-device-owner@wallet.fixture.example";
+				const password = "Synthetic wallet device password!";
+				const factor = "synthetic-wallet-device-totp-factor";
+				const cookieName = `__Secure-allauth_project_${slug}.session_token`;
+				const webhookURL = "https://wallet-device-hook.fixture.example/events";
+				await database.query(
+					`INSERT INTO "user" (id,email,name,"emailVerified") VALUES ($1,$2,'Wallet owner',true)`,
+					[walletOwner, walletEmail],
+				);
+				await database.query(
+					`INSERT INTO "walletAddress" (id,"userId",address,"chainId","isPrimary","createdAt") VALUES ($1,$2,$3,1,true,now())`,
+					[randomUUID(), walletOwner, signer.address],
+				);
+				await database.query(
+					`INSERT INTO "account" (id,"userId","accountId","providerId",password,"updatedAt") VALUES ($1,$2,$2,'credential',$3,now()),($4,$5,$6,'siwe',NULL,now())`,
+					[
+						randomUUID(),
+						owner,
+						await clerkCompatiblePasswords.hash(password),
+						randomUUID(),
+						walletOwner,
+						`${signer.address}:1`,
+					],
+				);
+				if (required) {
+					for (const userId of [owner, walletOwner])
+						await database.query(
+							`INSERT INTO "twoFactor" (id,secret,"backupCodes","userId",verified) VALUES ($1,$2,$3,$4,true)`,
+							[
+								randomUUID(),
+								sealLegacyMfaRecord(factor, { secret }),
+								sealLegacyMfaRecord("[]", { secret }),
+								userId,
+							],
+						);
+					await database.query(
+						`UPDATE "user" SET "twoFactorEnabled"=true WHERE id=ANY($1::text[])`,
+						[[owner, walletOwner]],
+					);
+				}
+				let nextIP = 110;
+				const clientIP = () => `192.0.2.${nextIP++}`;
+				const cookies = (response: Response) =>
+					response.headers
+						.getSetCookie()
+						.filter((value) => !/;\s*Max-Age=0(?:;|$)/i.test(value))
+						.map((value) => value.split(";", 1)[0]!);
+				function totp() {
+					const counter = Buffer.alloc(8);
+					counter.writeBigUInt64BE(BigInt(Math.floor(Date.now() / 30_000)));
+					const digest = createHmac("sha1", factor).update(counter).digest();
+					return String(
+						(digest.readUInt32BE(digest[digest.length - 1]! & 15) &
+							0x7fffffff) %
+							1_000_000,
+					).padStart(6, "0");
+				}
+				async function session(response: Response, userId: string) {
+					expect(response.status, await response.clone().text()).toBe(200);
+					const issued = cookies(response);
+					const token = readLegacySessionCookie(
+						new Headers({ cookie: issued.join("; ") }),
+						cookieName,
+						secret,
+					);
+					if (!token) throw new Error("Missing signed wallet browser session.");
+					const { rows } = await database.query<{ id: string; userId: string }>(
+						`SELECT id,"userId" FROM "session" WHERE token=$1`,
+						[token],
+					);
+					expect(rows).toEqual([{ id: expect.any(String), userId }]);
+					const primary = issued.find((value) =>
+						value.startsWith(`${cookieName}=`),
+					);
+					const device = issued.find((value) =>
+						value.startsWith(`${cookieName}_multi-${token.toLowerCase()}=`),
+					);
+					if (!primary || !device)
+						throw new Error("Missing wallet session cookies.");
+					const trusted = issued.find((value) =>
+						value.includes(".trust_device="),
+					);
+					return { id: rows[0]!.id, token, primary, device, trusted };
+				}
+				async function walletRequest(dispatch: Dispatch, incoming?: string) {
+					const ip = clientIP();
+					const input = request(
+						"/siwe/verify",
+						await proof(dispatch, signer, walletEmail, ip),
+						ip,
+					);
+					if (incoming) input.headers.set("cookie", incoming);
+					return dispatch(input);
+				}
+				async function browser(dispatch: Dispatch, userId: string) {
+					const primary =
+						userId === walletOwner
+							? await walletRequest(dispatch)
+							: await dispatch(
+									request(
+										"/sign-in/email",
+										{ email: canonicalEmail, password },
+										clientIP(),
+									),
+								);
+					if (!required) return session(primary, userId);
+					expect(primary.status, await primary.clone().text()).toBe(200);
+					expect(await primary.json()).toMatchObject({
+						twoFactorRedirect: true,
+					});
+					const challenge = request(
+						"/two-factor/verify-totp",
+						{ code: totp(), trustDevice: true },
+						clientIP(),
+					);
+					challenge.headers.set("cookie", cookies(primary).join("; "));
+					return session(await dispatch(challenge), userId);
+				}
+				for (const [index, dispatch] of writers.entries()) {
+					for (const state of ["active", "device-only", "expired"] as const) {
+						const expired = state === "expired";
+						const expiresOnRead = required && expired;
+						const label = `${index === 0 ? "legacy" : "AllAuth"} ${state}`;
+						const previous = await browser(dispatch, walletOwner);
+						const unrelated = await browser(dispatch, walletOwner);
+						const actor = await browser(dispatch, owner);
+						if (required) expect(previous.trusted).toBeTruthy();
+						if (expired)
+							await database.query(
+								`UPDATE "session" SET "expiresAt"=now()-interval '1 minute' WHERE id=$1`,
+								[actor.id],
+							);
+						const endpoint = randomUUID();
+						const signingKey = newWebhookSigningSecret();
+						await database.query(
+							`INSERT INTO "allauthWebhookEndpoint" (id,url,"eventTypes","encryptedSecret") VALUES ($1,$2,'["session.deleted"]',$3)`,
+							[
+								endpoint,
+								webhookURL,
+								await symmetricEncrypt({ key: secret, data: signingKey }),
+							],
+						);
+						const incoming = [
+							previous.device,
+							actor.device,
+							...(state !== "device-only" ? [actor.primary] : []),
+							...(previous.trusted ? [previous.trusted] : []),
+						].join("; ");
+						const completed = await walletRequest(dispatch, incoming);
+						expect(await completed.clone().json()).toMatchObject({
+							success: true,
+							user: {
+								id: walletOwner,
+								walletAddress: signer.address,
+								chainId: 1,
+							},
+						});
+						const replacement = await session(completed, walletOwner);
+						expect(
+							completed.headers
+								.getSetCookie()
+								.filter((value) => value.startsWith(`${cookieName}=`))
+								.at(-1)
+								?.split(";", 1)[0],
+							label,
+						).toBe(replacement.primary);
+						expect(
+							completed.headers
+								.getSetCookie()
+								.find((value) =>
+									value.startsWith(`${previous.device.split("=", 1)[0]}=;`),
+								),
+						).toContain("Max-Age=0");
+						const { rows } = await database.query<{ id: string }>(
+							`SELECT id FROM "session" WHERE id=ANY($1::text[])`,
+							[[previous.id, unrelated.id, actor.id, replacement.id]],
+						);
+						expect(new Set(rows.map(({ id }) => id)), label).toEqual(
+							new Set([
+								unrelated.id,
+								...(expiresOnRead ? [] : [actor.id]),
+								replacement.id,
+							]),
+						);
+						const count = expiresOnRead ? 2 : 1;
+						const events: ControlWebhookEnvelope[] = [];
+						expect(
+							await deliverPendingWebhooks({
+								database: legacy,
+								secret,
+								now: () => new Date(Date.now() + 2_000),
+								resolver: async () => [{ address: "93.184.216.34", family: 4 }],
+								async transport({ destination, headers, body }) {
+									expect(destination.url.href).toBe(webhookURL);
+									expect(headers["webhook-signature"]).toBe(
+										await webhookSignature(
+											signingKey,
+											headers["webhook-id"]!,
+											headers["webhook-timestamp"]!,
+											body,
+										),
+									);
+									for (const value of [
+										previous.token,
+										actor.token,
+										replacement.token,
+										signingKey,
+									])
+										expect(body).not.toContain(value);
+									events.push(JSON.parse(body) as ControlWebhookEnvelope);
+									return 204;
+								},
+							}),
+						).toEqual({
+							claimed: count,
+							delivered: count,
+							failed: 0,
+							retried: 0,
+						});
+						const expectedEvent = (
+							userId: string,
+							targetId: string,
+							actorId?: string,
+						) => ({
+							type: "session.deleted",
+							outcome: "success",
+							...(actorId ? { actorId } : {}),
+							userId,
+							targetId,
+							metadata: { path: "/siwe/verify" },
+						});
+						const observed = events.map(
+							({ id, type, timestamp, data: { event } }) => {
+								expect({ id, type, timestamp }).toEqual({
+									id: event.id,
+									type: event.type,
+									timestamp: event.createdAt,
+								});
+								const { id: _id, createdAt: _time, ...value } = event;
+								return value;
+							},
+						);
+						expect(observed, label).toEqual(
+							expect.arrayContaining([
+								expectedEvent(
+									walletOwner,
+									previous.id,
+									required && state === "active" ? owner : undefined,
+								),
+								...(expiresOnRead
+									? [expectedEvent(owner, actor.id, owner)]
+									: []),
+							]),
+						);
+						await database.query(
+							`DELETE FROM "allauthWebhookEndpoint" WHERE id=$1`,
+							[endpoint],
+						);
+					}
+				}
+			}, policy);
+		});
+
 		it("preserves native reserved-email denial, an existing wallet and a claimed-email fallback", async () => {
 			await withWalletFixture(async (database, dispatches) => {
 				for (const [index, dispatch] of dispatches.entries()) {

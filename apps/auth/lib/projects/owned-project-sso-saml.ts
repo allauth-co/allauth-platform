@@ -137,6 +137,16 @@ function json(value: unknown, status: number, headers = new Headers()) {
 	return Response.json(value, { status, headers });
 }
 
+function invalidSamlCallback() {
+	return markOwnedCallbackFailure(
+		json(
+			{ code: "INVALID_SAML_RESPONSE", message: "Invalid SAML response." },
+			400,
+		),
+		"saml_error",
+	);
+}
+
 /** Realm-scoped SP-initiated SAML sign-in and assertion consumer. */
 export function createOwnedProjectSaml(options: {
 	origin: string;
@@ -152,6 +162,7 @@ export function createOwnedProjectSaml(options: {
 	defaultError: URL;
 	store: SsoStore;
 	allowedReturn(value: string): URL | null;
+	cleanupExpiredPrimary?: OwnedProjectSsoOptions["cleanupExpiredPrimary"];
 	complete: OwnedProjectSsoOptions["complete"];
 	profilePolicy: ProjectSsoAdmission;
 }) {
@@ -465,7 +476,6 @@ export function createOwnedProjectSaml(options: {
 		const provider = await store.getProvider(providerId);
 		if (!provider?.samlConfig) return failure("invalid_provider");
 		let selected: Awaited<ReturnType<typeof configureProjectSamlTransport>>;
-		let proof: VerifiedSaml;
 		try {
 			selected = await configure({
 				...provider,
@@ -473,6 +483,15 @@ export function createOwnedProjectSaml(options: {
 			});
 			if (selected.custom && request.url !== selected.acs)
 				throw new Error("This transport is not the registered SAML receiver.");
+		} catch {
+			return invalidSamlCallback();
+		}
+		await options.cleanupExpiredPrimary?.(
+			request,
+			"/sso/saml2/sp/acs/:providerId",
+		);
+		let proof: VerifiedSaml;
+		try {
 			proof = await verifyOwnedSaml(payload.response, selected.configured);
 			const approval = options.encryptedApproval;
 			if (
@@ -483,13 +502,7 @@ export function createOwnedProjectSaml(options: {
 			)
 				throw new Error("This response is outside the approved SAML profile.");
 		} catch {
-			return markOwnedCallbackFailure(
-				json(
-					{ code: "INVALID_SAML_RESPONSE", message: "Invalid SAML response." },
-					400,
-				),
-				"saml_error",
-			);
+			return invalidSamlCallback();
 		}
 		const saved = selected.configured.saved;
 		const receiver =

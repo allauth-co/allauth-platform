@@ -222,6 +222,7 @@ describe.skipIf(!existsSync(fixture))(
 		let platform: Awaited<ReturnType<typeof native>>;
 		let legacy: Awaited<ReturnType<typeof native>>;
 		let owned: ReturnType<typeof createOwnedProjectEngine>;
+		let hostedOwned: ReturnType<typeof createOwnedProjectEngine>;
 		let other: ReturnType<typeof createOwnedProjectEngine>;
 		let rotatedAuthSigningKey: ReturnType<typeof createOwnedProjectEngine>;
 		let rootCookie: string;
@@ -231,6 +232,7 @@ describe.skipIf(!existsSync(fixture))(
 			policy = defaultAuthPolicy,
 			authorizeAdmin = readRoot,
 			email?: EmailEnvironment["EMAIL"],
+			direct = false,
 		) {
 			const options = createAuthOptions(
 				{ db: projectDatabase, type: "postgres", transaction: true },
@@ -251,7 +253,7 @@ describe.skipIf(!existsSync(fixture))(
 					basePath: alpha.path,
 					cookiePrefix: `allauth_project_${alpha.slug}`,
 					primaryOrigin: origin,
-					publicOrigin: origin,
+					publicOrigin: direct ? undefined : origin,
 					origins: [],
 					broker: {
 						clientId: "fixture-broker",
@@ -262,7 +264,13 @@ describe.skipIf(!existsSync(fixture))(
 				},
 				policy,
 			);
-			return betterAuth({ ...options, logger: { disabled: true } });
+			return betterAuth({
+				...options,
+				...(direct && {
+					advanced: { ...options.advanced, disableOriginCheck: false },
+				}),
+				logger: { disabled: true },
+			});
 		}
 
 		async function readRoot(
@@ -406,12 +414,16 @@ describe.skipIf(!existsSync(fixture))(
 			expect(
 				await readRoot(new Headers({ cookie: rootCookie })),
 			).not.toBeNull();
-			const engine = (project: typeof alpha, signingSecret = project.secret) =>
+			const engine = (
+				project: typeof alpha,
+				signingSecret = project.secret,
+				basePath = project.path,
+			) =>
 				createOwnedProjectEngine({
 					database,
 					project,
 					baseURL: origin,
-					basePath: project.path,
+					basePath,
 					signingSecret,
 					policy: defaultAuthPolicy,
 					trustedOrigins: [],
@@ -438,6 +450,7 @@ describe.skipIf(!existsSync(fixture))(
 					},
 				});
 			owned = engine(alpha);
+			hostedOwned = engine(alpha, alpha.secret, "/api/auth");
 			other = engine(beta);
 			rotatedAuthSigningKey = engine(
 				alpha,
@@ -2397,6 +2410,381 @@ describe.skipIf(!existsSync(fixture))(
 			expect(await exercise("owned")).toEqual(nativeEvents);
 		});
 
+		it.each([
+			{
+				label: "a valid profile",
+				body: { name: "Never updated" },
+				resolvesSession: true,
+			},
+			{
+				label: "a rejected profile email",
+				body: { email: "never-updated@fixture.example" },
+				resolvesSession: true,
+			},
+			{ label: "an empty profile object", body: {}, resolvesSession: true },
+			{ label: "a malformed profile body", body: [], resolvesSession: false },
+		])("handles an expired signed /update-user caller with $label", async ({
+			label,
+			body,
+			resolvesSession,
+		}) => {
+			const path = "/update-user";
+			const realm = `"${alpha.schemaName}"`;
+			const installed = installedNative();
+			async function exercise(
+				writer: "legacy" | "owned",
+				dispatch: (request: Request) => Promise<Response>,
+			) {
+				const expired = await browserSession(eventEmail);
+				const active = await browserSession(eventEmail);
+				const {
+					rows: [profile],
+				} = await database.query(
+					`SELECT name,email,"updatedAt" FROM ${realm}."user" WHERE id=$1`,
+					[eventUserId],
+				);
+				const subscription = await endpoint(
+					"legacy",
+					`profile-expiry-${label.replaceAll(" ", "-")}-${writer}`,
+					["session.*", "user.updated"],
+				);
+				const rateKey = `192.0.2.233|${path}`;
+				try {
+					await database.query(
+						`UPDATE ${realm}.session SET "expiresAt"=statement_timestamp()-interval '1 minute' WHERE id=$1`,
+						[expired.id],
+					);
+					if (label === "a valid profile") {
+						await database.query(
+							`INSERT INTO ${realm}."rateLimit" (id,"key",count,"lastRequest") VALUES ($1,$2,100,$3)`,
+							[randomUUID(), rateKey, Date.now()],
+						);
+						const blocked = request(alpha.path + path, body, expired.cookie);
+						blocked.headers.set("x-real-ip", "192.0.2.233");
+						const response = await dispatch(blocked);
+						expect(response.status, writer).toBe(429);
+						expect(await response.json()).toEqual({
+							message: "Too many requests. Please try again later.",
+						});
+						expect(await signedEvents(subscription, [expired.token])).toEqual(
+							[],
+						);
+						if (writer === "owned") {
+							const profileRequest = request(
+								alpha.path + path,
+								body,
+								expired.cookie,
+							);
+							const missing = await dispatch(
+								new Request(profileRequest.url, {
+									method: "POST",
+									headers: profileRequest.headers,
+								}),
+							);
+							expect(missing.status).toBe(400);
+							expect(await missing.json()).toEqual({
+								code: "INVALID_BODY",
+								message: "Invalid profile.",
+							});
+							expect(
+								(
+									await database.query(
+										`SELECT 1 FROM ${realm}.session WHERE id=$1`,
+										[expired.id],
+									)
+								).rowCount,
+							).toBe(1);
+							expect(await signedEvents(subscription, [expired.token])).toEqual(
+								[],
+							);
+						}
+					}
+					const attempts = [];
+					for (let attempt = 0; attempt < 2; attempt++) {
+						const response = await dispatch(
+							request(alpha.path + path, body, expired.cookie),
+						);
+						expect(response.status, writer).toBe(resolvesSession ? 401 : 400);
+						attempts.push({
+							body: await response.json(),
+							cleared: response.headers
+								.getSetCookie()
+								.some((value) => /\.session_token=;.*Max-Age=0/.test(value)),
+						});
+					}
+					const events = await signedEvents(
+						subscription,
+						[expired.cookie, expired.token, active.cookie, active.token],
+						new Map([[expired.id, "expired-caller"]]),
+					);
+					expect(
+						events.filter(({ event }) => event.type === "session.deleted"),
+					).toEqual(
+						resolvesSession
+							? [
+									{
+										event: {
+											type: "session.deleted",
+											outcome: "success",
+											actorId: eventUserId,
+											userId: eventUserId,
+											targetId: "expired-caller",
+											metadata: { path },
+										},
+									},
+								]
+							: [],
+					);
+					expect(
+						(
+							await database.query(
+								`SELECT id FROM ${realm}.session WHERE id=ANY($1::text[]) ORDER BY id`,
+								[[expired.id, active.id]],
+							)
+						).rows.map(({ id }) => id),
+					).toEqual(
+						resolvesSession ? [active.id] : [expired.id, active.id].sort(),
+					);
+					expect(
+						(
+							await database.query(
+								`SELECT name,email,"updatedAt" FROM ${realm}."user" WHERE id=$1`,
+								[eventUserId],
+							)
+						).rows,
+					).toEqual([profile]);
+					return { attempts, events };
+				} finally {
+					await database.query(
+						`DELETE FROM ${realm}."rateLimit" WHERE "key"=$1`,
+						[rateKey],
+					);
+					await database.query(
+						`DELETE FROM ${realm}.session WHERE id=ANY($1::text[])`,
+						[[expired.id, active.id]],
+					);
+					expect(
+						(
+							await send("legacy", `${base}/delete`, {
+								id: subscription.endpoint.id,
+							})
+						).status,
+					).toBe(200);
+				}
+			}
+			const native = await exercise("legacy", installed.handler);
+			expect(native.attempts).toEqual(
+				Array.from({ length: 2 }, () => ({
+					body: resolvesSession
+						? { code: "UNAUTHORIZED", message: "Unauthorized" }
+						: {
+								code: "VALIDATION_ERROR",
+								message: "Validation error",
+								originalMessage:
+									"[body] Invalid input: expected record, received array",
+							},
+					cleared: resolvesSession,
+				})),
+			);
+			expect(
+				native.events.filter(({ event }) => event.type === "user.updated"),
+			).toEqual(
+				Array.from({ length: 2 }, () => ({
+					event: {
+						type: "user.updated",
+						outcome: "failure",
+						ipAddress: "192.0.2.46",
+						userAgent: "webhook-management-fixture",
+						metadata: {
+							path,
+							errorCode: resolvesSession ? "UNAUTHORIZED" : "VALIDATION_ERROR",
+						},
+					},
+				})),
+			);
+			expect(await exercise("owned", owned.dispatch)).toEqual(native);
+		});
+
+		it("preserves direct profile updates, renewal, and expired signed bearer denial", async () => {
+			const path = "/update-user";
+			const realm = `"${alpha.schemaName}"`;
+			const native = installedNative(
+				defaultAuthPolicy,
+				readRoot,
+				undefined,
+				true,
+			);
+			async function exercise(
+				writer: "legacy" | "owned",
+				dispatch: (request: Request) => Promise<Response>,
+			) {
+				const active = await browserSession(eventEmail);
+				const signed = active.cookie.slice(active.cookie.indexOf("=") + 1);
+				const subscription = await endpoint(
+					"legacy",
+					`direct-profile-${writer}`,
+					["session.*", "user.updated"],
+				);
+				function update(name: string, headers: HeadersInit = {}) {
+					const input = request(alpha.path + path, { name });
+					input.headers.delete("origin");
+					new Headers(headers).forEach((value, key) =>
+						input.headers.set(key, value),
+					);
+					return input;
+				}
+				const auth = { authorization: `Bearer ${signed}` };
+				const sameOriginReferer = {
+					cookie: active.cookie,
+					referer: `${origin}/profile`,
+				};
+				const expiry = async () =>
+					(
+						await database.query<{ renewed: boolean }>(
+							`SELECT "expiresAt">now()+interval '1 day' AS renewed FROM ${realm}.session WHERE id=$1`,
+							[active.id],
+						)
+					).rows[0]?.renewed;
+				try {
+					await database.query(
+						`UPDATE ${realm}.session SET "expiresAt"=now()+interval '1 minute' WHERE id=$1`,
+						[active.id],
+					);
+					expect(await expiry()).toBe(false);
+					const bearer = await dispatch(update("Profile through server", auth));
+					expect(bearer.status, writer).toBe(200);
+					expect(await bearer.json()).toEqual({ status: true });
+					expect(bearer.headers.get("set-auth-token")).toBe(
+						decodeURIComponent(signed),
+					);
+					expect(bearer.headers.get("access-control-expose-headers")).toBe(
+						"set-auth-token",
+					);
+					expect(await expiry()).toBe(true);
+
+					const browser = await dispatch(
+						update("Profile through browser", {
+							...sameOriginReferer,
+							"sec-fetch-site": "same-origin",
+						}),
+					);
+					expect(browser.status, writer).toBe(200);
+					expect(browser.headers.get("set-auth-token")).toBeNull();
+					const refererOnly = await dispatch(
+						update("Profile through Referer", sameOriginReferer),
+					);
+					expect(refererOnly.status, writer).toBe(200);
+					expect(refererOnly.headers.get("set-auth-token")).toBe(
+						decodeURIComponent(signed),
+					);
+
+					for (const [headers, status, code] of [
+						[{ ...auth, origin }, 401, "UNAUTHORIZED"],
+						[{ ...auth, "sec-fetch-site": "same-origin" }, 401, "UNAUTHORIZED"],
+						[
+							{ ...auth, "allauth-proxy-signature": "fixture-proxy-marker" },
+							401,
+							"UNAUTHORIZED",
+						],
+						[{ cookie: active.cookie }, 403, "MISSING_OR_NULL_ORIGIN"],
+						[
+							{
+								cookie: active.cookie,
+								origin: "https://unrelated.fixture.example",
+							},
+							403,
+							"INVALID_ORIGIN",
+						],
+					] as const) {
+						const denied = await dispatch(update("Never updated", headers));
+						expect(denied.status, writer).toBe(status);
+						expect(await denied.json()).toMatchObject({ code });
+						expect(denied.headers.get("set-auth-token")).toBeNull();
+					}
+					if (writer === "owned") {
+						const mixed = await dispatch(
+							update("Never updated", {
+								...auth,
+								cookie: active.cookie,
+								origin,
+							}),
+						);
+						expect(mixed.status).toBe(403);
+						expect(mixed.headers.get("set-auth-token")).toBeNull();
+						const hosted = request(`/api/auth${path}`, {
+							name: "Never updated",
+						});
+						hosted.headers.delete("origin");
+						hosted.headers.set("authorization", auth.authorization);
+						const rejected = await hostedOwned.dispatch(hosted);
+						expect(rejected.status).toBe(403);
+						expect(rejected.headers.get("set-auth-token")).toBeNull();
+					}
+
+					await database.query(
+						`UPDATE ${realm}.session SET "expiresAt"=now()-interval '1 minute' WHERE id=$1`,
+						[active.id],
+					);
+					for (let attempt = 0; attempt < 2; attempt++) {
+						const denied = await dispatch(update("Never updated", auth));
+						expect(denied.status, writer).toBe(401);
+						expect(await denied.json()).toEqual({
+							code: "UNAUTHORIZED",
+							message: "Unauthorized",
+						});
+						expect(denied.headers.get("set-auth-token")).toBeNull();
+						expect(
+							denied.headers
+								.getSetCookie()
+								.some((value) => /\.session_token=;.*Max-Age=0/.test(value)),
+						).toBe(true);
+					}
+					expect(await expiry()).toBeUndefined();
+					expect(
+						(
+							await database.query(
+								`SELECT name FROM ${realm}."user" WHERE id=$1`,
+								[eventUserId],
+							)
+						).rows,
+					).toEqual([{ name: "Profile through Referer" }]);
+					const events = await signedEvents(
+						subscription,
+						[signed, active.token],
+						new Map([[active.id, "expired-bearer"]]),
+					);
+					expect(
+						events.filter(({ event }) => event.type === "session.deleted"),
+					).toEqual([
+						{
+							event: {
+								type: "session.deleted",
+								outcome: "success",
+								actorId: eventUserId,
+								userId: eventUserId,
+								targetId: "expired-bearer",
+								metadata: { path },
+							},
+						},
+					]);
+					return events;
+				} finally {
+					await database.query(`DELETE FROM ${realm}.session WHERE id=$1`, [
+						active.id,
+					]);
+					expect(
+						(
+							await send("legacy", `${base}/delete`, {
+								id: subscription.endpoint.id,
+							})
+						).status,
+					).toBe(200);
+				}
+			}
+			const legacyEvents = await exercise("legacy", native.handler);
+			expect(await exercise("owned", owned.dispatch)).toEqual(legacyEvents);
+		});
+
 		it("preserves the installed password-change bucket across writers", async () => {
 			const path = "/change-password";
 			const realm = `"${alpha.schemaName}"`;
@@ -3800,6 +4188,9 @@ describe.skipIf(!existsSync(fixture))(
 			["/sdk/sessions/revoke", "cookie"],
 			["/account/sessions", "cookie"],
 			["/account/sessions/revoke", "cookie"],
+			["/list-accounts", "cookie"],
+			["/account-info", "cookie"],
+			["/passkey/list-user-passkeys", "cookie"],
 		] as const)("cleans up an expired %s caller authenticated by %s", async (path, authority) => {
 			const realm = `"${alpha.schemaName}"`;
 			const shadow = `"${beta.schemaName}"`;
@@ -3813,6 +4204,37 @@ describe.skipIf(!existsSync(fixture))(
 							? "session.revoked-others"
 							: null;
 			const deviceRevoke = path === "/multi-session/revoke";
+			const linkedAccount =
+				path === "/list-accounts" || path === "/account-info";
+			const read =
+				linkedAccount ||
+				path.endsWith("/sessions") ||
+				path === "/passkey/list-user-passkeys";
+			const query =
+				path === "/account-info" ? `?accountId=${randomUUID()}` : "";
+			const candidate = linkedAccount
+				? createOwnedProjectEngine({
+						database,
+						project: alpha,
+						baseURL: origin,
+						basePath: alpha.path,
+						signingSecret: alpha.secret,
+						policy: defaultAuthPolicy,
+						trustedOrigins: [],
+						trustedIP: (incoming) => incoming.headers.get("x-real-ip"),
+						oauth: {
+							defaultErrorURL: `${origin}/auth-error`,
+							broker: {
+								clientId: "fixture-broker",
+								clientSecret: "synthetic-broker-secret",
+								redirectURI: `${origin}/api/auth/callback/allauth`,
+								issuer: "https://broker.webhook-management.fixture.example",
+								discoveryURL:
+									"https://broker.webhook-management.fixture.example/.well-known/openid-configuration",
+							},
+						},
+					})
+				: owned;
 			let nativeDenial: unknown;
 			let nativeClears: boolean | undefined;
 			for (const [writer, dispatch] of [
@@ -3820,7 +4242,7 @@ describe.skipIf(!existsSync(fixture))(
 					"legacy",
 					path.startsWith("/sdk/") ? legacy.handler : installed.handler,
 				],
-				["owned", owned.dispatch],
+				["owned", candidate.dispatch],
 			] as const) {
 				const expired = await browserSession(eventEmail);
 				const active = await browserSession(eventEmail);
@@ -3882,7 +4304,7 @@ describe.skipIf(!existsSync(fixture))(
 							? `${expired.cookie}; ${active.deviceCookie}`
 							: expired.cookie;
 						const incoming = request(
-							`${alpha.path}${path}`,
+							`${alpha.path}${path}${query}`,
 							body,
 							authority === "cookie" ? cookies : "",
 						);
@@ -3940,7 +4362,7 @@ describe.skipIf(!existsSync(fixture))(
 								? { sessionToken: active.token }
 								: path.endsWith("/sessions/revoke")
 									? { id: active.id }
-									: path.endsWith("/sessions")
+									: read
 										? undefined
 										: {};
 					if (

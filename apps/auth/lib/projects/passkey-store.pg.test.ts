@@ -309,9 +309,10 @@ describe.skipIf(!existsSync(fixturePath))("project passkey PostgreSQL interopera
 	});
 
 	it.each([
-		true,
-		false,
-	])("attributes signed passkey device replacement with an active browser cookie %s", async (hasBrowser) => {
+		["active", "192.0.2.190"],
+		["absent", "192.0.2.191"],
+		["expired", "192.0.2.192"],
+	] as const)("attributes signed passkey device replacement with an %s browser cookie", async (browserCookie, address) => {
 		if (!pool || !nativeDatabase)
 			throw new Error("Missing PostgreSQL fixture.");
 		const database = pool;
@@ -345,7 +346,7 @@ describe.skipIf(!existsSync(fixturePath))("project passkey PostgreSQL interopera
 		);
 		const installed = betterAuth({ ...options, logger: { disabled: true } });
 		const owned = ownedHttpFixture(database);
-		const address = hasBrowser ? "192.0.2.190" : "192.0.2.191";
+		const expired = browserCookie === "expired";
 		const path = "/passkey/verify-authentication";
 		const agent = "Synthetic passkey replacement fixture";
 		const owner = {
@@ -418,15 +419,17 @@ describe.skipIf(!existsSync(fixturePath))("project passkey PostgreSQL interopera
 					[randomUUID(), id, passwordHash],
 				);
 			}
-			const original = (await browser(owner.email)).primary;
+			const originalSession = await browser(owner.email);
+			const original = originalSession.primary;
 			const credential = virtualCredential();
 			const registration = await installed.handler(
 				request("/passkey/generate-register-options", original),
 			);
 			expect(registration.status).toBe(200);
-			const { challenge: registrationChallenge } = (await registration.json()) as {
-				challenge: string;
-			};
+			const { challenge: registrationChallenge } =
+				(await registration.json()) as {
+					challenge: string;
+				};
 			const registered = await installed.handler(
 				request(
 					"/passkey/verify-registration",
@@ -448,11 +451,20 @@ describe.skipIf(!existsSync(fixturePath))("project passkey PostgreSQL interopera
 				const signingKey = newWebhookSigningSecret();
 				const shadowOwner = randomUUID();
 				const client = randomUUID();
-				const grants = ["access", "online", "offline", "unrelated"].map(
-					(kind) => ({ id: randomUUID(), kind }),
-				);
+				const grants = [
+					"access",
+					"online",
+					"offline",
+					"unrelated",
+					...(expired ? ["browser-online", "browser-offline"] : []),
+				].map((kind) => ({ id: randomUUID(), kind }));
 				const sessionIds = [previous.id, active.id, unrelated.id];
 				try {
+					if (expired)
+						await database.query(
+							`UPDATE ${realm}.session SET "expiresAt"=statement_timestamp()-interval '1 minute' WHERE id=$1`,
+							[active.id],
+						);
 					await database.query(
 						`INSERT INTO ${sibling}."user" (id,name,email,"emailVerified") VALUES ($1,'Shadow owner',$2,true)`,
 						[shadowOwner, `${shadowOwner}@fixture.example`],
@@ -468,16 +480,21 @@ describe.skipIf(!existsSync(fixturePath))("project passkey PostgreSQL interopera
 					for (const { id, kind } of grants) {
 						const table =
 							kind === "access" ? "oauthAccessToken" : "oauthRefreshToken";
+						const browserGrant = kind.startsWith("browser-");
 						await database.query(
 							`INSERT INTO ${realm}."${table}" (id,token,"sessionId","userId","clientId","expiresAt","createdAt",scopes)
-							 VALUES ($1,$1,$2,$3,$4,now()+interval '1 day',now(),$5)`,
+						 VALUES ($1,$1,$2,$3,$4,now()+interval '1 day',now(),$5)`,
 							[
 								id,
-								kind === "unrelated" ? unrelated.id : previous.id,
-								owner.id,
+								browserGrant
+									? active.id
+									: kind === "unrelated"
+										? unrelated.id
+										: previous.id,
+								browserGrant ? browserActor.id : owner.id,
 								client,
 								JSON.stringify(
-									kind === "offline"
+									kind.endsWith("offline")
 										? ["openid", "offline_access"]
 										: ["openid"],
 								),
@@ -497,25 +514,60 @@ describe.skipIf(!existsSync(fixturePath))("project passkey PostgreSQL interopera
 						request("/passkey/generate-authenticate-options"),
 					);
 					expect(challenge.status).toBe(200);
-					const { challenge: assertionChallenge } = (await challenge.json()) as {
-						challenge: string;
-					};
+					const { challenge: assertionChallenge } =
+						(await challenge.json()) as {
+							challenge: string;
+						};
 					const assertion = {
 						response: credential.assertion(assertionChallenge, index + 1),
 					};
+					if (expired) {
+						const withoutChallenge = await dispatch(
+							request(path, active.primary, assertion),
+						);
+						expect(withoutChallenge.status).toBe(400);
+						expect(await withoutChallenge.json()).toMatchObject({
+							code: "CHALLENGE_NOT_FOUND",
+						});
+						expect(
+							(
+								await database.query(
+									`SELECT id FROM ${realm}.session WHERE id=$1`,
+									[active.id],
+								)
+							).rows,
+						).toEqual([{ id: active.id }]);
+					}
 					const incoming = [
-						...(hasBrowser ? [active.primary] : []),
+						...(browserCookie !== "absent" ? [active.primary] : []),
 						active.device,
 						previous.device,
 						...cookies(challenge),
 					].join("; ");
 					const signedIn = await dispatch(request(path, incoming, assertion));
 					expect(signedIn.status, await signedIn.clone().text()).toBe(200);
-					const replacement = await read(cookies(signedIn).join("; "));
+					const {
+						rows: [replacement],
+					} = await database.query<{ id: string; token: string }>(
+						`SELECT id, token FROM ${realm}.session WHERE "userId"=$1 AND id<>ALL($2::text[])`,
+						[owner.id, [...sessionIds, originalSession.id]],
+					);
 					if (!replacement)
 						throw new Error("Missing replacement passkey session.");
-					expect(replacement.user.id).toBe(owner.id);
-					sessionIds.push(replacement.session.id);
+					const primary = cookies(signedIn).find((value) =>
+						value.startsWith(`${cookieName}=`),
+					);
+					if (index === 0 && expired) {
+						expect(primary).toBeUndefined();
+						expect(signedIn.headers.getSetCookie()).toContainEqual(
+							expect.stringContaining(`${cookieName}=;`),
+						);
+					} else
+						expect(await read(primary ?? "")).toMatchObject({
+							session: { id: replacement.id },
+							user: { id: owner.id },
+						});
+					sessionIds.push(replacement.id);
 					const previousCookieName = previous.device.split("=", 1)[0];
 					expect(
 						signedIn.headers
@@ -536,7 +588,11 @@ describe.skipIf(!existsSync(fixturePath))("project passkey PostgreSQL interopera
 						[sessionIds],
 					);
 					expect(new Set(existing.rows.map(({ id }) => id))).toEqual(
-						new Set([active.id, unrelated.id, replacement.session.id]),
+						new Set([
+							...(!expired ? [active.id] : []),
+							unrelated.id,
+							replacement.id,
+						]),
 					);
 					expect(
 						(
@@ -556,14 +612,14 @@ describe.skipIf(!existsSync(fixturePath))("project passkey PostgreSQL interopera
 					).toEqual([]);
 					const grantState = await database.query(
 						`SELECT id,revoked IS NOT NULL AS revoked,"sessionId" FROM ${realm}."oauthAccessToken" WHERE "clientId"=$1
-						 UNION ALL SELECT id,revoked IS NOT NULL AS revoked,"sessionId" FROM ${realm}."oauthRefreshToken" WHERE "clientId"=$1`,
+					 UNION ALL SELECT id,revoked IS NOT NULL AS revoked,"sessionId" FROM ${realm}."oauthRefreshToken" WHERE "clientId"=$1`,
 						[client],
 					);
 					expect(grantState.rows).toHaveLength(grants.length);
 					for (const { id, kind } of grants)
 						expect(grantState.rows.find((grant) => grant.id === id)).toEqual({
 							id,
-							revoked: kind === "access" || kind === "online",
+							revoked: kind === "access" || kind.endsWith("online"),
 							sessionId: kind === "unrelated" ? unrelated.id : null,
 						});
 					const envelopes: ControlWebhookEnvelope[] = [];
@@ -585,7 +641,7 @@ describe.skipIf(!existsSync(fixturePath))("project passkey PostgreSQL interopera
 							for (const value of [
 								previous.token,
 								active.token,
-								replacement.session.token,
+								replacement.token,
 								credential.id,
 							])
 								expect(body).not.toContain(value);
@@ -594,14 +650,37 @@ describe.skipIf(!existsSync(fixturePath))("project passkey PostgreSQL interopera
 						},
 					});
 					expect(delivery).toEqual({
-						claimed: 1,
-						delivered: 1,
+						claimed: expired ? 2 : 1,
+						delivered: expired ? 2 : 1,
 						retried: 0,
 						failed: 0,
 					});
-					const { id, createdAt } = envelopes[0]!.data.event;
-					expect(envelopes).toEqual([
+					const deletions = [
 						{
+							targetId: previous.id,
+							userId: owner.id,
+							actorId:
+								browserCookie === "active" ? browserActor.id : undefined,
+						},
+						...(expired
+							? [
+									{
+										targetId: active.id,
+										userId: browserActor.id,
+										actorId: browserActor.id,
+									},
+								]
+							: []),
+					];
+					expect(envelopes).toHaveLength(deletions.length);
+					for (const { targetId, userId, actorId } of deletions) {
+						const envelope = envelopes.find(
+							({ data }) => data.event.targetId === targetId,
+						);
+						if (!envelope)
+							throw new Error("Missing signed passkey deletion event.");
+						const { id, createdAt } = envelope.data.event;
+						expect(envelope).toEqual({
 							id,
 							type: "session.deleted",
 							timestamp: createdAt,
@@ -611,14 +690,14 @@ describe.skipIf(!existsSync(fixturePath))("project passkey PostgreSQL interopera
 									createdAt,
 									type: "session.deleted",
 									outcome: "success",
-									...(hasBrowser ? { actorId: browserActor.id } : {}),
-									userId: owner.id,
-									targetId: previous.id,
+									...(actorId ? { actorId } : {}),
+									userId,
+									targetId,
 									metadata: { path },
 								},
 							},
-						},
-					]);
+						});
+					}
 				} finally {
 					for (const target of [realm, sibling])
 						await database.query(

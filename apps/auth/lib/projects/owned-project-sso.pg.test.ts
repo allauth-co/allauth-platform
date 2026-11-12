@@ -735,10 +735,15 @@ describe.skipIf(!existsSync(fixturePath))(
 				userId: managed,
 				browserUserId: decoy,
 				owned: engine.dispatch,
-				async prepare(dispatch, ip) {
+				async prepare(dispatch, ip, rejected) {
 					const request = startRequest();
 					request.headers.set("x-real-ip", ip);
-					return authorize(await dispatch(request));
+					const pending = await authorize(await dispatch(request));
+					if (!rejected) return pending;
+					const denied = new URL(pending.url);
+					denied.searchParams.delete("code");
+					denied.searchParams.set("error", "access_denied");
+					return new Request(denied, { headers: pending.headers });
 				},
 			});
 		});

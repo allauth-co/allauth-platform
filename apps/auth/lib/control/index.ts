@@ -6,7 +6,7 @@ import { isPlatformAdmin, rolesInclude } from "../configuration";
 import { isPrimaryAuthenticationPath, mutationEventType } from "./event-contract";
 import { controlResponseFailure, isNativeEndpointValidationError, recordControlEvent, writeControlEvent } from "./events";
 import { controlEventsQuery, controlIdentifier, controlSessionsQuery } from "./read-input";
-import { controlRetentionDays, pruneControlEvents, queryControlEvents, queryControlOverview, queryControlSessions } from "./queries";
+import { controlRetentionDays, queryControlEvents, queryControlOverview, queryControlSessions } from "./queries";
 import { createControlSecurity } from "./security";
 import { createControlWebhooks } from "./webhooks";
 import { createControlAnalytics } from "./analytics";
@@ -152,7 +152,7 @@ export function allauthControl(options: AllauthControlOptions = {}) {
 			if (!type) return;
 			if (
 				options.project &&
-				path === "/change-email" &&
+				(path === "/change-email" || path === "/update-user") &&
 				isNativeEndpointValidationError(ctx.context.returned)
 			) {
 				await recordControlEvent(

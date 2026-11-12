@@ -928,6 +928,269 @@ describe.skipIf(!existsSync(fixturePath))(
 			}
 		});
 
+		it.each([
+			"totp",
+			"backup",
+		] as const)("deletes an expired primary during pending %s verification", async (method) => {
+			if (!nativeDatabase) throw new Error("Missing fixture database.");
+			const scoped = nativeDatabase;
+			const policy = { ...defaultAuthPolicy, requireEmailVerification: false };
+			const installed = betterAuth({
+				...createAuthOptions(
+					{ db: scoped, type: "postgres", transaction: true },
+					{
+						ALLAUTH_AUTH_URL: origin,
+						ALLAUTH_AUTH_SECRET: secret,
+						AUTH_RUNTIME: "node",
+						SCIM_CREDENTIAL_HASH_SECRET:
+							"synthetic-mfa-expired-browser-fixture",
+					},
+					{
+						name: issuer,
+						basePath: "/api/auth",
+						cookiePrefix: `allauth_project_${slug}`,
+						primaryOrigin: origin,
+						publicOrigin: origin,
+						origins: [],
+						broker: {
+							clientId: "fixture-broker",
+							clientSecret: "synthetic-broker-secret",
+						},
+						authorizeAdmin: async () => null,
+						management: { id: "mfa-expired-browser-fixture" },
+					},
+					policy,
+				),
+				logger: { disabled: true },
+			});
+			const candidate = createOwnedProjectEngine({
+				database,
+				project: { schemaName: schema, slug },
+				baseURL: origin,
+				basePath: "/api/auth",
+				trustedOrigins: [],
+				signingSecret: secret,
+				policy,
+				trustedIP: (input) => input.headers.get("x-real-ip"),
+			});
+			const path =
+				method === "totp"
+					? "/two-factor/verify-totp"
+					: "/two-factor/verify-backup-code";
+			const endpoint = "https://mfa-expired-browser.fixture.example/receive";
+			let nextIP = method === "totp" ? 130 : 135;
+			for (const [writer, dispatch, start] of [
+				["native", installed.handler, candidate.dispatch],
+				["owned", candidate.dispatch, installed.handler],
+			] as const) {
+				for (const invalidFirst of [false, true]) {
+					const ip = `192.0.2.${nextIP++}`;
+					const request = (route: string, body: unknown, cookie = "") => {
+						const input = post(route, body, cookie);
+						input.headers.set("x-real-ip", ip);
+						return input;
+					};
+					const user = await signedIn();
+					const browser = await signedIn();
+					const enrolled = await installed.handler(
+						request("/two-factor/enable", { password }, user.cookie),
+					);
+					expect(enrolled.status).toBe(200);
+					const { backupCodes } = (await enrolled.json()) as {
+						backupCodes: string[];
+					};
+					const confirmed = await installed.handler(
+						request(
+							"/two-factor/verify-totp",
+							{ code: await verifyCode(user.id) },
+							user.cookie,
+						),
+					);
+					expect(confirmed.status).toBe(200);
+					const pending = await start(
+						request("/sign-in/email", { email: user.email, password }),
+					);
+					expect(await pending.json()).toMatchObject({
+						twoFactorRedirect: true,
+					});
+					const proof = cookies(pending);
+					const challenge = readLegacySessionCookie(
+						new Headers({ cookie: proof }),
+						`${prefix}two_factor`,
+						secret,
+					);
+					expect(challenge).toBeTruthy();
+					await protectedState(browser);
+					await database.query(
+						`UPDATE "${schema}"."session" SET "expiresAt"=now()-interval '1 minute' WHERE id=$1`,
+						[browser.sessionId],
+					);
+					const endpointId = randomUUID();
+					const webhookSecret = newWebhookSigningSecret();
+					await database.query(
+						`INSERT INTO "${schema}"."allauthWebhookEndpoint"(id,url,"eventTypes","encryptedSecret") VALUES ($1,$2,'["session.deleted"]',$3)`,
+						[
+							endpointId,
+							endpoint,
+							await symmetricEncrypt({ key: secret, data: webhookSecret }),
+						],
+					);
+					const verify = (code: string) =>
+						dispatch(request(path, { code }, `${proof}; ${browser.cookie}`));
+					try {
+						const code =
+							method === "totp" ? await verifyCode(user.id) : backupCodes[0]!;
+						const wrongCode = "synthetic-wrong-factor-code";
+						const first = await verify(invalidFirst ? wrongCode : code);
+						const cleared = (response: Response) =>
+							response.headers
+								.getSetCookie()
+								.filter((value) => /;\s*Max-Age=0(?:;|$)/i.test(value))
+								.map((value) => value.split("=", 1)[0]);
+						const browserCookies = [
+							sessionCookie,
+							`${prefix}session_data`,
+							`${prefix}dont_remember`,
+						];
+						if (invalidFirst) {
+							expect(first.status).toBe(401);
+							expect(await first.json()).toMatchObject({
+								code:
+									method === "totp" ? "INVALID_CODE" : "INVALID_BACKUP_CODE",
+							});
+							expect(cookies(first)).not.toContain(`${sessionCookie}=`);
+							expect(
+								(
+									await database.query(
+										`SELECT value FROM "${schema}"."verification" WHERE identifier=$1`,
+										[challenge],
+									)
+								).rows,
+							).toEqual([{ value: user.id }]);
+						}
+						expect(
+							(
+								await database.query(
+									`SELECT id FROM "${schema}"."session" WHERE id=$1`,
+									[browser.sessionId],
+								)
+							).rows,
+							`${writer} ${method} ${invalidFirst ? "rejected" : "successful"} verification`,
+						).toEqual([]);
+						expect(cleared(first)).toEqual(
+							invalidFirst
+								? browserCookies
+								: [...browserCookies, `${prefix}two_factor`],
+						);
+						for (const table of ["oauthAccessToken", "oauthRefreshToken"])
+							expect(
+								(
+									await database.query(
+										`SELECT revoked IS NOT NULL AS revoked,"sessionId" FROM "${schema}"."${table}" WHERE "userId"=$1`,
+										[browser.id],
+									)
+								).rows,
+							).toEqual([{ revoked: true, sessionId: null }]);
+						const events: ControlWebhookEnvelope[] = [];
+						const drain = () =>
+							deliverPendingWebhooks({
+								database: scoped,
+								secret,
+								now: () => new Date(Date.now() + 2_000),
+								resolver: async () => [{ address: "93.184.216.34", family: 4 }],
+								async transport({ destination, body, headers }) {
+									expect(destination.url.href).toBe(endpoint);
+									expect(headers["webhook-signature"]).toBe(
+										await webhookSignature(
+											webhookSecret,
+											headers["webhook-id"],
+											headers["webhook-timestamp"],
+											body,
+										),
+									);
+									for (const privateValue of [
+										code,
+										wrongCode,
+										challenge!,
+										browser.cookie,
+										webhookSecret,
+									])
+										expect(body).not.toContain(JSON.stringify(privateValue));
+									events.push(JSON.parse(body) as ControlWebhookEnvelope);
+									return 204;
+								},
+							});
+						expect(await drain()).toEqual({
+							claimed: 1,
+							delivered: 1,
+							failed: 0,
+							retried: 0,
+						});
+						const { id, createdAt } = events[0]!.data.event;
+						expect(events).toEqual([
+							{
+								id,
+								type: "session.deleted",
+								timestamp: createdAt,
+								data: {
+									event: {
+										id,
+										createdAt,
+										type: "session.deleted",
+										outcome: "success",
+										actorId: browser.id,
+										userId: browser.id,
+										targetId: browser.sessionId,
+										metadata: { path },
+									},
+								},
+							},
+						]);
+						const completed = invalidFirst ? await verify(code) : first;
+						expect(completed.status).toBe(200);
+						expect(cleared(completed)).toEqual([
+							...browserCookies,
+							`${prefix}two_factor`,
+						]);
+						const primaryCookies = completed.headers
+							.getSetCookie()
+							.filter((value) => value.startsWith(`${sessionCookie}=`));
+						expect(primaryCookies).toHaveLength(2);
+						expect(primaryCookies[0]).toContain("Max-Age=0");
+						expect(primaryCookies[1]).not.toContain("Max-Age=0");
+						expect(await completed.json()).toMatchObject({
+							user: { id: user.id },
+						});
+						expect(
+							await installed.api.getSession({
+								headers: new Headers({ cookie: cookies(completed) }),
+								query: { disableRefresh: true },
+							}),
+						).toMatchObject({ user: { id: user.id } });
+						expect(
+							(
+								await database.query(
+									`SELECT 1 FROM "${schema}"."verification" WHERE identifier=$1`,
+									[challenge],
+								)
+							).rowCount,
+						).toBe(0);
+						expect(await drain()).toEqual({
+							claimed: 0,
+							delivered: 0,
+							failed: 0,
+							retried: 0,
+						});
+					} finally {
+						await database.query(
+							`DELETE FROM "${schema}"."allauthWebhookEndpoint" WHERE id=$1`,
+							[endpointId],
+						);
+					}
+				}
+			}
+		});
+
 		it("delivers only the native active-session deletion when MFA changes revoke sibling sessions", async () => {
 			if (!nativeDatabase) throw new Error("Missing fixture database.");
 			const webhookDatabase = nativeDatabase;
