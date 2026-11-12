@@ -2948,7 +2948,7 @@ export function createOwnedProjectEngine(
 		trustedRequest,
 		readBody: requestBody,
 		auditContext: browserEventContext,
-		collectActivity: analytics
+		collectActivity: analytics !== false && analytics !== undefined
 			? (session, organizationId) =>
 					analytics.session(session, 4, organizationId, true)
 			: undefined,
