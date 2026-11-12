@@ -75,7 +75,7 @@ jobs:
           pnpm exec vitest run --root apps/auth --config vitest.config.ts
           lib/configuration-aliases.test.ts lib/clerk-password.test.ts lib/mfa.test.ts sdk/next.test.ts
           lib/broker-login.test.ts lib/projects/broker-two-factor.test.ts
-          lib/domains/hosting.pg.test.ts lib/projects/runtime.test.ts
+          lib/domains/hosting.pg.test.ts lib/domains/edge.test.ts lib/domains/gateway.test.ts lib/projects/runtime.test.ts
           lib/projects/session-introspection.test.ts lib/projects/session-introspection.legacy.test.ts
           lib/projects/service-directory-transport.test.ts lib/projects/sdk-version-observation.test.ts
           lib/projects/proxy-boundary.test.ts lib/projects/owned-project-runtime-factory.test.ts

@@ -1,6 +1,10 @@
 import { createHash, createHmac } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { GET, POST } from "../../app/api/projects/[slug]/auth/[...all]/route";
+import {
+	GET,
+	PATCH,
+	POST,
+} from "../../app/api/projects/[slug]/auth/[...all]/route";
 import { projectProxySecret } from "./proxy";
 import type { Project } from "./registry";
 
@@ -12,6 +16,7 @@ const state = vi.hoisted(() => ({
 	authorizeDirectory: vi.fn(async () => {}),
 	environment: {
 		BETTER_AUTH_SECRET: "disposable-project-proxy-fixture-secret",
+		ALLAUTH_PROJECT_ENGINE_INTERNAL_ID: "82340693-70e3-44b9-a1b1-508403d4de64",
 	},
 	project: {
 		id: "82340693-70e3-44b9-a1b1-508403d4de64",
@@ -241,5 +246,143 @@ describe("direct proxy verification and the admitted project writer", () => {
 		expect(state.authorizeDirectory).toHaveBeenCalledOnce();
 		expect(state.scope.engine.readDirectory).toHaveBeenCalledOnce();
 		expect(state.verify).not.toHaveBeenCalled();
+	});
+	it.each([
+		{
+			path: "scim/v2/Users",
+			method: "POST",
+			handle: POST,
+			media: "application/scim+json",
+		},
+		{
+			path: "scim/v2/Groups/fixture-group",
+			method: "PATCH",
+			handle: PATCH,
+			media: "application/json",
+		},
+		{
+			path: "sso/saml2/sp/acs/fixture-provider",
+			method: "POST",
+			handle: POST,
+			media: "application/x-www-form-urlencoded",
+		},
+	])("bounds unsigned $path before admission", async ({
+		path,
+		method,
+		handle,
+		media,
+	}) => {
+		vi.useFakeTimers();
+		const cancel = vi.fn();
+		const request = new Request(`${auth}/${path}`, {
+			method,
+			headers: { "content-type": media },
+			body: new ReadableStream<Uint8Array>({ cancel }),
+			duplex: "half",
+		} as RequestInit);
+		const response = handle(request, context);
+		await vi.advanceTimersByTimeAsync(4999);
+		expect(state.open).not.toHaveBeenCalled();
+		expect(cancel).not.toHaveBeenCalled();
+		await vi.advanceTimersByTimeAsync(1);
+		const rejected = await response;
+		expect(rejected.status).toBe(408);
+		expect(cancel).toHaveBeenCalledOnce();
+		expect(state.open).not.toHaveBeenCalled();
+		if (path.startsWith("scim/")) {
+			expect(rejected.headers.get("content-type")).toBe(
+				"application/scim+json",
+			);
+			expect(await rejected.json()).toMatchObject({
+				schemas: ["urn:ietf:params:scim:api:messages:2.0:Error"],
+				status: "408",
+			});
+		} else {
+			expect(await rejected.json()).toMatchObject({
+				code: "INVALID_SAML_RESPONSE",
+			});
+			expect(rejected.headers.has("location")).toBe(false);
+		}
+	});
+	it.each([
+		{
+			path: "scim/v2/Groups/fixture-group?attributes=displayName",
+			method: "PATCH",
+			handle: PATCH,
+			media: "application/scim+json; charset=utf-8",
+			payload:
+				'{"Operations":[{"op":"replace","path":"displayName","value":"R&D"}]}',
+		},
+		{
+			path: "sso/saml2/sp/acs/fixture-provider",
+			method: "POST",
+			handle: POST,
+			media: "application/x-www-form-urlencoded",
+			payload: "SAMLResponse=fixture%2B%2F%3D&RelayState=opaque",
+		},
+		{
+			path: "scim/v2/Users",
+			method: "POST",
+			handle: POST,
+			media: "application/json",
+			payload: '{"userName":"fixture@example.test"}' + " ".repeat(262144),
+		},
+	])("preserves exact unsigned $path bytes for the selected parser", async ({
+		path,
+		method,
+		handle,
+		media,
+		payload,
+	}) => {
+		const url = `${auth}/${path}`;
+		state.scope.engine.dispatch.mockImplementationOnce(async (request) => {
+			expect(request.url).toBe(url);
+			expect(request.method).toBe(method);
+			expect(request.headers.get("content-type")).toBe(media);
+			expect(request.headers.get("authorization")).toBe(
+				"Bearer isolated-fixture",
+			);
+			expect(await request.text()).toBe(payload);
+			return Response.json({ ok: true }, { status: 201 });
+		});
+		const response = await handle(
+			new Request(url, {
+				method,
+				headers: {
+					"content-type": media,
+					authorization: "Bearer isolated-fixture",
+				},
+				body: payload,
+			}),
+			context,
+		);
+		expect(response.status).toBe(201);
+	});
+
+	it("keeps the same deadline when a large body is handed to the native parser", async () => {
+		vi.useFakeTimers();
+		const cancel = vi.fn();
+		state.scope.engine.dispatch.mockImplementationOnce(async (request) => {
+			await request.arrayBuffer();
+			return Response.json({ ok: true });
+		});
+		const request = new Request(`${auth}/scim/v2/Users`, {
+			method: "POST",
+			headers: { "content-type": "application/scim+json" },
+			body: new ReadableStream<Uint8Array>({
+				start(controller) {
+					controller.enqueue(new Uint8Array(262145));
+				},
+				cancel,
+			}),
+			duplex: "half",
+		} as RequestInit);
+		const response = POST(request, context);
+		await vi.advanceTimersByTimeAsync(4999);
+		expect(state.open).toHaveBeenCalledOnce();
+		expect(cancel).not.toHaveBeenCalled();
+		await vi.advanceTimersByTimeAsync(1);
+		expect((await response).status).toBe(408);
+		expect(cancel).toHaveBeenCalledOnce();
 	});
 });

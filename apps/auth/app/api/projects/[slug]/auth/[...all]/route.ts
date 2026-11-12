@@ -5,6 +5,13 @@ import { json } from "@/lib/api";
 import { getAuthEnvironment } from "@/lib/auth";
 import { recordSdkVersionObservation } from "@/lib/notifications/repository";
 import { backendCredentialRepository } from "@/lib/projects/backend-credentials";
+import { ownedSCIMError } from "@/lib/projects/owned-project-scim-discovery";
+import { internalProjectEngineSelected } from "@/lib/projects/project-engine-internal-selection";
+import type { ProjectProtocolBody } from "@/lib/projects/project-protocol-body";
+import {
+	prepareProjectProtocolBody,
+	projectProtocolBody,
+} from "@/lib/projects/project-protocol-body";
 import { getProject, projectRegistryPool } from "@/lib/projects/registry";
 import {
 	projectSecret,
@@ -18,16 +25,45 @@ import { prepareProjectAuthentication } from "@/lib/projects/session-introspecti
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+
+function protocolBodyTimeout(protocol: ProjectProtocolBody) {
+	return protocol === "scim"
+		? ownedSCIMError(408, "The SCIM request body timed out")
+		: json(
+				{
+					code: "INVALID_SAML_RESPONSE",
+					message: "The SAML request body timed out.",
+				},
+				408,
+			);
+}
+
 async function handle(
 	request: Request,
 	context: { params: Promise<{ slug: string }> },
 ) {
+	let timedOut: (() => boolean) | undefined;
+	let protocol: ProjectProtocolBody | null = null;
 	try {
 		const { slug } = await context.params;
 		const environment = await getAuthEnvironment();
 		const project = await getProject(slug, environment);
+		if (
+			!request.headers.get("allauth-proxy-signature") &&
+			internalProjectEngineSelected(environment, project)
+		)
+			protocol = projectProtocolBody(
+				request,
+				`/api/projects/${project.slug}/auth`,
+			);
+		const protocolBody = protocol
+			? await prepareProjectProtocolBody(request, protocol)
+			: null;
+		timedOut = protocolBody?.timedOut;
+		if (protocol && timedOut?.()) return protocolBodyTimeout(protocol);
+		const transport = protocolBody?.request ?? request;
 		const prepare = () =>
-			prepareProjectAuthentication(request, project, environment, {
+			prepareProjectAuthentication(transport, project, environment, {
 				consumeBody: true,
 			});
 		const directoryRequest = hasServiceDirectoryCredentials(request, project);
@@ -79,10 +115,12 @@ async function handle(
 			},
 			environment,
 		);
+		if (protocol && timedOut?.()) return protocolBodyTimeout(protocol);
 		response.headers.set("Cache-Control", "no-store");
 		response.headers.set("Pragma", "no-cache");
 		return response;
 	} catch (error) {
+		if (protocol && timedOut?.()) return protocolBodyTimeout(protocol);
 		if (error instanceof APIError)
 			return json(
 				{ error: error.body?.message || "Request not permitted." },
