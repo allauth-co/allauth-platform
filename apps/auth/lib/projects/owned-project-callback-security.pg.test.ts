@@ -16,7 +16,10 @@ import {
 	defaultSecurityPolicy,
 	securitySubject,
 } from "../control/security-policy";
-import { newWebhookSigningSecret } from "../control/webhook-contract";
+import {
+	newWebhookSigningSecret,
+	webhookSignature,
+} from "../control/webhook-contract";
 import type { ControlWebhookEnvelope } from "../control/webhooks";
 import { deliverPendingWebhooks } from "../control/webhooks";
 import type { ProjectEmailAliasMap } from "../project-email-alias-config";
@@ -743,6 +746,245 @@ describe.skipIf(!existsSync(fixturePath))(
 					[rateKey],
 				);
 			}
+		});
+
+		it.each([
+			"valid address",
+			"invalid address",
+		] as const)("cleans up an expired email-change browser before rejecting a request with %s", async (scenario) => {
+			const path = "/change-email";
+			const nativeEngine = native(nativeDatabase);
+			const defer = vi.fn();
+			const candidate = createOwnedProjectEngine({
+				database,
+				project: { schemaName: schema, slug },
+				baseURL: origin,
+				basePath,
+				trustedOrigins: [],
+				signingSecret: secret,
+				trustedIP: (request) => request.headers.get("x-real-ip"),
+				policy: defaultAuthPolicy,
+				accountLinks: {
+					publicLinkBaseURL: `${origin}${basePath}`,
+					emailChange: true,
+					defer,
+					deliver: async () => {},
+				},
+			});
+			const { authCookies } = await nativeEngine.$context;
+			const valid = scenario === "valid address";
+			const submitted = valid
+				? "email-change-expired-new@fixture.example"
+				: "synthetic-invalid-address";
+			for (const [writer, dispatch] of [
+				["native", nativeEngine.handler],
+				["owned", candidate.dispatch],
+			] as const) {
+				const id = randomUUID();
+				const session = randomUUID();
+				const siblingSession = randomUUID();
+				const token = randomUUID();
+				const email = `${id}@fixture.example`;
+				const address = `192.0.2.${(valid ? 188 : 190) + (writer === "owned" ? 1 : 0)}`;
+				const endpoint = randomUUID();
+				const signing = newWebhookSigningSecret();
+				const callback = "https://expired-change-hook.fixture.example/events";
+				const signed = createHmac("sha256", secret)
+					.update(token)
+					.digest("base64");
+				const cookie = `${authCookies.sessionToken.name}=${encodeURIComponent(`${token}.${signed}`)}`;
+				const client = randomUUID();
+				const online = randomUUID();
+				const offline = randomUUID();
+				const unrelated = randomUUID();
+				const request = (body: string) =>
+					new Request(`${origin}${basePath}${path}`, {
+						method: "POST",
+						headers: {
+							origin,
+							cookie,
+							"content-type": "application/json",
+							"x-real-ip": address,
+							"user-agent": rawUserAgent,
+						},
+						body,
+					});
+				try {
+					await database.query(
+						`INSERT INTO ${scope}."user" (id,name,email,"emailVerified") VALUES ($1,'Expired email change fixture',$2,true)`,
+						[id, email],
+					);
+					await database.query(
+						`INSERT INTO ${scope}.session (id,token,"userId","expiresAt","updatedAt")
+							 VALUES ($1,$2,$3,now()-interval '1 minute',now()),($4,$4,$3,now()+interval '1 day',now())`,
+						[session, token, id, siblingSession],
+					);
+					await database.query(
+						`INSERT INTO ${scope}."oauthClient" (id,"clientId","redirectUris") VALUES ($1,$1,'[]')`,
+						[client],
+					);
+					await database.query(
+						`INSERT INTO ${scope}."oauthRefreshToken" (id,token,"sessionId","userId","clientId","expiresAt","createdAt",scopes)
+							 VALUES ($1,$1,$4,$5,$6,now()+interval '1 day',now(),'["openid"]'),
+							        ($2,$2,$4,$5,$6,now()+interval '1 day',now(),'["openid","offline_access"]'),
+							        ($3,$3,$7,$5,$6,now()+interval '1 day',now(),'["openid"]')`,
+						[online, offline, unrelated, session, id, client, siblingSession],
+					);
+					await database.query(
+						`INSERT INTO ${scope}."allauthWebhookEndpoint" (id,url,"eventTypes","encryptedSecret") VALUES ($1,$2,'["session.deleted","user.*"]',$3)`,
+						[
+							endpoint,
+							callback,
+							await symmetricEncrypt({ key: secret, data: signing }),
+						],
+					);
+					const sessions = async () =>
+						(
+							await database.query(
+								`SELECT id FROM ${scope}.session WHERE "userId"=$1 ORDER BY id`,
+								[id],
+							)
+						).rows.map(({ id }) => id);
+					expect((await dispatch(request("{"))).status).toBe(400);
+					expect(await sessions()).toEqual([session, siblingSession].sort());
+					for (let attempt = 0; attempt < 2; attempt++) {
+						const response = await dispatch(
+							request(JSON.stringify({ newEmail: submitted })),
+						);
+						expect(response.status).toBe(valid ? 401 : 400);
+						if (valid)
+							expect(await response.json()).toEqual({
+								code: "UNAUTHORIZED",
+								message: "Unauthorized",
+							});
+						else if (writer === "native")
+							expect(await response.json()).toEqual({
+								code: "VALIDATION_ERROR",
+								message: "Validation error",
+								originalMessage: "[body.newEmail] Invalid email address",
+							});
+						else
+							expect(await response.json()).toEqual({
+								code: "INVALID_BODY",
+								message: "Supply a valid new email address.",
+							});
+						expect(
+							response.headers
+								.getSetCookie()
+								.some((value) => /\.session_token=;.*Max-Age=0/.test(value)),
+							writer,
+						).toBe(valid);
+					}
+					expect(await sessions()).toEqual([siblingSession]);
+					expect(
+						(
+							await database.query(
+								`SELECT id,"sessionId",revoked IS NOT NULL AS revoked FROM ${scope}."oauthRefreshToken" WHERE "clientId"=$1 ORDER BY id`,
+								[client],
+							)
+						).rows,
+					).toEqual(
+						[
+							{ id: online, sessionId: null, revoked: true },
+							{ id: offline, sessionId: null, revoked: false },
+							{ id: unrelated, sessionId: siblingSession, revoked: false },
+						].sort((a, b) => a.id.localeCompare(b.id)),
+					);
+					expect(
+						(
+							await database.query(
+								`SELECT email,"emailVerified" FROM ${scope}."user" WHERE id=$1`,
+								[id],
+							)
+						).rows,
+					).toEqual([{ email, emailVerified: true }]);
+					const events: Omit<
+						ControlWebhookEnvelope["data"]["event"],
+						"id" | "createdAt"
+					>[] = [];
+					expect(
+						await deliverPendingWebhooks({
+							database: nativeDatabase,
+							secret,
+							now: () => new Date(Date.now() + 2_000),
+							resolver: async () => [{ address: "93.184.216.34", family: 4 }],
+							async transport({ destination, body, headers }) {
+								expect(destination.url.href).toBe(callback);
+								expect(headers["webhook-signature"]).toBe(
+									await webhookSignature(
+										signing,
+										headers["webhook-id"],
+										headers["webhook-timestamp"],
+										body,
+									),
+								);
+								for (const value of [
+									token,
+									signed,
+									submitted,
+									email,
+									online,
+									offline,
+									unrelated,
+								])
+									expect(body).not.toContain(value);
+								const envelope = JSON.parse(body) as ControlWebhookEnvelope;
+								const { id, createdAt, ...event } = envelope.data.event;
+								expect(envelope).toEqual({
+									id,
+									type: event.type,
+									timestamp: createdAt,
+									data: { event: { id, createdAt, ...event } },
+								});
+								events.push(event);
+								return 204;
+							},
+						}),
+					).toMatchObject({ claimed: 3, delivered: 3 });
+					expect(
+						events.filter(({ type }) => type === "session.deleted"),
+						writer,
+					).toEqual([
+						{
+							type: "session.deleted",
+							outcome: "success",
+							actorId: id,
+							userId: id,
+							targetId: session,
+							metadata: { path },
+						},
+					]);
+					expect(
+						events.filter(({ type }) => type === "user.email-change-requested"),
+					).toEqual(
+						Array.from({ length: 2 }, () => ({
+							type: "user.email-change-requested",
+							outcome: "failure",
+							ipAddress: address,
+							userAgent,
+							metadata: {
+								path,
+								errorCode: valid ? "UNAUTHORIZED" : "VALIDATION_ERROR",
+							},
+						})),
+					);
+				} finally {
+					await database.query(
+						`DELETE FROM ${scope}."allauthWebhookEndpoint" WHERE id=$1`,
+						[endpoint],
+					);
+					await database.query(
+						`DELETE FROM ${scope}."oauthClient" WHERE id=$1`,
+						[client],
+					);
+					await database.query(`DELETE FROM ${scope}."user" WHERE id=$1`, [id]);
+					await database.query(
+						`DELETE FROM ${scope}."rateLimit" WHERE "key"=$1`,
+						[`${address}|${path}`],
+					);
+				}
+			}
+			expect(defer).not.toHaveBeenCalled();
 		});
 
 		it("preserves native profile and stored-account domain denials after verifying a Google callback", async () => {

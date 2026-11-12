@@ -67,8 +67,10 @@ export async function HostedProjectAuthPage({
 				!(await hostedSdkSelected(env, binding.project, binding.kind))
 			)
 				return null;
+			if (params.interface === "legacy") return null;
+			const rejected = { kind: "redirect", destination: "/auth-error" } as const;
+			if (params.interface !== undefined) return rejected;
 			if (view === "authRedirect") {
-				if (params.interface !== undefined) return null;
 				const request = hostedAuthRedirectRequest(
 					params,
 					`https://${binding.hostname}`,
@@ -83,7 +85,7 @@ export async function HostedProjectAuthPage({
 							request.oauthQuery,
 						)))
 				)
-					return null;
+					return rejected;
 				if (request.issuer)
 					return { kind: "issuer", destination: request.destination } as const;
 				const destination = (await portalSession(requestHeaders))
@@ -92,7 +94,7 @@ export async function HostedProjectAuthPage({
 				return { kind: "redirect", destination } as const;
 			}
 			const request = hostedSdkViewRequest(view, params, binding.kind);
-			if (!request) return null;
+			if (!request) return rejected;
 			if (
 				request.oauthQuery &&
 				!(await verifiedHostedOAuthContinuation(
@@ -101,7 +103,7 @@ export async function HostedProjectAuthPage({
 					request.oauthQuery,
 				))
 			)
-				return null;
+				return rejected;
 			const config = await engine.dispatch(
 				new Request(`https://${binding.hostname}/api/auth/sdk/config`, {
 					headers: { accept: "application/json" },

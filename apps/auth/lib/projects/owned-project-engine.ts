@@ -3934,7 +3934,16 @@ export function createOwnedProjectEngine(
 			if (limited) return limited;
 			const denied = await factorAdmission(request, "change-email");
 			if (denied) return denied;
-			return emailChange.start(request, await requestBody(request));
+			const input = request.body ? await requestBody(request) : undefined;
+			const missing =
+				input === undefined
+					? null
+					: await missingBrowserSessionHeaders(request, path);
+			const response = await emailChange.start(request, input);
+			if (missing && response.status === 401)
+				for (const cookie of missing.getSetCookie())
+					response.headers.append("set-cookie", cookie);
+			return response;
 		}
 		if (emailChange && path === "/verify-email" && request.method === "GET") {
 			const response = await emailChange.verify(request);

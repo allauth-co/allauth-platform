@@ -7,7 +7,14 @@ import {
 import { symmetricEncrypt } from "better-auth/crypto";
 import { jwt, organization } from "better-auth/plugins";
 import { getTestInstance } from "better-auth/test";
-import { decodeJwt, exportJWK, generateKeyPair, SignJWT } from "jose";
+import {
+	createLocalJWKSet,
+	decodeJwt,
+	exportJWK,
+	generateKeyPair,
+	jwtVerify,
+	SignJWT,
+} from "jose";
 import { Kysely, PostgresDialect } from "kysely";
 import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -1135,6 +1142,119 @@ describe.skipIf(!existsSync(fixture))(
 			expect(consent.rows).toEqual([
 				{ scopes: ["openid", "profile"], requestedUserInfoClaims: ["name"] },
 			]);
+		});
+
+		it("redeems pending codes for a linked resource supplied at the token endpoint across writers", async () => {
+			const clientId = await registration([callback], ["openid"], true);
+			const resource = "https://late-resource.project-issuer.fixture.example";
+			const secondResource =
+				"https://second-resource.project-issuer.fixture.example";
+			const unlinkedResource =
+				"https://unlinked-resource.project-issuer.fixture.example";
+			for (const identifier of [resource, secondResource, unlinkedResource]) {
+				await database.query(
+					`INSERT INTO "${schema}"."oauthResource" (id,identifier,name) VALUES ($1,$2,'Fixture resource')`,
+					[randomUUID(), identifier],
+				);
+			}
+			await database.query(
+				`INSERT INTO "${schema}"."oauthClientResource" (id,"clientId","resourceId") VALUES ($1,$2,$3),($4,$2,$5)`,
+				[randomUUID(), clientId, resource, randomUUID(), secondResource],
+			);
+			const account = await browser();
+			const ownedDispatch = managementEngine().dispatch;
+			const issue = async (writer: typeof legacy, binding?: string) => {
+				const redirect = await resultURL(
+					await writer(
+						request("/oauth2/authorize", {
+							cookie: account.cookie,
+							query: query(clientId, {
+								scope: "openid",
+								...(binding ? { resource: binding } : {}),
+							}),
+						}),
+					),
+				);
+				expect(redirect.origin + redirect.pathname).toBe(
+					new URL(callback).origin + new URL(callback).pathname,
+				);
+				const code = redirect.searchParams.get("code");
+				expect(code).toBeTruthy();
+				const { rows } = await database.query<{ value: string }>(
+					`SELECT value FROM "${schema}"."verification" WHERE identifier=$1`,
+					[issuerDigest(code!)],
+				);
+				expect(JSON.parse(rows[0]!.value)).toMatchObject({
+					resource: binding ? [binding] : [],
+				});
+				return code!;
+			};
+			const redeem = (writer: typeof legacy, code: string, target?: string) =>
+				writer(
+					request("/oauth2/token", {
+						body: new URLSearchParams({
+							grant_type: "authorization_code",
+							client_id: clientId,
+							code,
+							redirect_uri: callback,
+							code_verifier: verifier,
+							...(target ? { resource: target } : {}),
+						}),
+					}),
+				);
+			for (const [label, start, finish] of [
+				["native baseline", legacy, legacy],
+				["activate AllAuth", legacy, ownedDispatch],
+				["roll back", ownedDispatch, legacy],
+				["AllAuth", ownedDispatch, ownedDispatch],
+			] as const) {
+				const response = await redeem(finish, await issue(start), resource);
+				expect(
+					response.status,
+					`${label}: ${await response.clone().text()}`,
+				).toBe(200);
+				const tokens = (await response.json()) as {
+					access_token: string;
+					id_token: string;
+					scope: string;
+				};
+				expect(tokens.scope).toBe("openid");
+				const keys = createLocalJWKSet(
+					await (await finish(request("/jwks"))).json(),
+				);
+				const access = await jwtVerify(tokens.access_token, keys, {
+					issuer,
+					audience: resource,
+					subject: account.userId,
+				});
+				expect(access.payload.aud).toEqual([
+					resource,
+					`${issuer}/oauth2/userinfo`,
+				]);
+				await jwtVerify(tokens.id_token, keys, {
+					issuer,
+					audience: clientId,
+					subject: account.userId,
+				});
+			}
+			for (const [binding, target] of [
+				[undefined, unlinkedResource],
+				[resource, secondResource],
+			]) {
+				const response = await redeem(
+					ownedDispatch,
+					await issue(legacy, binding),
+					target,
+				);
+				expect(response.status).toBe(400);
+				expect(await response.json()).toMatchObject({
+					error: "invalid_target",
+				});
+			}
+			const response = await redeem(ownedDispatch, await issue(legacy));
+			expect(response.status).toBe(200);
+			const opaque = (await response.json()) as { access_token: string };
+			expect(opaque.access_token).toMatch(/^[A-Za-z0-9]+$/);
 		});
 
 		it("resumes a native login and permits the legacy engine to accept an owned consent prompt", async () => {

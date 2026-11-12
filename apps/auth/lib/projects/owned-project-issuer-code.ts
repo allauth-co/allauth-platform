@@ -37,7 +37,7 @@ function invalidCode(message = "invalid code") {
 }
 
 function list(value?: string | string[]) {
-	return value === undefined ? null : Array.isArray(value) ? value : [value];
+	return typeof value === "string" ? [value] : value?.length ? value : null;
 }
 
 export async function readAuthorizationCode(
@@ -59,6 +59,7 @@ export async function readAuthorizationCode(
 		throw new ProjectOAuthError("invalid_request", "code is required");
 	const digest = issuerDigest(code);
 	// Serialize consumption and replay cleanup across project replicas.
+	// cspell:ignore xact
 	await database.query("SELECT pg_advisory_xact_lock(hashtext($1))", [
 		`allauth-oauth-code:${digest}`,
 	]);
@@ -130,7 +131,7 @@ export async function readAuthorizationCode(
 				401,
 			);
 	}
-	const originalResources = list(record.resource ?? query.resource);
+	const originalResources = list(record.resource) ?? list(query.resource);
 	const supplied = form.getAll("resource");
 	if (
 		supplied.length &&

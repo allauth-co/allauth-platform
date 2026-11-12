@@ -1,8 +1,7 @@
 import { createHash } from "node:crypto";
 import { APIError } from "better-auth";
-import { getSessionCookie } from "better-auth/cookies";
 import type { AuthEnvironment } from "../configuration";
-import { verifyLegacySessionCookie } from "./legacy-session-cookie";
+import { readProjectSessionAdmissionCookie } from "./legacy-session-cookie";
 import { verifiedProjectRequest, withoutProjectProxyAssertions } from "./proxy";
 import type { Project } from "./registry";
 import type { SessionCheckCoordinator } from "./session-check-coordinator";
@@ -66,24 +65,6 @@ function diagnostic(
 		(observe ?? ((value) => console.info(JSON.stringify(value))))(event);
 	} catch {
 		/* Observability cannot change authentication. */
-	}
-}
-
-/** A valid cookie selects a rate bucket; it never establishes live authority. */
-function authenticSessionCookie(
-	request: Request,
-	project: Project,
-	secret: string,
-): string | null {
-	try {
-		const serialized = getSessionCookie(request, {
-			cookiePrefix: `allauth_project_${project.slug}`,
-		});
-		if (!serialized || serialized.length > 1024) return null;
-		const value = decodeURIComponent(serialized);
-		return verifyLegacySessionCookie(value, secret) ? value : null;
-	} catch {
-		return null;
 	}
 }
 
@@ -163,7 +144,11 @@ async function dispatchProjectAuthentication(
 	if (!introspection) return dependencies.fallback(verified);
 	const sessionSecret =
 		typeof sessionKey === "function" ? sessionKey() : sessionKey;
-	const cookie = authenticSessionCookie(verified, project, sessionSecret);
+	const cookie = readProjectSessionAdmissionCookie(
+		verified.headers,
+		`allauth_project_${project.slug}`,
+		sessionSecret,
+	);
 	if (!cookie) return dependencies.fallback(verified);
 	const digest = createHash("sha256")
 		.update(JSON.stringify([project.id, cookie]))

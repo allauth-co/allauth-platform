@@ -96,10 +96,9 @@ it("preserves exact sign-out destinations, verifies a direct OAuth query, and de
 	expect(local.props).toMatchObject({
 		destination: `/sign-in?${new URLSearchParams({ callbackUrl: callback })}`,
 	});
-	expect(
-		(await read(Promise.resolve({ callbackUrl: "//other.example/account" })))
-			.type,
-	).toBe(AllAuthAuth);
+	await expect(
+		read(Promise.resolve({ callbackUrl: "//other.example/account" })),
+	).rejects.toThrow("redirect:/auth-error");
 	const signed = {
 		client_id: "fixture",
 		resource: ["one", "two"],
@@ -115,7 +114,9 @@ it("preserves exact sign-out destinations, verifies a direct OAuth query, and de
 	expect(engine.readOAuthContext.mock.calls[0]?.[0].url).toBe(
 		`https://${accountsHostname}/api/oauth/context?${query}`,
 	);
-	expect((await read(Promise.resolve(signed))).type).toBe(AllAuthAuth);
+	await expect(read(Promise.resolve(signed))).rejects.toThrow(
+		"redirect:/auth-error",
+	);
 });
 
 it("shows supported callback results with verified local destinations and keeps redirect compatibility", async () => {
@@ -152,11 +153,10 @@ it("shows supported callback results with verified local destinations and keeps 
 		["authCallback", { result: "email_verified", returnTo: "/api/auth/callback" }],
 		["authCallback", { result: "email_verified", code: "opaque" }],
 	] as const) {
-		const fallback = await HostedProjectAuthPage({
+		await expect(HostedProjectAuthPage({
 			view,
 			searchParams: Promise.resolve(query),
-		});
-		expect(fallback.type).toBe(AllAuthAuth);
+		})).rejects.toThrow("redirect:/auth-error");
 	}
 	expect(runtime.portalSession).not.toHaveBeenCalled();
 	const redirect = () =>
@@ -252,14 +252,18 @@ it("verifies a signed redirect continuation and carries it through signed-out lo
 	await expect(read(params)).rejects.toThrow(`redirect:${path}`);
 
 	runtime.portalSession.mockClear();
-	expect((await read({ redirectTo: path })).type).toBe(AllAuthAuth);
+	await expect(read({ redirectTo: path })).rejects.toThrow("redirect:/auth-error");
 	expect(runtime.portalSession).not.toHaveBeenCalled();
 });
 
 it("keeps explicit legacy fallback and refuses unsafe or ambiguous auth redirects", async () => {
 	const { engine, read } = redirectFixture();
+	expect((await read({ interface: "legacy", redirectTo: "/account" })).type).toBe(
+		AllAuthAuth,
+	);
 	for (const params of [
-		{ interface: "legacy", redirectTo: "/account" },
+		{ interface: "other", redirectTo: "/account" },
+		{ interface: ["legacy", "legacy"], redirectTo: "/account" },
 		{ redirectTo: ["/account", "/console"] },
 		{ redirectTo: "//elsewhere.example/account" },
 		{ redirectTo: `https://${accountsHostname}//elsewhere.example/account` },
@@ -269,7 +273,7 @@ it("keeps explicit legacy fallback and refuses unsafe or ambiguous auth redirect
 		{ redirectTo: "/api/auth/verify-email?token=opaque" },
 		{ redirectTo: "/api/auth/oauth2/authorize?client_id=fixture#unsupported" },
 	]) {
-		expect((await read(params)).type).toBe(AllAuthAuth);
+		await expect(read(params)).rejects.toThrow("redirect:/auth-error");
 	}
 	expect(runtime.portalSession).not.toHaveBeenCalled();
 	expect(engine.readOAuthContext).not.toHaveBeenCalled();
@@ -285,7 +289,7 @@ it("uses the standard page for an unverified account hostname without looking up
 	expect(runtime.withPortalHeadersEngine).not.toHaveBeenCalled();
 });
 
-it("keeps an unsigned OAuth query in the standard page even when preview is configured", async () => {
+it("rejects an unsigned project OAuth query without loading a legacy form", async () => {
 	runtime.headers.mockResolvedValue(
 		new Headers({ [portalHeader]: "fixture-proof" }),
 	);
@@ -293,11 +297,10 @@ it("keeps an unsigned OAuth query in the standard page even when preview is conf
 	runtime.withPortalHeadersEngine.mockImplementation(async (_headers, select) =>
 		select(engine, new Headers(), { kind: "accounts", project, hostname: accountsHostname }),
 	);
-	const result = await HostedProjectAuthPage({
+	await expect(HostedProjectAuthPage({
 		view: "signIn",
 		searchParams: Promise.resolve({ client_id: "fixture" }),
-	});
-	expect(result.type).toBe(AllAuthAuth);
+	})).rejects.toThrow("redirect:/auth-error");
 	expect(runtime.withPortalHeadersEngine).toHaveBeenCalledOnce();
 	expect(engine.dispatch).not.toHaveBeenCalled();
 });
@@ -347,11 +350,10 @@ it("renders verified signed OAuth sign-in and MFA with the exact continuation", 
 	engine.readOAuthContext.mockResolvedValue(
 		new Response(null, { status: 400 }),
 	);
-	const rejected = await HostedProjectAuthPage({
+	await expect(HostedProjectAuthPage({
 		view: "signIn",
 		searchParams: Promise.resolve(signed),
-	});
-	expect(rejected.type).toBe(AllAuthAuth);
+	})).rejects.toThrow("redirect:/auth-error");
 });
 
 it("uses the first-party page for an allowlisted development accounts realm with an exact callback", async () => {
@@ -534,7 +536,8 @@ it("switches registered production sign-in by the current writer and requires it
 	runtime.withPortalHeadersEngine.mockImplementation(async (_headers, select) =>
 		select(engine, new Headers(), { kind: "accounts", project: production, hostname: accountsHostname }),
 	);
-	const read = () => HostedProjectAuthPage({ view: "signIn", searchParams: Promise.resolve({}) });
+	const read = (params: Awaited<HostedProjectAuthPageProps["searchParams"]> = {}) =>
+		HostedProjectAuthPage({ view: "signIn", searchParams: Promise.resolve(params) });
 	const prepare = (revision: number) => runtime.getAuthEnvironment.mockResolvedValue({
 		ALLAUTH_PROJECT_ENGINE_PRODUCTION_REVISIONS: JSON.stringify({ [production.id]: revision }),
 	});
@@ -543,8 +546,12 @@ it("switches registered production sign-in by the current writer and requires it
 	expect((await read()).type).toBe(AllAuthAuth);
 	runtime.readWriter.mockResolvedValue({ writer: "allauth", revision: 1 });
 	expect((await read()).type).toBe(HostedProjectAuth);
+	const expired = { client_id: "fixture", sig: "fixture", exp: "1" };
+	await expect(read(expired)).rejects.toThrow("redirect:/auth-error");
+	expect((await read({ ...expired, interface: "legacy" })).type).toBe(AllAuthAuth);
 	runtime.readWriter.mockResolvedValue({ writer: "legacy", revision: 2 });
 	expect((await read()).type).toBe(AllAuthAuth);
+	expect((await read(expired)).type).toBe(AllAuthAuth);
 	runtime.readWriter.mockResolvedValue({ writer: "allauth", revision: 3 });
 	expect((await read()).type).toBe(HostedProjectUnavailable);
 	prepare(2);
@@ -593,7 +600,7 @@ it("only selects alternate sign-in methods when the verified project can offer t
 	});
 });
 
-it("selects project MFA for a local callback and keeps signed broker MFA on the standard page", async () => {
+it("selects project MFA for a local callback and keeps unbound broker MFA on the standard page", async () => {
 	runtime.headers.mockResolvedValue(
 		new Headers({ [portalHeader]: "fixture-proof" }),
 	);
@@ -613,14 +620,16 @@ it("selects project MFA for a local callback and keeps signed broker MFA on the 
 		view: "twoFactor",
 		destination: "/account/security",
 	});
-	const signed = await HostedProjectAuthPage({
+	const signed = () => HostedProjectAuthPage({
 		view: "twoFactor",
 		searchParams: Promise.resolve({
 			allauth_mfa: "app-v1",
 			client_id: "broker",
 		}),
 	});
-	expect(signed.type).toBe(AllAuthAuth);
+	await expect(signed()).rejects.toThrow("redirect:/auth-error");
+	runtime.headers.mockResolvedValue(new Headers());
+	expect((await signed()).type).toBe(AllAuthAuth);
 });
 
 it("selects email status views only for an enabled hosted project without a bearer in the page query", async () => {
@@ -672,14 +681,13 @@ it("selects email status views only for an enabled hosted project without a bear
 	}
 
 	runtime.withPortalHeadersEngine.mockClear();
-	const bearer = await HostedProjectAuthPage({
+	await expect(HostedProjectAuthPage({
 		view: "verifyEmail",
 		searchParams: Promise.resolve({
 			callbackUrl: destination,
 			token: "fixture",
 		}),
-	});
-	expect(bearer.type).toBe(AllAuthAuth);
+	})).rejects.toThrow("redirect:/auth-error");
 	expect(runtime.withPortalHeadersEngine).toHaveBeenCalledOnce();
 
 	runtime.getAuthEnvironment.mockResolvedValue({});
