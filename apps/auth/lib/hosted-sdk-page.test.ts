@@ -4,6 +4,7 @@ import { HostedProjectAuth } from "@/components/hosted-project-auth";
 import { HostedProjectAuthPage } from "@/components/hosted-project-auth-page";
 import type { HostedProjectAuthPageProps } from "@/components/hosted-project-auth-page";
 import { portalHeader } from "./domains/edge";
+import { platformWorkspaceId } from "./workspaces/types";
 
 const runtime = vi.hoisted(() => ({
 	headers: vi.fn(),
@@ -511,4 +512,41 @@ it("selects email status views only for an enabled hosted project without a bear
 	expect(standard.type).toBe(AllAuthAuth);
 	expect(standard.props).toEqual({ path: "reset-link-sent" });
 	expect(runtime.withPortalHeadersEngine).not.toHaveBeenCalled();
+});
+
+it("uses the first-party sign-in on the verified accounts domain of the selected internal writer", async () => {
+	runtime.getAuthEnvironment.mockResolvedValue({
+		ALLAUTH_PROJECT_ENGINE_INTERNAL_ID: project.id,
+	});
+	runtime.headers.mockResolvedValue(
+		new Headers({ [portalHeader]: "fixture-proof" }),
+	);
+	const engine = engineConfiguration({ emailPassword: true });
+	const internal = {
+		...project,
+		workspaceId: platformWorkspaceId,
+		schemaName: `allauth_project_${project.id.replaceAll("-", "")}`,
+	};
+	let binding = {
+		kind: "accounts",
+		project: internal,
+		hostname: accountsHostname,
+	};
+	runtime.withPortalHeadersEngine.mockImplementation(async (_headers, select) =>
+		select(engine, new Headers(), binding),
+	);
+	const read = () =>
+		HostedProjectAuthPage({
+			view: "signIn",
+			searchParams: Promise.resolve({}),
+		});
+	expect((await read()).type).toBe(HostedProjectAuth);
+	binding = { ...binding, kind: "frontend-api" };
+	expect((await read()).type).toBe(AllAuthAuth);
+	binding = {
+		...binding,
+		kind: "accounts",
+		project: { ...internal, workspaceId: "customer-workspace" },
+	};
+	expect((await read()).type).toBe(AllAuthAuth);
 });

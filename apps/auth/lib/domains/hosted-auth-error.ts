@@ -1,14 +1,13 @@
 import { getAuthEnvironment } from "../auth";
-import { setting } from "../configuration";
 import { oauthBrowserQuery, oauthBrowserReturnPath } from "../oauth-browser";
 import { portalHeader } from "./edge";
 import { verifiedHostedOAuthContinuation } from "./hosted-oauth-continuation";
 import type { HostedSdkSearchParams } from "./hosted-sdk-policy";
+import { hostedSdkReturnPath } from "./hosted-sdk-policy";
 import {
-	hostedSdkProjectEnabled,
-	hostedSdkProjectIdsSetting,
-	hostedSdkReturnPath,
-} from "./hosted-sdk-policy";
+	hasHostedSdkSelection,
+	hostedSdkSelected,
+} from "./hosted-sdk-selection";
 import { withPortalHeadersEngine } from "./hosting";
 
 const signIn = "/sign-in";
@@ -66,12 +65,11 @@ export async function hostedAuthErrorRetry(
 	if (!headers.has(portalHeader) || params.interface !== undefined)
 		return undefined;
 	const env = await getAuthEnvironment();
-	const configured = setting(env, hostedSdkProjectIdsSetting);
-	if (!configured.trim()) return undefined;
+	if (!hasHostedSdkSelection(env)) return undefined;
 	return withPortalHeadersEngine(headers, async (engine, _bound, binding) => {
 		if (
 			binding?.kind !== "accounts" ||
-			!hostedSdkProjectEnabled(configured, binding.project)
+			!hostedSdkSelected(env, binding.project)
 		)
 			return undefined;
 		const { query, callback } = retryIntent(params);

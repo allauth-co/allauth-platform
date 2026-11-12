@@ -7,10 +7,12 @@ import { promisify } from "node:util";
 import { getCookies } from "better-auth/cookies";
 import { clerkCompatiblePasswords } from "../../lib/clerk-password";
 import { signEdgeRequest } from "../../lib/domains/edge";
+import { platformWorkspaceId } from "../../lib/workspaces/types";
 import { createRailwayProjectEngineTransport } from "./railway-project-engine-transport";
 
 const execute = promisify(execFile);
 const [target, argument] = process.argv.slice(2);
+const internalSelection = target === "--internal";
 if (target === "--railway")
 	assert.ok(argument, "Pass the isolated Railway fixture profile.");
 const railway =
@@ -19,12 +21,14 @@ const railway =
 		: undefined;
 const [releaseImage, rehearsalImage] = railway
 	? ["release", "candidate"]
-	: [target, argument];
+	: internalSelection
+		? [argument, argument]
+		: [target, argument];
 assert.ok(
 	releaseImage && rehearsalImage,
 	"Pass the normal release and project-engine-rehearsal Docker images.",
 );
-assert.notEqual(releaseImage, rehearsalImage);
+if (!internalSelection) assert.notEqual(releaseImage, rehearsalImage);
 const run = randomUUID().replaceAll("-", "");
 const network = `allauth-engine-rehearsal-${run}`;
 const database = `${network}-db`;
@@ -296,22 +300,26 @@ async function seed() {
 		definition.attributes,
 	);
 	const cookie = signed.split(";", 1)[0];
-	const workspaceResponse = await request("/api/workspaces", {
-		cookie,
-		body: {
-			name: "Project Engine Rehearsal",
-			slug: "compiled-engine-rehearsal",
-		},
-	});
-	expectStatus(
-		workspaceResponse,
-		201,
-		"Create a workspace through the compiled platform.",
-	);
-	const workspace = (
-		JSON.parse(workspaceResponse.body) as { workspace: { id: string } }
-	).workspace;
-	assert.match(workspace.id, /^[a-f0-9-]{36}$/);
+	async function createFixtureWorkspace() {
+		const response = await request("/api/workspaces", {
+			cookie,
+			body: {
+				name: "Project Engine Rehearsal",
+				slug: "compiled-engine-rehearsal",
+			},
+		});
+		expectStatus(
+			response,
+			201,
+			"Create a workspace through the compiled platform.",
+		);
+		return (JSON.parse(response.body) as { workspace: { id: string } })
+			.workspace.id;
+	}
+	const workspaceId = internalSelection
+		? platformWorkspaceId
+		: await createFixtureWorkspace();
+	assert.match(workspaceId, /^[a-f0-9-]{36}$/);
 	async function create(slug: string, env: string, applicationId?: string) {
 		const response = await request("/api/admin/projects", {
 			cookie,
@@ -320,7 +328,7 @@ async function seed() {
 				slug,
 				primaryOrigin: `https://${slug}.project-engine-rehearsal.invalid`,
 				origins: [],
-				workspaceId: workspace.id,
+				workspaceId,
 				environment: env,
 				...(applicationId ? { applicationId } : {}),
 			},
@@ -333,7 +341,7 @@ async function seed() {
 		const { project } = JSON.parse(response.body) as { project: Realm };
 		assert.match(project.id, /^[a-f0-9-]{36}$/);
 		assert.equal(project.environment, env);
-		assert.equal(project.workspaceId, workspace.id);
+		assert.equal(project.workspaceId, workspaceId);
 		const schema = `allauth_project_${project.id.replaceAll("-", "")}`;
 		const password = await clerkCompatiblePasswords.hash(oldPassword);
 		assert.match(password, /^[0-9a-f]+:[0-9a-f]+$/);
@@ -483,7 +491,7 @@ try {
 			"A failed selection does not change its sibling.",
 		);
 	}
-	if (!railway) {
+	if (!railway && !internalSelection) {
 		await start(rehearsalImage, restored);
 		expectStatus(
 			await request(`${direct}/not-installed`, { realm: owned }),
@@ -515,7 +523,18 @@ try {
 		);
 	}
 
-	await start(rehearsalImage, restored, selected);
+	if (internalSelection) {
+		await start(releaseImage, restored, {
+			ALLAUTH_PROJECT_ENGINE_INTERNAL_ID: owned.id,
+		});
+		expectStatus(
+			await request("/api/auth/hosted-ui/sdk/config", { host }),
+			200,
+			"The internal realm uses the first-party hosted API.",
+		);
+	} else {
+		await start(rehearsalImage, restored, selected);
+	}
 	if (railway) {
 		const marker = createHash("sha256").update(databaseNonce).digest("hex");
 		await query(
@@ -579,37 +598,49 @@ try {
 		}),
 		null,
 	);
-	const changed = await request(`${direct}/change-password`, {
-		realm: owned,
-		cookie: originalCookie,
-		body: {
-			currentPassword: oldPassword,
-			newPassword,
-			revokeOtherSessions: true,
-		},
-	});
-	expectStatus(
-		changed,
-		200,
-		"Change the legacy password through the owned writer.",
-	);
-	const ownedCookie = sessionCookie(changed);
-	assert.equal(
-		await currentSession("/api/auth/get-session", {
-			host,
-			cookie: originalHostedCookie,
-		}),
-		null,
-	);
+	const fixturePassword = internalSelection ? oldPassword : newPassword;
+	async function switchDirectSession() {
+		if (internalSelection) {
+			const loginResponse = await request(`${direct}/sign-in/email`, {
+				realm: owned,
+				body: login,
+			});
+			expectStatus(
+				loginResponse,
+				200,
+				"The internal project signs in through the AllAuth writer.",
+			);
+			return sessionCookie(loginResponse);
+		}
+		const changed = await request(`${direct}/change-password`, {
+			realm: owned,
+			cookie: originalCookie,
+			body: {
+				currentPassword: oldPassword,
+				newPassword,
+				revokeOtherSessions: true,
+			},
+		});
+		expectStatus(
+			changed,
+			200,
+			"Change the legacy password through the owned writer.",
+		);
+		assert.equal(
+			await currentSession("/api/auth/get-session", {
+				host,
+				cookie: originalHostedCookie,
+			}),
+			null,
+		);
+		return sessionCookie(changed);
+	}
+	const ownedCookie = await switchDirectSession();
 	const ownedHosted = await request("/api/auth/sign-in/email", {
 		host,
-		body: { ...login, password: newPassword },
+		body: { ...login, password: fixturePassword },
 	});
-	expectStatus(
-		ownedHosted,
-		200,
-		"The owned hosted route signs in with the changed password.",
-	);
+	expectStatus(ownedHosted, 200, "The AllAuth hosted route signs in.");
 	const ownedHostedCookie = sessionCookie(ownedHosted);
 	const createdKey = await request("/api/auth/api-key/create", {
 		host,
@@ -644,7 +675,7 @@ try {
 	expectStatus(
 		await request(`${direct}/not-installed`, { realm: owned }),
 		404,
-		"Even valid rehearsal settings cannot activate the normal image.",
+		"The normal image rolls the project back to legacy.",
 	);
 	expectStatus(
 		await request("/api/auth/not-installed", { host }),
@@ -676,21 +707,23 @@ try {
 	expectStatus(
 		await request(`${direct}/sign-in/email`, {
 			realm: owned,
-			body: { ...login, password: newPassword },
+			body: { ...login, password: fixturePassword },
 		}),
 		200,
-		"Native reads the changed password after rollback.",
+		"Native reads the project password after rollback.",
 	);
-	expectStatus(
-		// A second synthetic browser has its own admission bucket.
-		await request(`${direct}/sign-in/email`, {
-			realm: owned,
-			body: login,
-			clientIP: "192.0.2.55",
-		}),
-		401,
-		"Rollback retains password revocation.",
-	);
+	if (!internalSelection) {
+		expectStatus(
+			// A second synthetic browser has its own admission bucket.
+			await request(`${direct}/sign-in/email`, {
+				realm: owned,
+				body: login,
+				clientIP: "192.0.2.55",
+			}),
+			401,
+			"Rollback retains password revocation.",
+		);
+	}
 	expectStatus(
 		await request(`${controlPath}/sign-in/email`, {
 			realm: control,
@@ -701,7 +734,9 @@ try {
 	);
 	await stop(restored);
 	console.log(
-		"Compiled project rehearsal passed from legacy to AllAuth and back.",
+		internalSelection
+			? "Compiled internal project selection passed from legacy to AllAuth and back."
+			: "Compiled project rehearsal passed from legacy to AllAuth and back.",
 	);
 } finally {
 	await railway?.stop();

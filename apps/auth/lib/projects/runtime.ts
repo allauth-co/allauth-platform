@@ -67,6 +67,7 @@ import { observeProjectEngine, projectEngineMetricsSelected } from "./engine-met
 import { projectManagement } from "./management-plugin";
 import { projectOriginFingerprint } from "./origins";
 import type { OwnedProjectSCIMConsole } from "./owned-project-scim-console";
+import { selectInternalProjectEngine } from "./project-engine-internal-selection";
 import { selectRehearsalProjectEngine } from "./project-engine-rehearsal-selection";
 import { localizeProjectErrors } from "./project-error-localization";
 import { verifiedProjectRequest } from "./proxy";
@@ -519,9 +520,11 @@ async function withProjectEntry<T>(
 	callback: (entry: Entry, project: Project) => Promise<T>,
 ): Promise<T> {
 	projectRuntimeStarted = true;
-	const owned =
+	const rehearsal =
 		fixtureFor(project, env)?.build ??
 		(await selectRehearsalProjectEngine(project, env));
+	const internal = rehearsal ? undefined : selectInternalProjectEngine(project, env);
+	const owned = rehearsal ?? internal;
 	const [configured, googleProvider] = await Promise.all([
 		readAuthPolicy(project.id, env),
 		readGoogleProvider(project.id, env),
@@ -531,7 +534,7 @@ async function withProjectEntry<T>(
 	// Transport secrets can rotate while the native auth instance remains cached.
 	// Verification must receive the registry row read for this request.
 	return entries.use(
-		`${project.id}:${configured.version}:engine:${owned ? "owned-fixture" : "legacy"}:metrics:${projectEngineMetricsSelected(env, project.id)}:shadow:${projectSessionShadowSelected(env, project)}:origins:${projectOriginFingerprint(project)}:owned-avatars:${ownedAvatarSelected(env, project.id)}:native-passkeys:${selectedNativePasskeys(env, project, publicOrigin).version}:google:${googleProvider.version}:microsoft:${microsoftConfigurationVersion(microsoft)}:apple:${appleConfigurationVersion(apple)}:${apple ? Math.floor(Date.now() / 86400000) : 0}:${publicOrigin ?? ""}`,
+		`${project.id}:${configured.version}:engine:${rehearsal ? "owned-fixture" : internal ? "owned-internal" : "legacy"}:metrics:${projectEngineMetricsSelected(env, project.id)}:shadow:${projectSessionShadowSelected(env, project)}:origins:${projectOriginFingerprint(project)}:owned-avatars:${ownedAvatarSelected(env, project.id)}:native-passkeys:${selectedNativePasskeys(env, project, publicOrigin).version}:google:${googleProvider.version}:microsoft:${microsoftConfigurationVersion(microsoft)}:apple:${appleConfigurationVersion(apple)}:${apple ? Math.floor(Date.now() / 86400000) : 0}:${publicOrigin ?? ""}`,
 		() => build(project, env, configured.policy, googleProvider, publicOrigin, owned),
 		(entry) => callback(entry, project),
 	);

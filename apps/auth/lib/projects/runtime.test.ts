@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AuthEnvironment } from "../configuration";
 import type { Project } from "./registry";
-import { closeProjectInstances, withProjectAuth } from "./runtime";
+import { closeProjectInstances, withHostedProjectAuthEngine, withProjectAuth, withProjectAuthEngine } from "./runtime";
+import { platformWorkspaceId } from "../workspaces/types";
 import { defaultStoredAuthPolicy } from "../auth-policy/policy";
 
 const fixture = vi.hoisted(() => {
@@ -9,6 +10,9 @@ const fixture = vi.hoisted(() => {
 	return {
 		getProject: vi.fn(), readAuthPolicy: vi.fn(),
 		readGoogleProvider: vi.fn(async () => ({ version: 0, enabled: false, clientId: "", encryptedClientSecret: "", updatedAt: null as string | null })),
+		createOwned: vi.fn(async (_options: unknown) => ({
+			dispatch: async () => new Response(null, { status: 202 }),
+		})),
 		createAuth: vi.fn((..._arguments: unknown[]) => ({
 			handler: async () => new Response(null, { status: 204 }),
 			$context: Promise.resolve({
@@ -21,6 +25,9 @@ const fixture = vi.hoisted(() => {
 });
 vi.mock("../project-providers/repository", () => ({ readGoogleProvider: fixture.readGoogleProvider, googleProviderCredentials: async (stored: { enabled: boolean; clientId: string }) => stored.enabled ? { clientId: stored.clientId, clientSecret: "fixture-direct-secret" } : undefined }));
 vi.mock("../auth-policy/storage", () => ({ readAuthPolicy: fixture.readAuthPolicy }));
+vi.mock("./owned-project-runtime-factory", () => ({
+	createOwnedProjectRuntimeCandidate: fixture.createOwned,
+}));
 vi.mock("./registry", () => ({ getProject: fixture.getProject, projectBrokerSecret: async () => "fixture-broker-secret" }));
 vi.mock("../auth", () => ({ auth: {}, createAuth: fixture.createAuth, getAuthEnvironment: async () => ({}), postgresDatabase: () => ({ fixture: true }) }));
 vi.mock("pg", () => ({ Pool: vi.fn(function fixturePool() { return { on: vi.fn(), end: fixture.end }; }) }));
@@ -115,5 +122,56 @@ describe("native passkey policy cache isolation", () => {
 		await withProjectAuth(current.slug, async instance => { expect(instance).toBe(first); }, { ...configured, ALLAUTH_PROJECT_NATIVE_PASSKEYS: JSON.stringify({ [current.slug]: native, another: { enabled: true } }) });
 		await withProjectAuth(current.slug, async instance => { expect(instance).not.toBe(first); }, { ...configured, ALLAUTH_PROJECT_NATIVE_PASSKEYS: JSON.stringify({ [current.slug]: { ...native, ios: { ...native.ios, teamId: "OTHER12345" } } }) });
 		expect(fixture.createAuth).toHaveBeenCalledTimes(2); expect(fixture.createAuth.mock.calls[0]?.[2]).toMatchObject({ nativePasskeys: { enabled: true, ios: true, android: false, rpId: "app.example" } });
+	});
+});
+
+describe("protected internal project writer selection", () => {
+	it("selects the exact development realm and its verified hosted transport, then restores legacy", async () => {
+		const id = "8d0da368-94b3-4897-988e-39c320a3e852";
+		const internal: Project = {
+			...project(),
+			id,
+			schemaName: `allauth_project_${id.replaceAll("-", "")}`,
+			workspaceId: platformWorkspaceId,
+			environment: "development",
+		};
+		const selected = { ...environment, ALLAUTH_PROJECT_ENGINE_INTERNAL_ID: id };
+		fixture.readAuthPolicy.mockResolvedValue(defaultStoredAuthPolicy());
+		const dispatch = (realm: Project, settings: AuthEnvironment) => {
+			fixture.getProject.mockResolvedValueOnce(realm);
+			return withProjectAuthEngine(
+				realm.slug,
+				({ engine }) => engine.dispatch(new Request("https://allauth.example/request")),
+				settings,
+			);
+		};
+		expect((await dispatch(internal, environment)).status).toBe(204);
+		expect((await dispatch(internal, selected)).status).toBe(202);
+		const hostname = "accounts.internal.fixture.example";
+		const hosted = await withHostedProjectAuthEngine(
+			internal,
+			hostname,
+			(engine) => engine.dispatch(new Request(`https://${hostname}/api/auth/get-session`)),
+			selected,
+		);
+		expect(hosted.status).toBe(202);
+		for (const rejected of [
+			{ ...internal, workspaceId: project().workspaceId },
+			{ ...internal, environment: "production" as const },
+			{ ...internal, schemaName: project().schemaName },
+			{ ...internal, id: "0953c4f5-a783-4e91-9055-a05ead278cd0" },
+		])
+			expect((await dispatch(rejected, selected)).status).toBe(204);
+		expect((await dispatch(internal, { ...selected, ALLAUTH_PROJECT_ENGINE_INTERNAL_ID: `${id},*` })).status).toBe(204);
+		expect((await dispatch(internal, environment)).status).toBe(204);
+		expect(fixture.createOwned).toHaveBeenCalledTimes(2);
+		expect(fixture.createOwned.mock.calls[0]?.[0]).toMatchObject({
+			project: { id, workspaceId: platformWorkspaceId },
+			transport: { kind: "direct" },
+		});
+		expect(fixture.createOwned.mock.calls[1]?.[0]).toMatchObject({
+			project: { id, workspaceId: platformWorkspaceId },
+			transport: { kind: "hosted", origin: `https://${hostname}` },
+		});
 	});
 });

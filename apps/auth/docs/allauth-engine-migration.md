@@ -55,6 +55,20 @@ The records cover sign-in and second-factor requests, provider callbacks, sessio
 - A second rehearsal restarts three separate Node processes over a restored development realm and exercises the direct and verified hosted HTTP handlers. It checks session continuity, password changes and revocation while a control realm stays on the existing engine. The configured factory also exercises hosted verification email and back-channel logout, discovery and PKCE exchanges on both transports, and pending Google, Microsoft and Apple callbacks across engine switches. The factory checks for persisted or configured features it cannot serve. The self-hosted Docker images preserved the restored administrator account and sessions on the existing writer through upgrade and rollback.
 - Select realms by immutable project ID and keep one authoritative writer in each. Start with internal development projects and advance only after compatibility, isolation and rollback pass. Compare aggregate sign-in, callback and refresh outcomes and latency before expanding a cohort.
 
+## Internal project selection
+
+`ALLAUTH_PROJECT_ENGINE_INTERNAL_ID` selects one immutable development project in the protected AllAuth platform workspace. Set it to the project ID after its configured flows and rollback have passed. The selected project uses the AllAuth writer and the verified accounts hostname uses the first-party forms. The factory checks the registry binding, derived schema, keys and configured features before accepting the realm. Requests outside that selection use the existing writer. The setting defaults to empty.
+
+Before starting the candidate, stop the preceding writer and confirm that no application connections remain for the selected database. Configure zero deployment overlap and keep one deployment serving the realm. To switch back, stop the candidate, confirm its database connections have closed, and start the previous deployment with the setting cleared. Use the existing project session comparison, route metrics and saved compatibility fixtures for the same immutable project ID.
+
+Rehearse the release selector using the normal runtime image and an isolated Docker database. The harness checks the verified hosted API, signed app proxy, saved sessions and legacy-readable writes.
+
+```sh
+docker build --target runtime -f apps/auth/Dockerfile -t allauth-auth:internal-rehearsal .
+pnpm --dir apps/auth exec tsx scripts/rehearsal/check-compiled-project-engine.ts \
+  --internal allauth-auth:internal-rehearsal
+```
+
 ## Compiled project rehearsal
 
 From the repository root, build both standalone images and run the fixture:
@@ -66,7 +80,7 @@ pnpm --dir apps/auth exec tsx scripts/rehearsal/check-compiled-project-engine.ts
   allauth-auth:rehearsal-baseline allauth-auth:rehearsal-candidate
 ```
 
-The script creates an internal Docker network and a synthetic PostgreSQL database. It provisions a development realm and a production sibling through the compiled service, stops the legacy writer, checks that its database connections have closed, and clones the database. The candidate image requires the exact development project and workspace IDs, its derived schema, and a nonce whose hash matches a row in the restored database. The same standalone entry point serves signed app-proxy requests and verifies gateway envelopes for a stored custom hostname. The fixture checks session continuity, password rotation, revocation, isolation and personal key reads, then restarts the normal image over the same restored database to check rollback. The default release target has no environment-controlled engine selection.
+The script creates an internal Docker network and a synthetic PostgreSQL database. It provisions a development realm and a production sibling through the compiled service, stops the legacy writer, checks that its database connections have closed, and clones the database. The candidate image requires the exact development project and workspace IDs, its derived schema, and a nonce whose hash matches a row in the restored database. The same standalone entry point serves signed app-proxy requests and verifies gateway envelopes for a stored custom hostname. The fixture checks session continuity, password rotation, revocation, isolation and personal key reads, then restarts the normal image over the same restored database to check rollback. The normal release target ignores the synthetic rehearsal settings.
 
 The Railway HTTPS rehearsal passed at revision `e4b429f` with private PostgreSQL 18.6, one app replica and zero deployment overlap. The native writer stopped before the database restore. The candidate and rollback deployments stopped in sequence, with zero app database connections observed before each switch. Signed proxy and verified custom-domain checks passed through Railway ingress. All three app deployments and the private database deployment were stopped after verification.
 

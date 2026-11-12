@@ -4,7 +4,6 @@ import { getAuthEnvironment } from "@/lib/auth";
 import {
 	authConfiguration,
 	projectEmailEnvironment,
-	setting,
 } from "@/lib/configuration";
 import { portalHeader } from "@/lib/domains/edge";
 import { verifiedHostedOAuthContinuation } from "@/lib/domains/hosted-oauth-continuation";
@@ -14,10 +13,12 @@ import type {
 } from "@/lib/domains/hosted-sdk-policy";
 import {
 	hostedSdkBasePath,
-	hostedSdkProjectEnabled,
-	hostedSdkProjectIdsSetting,
 	hostedSdkViewRequest,
 } from "@/lib/domains/hosted-sdk-policy";
+import {
+	hasHostedSdkSelection,
+	hostedSdkSelected,
+} from "@/lib/domains/hosted-sdk-selection";
 import { portalSession, withPortalHeadersEngine } from "@/lib/domains/hosting";
 import { emailConfigured } from "@/lib/email/send";
 import { AllAuthAuth } from "./better-auth-ui/allauth-auth";
@@ -56,8 +57,7 @@ export async function HostedProjectAuthPage({
 	if (!requestHeaders.has(portalHeader)) return standardForm;
 
 	const env = await getAuthEnvironment();
-	const configured = setting(env, hostedSdkProjectIdsSetting);
-	if (!configured.trim()) return standardForm;
+	if (!hasHostedSdkSelection(env)) return standardForm;
 	const request = hostedSdkViewRequest(view, await searchParams);
 	if (!request) return standardForm;
 
@@ -67,7 +67,7 @@ export async function HostedProjectAuthPage({
 			if (
 				!binding ||
 				binding.kind !== "accounts" ||
-				!hostedSdkProjectEnabled(configured, binding.project)
+				!hostedSdkSelected(env, binding.project)
 			)
 				return null;
 			if (
