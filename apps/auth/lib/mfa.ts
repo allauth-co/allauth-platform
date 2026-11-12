@@ -6,6 +6,7 @@ import { twoFactor } from "better-auth/plugins";
 import { brokerTwoFactorBrowserEndpoint, brokerTwoFactorHandoff } from "./broker-two-factor";
 
 import { applicationMfaCallback } from "./mfa-continuation";
+import { createOwnedProjectEmailCallbackPolicy } from "./projects/owned-project-email-callback";
 
 export { applicationMfaCallback } from "./mfa-continuation";
 
@@ -15,6 +16,26 @@ export function productionTwoFactor(origin: string, challengePath = "/two-factor
 	const challenge = plugin.hooks.after[0];
 	const browserChallenge = new URL(challengePath, origin);
 	const applicationChallenge = browserChallenge.origin === origin && browserChallenge.pathname === "/sign-in" && browserChallenge.searchParams.get("challenge") === "two-factor";
+	function hostedProjectMagicLink(ctx: HookEndpointContext) {
+		return ctx.path === "/magic-link/verify" &&
+			browserChallenge.origin === origin && browserChallenge.pathname === "/two-factor" &&
+			ctx.context.options.advanced?.cookiePrefix?.startsWith("allauth_project_");
+	}
+
+	function expiredHostedMagicLinkContinuation(ctx: HookEndpointContext, callback: URL) {
+		if (
+			!hostedProjectMagicLink(ctx) ||
+			callback.origin !== origin ||
+			callback.pathname !== "/oauth2/continue"
+		) return false;
+		const policy = createOwnedProjectEmailCallbackPolicy({
+			browserOrigin: origin,
+			publicLinkBaseURL: ctx.context.baseURL,
+			signingSecret: ctx.context.secret,
+		});
+		return policy(callback, "hosted-magic-link", "consume")?.expiredContinuation === true;
+	}
+
 	return {
 		...plugin,
 		endpoints: { ...plugin.endpoints, brokerTwoFactorBrowserHandoff: brokerTwoFactorBrowserEndpoint() },
@@ -46,15 +67,14 @@ export function productionTwoFactor(origin: string, challengePath = "/two-factor
 								throw ctx.redirect(handoff);
 							}
 							target = appendQueryParams(target, callback.searchParams);
+						} else if (expiredHostedMagicLinkContinuation(ctx, callback)) {
+							target = appendQueryParams(target, new URLSearchParams({ callbackUrl: "/account" }));
 						} else if (applicationChallenge) {
 							const continuation = applicationMfaCallback(location, origin, ctx.context.options.basePath);
 							if (continuation) target = appendQueryParams(target, new URLSearchParams({ callbackUrl: continuation }));
 						} else if (callback.origin === origin && (/^\/(account|organizations|accept-invitation|device)(\/|$)/.test(callback.pathname) || (["/admin/workspaces", "/console"].includes(callback.pathname) && !callback.hash))) {
 							const hostedAccountFragment =
-								ctx.path === "/magic-link/verify" &&
-								browserChallenge.origin === origin &&
-								browserChallenge.pathname === "/two-factor" &&
-								ctx.context.options.advanced?.cookiePrefix?.startsWith("allauth_project_") &&
+								hostedProjectMagicLink(ctx) &&
 								/^\/account(?:\/|$)/.test(callback.pathname) &&
 								callback.hash !== "";
 							const preserved = hostedAccountFragment
@@ -77,14 +97,16 @@ export function productionTwoFactor(origin: string, challengePath = "/two-factor
 					// Keep the exact local destination selected by a hosted project magic link.
 					const registrationCallback = ctx.query?.newUserCallbackURL;
 					if (
-						browserChallenge.pathname !== "/two-factor" ||
-						!ctx.context.options.advanced?.cookiePrefix?.startsWith("allauth_project_") ||
+						!hostedProjectMagicLink(ctx) ||
 						(typeof registrationCallback === "string" && registrationCallback !== raw)
 					) return;
-					const local = applicationMfaCallback(raw, origin, ctx.context.options.basePath);
 					const accountPath = /^\/(account|organizations|accept-invitation)(\/|$)/.test(callback.pathname);
 					const consolePath = callback.pathname === "/console" && !callback.hash;
-					if (!local || (!accountPath && !consolePath)) return;
+					const expired = expiredHostedMagicLinkContinuation(ctx, callback);
+					const local = expired
+						? "/account"
+						: applicationMfaCallback(raw, origin, ctx.context.options.basePath);
+					if (!local || (!expired && !accountPath && !consolePath)) return;
 					const nativeLocation = ctx.context.responseHeaders?.get("location");
 					if (nativeLocation === new URL(decodeURIComponent(raw), origin).href)
 						throw ctx.redirect(new URL(local, origin).href);

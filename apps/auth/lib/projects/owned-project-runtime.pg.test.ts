@@ -6169,6 +6169,7 @@ describe.skipIf(!existsSync(fixture))(
 				expect(cookie(continuedLong)).toContain(".session_token=");
 				const pendingLong = await issue(customHost, longDestination, credentials.realmAdmin.email, false, "192.0.2.83");
 				const recoveryCode = "test0-12345";
+				const delayedRecoveryCode = "test1-23456";
 				const { encryptionKeys } = readLegacyProjectKeyring(
 					projectSecret(childEnvironment(), alpha.id),
 					versionedEncryption,
@@ -6179,7 +6180,7 @@ describe.skipIf(!existsSync(fixture))(
 					[
 						randomUUID(),
 						sealLegacyMfaRecord("isolated-runtime-totp-secret", encryptionKeys),
-						sealLegacyMfaRecord(JSON.stringify([recoveryCode]), encryptionKeys),
+						sealLegacyMfaRecord(JSON.stringify([recoveryCode, delayedRecoveryCode]), encryptionKeys),
 						credentials.project.id,
 					],
 				);
@@ -6202,6 +6203,17 @@ describe.skipIf(!existsSync(fixture))(
 				);
 				expect(cookie(challenge)).toContain(".two_factor=");
 				expect(cookie(challenge)).not.toContain(".session_token=");
+				// Keep the real emailed links unchanged while making their signed returns expire soon.
+				const issueTime = Date.now() - 48_000;
+				const clock = vi.spyOn(Date, "now").mockReturnValue(issueTime);
+				const delayedQuery = signProjectIssuerQuery(fixtureAuthorizationQuery(longState), versionedSigningSecret);
+				clock.mockRestore();
+				const delayedDestination = `/oauth2/continue?${delayedQuery}`;
+				const delayedLogin = await issue(customHost, delayedDestination, credentials.realmAdmin.email, false, "192.0.2.85");
+				const delayedMfa = await issue(customHost, delayedDestination, credentials.project.email, false, "192.0.2.86");
+				await service.stop();
+				service = undefined;
+				service = await openProcess(databaseURL, alpha, false, alpha.slug, undefined, undefined, rollout);
 				const completedMfa = await service.request(
 					"/api/auth/hosted-ui/two-factor/verify-backup-code",
 					{
@@ -6213,9 +6225,6 @@ describe.skipIf(!existsSync(fixture))(
 				);
 				expect(completedMfa.status, await completedMfa.clone().text()).toBe(200);
 				expect(cookie(completedMfa)).toContain(".session_token=");
-				await service.stop();
-				service = undefined;
-				service = await openProcess(databaseURL, alpha, false, alpha.slug, undefined, undefined, rollout);
 				const rolledBack = await service.request(custom.pathname + custom.search, { host: customHost });
 				expect(rolledBack.status).toBe(302);
 				expect(rolledBack.headers.get("location")).toBe(`https://${customHost}${customDestination}`);
@@ -6227,6 +6236,30 @@ describe.skipIf(!existsSync(fixture))(
 				expect(continuedAfterRollback.status).toBe(302);
 				expect(continuedAfterRollback.headers.get("location")).toBe(longBody.callbackURL);
 				expect(cookie(continuedAfterRollback)).toContain(".session_token=");
+				const expires = Number(delayedQuery.get("exp")) * 1000;
+				await vi.waitFor(() => expect(Date.now()).toBeGreaterThan(expires), { timeout: 13_000 });
+				const expiredLogin = await service.request(delayedLogin.pathname + delayedLogin.search, {
+					host: customHost, clientIP: "192.0.2.85",
+				});
+				expect(expiredLogin.status).toBe(302);
+				expect(expiredLogin.headers.get("location")).toBe(`https://${customHost}/account`);
+				expect(cookie(expiredLogin)).toContain(".session_token=");
+				const expiredChallenge = await service.request(delayedMfa.pathname + delayedMfa.search, {
+					host: customHost, clientIP: "192.0.2.86",
+				});
+				expect(expiredChallenge.status).toBe(302);
+				expect(expiredChallenge.headers.get("location")).toBe(`https://${customHost}/two-factor?callbackUrl=%2Faccount`);
+				expect(cookie(expiredChallenge)).toContain(".two_factor=");
+				expect(cookie(expiredChallenge)).not.toContain(".session_token=");
+				const expiredCompletion = await service.request("/api/auth/hosted-ui/two-factor/verify-backup-code", {
+					host: customHost, clientIP: "192.0.2.86", accept: "application/json",
+					cookie: cookie(expiredChallenge), body: { code: delayedRecoveryCode },
+				});
+				expect(expiredCompletion.status, await expiredCompletion.clone().text()).toBe(200);
+				const current = await service.request("/api/auth/get-session", {
+					host: customHost, cookie: cookie(expiredCompletion),
+				});
+				expect(await current.json()).toMatchObject({ user: { id: credentials.project.id } });
 			} finally {
 				try {
 					await service?.stop();
