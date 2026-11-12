@@ -613,7 +613,7 @@ try {
 	const connected = internalSelection ? await startConnectedApplication(owned, originalHostedCookie) : undefined;
 	const managedHost = `${owned.slug}-accounts.${portalDomain}`;
 	const managedApi = `${owned.slug}-api.${portalDomain}`;
-	let nativeManagedCookie: string | undefined;
+	let nativeManagedSession: { cookie: string; id: string } | undefined;
 	let ownedManagedCookie: string | undefined;
 	if (internalSelection) {
 		const nativeManaged = await request("/api/auth/sign-in/email", {
@@ -626,7 +626,14 @@ try {
 			200,
 			"Native sign-in works on the managed accounts hostname.",
 		);
-		nativeManagedCookie = sessionCookie(nativeManaged);
+		const cookie = sessionCookie(nativeManaged);
+		const current = await readSession("/api/auth/get-session", {
+			host: managedHost,
+			cookie,
+		});
+		assert.equal(current?.user.id, accountId);
+		assert.ok(current?.session.id);
+		nativeManagedSession = { cookie, id: current.session.id };
 		assert.ok(
 			nativeManaged.cookies
 				.filter((cookie) => cookie.includes(".session_token="))
@@ -707,7 +714,7 @@ try {
 		assert.equal(page.body.includes("/api/auth/hosted-ui"), firstParty);
 	}
 
-	async function currentSession(
+	async function readSession(
 		path: string,
 		options: Parameters<typeof request>[1],
 	) {
@@ -717,10 +724,29 @@ try {
 			200,
 			"Read a live session through the compiled route.",
 		);
-		return (
-			(JSON.parse(response.body) as { user: { id: string } } | null)?.user.id ??
-			null
-		);
+		return JSON.parse(response.body) as {
+			session: { id: string };
+			user: { id: string };
+		} | null;
+	}
+
+	async function currentSession(
+		path: string,
+		options: Parameters<typeof request>[1],
+	) {
+		return (await readSession(path, options))?.user.id ?? null;
+	}
+
+	async function checkOriginalManagedSession(
+		original: NonNullable<typeof nativeManagedSession>,
+	) {
+		const current = await readSession("/api/auth/hosted-ui/get-session", {
+			host: managedHost,
+			cookie: original.cookie,
+			accept: "application/json",
+		});
+		assert.equal(current?.user.id, accountId);
+		assert.equal(current?.session.id, original.id);
 	}
 
 	let internalEnvironment: Record<string, string> = {};
@@ -895,7 +921,7 @@ try {
 	});
 	expectStatus(ownedHosted, 200, "The AllAuth hosted route signs in.");
 	const ownedHostedCookie = sessionCookie(ownedHosted);
-	if (nativeManagedCookie) {
+	if (nativeManagedSession) {
 		expectStatus(
 			await request("/api/auth/hosted-ui/sdk/config", { host: managedHost }),
 			200,
@@ -906,16 +932,11 @@ try {
 			404,
 			"The frontend API hostname keeps its existing hosted UI boundary.",
 		);
-		assert.equal(
-			await currentSession("/api/auth/get-session", {
-				host: managedHost,
-				cookie: nativeManagedCookie,
-			}),
-			accountId,
-		);
-		const ownedManaged = await request("/api/auth/sign-in/email", {
+		await checkOriginalManagedSession(nativeManagedSession);
+		const ownedManaged = await request("/api/auth/hosted-ui/sign-in/email", {
 			host: managedHost,
 			clientIP: "192.0.2.56",
+			accept: "application/json",
 			body: ownedLogin,
 		});
 		expectStatus(
@@ -987,6 +1008,8 @@ try {
 			200,
 			"A first-party page already open at rollback keeps its transport.",
 		);
+		assert.ok(nativeManagedSession);
+		await checkOriginalManagedSession(nativeManagedSession);
 	} else await start(releaseImage, restored, selected);
 	expectStatus(
 		await request(`${direct}/not-installed`, { realm: owned }),
