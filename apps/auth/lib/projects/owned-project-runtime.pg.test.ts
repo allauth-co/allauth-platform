@@ -215,7 +215,7 @@ async function openProcess(
 					clientIP?: string;
 					proxy?: Project;
 					authorization?: string;
-					method?: "PATCH";
+					method?: "PATCH" | "DELETE";
 				} = {},
 			) {
 				const origin = options.host
@@ -954,6 +954,15 @@ describe.skipIf(!existsSync(fixture))(
 				};
 				const management = (project: Project) =>
 					`/api/admin/organizations?project=${project.slug}`;
+				const organizationDetail = (project: Project, id: string) =>
+					`/api/admin/organizations/${encodeURIComponent(id)}?project=${project.slug}`;
+				const usersPath = (project: Project) =>
+					`/api/admin/users?project=${project.slug}&search=${credentials.project.id}&limit=1`;
+				const userPath = (project: Project, metadata = false) =>
+					`/api/admin/users/${credentials.project.id}${metadata ? "/metadata" : ""}?project=${project.slug}`;
+				const nativePublicMetadata = { consoleLabel: "legacy writer" };
+				const ownedPublicMetadata = { consoleLabel: "AllAuth writer" };
+				const ownedPrivateMetadata = { fixtureInternal: "visible only to the database" };
 				const scimManagement = `/api/organizations/${directoryOrg}/scim`;
 				const scimProject = `?project=${alpha.slug}`;
 				const hostedScim = "/api/auth/scim/v2/Users";
@@ -1157,6 +1166,11 @@ describe.skipIf(!existsSync(fixture))(
 						avatarBase,
 					),
 				).toBe(true);
+				expect((await service.request(userPath(alpha, true), {
+					cookie: rootCookie,
+					method: "PATCH",
+					body: { publicMetadata: nativePublicMetadata },
+				})).status).toBe(200);
 				const nativeDirectKey = await runtimeCreateApiKey(
 					service,
 					{ prefix: alphaPath, cookie: legacyCookie },
@@ -1218,6 +1232,39 @@ describe.skipIf(!existsSync(fixture))(
 
 				service = await open(restored, true);
 				expect((await service.request("/api/health")).status).toBe(200);
+				const userDirectory = await service.request(usersPath(alpha), { cookie: rootCookie });
+				expect(userDirectory.status, await userDirectory.clone().text()).toBe(200);
+				expect(await userDirectory.json()).toMatchObject({
+					users: [{ id: credentials.project.id, publicMetadata: nativePublicMetadata }],
+					total: 1,
+					limit: 1,
+					offset: 0,
+				});
+				expect((await service.request(usersPath(alpha), { cookie: legacyCookie })).status).toBe(401);
+				expect((await service.request(userPath(alpha, true), {
+					cookie: rootCookie,
+					origin: alpha.primaryOrigin,
+					method: "PATCH",
+					body: { publicMetadata: ownedPublicMetadata },
+				})).status).toBe(403);
+				expect((await service.request(userPath(alpha, true), {
+					cookie: rootCookie,
+					method: "PATCH",
+					body: { publicMetadata: ownedPublicMetadata, privateMetadata: ownedPrivateMetadata },
+				})).status).toBe(200);
+				const userDetail = await service.request(userPath(alpha), { cookie: rootCookie });
+				expect(userDetail.status).toBe(200);
+				const ownedDetail = await userDetail.json();
+				expect(ownedDetail).toMatchObject({
+					user: { id: credentials.project.id, publicMetadata: ownedPublicMetadata },
+					accounts: expect.arrayContaining([expect.objectContaining({ providerId: "credential" })]),
+				});
+				expect(JSON.stringify(ownedDetail)).not.toContain("fixtureInternal");
+				expect(JSON.stringify(ownedDetail)).not.toContain('"password"');
+				expect(JSON.stringify(ownedDetail)).not.toContain('"token"');
+				const siblingDetail = await service.request(userPath(beta), { cookie: rootCookie });
+				expect(siblingDetail.status).toBe(200);
+				expect(await siblingDetail.text()).not.toContain("consoleLabel");
 				for (const [path, host, issuer] of [
 					[hostedSchemaPath, alphaHost, hostedIssuer],
 					[directSchemaPath, undefined, directIssuer],
@@ -2163,6 +2210,250 @@ describe.skipIf(!existsSync(fixture))(
 					organizations: [],
 					total: 0,
 				});
+				const detail = organizationDetail(alpha, ownedOrganization.id);
+				const foreignDetail = organizationDetail(beta, ownedOrganization.id);
+				expect(
+					(await service.request(detail, { cookie: legacyCookie })).status,
+				).toBe(401);
+				expect(
+					(await service.request(foreignDetail, { cookie: rootCookie })).status,
+				).toBe(404);
+				const initialDetail = await service.request(detail, {
+					cookie: rootCookie,
+				});
+				expect(initialDetail.status).toBe(200);
+				expect(await initialDetail.json()).toMatchObject({
+					organization: ownedOrganization,
+					members: [
+						expect.objectContaining({
+							userId: credentials.project.id,
+							role: "owner",
+						}),
+					],
+					teams: [],
+					providers: [],
+				});
+				const patch = {
+					name: "Renamed Fixture Organization",
+					logo: "https://fixtures.example/organization-logo.png",
+				};
+				const updateDetail = await service.request(detail, {
+					cookie: rootCookie,
+					method: "PATCH",
+					body: patch,
+				});
+				expect(updateDetail.status, await updateDetail.clone().text()).toBe(
+					200,
+				);
+				const patchedOrganization = { ...ownedOrganization, ...patch };
+				expect(await updateDetail.json()).toMatchObject({
+					organization: { id: ownedOrganization.id, ...patch },
+				});
+				expect(
+					(
+						await service.request(detail, {
+							cookie: rootCookie,
+							origin: alpha.primaryOrigin,
+							method: "PATCH",
+							body: { name: "Untrusted Change" },
+						})
+					).status,
+				).toBe(403);
+
+				const removable = await service.request(management(alpha), {
+					cookie: rootCookie,
+					body: { ...organization, slug: "removable-fixture-organization" },
+				});
+				expect(removable.status).toBe(201);
+				const { organization: removableOrganization } =
+					(await removable.json()) as { organization: { id: string } };
+				const removableId = removableOrganization.id;
+				const removableDetail = organizationDetail(alpha, removableId);
+				const remove = (path: string, confirmOrganizationId: string) =>
+					service!.request(path, {
+						cookie: rootCookie,
+						method: "DELETE",
+						body: { confirmOrganizationId },
+					});
+				expect(
+					(await remove(removableDetail, ownedOrganization.id)).status,
+				).toBe(400);
+				expect(
+					(await remove(organizationDetail(beta, removableId), removableId))
+						.status,
+				).toBe(404);
+				const enterpriseDenied = await remove(
+					organizationDetail(alpha, directoryOrg),
+					directoryOrg,
+				);
+				expect(enterpriseDenied.status).toBe(409);
+				expect(await enterpriseDenied.json()).toMatchObject({
+					error:
+						"Remove enterprise SSO and SCIM connections before deleting this organization.",
+				});
+				const relations = new Pool({ connectionString: url(restored), max: 1 });
+				try {
+					const realm = `"${alpha.schemaName}"`;
+					const team = randomUUID();
+					const session = randomUUID();
+					const preservedSession = randomUUID();
+					const client = randomUUID();
+					const grant = randomUUID();
+					const preservedGrant = randomUUID();
+					const authCode = createHash("sha256")
+						.update(randomUUID())
+						.digest("base64url");
+					const preservedCode = createHash("sha256")
+						.update(randomUUID())
+						.digest("base64url");
+					await relations.query(
+						`INSERT INTO ${realm}."team"(id,name,"organizationId","memberCount","createdAt") VALUES ($1,'Synthetic Team',$2,0,now())`,
+						[team, removableId],
+					);
+					await relations.query(
+						`INSERT INTO ${realm}."session"(id,token,"userId","expiresAt","updatedAt","activeOrganizationId","activeTeamId")
+						 VALUES ($1,$1,$3,now()+interval '1 hour',now(),$4,$6),($2,$2,$3,now()+interval '1 hour',now(),$5,$6)`,
+						[
+							session,
+							preservedSession,
+							credentials.project.id,
+							removableId,
+							directoryOrg,
+							team,
+						],
+					);
+					await relations.query(
+						`INSERT INTO ${realm}."oauthClient"(id,"clientId","redirectUris",metadata) VALUES ($1,$1,'[]',$2::jsonb)`,
+						[client, JSON.stringify({ allauthOrganizationIds: [removableId] })],
+					);
+					for (const [id, referenceId, code] of [
+						[grant, removableId, authCode],
+						[preservedGrant, directoryOrg, preservedCode],
+					]) {
+						const params = [id, client, credentials.project.id, referenceId];
+						await relations.query(
+							`INSERT INTO ${realm}."oauthRefreshToken"(id,token,"clientId","userId","referenceId","expiresAt","createdAt",scopes,"rotationReplayResponse","rotationReplayExpiresAt")
+							 VALUES ($1,$1,$2,$3,$4,now()+interval '1 hour',now(),'["organization:read"]','synthetic-encrypted-replay',now()+interval '1 minute')`,
+							params,
+						);
+						await relations.query(
+							`INSERT INTO ${realm}."oauthAccessToken"(id,token,"clientId","userId","referenceId","refreshId","expiresAt","createdAt",scopes)
+							 VALUES ($1,$1,$2,$3,$4,$1,now()+interval '1 hour',now(),'["organization:read"]')`,
+							params,
+						);
+						await relations.query(
+							`INSERT INTO ${realm}."oauthConsent"(id,"clientId","userId","referenceId","createdAt","updatedAt",scopes)
+							 VALUES ($1,$2,$3,$4,now(),now(),'["organization:read"]')`,
+							params,
+						);
+						await relations.query(
+							`INSERT INTO ${realm}."verification"(id,identifier,value,"expiresAt") VALUES ($1,$1,$2,now()+interval '1 hour')`,
+							[
+								code,
+								JSON.stringify({
+									type: "authorization_code",
+									referenceId,
+									userId: credentials.project.id,
+								}),
+							],
+						);
+					}
+					const appDenied = await remove(removableDetail, removableId);
+					expect(appDenied.status).toBe(409);
+					expect(await appDenied.json()).toMatchObject({
+						error:
+							"Remove this organization's application bindings before deleting it.",
+					});
+					await relations.query(
+						`UPDATE ${realm}."oauthClient" SET metadata=NULL WHERE id=$1`,
+						[client],
+					);
+					const deleted = await remove(removableDetail, removableId);
+					expect(deleted.status, await deleted.clone().text()).toBe(200);
+					expect(await deleted.json()).toEqual({ success: true });
+					expect(
+						(await service.request(removableDetail, { cookie: rootCookie }))
+							.status,
+					).toBe(404);
+					for (const table of [
+						"oauthAccessToken",
+						"oauthRefreshToken",
+						"oauthConsent",
+					]) {
+						const rows = await relations.query(
+							`SELECT id FROM ${realm}."${table}" WHERE id=ANY($1::text[])`,
+							[[grant, preservedGrant]],
+						);
+						expect(rows.rows).toEqual([{ id: preservedGrant }]);
+					}
+					const codes = await relations.query(
+						`SELECT id FROM ${realm}."verification" WHERE id=ANY($1::text[])`,
+						[[authCode, preservedCode]],
+					);
+					expect(codes.rows).toEqual([{ id: preservedCode }]);
+					const sessions = await relations.query(
+						`SELECT id,"activeOrganizationId","activeTeamId" FROM ${realm}."session" WHERE id=ANY($1::text[])`,
+						[[session, preservedSession]],
+					);
+					expect(sessions.rows).toEqual(
+						expect.arrayContaining([
+							{ id: session, activeOrganizationId: null, activeTeamId: null },
+							{
+								id: preservedSession,
+								activeOrganizationId: directoryOrg,
+								activeTeamId: null,
+							},
+						]),
+					);
+					expect(
+						(
+							await relations.query(
+								`SELECT id FROM ${realm}."team" WHERE id=$1`,
+								[team],
+							)
+						).rowCount,
+					).toBe(0);
+					expect(
+						(
+							await relations.query(
+								`SELECT id FROM ${realm}."member" WHERE "organizationId"=$1`,
+								[removableId],
+							)
+						).rowCount,
+					).toBe(0);
+					const audit = await relations.query(
+						`SELECT action,"actorId","organizationId" FROM ${realm}."allauthAudit" WHERE action IN ('organization.updated','organization.deleted') AND "organizationId"=ANY($1::text[])`,
+						[[ownedOrganization.id, removableId]],
+					);
+					expect(audit.rows).toEqual(
+						expect.arrayContaining([
+							{
+								action: "organization.updated",
+								actorId: credentials.platform.id,
+								organizationId: ownedOrganization.id,
+							},
+							{
+								action: "organization.deleted",
+								actorId: credentials.platform.id,
+								organizationId: removableId,
+							},
+						]),
+					);
+					await relations.query(
+						`DELETE FROM ${realm}."session" WHERE id=ANY($1::text[])`,
+						[[session, preservedSession]],
+					);
+					await relations.query(
+						`DELETE FROM ${realm}."oauthClient" WHERE id=$1`,
+						[client],
+					);
+					await relations.query(
+						`DELETE FROM ${realm}."verification" WHERE id=$1`,
+						[preservedCode],
+					);
+				} finally {
+					await relations.end();
+				}
 				const ownedConfig = await service.request("/api/config", {
 					host: alphaHost,
 				});
@@ -2464,6 +2755,30 @@ describe.skipIf(!existsSync(fixture))(
 					).status,
 				).toBe(200);
 				expect((await service.request("/api/health")).status).toBe(200);
+				const rollbackUser = await service.request(userPath(alpha), { cookie: rootCookie });
+				expect(rollbackUser.status).toBe(200);
+				expect(await rollbackUser.json()).toMatchObject({
+					user: { id: credentials.project.id, publicMetadata: ownedPublicMetadata },
+				});
+				const userAudit = new Pool({ connectionString: url(restored), max: 1 });
+				try {
+					const metadata = await userAudit.query(
+						`SELECT "privateMetadata" FROM "${alpha.schemaName}"."user" WHERE id=$1`,
+						[credentials.project.id],
+					);
+					expect(metadata.rows).toEqual([{ privateMetadata: ownedPrivateMetadata }]);
+					for (const [table, column] of [["allauthAudit", "action"], ["allauthEvent", "type"]]) {
+						const events = await userAudit.query(
+							`SELECT "actorId", "targetId" FROM "${alpha.schemaName}"."${table}" WHERE "${column}"='user.metadata.updated'`,
+						);
+						expect(events.rows).toEqual(Array.from({ length: 2 }, () => ({
+							actorId: credentials.platform.id,
+							targetId: credentials.project.id,
+						})));
+					}
+				} finally {
+					await userAudit.end();
+				}
 				const nativeRealmStop = await service.request(
 					"/api/auth/admin/stop-impersonating",
 					{
@@ -2694,10 +3009,20 @@ describe.skipIf(!existsSync(fixture))(
 				expect(await catalog.json()).toMatchObject({
 					organizations: expect.arrayContaining([
 						expect.objectContaining({ id: directoryOrg }),
-						ownedOrganization,
+						patchedOrganization,
 					]),
 					total: 2,
 				});
+				const rollbackDetail = await service.request(detail, {
+					cookie: rootCookie,
+				});
+				expect(await rollbackDetail.json()).toMatchObject({
+					organization: patchedOrganization,
+				});
+				expect(
+					(await service.request(removableDetail, { cookie: rootCookie }))
+						.status,
+				).toBe(404);
 				const control = await service.request(management(beta), {
 					cookie: rootCookie,
 				});

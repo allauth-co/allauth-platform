@@ -590,6 +590,20 @@ export function withProjectOrganizationConsole(
 	);
 }
 
+export function withProjectUserConsole(
+	slug: string,
+	callback: (
+		manage: AuthEngine["manageUserConsole"],
+		readLegacy: () => Instance,
+		env: AuthEnvironment,
+		project: Project,
+	) => Promise<Response>,
+) {
+	return withDirectProjectEntry(slug, (entry, project) =>
+		callback(entry.engine.manageUserConsole, () => legacyInstance(entry), entry.env, project),
+	);
+}
+
 export async function closeProjectInstances() {
 	await entries.close();
 }

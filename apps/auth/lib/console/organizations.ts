@@ -1,10 +1,12 @@
 import { createHash, randomUUID } from "node:crypto";
 import { APIError } from "better-auth";
 import { defaultStatements, defaultRoles } from "better-auth/plugins/organization/access";
-import { sql } from "kysely";
+import { CompiledQuery, sql } from "kysely";
 import * as z from "zod";
 import { rolesInclude } from "../configuration";
 import type { ControlDatabase } from "../control/types";
+import type { ProjectOrganizationTransaction } from "../projects/owned-project-organization-lifecycle-store";
+import { projectOrganizationLifecycle } from "../projects/owned-project-organization-lifecycle-store";
 
 const identifier = z.string().min(1).max(160);
 const slug = z.string().regex(/^[a-z0-9][a-z0-9-]{1,63}$/);
@@ -23,6 +25,19 @@ const wildcard = (text: string) => `%${text.replace(/[\\%_]/g, (character) => `\
 // Match ECMAScript String.trim(), including native role strings with edge whitespace.
 const roleWhitespace = "\u0009\u000a\u000b\u000c\u000d\u0020\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff";
 const roleHas = (column: string, expected: string) => sql<boolean>`EXISTS (SELECT 1 FROM unnest(string_to_array(${sql.ref(column)},',')) AS assigned(value) WHERE btrim(assigned.value,${roleWhitespace})=${expected})`;
+
+function organizationTransaction<T>(database: ControlDatabase, work: (transaction: ControlDatabase) => Promise<T>) {
+	return database.isTransaction ? work(database) : database.transaction().execute(work);
+}
+
+export function consoleOrganizationTransactionClient(transaction: ControlDatabase): ProjectOrganizationTransaction {
+	return {
+		async query<Row extends object>(text: string, values: unknown[]) {
+			const result = await transaction.executeQuery<Row>(CompiledQuery.raw(text, values));
+			return { rows: result.rows, rowCount: result.numAffectedRows === undefined ? result.rows.length : Number(result.numAffectedRows) };
+		},
+	};
+}
 
 /** Console writes and their credential-free audit event commit together. Database triggers enqueue webhooks. */
 async function audit(database: ControlDatabase, actorId: string, type: string, organizationId: string, targetId?: string, userId?: string) {
@@ -160,11 +175,11 @@ export async function createConsoleOrganization(database: ControlDatabase, raw: 
 		await audit(transaction, actorId, "organization.created", id, id, input.ownerId);
 		return { organization: { ...organization, memberCount: 1, teamCount: 0 } as Record<string, unknown> };
 	}
-	return database.isTransaction ? create(database) : database.transaction().execute(create);
+	return organizationTransaction(database, create);
 }
 export async function updateConsoleOrganization(database: ControlDatabase, organizationId: string, raw: unknown, actorId: string) {
 	const input = updateOrganizationInput.parse(raw);
-	return database.transaction().execute(async (transaction) => {
+	return organizationTransaction(database, async (transaction) => {
 		const current = await organizationLock(transaction, organizationId);
 		if (input.slug && (await sql`SELECT id FROM organization WHERE slug=${input.slug} AND id<>${organizationId}`.execute(transaction)).rows.length) throw new APIError("CONFLICT", { message: "This organization slug is already in use." });
 		const organization = (await sql<Record<string, unknown>>`UPDATE organization SET name=${input.name ?? current.name},slug=${input.slug ?? current.slug},logo=${input.logo === undefined ? current.logo : input.logo} WHERE id=${organizationId} RETURNING id,name,slug,logo,"createdAt"`.execute(transaction)).rows[0];
@@ -172,22 +187,56 @@ export async function updateConsoleOrganization(database: ControlDatabase, organ
 	});
 }
 /** Delete a confirmed organization only after its enterprise connections and app bindings are removed. */
-export async function deleteConsoleOrganization(database: ControlDatabase, organizationId: string, raw: unknown, actorId: string) {
+export async function deleteConsoleOrganization(database: ControlDatabase, organizationId: string, raw: unknown, actorId: string, mode: "native" | "owned" = "native") {
 	const input = z.object({ confirmOrganizationId: identifier }).strict().parse(raw);
 	if (input.confirmOrganizationId !== organizationId) throw new APIError("BAD_REQUEST", { message: "Confirm the selected organization ID." });
-	return database.transaction().execute(async (transaction) => {
+	return organizationTransaction(database, async (transaction) => {
 		await organizationLock(transaction, organizationId);
-		if ((await sql`SELECT id FROM "ssoProvider" WHERE "organizationId"=${organizationId} UNION ALL SELECT id FROM "allauthDirectory" WHERE "organizationId"=${organizationId} LIMIT 1`.execute(transaction)).rows.length) throw new APIError("CONFLICT", { message: "Remove enterprise SSO and SCIM connections before deleting this organization." });
+		const lifecycle = mode === "owned" ? projectOrganizationLifecycle(consoleOrganizationTransactionClient(transaction)) : undefined;
+		await lifecycle?.lockOrganizationMemberships(organizationId);
+		const enterprise = lifecycle ? await lifecycle.hasEnterpriseOrganizationAuthority(organizationId)
+			: (await sql`SELECT id FROM "ssoProvider" WHERE "organizationId"=${organizationId} UNION ALL SELECT id FROM "allauthDirectory" WHERE "organizationId"=${organizationId} LIMIT 1`.execute(transaction)).rows.length > 0;
+		if (enterprise) throw new APIError("CONFLICT", { message: "Remove enterprise SSO and SCIM connections before deleting this organization." });
 		if ((await sql`SELECT id FROM "oauthClient" WHERE metadata @> ${JSON.stringify({ allauthOrganizationIds: [organizationId] })}::jsonb LIMIT 1`.execute(transaction)).rows.length) throw new APIError("CONFLICT", { message: "Remove this organization's application bindings before deleting it." });
-		await sql`UPDATE session SET "activeOrganizationId"=NULL,"activeTeamId"=NULL WHERE "activeOrganizationId"=${organizationId}`.execute(transaction);
-		await sql`DELETE FROM "oauthAccessToken" WHERE "referenceId"=${organizationId}`.execute(transaction);
-		await sql`DELETE FROM "oauthRefreshToken" WHERE "referenceId"=${organizationId}`.execute(transaction);
-		await sql`DELETE FROM "oauthConsent" WHERE "referenceId"=${organizationId}`.execute(transaction);
-		await sql`DELETE FROM organization WHERE id=${organizationId}`.execute(transaction);
+		if (lifecycle) await lifecycle.deleteOrganization(organizationId, true);
+		else {
+			await sql`UPDATE session SET "activeOrganizationId"=NULL,"activeTeamId"=NULL WHERE "activeOrganizationId"=${organizationId}`.execute(transaction);
+			await sql`DELETE FROM "oauthAccessToken" WHERE "referenceId"=${organizationId}`.execute(transaction);
+			await sql`DELETE FROM "oauthRefreshToken" WHERE "referenceId"=${organizationId}`.execute(transaction);
+			await sql`DELETE FROM "oauthConsent" WHERE "referenceId"=${organizationId}`.execute(transaction);
+			await sql`DELETE FROM organization WHERE id=${organizationId}`.execute(transaction);
+		}
 		await audit(transaction, actorId, "organization.deleted", organizationId, organizationId);
 		return { success: true };
 	});
 }
+
+/** Console collection and detail endpoints share a response contract across project writers. */
+export async function executeConsoleOrganization(
+	database: ControlDatabase,
+	request: Request,
+	readBody: () => Promise<unknown>,
+	actorId: string,
+	organizationId?: string,
+	mode: "native" | "owned" = "native",
+): Promise<{ body: unknown; status: 200 | 201 }> {
+	if (organizationId === undefined) {
+		if (request.method === "GET")
+			return { body: await listConsoleOrganizations(database, consoleOrganizationListQuery(new URL(request.url).searchParams)), status: 200 };
+		if (request.method === "POST")
+			return { body: await createConsoleOrganization(database, await readBody(), actorId), status: 201 };
+	}
+	if (organizationId !== undefined) {
+		if (request.method === "GET")
+			return { body: await getConsoleOrganization(database, organizationId), status: 200 };
+		if (request.method === "PATCH")
+			return { body: await updateConsoleOrganization(database, organizationId, await readBody(), actorId), status: 200 };
+		if (request.method === "DELETE")
+			return { body: await deleteConsoleOrganization(database, organizationId, await readBody(), actorId, mode), status: 200 };
+	}
+	throw new APIError("METHOD_NOT_ALLOWED");
+}
+
 export async function changeConsoleMember(database: ControlDatabase, organizationId: string, raw: unknown, actorId: string) {
 	const input = memberInput.parse(raw);
 	return database.transaction().execute(async (transaction) => {

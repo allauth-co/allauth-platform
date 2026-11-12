@@ -1,5 +1,4 @@
 import { randomUUID } from "node:crypto";
-import type { PoolClient } from "pg";
 import * as z from "zod";
 import type { OrganizationRecord } from "./owned-project-organization-store";
 
@@ -28,8 +27,17 @@ const authorizationCode = z.object({
 	userId: z.string(),
 });
 
+export interface ProjectOrganizationTransaction {
+	query<Row extends object>(
+		text: string,
+		values: unknown[],
+	): Promise<{ rows: Row[]; rowCount: number | null }>;
+}
+
 /** Membership, grant, and session changes share the caller's project transaction. */
-export function projectOrganizationLifecycle(client: PoolClient) {
+export function projectOrganizationLifecycle(
+	client: ProjectOrganizationTransaction,
+) {
 	async function lifecycleMember(
 		idOrEmail: string,
 		organizationId: string,
@@ -92,21 +100,33 @@ export function projectOrganizationLifecycle(client: PoolClient) {
 	async function revokeOrganizationGrants(
 		organizationId: string,
 		userId?: string,
+		eraseGrants = false,
 	) {
 		const scope = [organizationId, userId ?? null];
-		await client.query(
-			`UPDATE "oauthAccessToken" SET revoked = statement_timestamp()
-			 WHERE "referenceId" = $1 AND ($2::text IS NULL OR "userId" = $2)
-			 AND revoked IS NULL`,
-			scope,
-		);
-		await client.query(
-			`UPDATE "oauthRefreshToken" SET revoked = COALESCE(revoked, statement_timestamp()),
-			 "rotationReplayResponse" = NULL, "rotationReplayExpiresAt" = NULL
-			 WHERE "referenceId" = $1 AND ($2::text IS NULL OR "userId" = $2)
-			 AND (revoked IS NULL OR "rotationReplayResponse" IS NOT NULL OR "rotationReplayExpiresAt" IS NOT NULL)`,
-			scope,
-		);
+		if (eraseGrants) {
+			await client.query(
+				`DELETE FROM "oauthAccessToken" WHERE "referenceId" = $1 AND ($2::text IS NULL OR "userId" = $2)`,
+				scope,
+			);
+			await client.query(
+				`DELETE FROM "oauthRefreshToken" WHERE "referenceId" = $1 AND ($2::text IS NULL OR "userId" = $2)`,
+				scope,
+			);
+		} else {
+			await client.query(
+				`UPDATE "oauthAccessToken" SET revoked = statement_timestamp()
+				 WHERE "referenceId" = $1 AND ($2::text IS NULL OR "userId" = $2)
+				 AND revoked IS NULL`,
+				scope,
+			);
+			await client.query(
+				`UPDATE "oauthRefreshToken" SET revoked = COALESCE(revoked, statement_timestamp()),
+				 "rotationReplayResponse" = NULL, "rotationReplayExpiresAt" = NULL
+				 WHERE "referenceId" = $1 AND ($2::text IS NULL OR "userId" = $2)
+				 AND (revoked IS NULL OR "rotationReplayResponse" IS NOT NULL OR "rotationReplayExpiresAt" IS NOT NULL)`,
+				scope,
+			);
+		}
 		await client.query(
 			`DELETE FROM "oauthConsent" WHERE "referenceId" = $1
 			 AND ($2::text IS NULL OR "userId" = $2)`,
@@ -192,9 +212,16 @@ export function projectOrganizationLifecycle(client: PoolClient) {
 		return rows[0]?.configured === true;
 	}
 
-	async function deleteOrganization(id: string) {
+	async function lockOrganizationMemberships(id: string) {
+		await client.query(
+			`SELECT id FROM "member" WHERE "organizationId" = $1 ORDER BY id FOR UPDATE`,
+			[id],
+		);
+	}
+
+	async function deleteOrganization(id: string, eraseGrants = false) {
 		await clearOrganizationSessions(id);
-		await revokeOrganizationGrants(id);
+		await revokeOrganizationGrants(id, undefined, eraseGrants);
 		// Native foreign keys remove members, invitations, teams and custom roles.
 		await client.query('DELETE FROM "organization" WHERE id = $1', [id]);
 	}
@@ -228,6 +255,7 @@ export function projectOrganizationLifecycle(client: PoolClient) {
 		removeOrganizationMember,
 		updateOrganizationMemberRole,
 		hasEnterpriseOrganizationAuthority,
+		lockOrganizationMemberships,
 		deleteOrganization,
 		recordOrganizationChange,
 	};

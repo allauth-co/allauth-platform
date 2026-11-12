@@ -60,6 +60,7 @@ import { createOwnedProjectOrganizationConsole } from "./owned-project-organizat
 import { createOwnedProjectInvitationEmail } from "./owned-project-organization-email";
 import { createOwnedProjectPasswordSafety } from "./owned-project-password-safety";
 import { createOwnedProjectSCIMConsole } from "./owned-project-scim-console";
+import { createOwnedProjectUserConsole } from "./owned-project-user-console";
 import { checkProjectOidcConfiguration } from "./owned-project-sso-oidc";
 import { readStoredSsoConfiguration } from "./owned-project-sso-projection";
 import { checkProjectSamlConfiguration } from "./owned-project-sso-saml-eligibility";
@@ -518,6 +519,12 @@ export async function createOwnedProjectRuntimeCandidate(options: Options) {
 		managementOrigin: platform,
 		readWorkspacePrincipal,
 	});
+	const manageUserConsole = createOwnedProjectUserConsole({
+		database,
+		project,
+		managementOrigin: platform,
+		readWorkspacePrincipal,
+	});
 	const manageSCIMConsole = createOwnedProjectSCIMConsole({
 		database,
 		env,
@@ -561,6 +568,7 @@ export async function createOwnedProjectRuntimeCandidate(options: Options) {
 		scim: { credentialHashSecret: options.credentialHashSecret },
 		manageSCIMConsole,
 		manageOrganizationConsole,
+		manageUserConsole,
 		backchannelLogout: { defer, post: options.postBackchannelLogout },
 		support: projectSupport(options, platform),
 		walletOrigin: browserOrigin,

@@ -7,6 +7,26 @@ import { defaultSecurityPolicy, securityPolicySchema } from "../control/security
 import { publicProjectUser } from "../projects/management-plugin";
 
 export const directoryQuery = z.object({ excludeOrganizationId: z.string().min(1).max(160).optional(), search: z.string().trim().max(128).default(""), status: z.enum(["all", "verified", "unverified", "banned"]).default("all"), role: z.enum(["all", "admin", "user"]).default("all"), sort: z.enum(["createdAt", "name", "email", "lastSignInAt"]).default("createdAt"), direction: z.enum(["asc", "desc"]).default("desc"), limit: z.coerce.number().int().min(1).max(100).default(25), offset: z.coerce.number().int().min(0).max(100000).default(0) }).strict();
+export function consoleUserListQuery(parameters: URLSearchParams) {
+	const input: Record<string, string> = {};
+	for (const key of ["search", "status", "role", "sort", "direction", "limit", "offset", "excludeOrganizationId"]) {
+		const value = parameters.get(key);
+		if (value !== null) input[key] = value;
+	}
+	return input;
+}
+
+const metadataSchema = z.object({
+	publicMetadata: z.record(z.string(), z.unknown()).optional(),
+	privateMetadata: z.record(z.string(), z.unknown()).optional(),
+}).strict().refine((value) => value.publicMetadata !== undefined || value.privateMetadata !== undefined);
+
+export async function readConsoleUserMetadata(request: Request) {
+	const body = metadataSchema.parse(await request.json());
+	if (JSON.stringify(body).length > 64_000) throw new APIError("BAD_REQUEST");
+	return body;
+}
+
 const wildcard = (text: string) => `%${text.replace(/[\\%_]/g, (character) => `\\${character}`)}%`;
 const userFields = sql`u.id,u.name,u.email,u.image,u."emailVerified",u.role,u.banned,u."banReason",u."banExpires",u."createdAt",u."updatedAt",u."publicMetadata",u.username,u."displayUsername",u."twoFactorEnabled",u."isAnonymous"`;
 const lastSignIn = (cutoff: Date) => sql`(SELECT max(e."createdAt") FROM "allauthEvent" e WHERE e."userId"=u.id AND e.type='auth.sign-in' AND e.outcome='success' AND e."createdAt">${cutoff})`;

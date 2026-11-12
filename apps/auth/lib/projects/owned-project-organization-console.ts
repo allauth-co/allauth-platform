@@ -1,10 +1,9 @@
 import { APIError } from "better-auth";
-import { CompiledQuery, Kysely, PostgresDialect, sql } from "kysely";
+import { Kysely, PostgresDialect, sql } from "kysely";
 import type { Pool } from "pg";
 import {
-	consoleOrganizationListQuery,
-	createConsoleOrganization,
-	listConsoleOrganizations,
+	consoleOrganizationTransactionClient,
+	executeConsoleOrganization,
 } from "../console/organizations";
 import type { ControlDatabase, ControlPrincipal } from "../control/types";
 import { lockOwnedProjectWorkspaceAdministrator } from "./owned-project-admin-authority";
@@ -14,12 +13,36 @@ import { checkedProjectSchema, projectOrigin, projectSlug } from "./validation";
 export type OwnedProjectOrganizationConsole = (
 	request: Request,
 	readBody: () => Promise<unknown>,
+	organizationId?: string,
 ) => Promise<{ body: unknown; status: 200 | 201 }>;
 
 type ProjectIdentity = Pick<
 	Project,
 	"id" | "slug" | "schemaName" | "workspaceId"
 >;
+
+const collectionPath = "/api/admin/organizations";
+const detailPath = /^\/api\/admin\/organizations\/([^/]+)$/;
+
+function matchesConsoleOrganizationRequest(
+	request: Request,
+	url: URL,
+	organizationId?: string,
+) {
+	if (organizationId === undefined)
+		return (
+			url.pathname === collectionPath &&
+			["GET", "POST"].includes(request.method)
+		);
+	const path = detailPath.exec(url.pathname)?.[1];
+	if (!path || !["GET", "PATCH", "DELETE"].includes(request.method))
+		return false;
+	try {
+		return decodeURIComponent(path) === organizationId;
+	} catch {
+		return false;
+	}
+}
 
 /** Reuse the console's SQL projection and write contract on the selected project writer. */
 export function createOwnedProjectOrganizationConsole(options: {
@@ -38,15 +61,14 @@ export function createOwnedProjectOrganizationConsole(options: {
 		dialect: new PostgresDialect({ pool: options.database }),
 	});
 
-	return async (request, readBody) => {
+	return async (request, readBody, organizationId) => {
 		const url = new URL(request.url);
 		if (
-			url.pathname !== "/api/admin/organizations" ||
 			url.searchParams.get("project") !== project.slug ||
-			(request.method !== "GET" && request.method !== "POST")
+			!matchesConsoleOrganizationRequest(request, url, organizationId)
 		)
 			throw new APIError("FORBIDDEN");
-		const writing = request.method === "POST";
+		const writing = request.method !== "GET";
 		if (writing && request.headers.get("origin") !== origin)
 			throw new APIError("FORBIDDEN", {
 				message: "A same-origin request is required.",
@@ -60,30 +82,19 @@ export function createOwnedProjectOrganizationConsole(options: {
 				transaction,
 			);
 			const authorized = await lockOwnedProjectWorkspaceAdministrator(
-				{
-					query: (text, values) =>
-						transaction.executeQuery(CompiledQuery.raw(text, values)),
-				},
+				consoleOrganizationTransactionClient(transaction),
 				project,
 				principal,
 			);
 			if (!authorized) throw new APIError("UNAUTHORIZED");
-			if (writing)
-				return {
-					body: await createConsoleOrganization(
-						transaction,
-						await readBody(),
-						principal.user.id,
-					),
-					status: 201,
-				};
-			return {
-				body: await listConsoleOrganizations(
-					transaction,
-					consoleOrganizationListQuery(url.searchParams),
-				),
-				status: 200,
-			};
+			return executeConsoleOrganization(
+				transaction,
+				request,
+				readBody,
+				principal.user.id,
+				organizationId,
+				"owned",
+			);
 		});
 	};
 }
