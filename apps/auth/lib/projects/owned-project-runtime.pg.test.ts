@@ -13,6 +13,8 @@ import {
 	SignJWT,
 } from "jose";
 import { Pool } from "pg";
+import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
+import { createSiweMessage } from "viem/siwe";
 import { describe, expect, it, vi } from "vitest";
 import { defaultAuthPolicy } from "../auth-policy/policy";
 import { authPolicyRepository } from "../auth-policy/storage";
@@ -836,6 +838,47 @@ describe.skipIf(!existsSync(fixture))(
 				const hostedScim = "/api/auth/scim/v2/Users";
 				const directScim = `${alphaPath}/scim/v2/Users`;
 				const scimName = "directory-user@runtime.fixture.example";
+				const wallet = privateKeyToAccount(generatePrivateKey());
+				const directWallet = {
+					prefix: alphaPath,
+					origin: alpha.primaryOrigin,
+					proxy: alpha,
+				};
+				const hostedWallet = {
+					prefix: "/api/auth",
+					origin: `https://${alphaHost}`,
+					host: alphaHost,
+				};
+				async function walletProof(
+					writer: Awaited<ReturnType<typeof openProcess>>,
+					transport: typeof directWallet | typeof hostedWallet,
+					chainId: number,
+					alias = "nonce",
+					signer = wallet,
+				) {
+					const challenged = await writer.request(
+						`${transport.prefix}/siwe/${alias}`,
+						{ ...transport, body: {} },
+					);
+					expect(
+						challenged.status,
+						challenged.ok ? undefined : await challenged.clone().text(),
+					).toBe(200);
+					const { nonce } = (await challenged.json()) as { nonce: string };
+					const message = createSiweMessage({
+						address: signer.address,
+						domain: new URL(transport.origin).host,
+						uri: `${transport.origin}/account`,
+						chainId,
+						nonce,
+						version: "1",
+					});
+					return {
+						message,
+						signature: await signer.signMessage({ message }),
+						email: "wallet@runtime.fixture.example",
+					};
+				}
 				service = await open(source, false);
 				expect((await service.request("/api/health")).status).toBe(200);
 				const rootLogin = await service.request("/api/auth/sign-in/email", {
@@ -846,6 +889,19 @@ describe.skipIf(!existsSync(fixture))(
 				});
 				expect(rootLogin.status).toBe(200);
 				const rootCookie = cookie(rootLogin);
+				const walletSignup = await walletProof(service, directWallet, 1);
+				const nativeWallet = await service.request(`${alphaPath}/siwe/verify`, {
+					...directWallet,
+					body: walletSignup,
+				});
+				expect(
+					nativeWallet.status,
+					nativeWallet.ok ? undefined : await nativeWallet.clone().text(),
+				).toBe(200);
+				const walletId = (
+					(await nativeWallet.json()) as { user: { id: string } }
+				).user.id;
+				const nativeWalletProof = await walletProof(service, directWallet, 137);
 				const directory = await service.request(scimManagement + scimProject, {
 					cookie: rootCookie,
 					body: { providerId: directoryProvider },
@@ -983,6 +1039,96 @@ describe.skipIf(!existsSync(fixture))(
 
 				service = await open(restored, true);
 				expect((await service.request("/api/health")).status).toBe(200);
+				const compatibleWallet = await service.request(
+					`${alphaPath}/siwe/verify`,
+					{ ...directWallet, body: nativeWalletProof },
+				);
+				expect(
+					compatibleWallet.status,
+					compatibleWallet.ok
+						? undefined
+						: await compatibleWallet.clone().text(),
+				).toBe(200);
+				expect(await compatibleWallet.json()).toMatchObject({
+					success: true,
+					user: { id: walletId, walletAddress: wallet.address, chainId: 137 },
+				});
+				expect(
+					await (
+						await service.request(`${alphaPath}/get-session`, {
+							cookie: cookie(compatibleWallet),
+						})
+					).json(),
+				).toMatchObject({
+					user: {
+						id: walletId,
+						email: walletSignup.email,
+						emailVerified: false,
+					},
+				});
+				const replay = await service.request(`${alphaPath}/siwe/verify`, {
+					...directWallet,
+					body: nativeWalletProof,
+				});
+				expect(replay.status).toBe(401);
+				expect(await replay.json()).toMatchObject({
+					code: "UNAUTHORIZED_INVALID_OR_EXPIRED_NONCE",
+				});
+				const newWallet = privateKeyToAccount(generatePrivateKey());
+				const hostedWalletSignup = await walletProof(
+					service,
+					hostedWallet,
+					1,
+					"nonce",
+					newWallet,
+				);
+				const ownedWalletSignup = await service.request(
+					"/api/auth/siwe/verify",
+					{
+						...hostedWallet,
+						body: { ...hostedWalletSignup, email: credentials.project.email },
+					},
+				);
+				expect(
+					ownedWalletSignup.status,
+					ownedWalletSignup.ok
+						? undefined
+						: await ownedWalletSignup.clone().text(),
+				).toBe(200);
+				const ownedWalletId = (
+					(await ownedWalletSignup.json()) as { user: { id: string } }
+				).user.id;
+				expect(ownedWalletId).not.toBe(credentials.project.id);
+				const wrongOriginProof = await walletProof(service, directWallet, 1);
+				const wrongMessage = wrongOriginProof.message.replace(
+					`URI: ${directWallet.origin}/account`,
+					"URI: https://other.runtime.fixture.example/account",
+				);
+				const wrongOrigin = await service.request(`${alphaPath}/siwe/verify`, {
+					...directWallet,
+					body: {
+						...wrongOriginProof,
+						message: wrongMessage,
+						signature: await wallet.signMessage({ message: wrongMessage }),
+					},
+				});
+				expect(wrongOrigin.status).toBe(401);
+				expect(await wrongOrigin.json()).toMatchObject({
+					code: "UNAUTHORIZED_INVALID_SIGNATURE",
+				});
+				const burned = await service.request(`${alphaPath}/siwe/verify`, {
+					...directWallet,
+					body: wrongOriginProof,
+				});
+				expect(await burned.json()).toMatchObject({
+					code: "UNAUTHORIZED_INVALID_OR_EXPIRED_NONCE",
+				});
+				const ownedWalletProof = await walletProof(
+					service,
+					hostedWallet,
+					10,
+					"get-nonce",
+				);
 				const guestCookies = cookie(nativeGuest);
 				expect(
 					await (
@@ -1789,6 +1935,34 @@ describe.skipIf(!existsSync(fixture))(
 
 				service = await open(restored, false);
 				expect((await service.request("/api/health")).status).toBe(200);
+				const rolledBackWallet = await service.request(
+					"/api/auth/siwe/verify",
+					{ ...hostedWallet, body: ownedWalletProof },
+				);
+				expect(
+					rolledBackWallet.status,
+					rolledBackWallet.ok
+						? undefined
+						: await rolledBackWallet.clone().text(),
+				).toBe(200);
+				expect(await rolledBackWallet.json()).toMatchObject({
+					success: true,
+					user: { id: walletId, walletAddress: wallet.address, chainId: 10 },
+				});
+				const ownedWalletSession = await service.request(
+					"/api/auth/get-session",
+					{
+						host: alphaHost,
+						cookie: cookie(ownedWalletSignup),
+					},
+				);
+				expect(await ownedWalletSession.json()).toMatchObject({
+					user: {
+						id: ownedWalletId,
+						email: `${newWallet.address.toLowerCase()}@siwe.placeholder.invalid`,
+						emailVerified: false,
+					},
+				});
 				const restoredGuest = await service.request("/api/auth/get-session", {
 					host: alphaHost,
 					cookie: cookie(candidateGuest),

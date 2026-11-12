@@ -168,6 +168,7 @@ async function readSupportedProviders(options: Options) {
 	const providers = [
 		"credential",
 		"allauth",
+		"siwe",
 		...(google ? ["google"] : []),
 		...(microsoft ? ["microsoft"] : []),
 		...(apple ? ["apple"] : []),
@@ -191,7 +192,6 @@ async function readSupportedProviders(options: Options) {
 		   k."rateLimitTimeWindow" IS DISTINCT FROM 60000 OR
 		   k."rateLimitMax" IS DISTINCT FROM 100
 		 ) OR
-		 EXISTS (SELECT 1 FROM "${schema}"."walletAddress") OR
 		 EXISTS (SELECT 1 FROM "${schema}"."agentHost") OR
 		 EXISTS (SELECT 1 FROM "${schema}"."allauthWebhookEndpoint") OR
 		 (NOT $2::boolean AND EXISTS (SELECT 1 FROM "${schema}"."allauthAvatarAsset" WHERE state <> 'deleted')) OR
@@ -490,6 +490,7 @@ export async function createOwnedProjectRuntimeCandidate(options: Options) {
 			...(appleOAuth ? { apple: appleOAuth } : {}),
 			broker: {
 				clientId: project.brokerClientId,
+		walletOrigin: browserOrigin,
 				clientSecret,
 				issuer: platform,
 				discoveryURL: `${platform}/.well-known/openid-configuration`,

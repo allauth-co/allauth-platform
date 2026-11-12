@@ -87,6 +87,7 @@ import { createOwnedProjectSsoManagement } from "./owned-project-sso-management"
 import type { OwnedProjectSupportOptions } from "./owned-project-support";
 import { createOwnedProjectSupportHttp } from "./owned-project-support";
 import { createOwnedRecoveryHttp } from "./owned-recovery-http";
+import { createOwnedProjectWallet } from "./owned-project-wallet";
 import {
 	createOwnedSignUpHttp,
 	scheduleOwnedSignUpVerification,
@@ -238,6 +239,7 @@ interface OwnedProjectEngineOptions {
 	};
 	passkeys?: Parameters<typeof createOwnedProjectPasskeyHttp>[0]["rp"];
 	recovery?: Omit<
+	walletOrigin?: string;
 		Parameters<typeof createOwnedRecoveryHttp>[0],
 		| "database"
 		| "project"
@@ -730,6 +732,7 @@ export function createOwnedProjectEngine(
 			allowUnverifiedEmail: boolean;
 			anonymousUserId?: string;
 		},
+			wallet?: { address: string; chainId: number };
 	): Promise<Response> {
 		if (!activeUser(user) || (user.directoryManaged && !providerProof?.managed))
 			return forbidden();
@@ -811,6 +814,20 @@ export function createOwnedProjectEngine(
 		if (path === "/sign-in/social")
 			return json({ redirect: false, token, user: value }, 200, headers);
 		if (path === "/magic-link/verify")
+		if (providerProof?.wallet)
+			return json(
+				{
+					token,
+					success: true,
+					user: {
+						id: user.id,
+						walletAddress: providerProof.wallet.address,
+						chainId: providerProof.wallet.chainId,
+					},
+				},
+				200,
+				headers,
+			);
 			return json(
 				{ token, user: value, session: { ...session, token } },
 				200,
@@ -1935,6 +1952,35 @@ export function createOwnedProjectEngine(
 			async readGuestUserId(request) {
 				if (!guest) return undefined;
 				const current = await currentSession(request.headers);
+	const wallet =
+		options.walletOrigin &&
+		createOwnedProjectWallet({
+			store,
+			schemaName: options.project.schemaName,
+			signingOrigin: options.walletOrigin,
+			signUpEnabled: policy.signUpEnabled,
+			readBody: requestBody,
+			async admit(client, request, email) {
+				return (await security.admit(client, request, { email }))
+					? securityBlocked()
+					: null;
+			},
+			complete(client, request, user, wallet) {
+				return primaryResult(
+					client,
+					user,
+					request,
+					true,
+					"/siwe/verify",
+					undefined,
+					{
+						allowUnverifiedEmail: true,
+						wallet,
+					},
+				);
+			},
+		});
+
 				return current?.user.isAnonymous ? current.user.id : undefined;
 			},
 			signingSecret: options.signingSecret,
@@ -2295,6 +2341,14 @@ export function createOwnedProjectEngine(
 			request.method === "POST" &&
 			options.brokerTwoFactor
 		)
+		if (
+			wallet &&
+			request.method === "POST" &&
+			["/siwe/nonce", "/siwe/get-nonce", "/siwe/verify"].includes(path)
+		)
+			return trustedRequest(request.headers, true)
+				? wallet(path, request)
+				: forbidden();
 			return verifyOwnedProjectBrokerMfa(request, {
 				authorize: options.brokerTwoFactor,
 				admit: (verified) =>
