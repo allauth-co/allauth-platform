@@ -1,7 +1,18 @@
 const commonSelectors = /** @type {const} */ (["api-key.*", "session.created"]);
 const optionalMfaSelectors = /** @type {const} */ ([
-	"mfa.*",
 	...commonSelectors,
+	"user.*",
+	"user.created",
+	"user.updated",
+	"user.deleted",
+	"admin.*",
+	"directory.*",
+	"organization.*",
+	"security.*",
+]);
+const optionalMfaWithoutEmailVerificationSelectors = /** @type {const} */ ([
+	"mfa.*",
+	...optionalMfaSelectors,
 	"passkey.*",
 ]);
 
@@ -17,14 +28,17 @@ function checkedSchema(schemaName) {
 
 /** @param {WebhookPolicy} policy */
 export function ownedWebhookSelectors(policy) {
-	return policy.mfaMode === "optional" && !policy.requireEmailVerification
+	if (policy.mfaMode !== "optional") return commonSelectors;
+	return policy.requireEmailVerification
 		? optionalMfaSelectors
-		: commonSelectors;
+		: optionalMfaWithoutEmailVerificationSelectors;
 }
 
 /** @param {readonly string[]} selectors */
 export function ownedWebhookUsesPolicyGuard(selectors) {
-	return optionalMfaSelectors.some((selector) => selectors.includes(selector));
+	return optionalMfaWithoutEmailVerificationSelectors.some((selector) =>
+		selectors.includes(selector),
+	);
 }
 
 /** Fail closed for ambiguous credential records and inconsistent live sessions.
@@ -73,7 +87,7 @@ export async function storedProjectWebhookSelectors(
 
 function unavailable() {
 	return new Error(
-		"This development project's configured webhooks are outside the candidate scope.",
+		"This project's configured webhooks are outside the candidate scope.",
 	);
 }
 

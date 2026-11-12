@@ -20,6 +20,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { createAuthOptions } from "../auth";
 import { authPolicyPlugin } from "../auth-policy/plugin";
 import { defaultAuthPolicy } from "../auth-policy/policy";
+import { authPolicyRepository } from "../auth-policy/storage";
 import { clerkCompatiblePasswords } from "../clerk-password";
 import { allauthControl } from "../control";
 import { recordControlEvent } from "../control/events";
@@ -320,6 +321,7 @@ describe.skipIf(!existsSync(fixture))(
 				for (const migration of [
 					...migrations,
 					"003-projects",
+					"007-auth-configuration",
 					"008-application-environments",
 					"009-workspaces",
 				])
@@ -951,6 +953,55 @@ describe.skipIf(!existsSync(fixture))(
 				maxAttempts: number;
 			};
 		}
+		it("rechecks the stored policy before creating a mixed project subscription", async () => {
+			const selectors = [
+				"user.*",
+				"admin.*",
+				"directory.*",
+				"organization.*",
+				"security.*",
+			];
+			const stored = authPolicyRepository(database);
+			const registered = await endpoint("owned", "mixed-policy", selectors);
+			try {
+				expect(registered.endpoint).toMatchObject({
+					eventTypes: selectors,
+					enabled: true,
+				});
+				const configured = await listed("legacy");
+				expect(configured.endpoints).toContainEqual(registered.endpoint);
+				await stored.update(
+					alpha.id,
+					0,
+					{
+						...defaultAuthPolicy,
+						mfaMode: "required",
+						signUpEnabled: false,
+					},
+					rootId,
+				);
+				const stale = await send("owned", `${base}/create`, {
+					url: "https://stale-policy.webhook.fixture.example/events",
+					eventTypes: selectors,
+				});
+				expect(stale.status).toBe(400);
+				expect(await stale.json()).toMatchObject({
+					message:
+						"These webhook subscriptions are unavailable for this project configuration.",
+				});
+				expect(await listed("legacy")).toEqual(configured);
+			} finally {
+				await database.query(
+					'DELETE FROM public."allauthAuthConfiguration" WHERE id=$1',
+					[alpha.id],
+				);
+				const removed = await send("legacy", `${base}/delete`, {
+					id: registered.endpoint.id,
+				});
+				expect(removed.status).toBe(200);
+			}
+		});
+
 		async function deliveries(engine: "legacy" | "owned", id: string) {
 			const response = await send(
 				engine,

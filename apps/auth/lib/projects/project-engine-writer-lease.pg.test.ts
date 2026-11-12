@@ -75,6 +75,7 @@ describe.skipIf(!existsSync(fixturePath))(
 		const heartbeatRealm = realm();
 		const upgrade = realm();
 		const webhookActivation = realm();
+		const mixedWebhookActivation = realm();
 		const oauthActivation = realm();
 		const production = realm("production");
 		const externalWorkspace = randomUUID();
@@ -165,6 +166,7 @@ describe.skipIf(!existsSync(fixturePath))(
 					heartbeatRealm,
 					upgrade,
 					webhookActivation,
+					mixedWebhookActivation,
 					oauthActivation,
 					production,
 					external,
@@ -290,6 +292,77 @@ describe.skipIf(!existsSync(fixturePath))(
 				writer: "legacy",
 				revision: 2,
 			});
+		});
+
+		it("admits mixed user, admin, directory, organization and security subscriptions under optional MFA", async () => {
+			const project = mixedWebhookActivation;
+			const writer = writerPool(project);
+			const policy = authPolicyRepository(database);
+			const selectors = [
+				"user.*",
+				"user.created",
+				"user.updated",
+				"user.deleted",
+				"admin.*",
+				"directory.*",
+				"organization.*",
+				"security.*",
+			];
+			const required = {
+				...defaultAuthPolicy,
+				mfaMode: "required" as const,
+				signUpEnabled: false,
+			};
+			await seedWebhook(writer);
+			const saveSelectors = (eventTypes: string[]) =>
+				writer.query(
+					`UPDATE "allauthWebhookEndpoint" SET "eventTypes"=$1::jsonb WHERE id='fixture-endpoint'`,
+					[JSON.stringify(eventTypes)],
+				);
+			await saveSelectors(selectors);
+			await policy.update(project.id, 0, required, "fixture");
+			await expect(
+				writerCommand(project, "switch", "legacy", "0", "allauth"),
+			).rejects.toThrow(/configured webhooks/);
+			await expect(fence(project).read()).resolves.toEqual(legacy);
+
+			await policy.update(project.id, 1, defaultAuthPolicy, "fixture");
+			await saveSelectors([...selectors, "session.*"]);
+			await expect(
+				writerCommand(project, "switch", "legacy", "0", "allauth"),
+			).rejects.toThrow(/configured webhooks/);
+			await expect(fence(project).read()).resolves.toEqual(legacy);
+			await saveSelectors(selectors);
+			await expect(
+				writerCommand(project, "switch", "legacy", "0", "allauth"),
+			).resolves.toEqual({ writer: "allauth", revision: 1 });
+			await expect(
+				policy.update(
+					project.id,
+					2,
+					required,
+					"fixture",
+					project.schemaName,
+					"allauth",
+				),
+			).rejects.toMatchObject({ statusCode: 409 });
+			await assertOwnedProjectWebhookAdmission(database, project.schemaName, {
+				...defaultAuthPolicy,
+				requireEmailVerification: false,
+			});
+			await expect(
+				writerCommand(project, "switch", "allauth", "1", "legacy"),
+			).resolves.toEqual({ writer: "legacy", revision: 2 });
+			await expect(
+				policy.update(
+					project.id,
+					2,
+					required,
+					"fixture",
+					project.schemaName,
+					"legacy",
+				),
+			).resolves.toMatchObject({ version: 3, policy: required });
 		});
 
 		it("checks stored OAuth grants again under the operator's activation lock", async () => {
