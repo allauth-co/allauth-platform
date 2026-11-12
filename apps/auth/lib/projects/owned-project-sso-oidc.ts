@@ -99,11 +99,7 @@ function parseProjectOidc(
 ) {
 	const config = configSchema.parse(provider.oidcConfig);
 	const issuer = ssoHttpsUrl(provider.issuer);
-	if (
-		issuer.search ||
-		(config.issuer && config.issuer !== provider.issuer) ||
-		config.overrideUserInfo
-	)
+	if (issuer.search || (config.issuer && config.issuer !== provider.issuer))
 		throw new Error("Unsupported enterprise identity configuration.");
 	return { config, issuer };
 }

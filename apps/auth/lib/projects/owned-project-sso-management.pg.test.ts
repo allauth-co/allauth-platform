@@ -626,7 +626,7 @@ describe.skipIf(!existsSync(fixture))(
 			const nativeUpdated = await native(
 				request("update-provider", orgAdmin, {
 					providerId,
-					oidcConfig: { scopes: ["openid", "email"] },
+					oidcConfig: { scopes: ["openid", "email"], overrideUserInfo: true },
 				}),
 			);
 			expect(nativeUpdated.status, await nativeUpdated.clone().text()).toBe(
@@ -636,6 +636,23 @@ describe.skipIf(!existsSync(fixture))(
 				await (await owned.dispatch(request(detail, orgAdmin))).json(),
 			);
 			expect(ssoProviderReference(await readProvider())).not.toEqual(original);
+			expect((await readProvider()).oidcConfig?.overrideUserInfo).toBe(true);
+
+			for (const overrideUserInfo of [false, true]) {
+				const updated = await owned.dispatch(
+					request("update-provider", orgAdmin, {
+						providerId,
+						oidcConfig: { overrideUserInfo },
+					}),
+				);
+				expect(updated.status, await updated.clone().text()).toBe(200);
+				expect(await updated.json()).toEqual(
+					await (await native(request(detail, orgAdmin))).json(),
+				);
+				expect((await readProvider()).oidcConfig?.overrideUserInfo).toBe(
+					overrideUserInfo,
+				);
+			}
 
 			await database.query(
 				`INSERT INTO "${schema}"."verification" (id,identifier,value,"expiresAt") VALUES ($1,$2,'stale-dns-proof',now()+interval '1 day')`,
@@ -738,6 +755,7 @@ describe.skipIf(!existsSync(fixture))(
 				issuer,
 				domain: "registered.corp.example",
 				organizationId,
+				overrideUserInfo: true,
 				oidcConfig: {
 					clientId: oidcConfig.clientId,
 					clientSecret: oidcConfig.clientSecret,
@@ -785,7 +803,7 @@ describe.skipIf(!existsSync(fixture))(
 					clientSecret: oidcConfig.clientSecret,
 					tokenEndpointAuthentication: "client_secret_basic",
 					pkce: true,
-					overrideUserInfo: false,
+					overrideUserInfo: true,
 				},
 				samlConfig: null,
 			});
@@ -815,6 +833,9 @@ describe.skipIf(!existsSync(fixture))(
 				nativeRegistered.status,
 				await nativeRegistered.clone().text(),
 			).toBe(200);
+			expect(await nativeRegistered.json()).toMatchObject({
+				oidcConfig: { overrideUserInfo: true },
+			});
 			expect(
 				await (
 					await owned.dispatch(

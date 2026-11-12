@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { Pool, PoolClient } from "pg";
+import { DatabaseError } from "pg";
 import * as z from "zod";
 import { storedSamlProviderId as ssoProviderId } from "../../scripts/project-engine-saml-approval.mjs";
 import { reservedProjectEmailError } from "../project-email-alias-config";
@@ -7,6 +8,7 @@ import type { LegacyMfaKeys } from "./legacy-mfa-record";
 import { sealLegacyMfaRecord } from "./legacy-mfa-record";
 import type { OwnedProjectEmailAliases } from "./owned-project-email-aliases";
 import { createProjectEngineStore } from "./owned-project-engine-store";
+import { invalidateProjectMailboxProofs } from "./owned-project-mailbox-proofs";
 import { projectOrganizations } from "./owned-project-organization-store";
 import { ssoProfileRejected } from "./owned-project-sso-admission";
 import { checkedProjectSchema } from "./validation";
@@ -359,7 +361,7 @@ export function createProjectSsoStore(
 		const providerId = current.providerId;
 		// OAuth and OIDC provider accounts share the existing subject namespace.
 		await client.query(
-			"SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+			"SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", // cspell:ignore xact
 			[`${schema}\n${providerId}\n${identity.subject}`],
 		);
 		const bindings = await client.query<Directory>(
@@ -492,6 +494,52 @@ export function createProjectSsoStore(
 				path,
 				user.id,
 				id,
+			);
+		}
+		if (
+			protocol === "oidc" &&
+			!directory &&
+			!registered &&
+			current.oidcConfig?.overrideUserInfo === true
+		) {
+			const emailChanged = user.email !== identity.email;
+			if (emailChanged) {
+				if (
+					!current.domainVerified ||
+					!matchesSsoDomain(identity.email.split("@")[1] ?? "", current.domain)
+				)
+					return "account_not_linked" as const;
+				if (emailAliases?.reserved(identity.email))
+					return reservedProjectEmailError.code;
+			}
+			try {
+				await client.query(
+					`UPDATE "${schema}"."user"
+					 SET name=$2, image=COALESCE($3,image), email=$4,
+					     "emailVerified"=CASE WHEN email=$4 THEN "emailVerified" ELSE FALSE END,
+					     "updatedAt"=statement_timestamp()
+					 WHERE id=$1`,
+					[user.id, identity.name, identity.image ?? null, identity.email],
+				);
+			} catch (error) {
+				if (
+					error instanceof DatabaseError &&
+					error.code === "23505" &&
+					error.constraint === "user_email_key"
+				)
+					return "account_not_linked" as const;
+				throw error;
+			}
+			if (emailChanged) await invalidateProjectMailboxProofs(client, user.id);
+			user = await engine.lockUser(client, user.id);
+			if (!user) return "account_not_linked" as const;
+			await engine.record(
+				client,
+				"user.updated",
+				"success",
+				"/sso/callback/:providerId",
+				user.id,
+				user.id,
 			);
 		}
 		if (!directory && current.organizationId) {

@@ -59,6 +59,13 @@ const scopedKey = (parts: string[]) =>
 	createHash("sha256").update(JSON.stringify(parts)).digest("base64url");
 
 type LegacyDatabase = Kysely<Record<string, Record<string, unknown>>>;
+type FixtureOidcProfile = {
+	email: string;
+	subject: string;
+	name?: string;
+	image?: string;
+	emailVerified?: boolean;
+};
 
 async function nativeSso(
 	db: LegacyDatabase,
@@ -188,7 +195,7 @@ describe.skipIf(!existsSync(fixturePath))(
 			};
 		};
 		const authorizationCodes = new Map<string, URL>();
-		const profiles = new Map<string, { email: string; subject: string }>();
+		const profiles = new Map<string, FixtureOidcProfile>();
 		let database: Pool;
 		let administrator: Pool | undefined;
 		let nativeDatabase: LegacyDatabase | undefined;
@@ -284,7 +291,9 @@ describe.skipIf(!existsSync(fixturePath))(
 				...(profile
 					? {
 							enterprise_email: profile.email,
-							enterprise_name: "New fixture user",
+							enterprise_name: profile.name ?? "New fixture user",
+							picture: profile.image,
+							email_verified: profile.emailVerified,
 						}
 					: {}),
 			})
@@ -479,7 +488,7 @@ describe.skipIf(!existsSync(fixturePath))(
 		async function authorize(
 			started: Response,
 			expectedCallback = callbackURL,
-			profile?: { email: string; subject: string },
+			profile?: FixtureOidcProfile,
 			expectedAuthorization = config.authorizationEndpoint,
 		) {
 			expect(started.status, await started.clone().text()).toBe(200);
@@ -769,6 +778,276 @@ describe.skipIf(!existsSync(fixturePath))(
 					expect(denied.status, name).toBe(400);
 					expect(cookies(denied)).toBe("");
 				}
+			}
+		});
+
+		it("updates an exact linked OIDC profile across writers while preserving mailbox authority", async () => {
+			if (!nativeDatabase)
+				throw new Error("Expected the scoped fixture database.");
+			const providerId = "overriding-oidc";
+			const redirect = `${origin}/api/auth/sso/callback/${providerId}`;
+			const accountId = randomUUID();
+			const userId = randomUUID();
+			const subject = randomUUID();
+			const initialEmail = "old-override@corp.example";
+			const newEmail = "new-override@corp.example";
+			const rollbackEmail = "legacy-override@corp.example";
+			const alias = "override-alias@corp.example";
+			const aliases = { [alias]: decoy };
+			const picture = `${issuer}/fixture-picture.png`;
+			const ip = "203.0.113.44";
+			const deliveries: (() => Promise<void>)[] = [];
+			const mailLinks: string[] = [];
+			const legacy = await nativeSso(
+				nativeDatabase,
+				resolvePrivateKey,
+				aliases,
+				true,
+			);
+			const candidate = createOwnedProjectEngine({
+				database,
+				project: { slug, schemaName: schema },
+				baseURL: origin,
+				basePath: "/api/auth",
+				trustedOrigins: [],
+				signingSecret: secret,
+				policy: defaultAuthPolicy,
+				trustedIP: () => ip,
+				emailAliases: aliases,
+				accountLinks: {
+					publicLinkBaseURL: `${origin}/api/auth`,
+					emailChange: true,
+					defer: (work) => deliveries.push(work),
+					async deliver(message) {
+						mailLinks.push(message.url);
+					},
+				},
+				sso: { defaultErrorURL: `${origin}/auth-error`, fetch: network },
+			});
+			await database.query(
+				`INSERT INTO "${schema}"."user"(id,email,name,"emailVerified") VALUES ($1,$2,'Original',TRUE)`,
+				[userId, initialEmail],
+			);
+			await database.query(
+				`INSERT INTO "${schema}"."account"(id,"providerId","accountId","userId","updatedAt") VALUES ($1,$2,$3,$4,now())`,
+				[accountId, providerId, subject, userId],
+			);
+			await database.query(
+				`INSERT INTO "${schema}"."ssoProvider"(id,"providerId",issuer,"oidcConfig","userId",domain,"domainVerified") VALUES ($1,$2,$3,$4,$5,'corp.example',TRUE)`,
+				[
+					randomUUID(),
+					providerId,
+					issuer,
+					JSON.stringify({
+						...config,
+						userInfoEndpoint: undefined,
+						overrideUserInfo: true,
+					}),
+					decoy,
+				],
+			);
+			const run = async (
+				start: typeof legacy.handler,
+				complete: typeof legacy.handler,
+				profile: Omit<FixtureOidcProfile, "subject">,
+			) => {
+				const request = startRequest({ ...body, providerId });
+				request.headers.set("x-real-ip", ip);
+				const pending = await authorize(await start(request), redirect, {
+					...profile,
+					subject,
+				});
+				pending.headers.set("x-real-ip", ip);
+				return complete(pending);
+			};
+			const session = async (cookie: string) =>
+				legacy.api.getSession({
+					headers: new Headers({ cookie }),
+					query: { disableRefresh: true },
+				});
+			const first = await run(legacy.handler, candidate.dispatch, {
+				email: initialEmail,
+				name: "Updated profile",
+				image: picture,
+			});
+			expect(first.headers.get("location")).toBe(destination);
+			expect(await session(cookies(first))).toMatchObject({
+				user: {
+					id: userId,
+					email: initialEmail,
+					name: "Updated profile",
+					image: picture,
+					emailVerified: true,
+				},
+			});
+			const queued = await candidate.dispatch(
+				new Request(`${origin}/api/auth/change-email`, {
+					method: "POST",
+					headers: {
+						origin,
+						cookie: cookies(first),
+						"content-type": "application/json",
+					},
+					body: JSON.stringify({
+						newEmail: "older-confirmation@corp.example",
+						callbackURL: destination,
+					}),
+				}),
+			);
+			expect(queued.status).toBe(200);
+			await Promise.all(deliveries.splice(0).map((send) => send()));
+			expect(mailLinks).toHaveLength(1);
+
+			await database.query(
+				`INSERT INTO "${schema}"."verification"(id,identifier,value,"expiresAt")
+				 SELECT key,key,$1,now()+interval '1 hour' FROM unnest(ARRAY['reset-password:override-fixture','delete-account-override-fixture','unrelated-override-fixture']) key`,
+				[userId],
+			);
+			const changed = await run(legacy.handler, candidate.dispatch, {
+				email: newEmail,
+				name: "Moved mailbox",
+				emailVerified: true,
+			});
+			expect(changed.headers.get("location")).toBe(destination);
+			for (const response of [first, changed]) {
+				expect(await session(cookies(response))).toMatchObject({
+					user: {
+						id: userId,
+						email: newEmail,
+						name: "Moved mailbox",
+						image: picture,
+						emailVerified: false,
+					},
+				});
+			}
+			expect(
+				(
+					await database.query(
+						`SELECT identifier FROM "${schema}"."verification" WHERE value=$1`,
+						[userId],
+					)
+				).rows,
+			).toEqual([{ identifier: "unrelated-override-fixture" }]);
+
+			const rolledBack = await run(candidate.dispatch, legacy.handler, {
+				email: rollbackEmail,
+				name: "Legacy profile update",
+				emailVerified: true,
+			});
+			expect(rolledBack.headers.get("location")).toBe(destination);
+			expect(await session(cookies(rolledBack))).toMatchObject({
+				user: {
+					id: userId,
+					email: rollbackEmail,
+					name: "Legacy profile update",
+					image: picture,
+					emailVerified: false,
+				},
+			});
+			const linkedAccount = async () =>
+				(
+					await database.query(
+						`SELECT * FROM "${schema}"."account" WHERE "providerId"=$1`,
+						[providerId],
+					)
+				).rows;
+			const priorAccount = await linkedAccount();
+			expect(priorAccount).toMatchObject([
+				{ id: accountId, userId, accountId: subject },
+			]);
+			for (const [email, error] of [
+				["outside@unverified.fixture.example", "account_not_linked"],
+				[alias, "USER_ALREADY_EXISTS_USE_ANOTHER_EMAIL"],
+				[providerEmail, "account_not_linked"],
+			]) {
+				const denied = await run(legacy.handler, candidate.dispatch, {
+					email,
+					name: "Unapplied profile",
+				});
+				expect(
+					new URL(denied.headers.get("location")!).searchParams.get("error"),
+				).toBe(error);
+				expect(cookies(denied)).toBe("");
+				expect(await linkedAccount()).toEqual(priorAccount);
+			}
+			expect(await session(cookies(rolledBack))).toMatchObject({
+				user: {
+					id: userId,
+					email: rollbackEmail,
+					name: "Legacy profile update",
+					emailVerified: false,
+				},
+			});
+			const returned = await run(legacy.handler, candidate.dispatch, {
+				email: initialEmail,
+				name: "Returned mailbox",
+			});
+			expect(returned.headers.get("location")).toBe(destination);
+			expect(await session(cookies(returned))).toMatchObject({
+				user: { id: userId, email: initialEmail, emailVerified: false },
+			});
+			const olderProof = await candidate.dispatch(
+				new Request(mailLinks[0]!, { headers: { cookie: cookies(returned) } }),
+			);
+			expect(
+				new URL(olderProof.headers.get("location")!).searchParams.get("error"),
+			).toBe("INVALID_TOKEN");
+			expect(deliveries).toHaveLength(0);
+			expect(
+				(
+					await database.query(
+						`SELECT type,"actorId","userId","targetId",metadata->>'path' AS path
+					 FROM "${schema}"."allauthEvent" WHERE type='user.updated' AND "userId"=$1`,
+						[userId],
+					)
+				).rows,
+			).toEqual(
+				Array.from({ length: 4 }, () => ({
+					type: "user.updated",
+					actorId: userId,
+					userId,
+					targetId: userId,
+					path: "/sso/callback/:providerId",
+				})),
+			);
+		});
+
+		it("keeps a configured profile override subordinate to the exact SCIM directory identity", async () => {
+			const storeConfig = (next: object) =>
+				database.query(
+					`UPDATE "${schema}"."ssoProvider" SET "oidcConfig"=$1 WHERE "providerId"=$2`,
+					[JSON.stringify(next), providerId],
+				);
+			await storeConfig({ ...config, overrideUserInfo: true });
+			try {
+				const candidate = owned();
+				const pendingNative = await authorize(
+					await native.handler(startRequest()),
+				);
+				const pendingOwned = await authorize(
+					await candidate.start(startRequest(), body),
+				);
+				for (const response of [
+					await candidate.callback(pendingNative, providerId),
+					await native.handler(pendingOwned),
+				]) {
+					expect(response.headers.get("location")).toBe(destination);
+					expect(
+						await native.api.getSession({
+							headers: new Headers({ cookie: cookies(response) }),
+							query: { disableRefresh: true },
+						}),
+					).toMatchObject({
+						user: {
+							id: managed,
+							email: managedEmail,
+							name: "Directory profile",
+							emailVerified: true,
+						},
+					});
+				}
+			} finally {
+				await storeConfig(config);
 			}
 		});
 

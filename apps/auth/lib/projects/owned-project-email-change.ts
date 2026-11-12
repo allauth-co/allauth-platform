@@ -21,6 +21,10 @@ import {
 	createProjectEngineStore,
 	projectUserResponse,
 } from "./owned-project-engine-store";
+import {
+	invalidateProjectMailboxProofs,
+	projectEmailChangeGenerationKey,
+} from "./owned-project-mailbox-proofs";
 
 const age = 3600;
 const purpose = "allauth-email-change";
@@ -320,10 +324,9 @@ export function createOwnedProjectEmailChange(
 						!(await store.lockSession(client, current.token, user.id, false)))
 				)
 					return failed("INVALID_USER", destination);
-				const generationKey = `allauth-change-email-generation:${user.id}`;
 				const generation = await client.query<{ value: string }>(
 					'SELECT value FROM "verification" WHERE id=$1 AND "expiresAt" > statement_timestamp()',
-					[generationKey],
+					[projectEmailChangeGenerationKey(user.id)],
 				);
 				const lastChanged = Number(generation.rows[0]?.value ?? 0);
 				if (
@@ -352,16 +355,7 @@ export function createOwnedProjectEmailChange(
 					'UPDATE "user" SET email=$1, "emailVerified"=TRUE, "updatedAt"=statement_timestamp() WHERE id=$2',
 					[newEmail, user.id],
 				);
-				// Recovery and deletion links from the former mailbox are bound to the user ID.
-				await client.query(
-					`DELETE FROM "verification" WHERE value=$1 AND (starts_with(identifier, 'reset-password:') OR starts_with(identifier, 'delete-account-'))`,
-					[user.id],
-				);
-				await client.query(
-					`INSERT INTO "verification"(id,identifier,value,"expiresAt") VALUES ($1,$1,$2,statement_timestamp() + interval '1 hour')
-					 ON CONFLICT (id) DO UPDATE SET value=EXCLUDED.value, "expiresAt"=EXCLUDED."expiresAt", "updatedAt"=statement_timestamp()`,
-					[generationKey, String(Date.now())],
-				);
+				await invalidateProjectMailboxProofs(client, user.id);
 				const updated = await store.lockUser(client, user.id);
 				if (!updated) throw abort;
 				await store.record(

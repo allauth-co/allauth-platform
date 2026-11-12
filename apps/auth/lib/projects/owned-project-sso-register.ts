@@ -132,14 +132,14 @@ export async function prepareProjectSsoRegistration(
 			return unsupportedConfig();
 		}
 	}
-	if (!input.oidcConfig || input.overrideUserInfo) return unsupportedConfig();
+	if (!input.oidcConfig) return unsupportedConfig();
 	const { skipDiscovery, ...submitted } = input.oidcConfig;
 	const issuer = input.issuer;
 	const oidcConfig = {
 		...submitted,
 		issuer,
 		pkce: submitted.pkce ?? true,
-		overrideUserInfo: false,
+		overrideUserInfo: input.overrideUserInfo ?? false,
 		discoveryEndpoint:
 			submitted.discoveryEndpoint ??
 			`${skipDiscovery ? issuer : issuer.replace(/\/$/, "")}/.well-known/openid-configuration`,
