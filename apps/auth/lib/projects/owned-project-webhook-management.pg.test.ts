@@ -414,6 +414,12 @@ describe.skipIf(!existsSync(fixture))(
 					policy: defaultAuthPolicy,
 					trustedOrigins: [],
 					trustedIP: (incoming) => incoming.headers.get("x-real-ip"),
+					passkeys: {
+						id: new URL(origin).hostname,
+						name: "Webhook fixture",
+						origins: [origin],
+						requireUserVerification: false,
+					},
 					adminDeletion: {
 						id: project.id,
 						workspaceId: project.workspaceId,
@@ -1045,6 +1051,7 @@ describe.skipIf(!existsSync(fixture))(
 			const owner = randomUUID();
 			const email = `${owner}@webhook-management.fixture.example`;
 			const backupCode = "test3-67890";
+			const incorrectCode = "test4-09876";
 			const realm = `"${alpha.schemaName}"`;
 			const sibling = `"${beta.schemaName}"`;
 			const deviceName = `__Secure-allauth_project_${alpha.slug}.control_device`;
@@ -1104,7 +1111,7 @@ describe.skipIf(!existsSync(fixture))(
 				input.headers.set("x-real-ip", ip);
 				return input;
 			}
-			const privateValues = [email, password, backupCode];
+			const privateValues = [email, password, backupCode, incorrectCode];
 			const observe = () => signedEvents(subscription, privateValues);
 			async function expectNewDeviceEvents(ipAddress: string) {
 				const identity = {
@@ -1225,9 +1232,33 @@ describe.skipIf(!existsSync(fixture))(
 					await drain();
 					expect(await observe()).toEqual([]);
 					expect(notifications).toEqual([email]);
+					const recoveryPath = "/two-factor/verify-backup-code";
+					const invalid = await second(
+						deviceRequest(
+							recoveryPath,
+							"192.0.2.210",
+							{ code: incorrectCode },
+							pairs(pending),
+						),
+					);
+					expect(invalid.status).toBe(401);
+					expect(await invalid.json()).toMatchObject({
+						code: "INVALID_BACKUP_CODE",
+					});
+					expect(await observe()).toEqual([
+						{
+							event: {
+								type: "security.sign-in-failed",
+								outcome: "failure",
+								ipAddress: "192.0.2.210",
+								userAgent: "webhook-management-fixture",
+								metadata: { method: "verify-backup-code", path: recoveryPath },
+							},
+						},
+					]);
 					const completed = await second(
 						deviceRequest(
-							"/two-factor/verify-backup-code",
+							recoveryPath,
 							"192.0.2.209",
 							{ code: backupCode },
 							pairs(pending),
@@ -1586,6 +1617,56 @@ describe.skipIf(!existsSync(fixture))(
 					await database.query(
 						`DELETE FROM ${realm}."allauthSecurityPolicy" WHERE id='default'`,
 					);
+			}
+		});
+
+		it("counts passkey assertion failures only after the installed request envelope is valid", async () => {
+			const path = "/passkey/verify-authentication";
+			const realm = `"${alpha.schemaName}"`;
+			const stock = installedNative();
+			const subscription = await endpoint(
+				"legacy",
+				"security-passkey-assertion",
+				["security.*"],
+			);
+			const submitted = "synthetic-passkey-assertion";
+			try {
+				for (const [dispatch, ip] of [
+					[stock.handler, "192.0.2.236"],
+					[owned.dispatch, "192.0.2.237"],
+				] as const) {
+					async function attempt(body: object) {
+						const input = request(`${alpha.path}${path}`, body);
+						input.headers.set("x-real-ip", ip);
+						return dispatch(input);
+					}
+					const invalid = await attempt({ response: submitted });
+					expect(invalid.status).toBe(400);
+					expect(await signedEvents(subscription, [submitted])).toEqual([]);
+					const missingChallenge = await attempt({
+						response: { id: submitted },
+					});
+					expect(missingChallenge.status).toBe(400);
+					expect(await missingChallenge.json()).toMatchObject({
+						code: "CHALLENGE_NOT_FOUND",
+					});
+					expect(await signedEvents(subscription, [submitted])).toEqual([
+						{
+							event: {
+								type: "security.sign-in-failed",
+								outcome: "failure",
+								ipAddress: ip,
+								userAgent: "webhook-management-fixture",
+								metadata: { method: "verify-authentication", path },
+							},
+						},
+					]);
+				}
+			} finally {
+				await database.query(
+					`DELETE FROM ${realm}."allauthWebhookEndpoint" WHERE id=$1`,
+					[subscription.endpoint.id],
+				);
 			}
 		});
 

@@ -56,6 +56,9 @@ const registrationProof = credentialResponse.extend({
 		transports: z.array(transports).max(8).optional(),
 	}),
 });
+const authenticationEnvelope = z.object({
+	response: z.record(z.string(), z.unknown()),
+});
 const authentication = z.object({
 	response: credentialResponse.extend({
 		response: z.object({
@@ -122,6 +125,7 @@ interface Options {
 		request: Request,
 		operation: "options" | "verification",
 	) => Promise<Response | null>;
+	recordFailedAuthentication: (request: Request) => Promise<void>;
 	completeSignIn: (
 		request: Request,
 		userId: string,
@@ -403,16 +407,27 @@ export function createOwnedProjectPasskeyHttp(options: Options) {
 	async function verifyAuthentication(request: Request) {
 		const refused = await options.admit(request, "verification");
 		if (refused) return refused;
-		const input = authentication.safeParse(
+		const envelope = authenticationEnvelope.safeParse(
 			await options.readBody(request, webAuthnBytes),
 		);
-		if (!input.success) return invalid();
+		if (!envelope.success) return invalid();
+		async function outcome(response: Response) {
+			if (
+				response.status >= 400 &&
+				response.status < 500 &&
+				response.status !== 429
+			)
+				await options.recordFailedAuthentication(request);
+			return response;
+		}
 		const token = readLegacySessionCookie(
 			request.headers,
 			cookie,
 			options.signingSecret,
 		);
-		if (!token) return challengeNotFound();
+		if (!token) return outcome(challengeNotFound());
+		const input = authentication.safeParse(envelope.data);
+		if (!input.success) return outcome(invalid());
 		let response: Response | null = null;
 		const result = await verify.authenticate({
 			token,
@@ -426,7 +441,7 @@ export function createOwnedProjectPasskeyHttp(options: Options) {
 				return response !== null;
 			},
 		});
-		if (result.ok && response) return withExpiredCookie(response, clear);
+		if (result.ok && response) return outcome(withExpiredCookie(response, clear));
 		const failed =
 			!result.ok && result.reason === "challenge"
 				? challengeNotFound()
@@ -434,7 +449,7 @@ export function createOwnedProjectPasskeyHttp(options: Options) {
 						{ code: "AUTHENTICATION_FAILED", message: "Authentication failed" },
 						401,
 					);
-		return withExpiredCookie(failed, clear);
+		return outcome(withExpiredCookie(failed, clear));
 	}
 
 	async function verifyRegistration(request: Request) {

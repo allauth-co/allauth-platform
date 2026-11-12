@@ -2155,6 +2155,10 @@ export function createOwnedProjectEngine(
 			readBody: requestBody,
 			auditContext: browserEventContext,
 			writeCookie,
+			recordFailedAuthentication: (request) =>
+				store.transaction((client) =>
+					security.failed(client, request, "/passkey/verify-authentication"),
+				),
 			async readSession(request) {
 				const current = await currentSession(request.headers);
 				if (!current) return null;
@@ -3764,18 +3768,7 @@ export function createOwnedProjectEngine(
 			if (!trustedRequest(request.headers, request.method !== "GET"))
 				return forbidden();
 			const response = await passkeyHttp(path, request);
-			if (response) {
-				if (
-					path === "/passkey/verify-authentication" &&
-					response.status >= 400 &&
-					response.status < 500 &&
-					response.status !== 429
-				)
-					await store.transaction((client) =>
-						security.failed(client, request, path),
-					);
-				return response;
-			}
+			if (response) return response;
 		}
 		if (request.method === "POST" && path === "/two-factor/enable")
 			return manageMfa(request, "enable");
