@@ -400,7 +400,7 @@ describe.skipIf(!existsSync(fixturePath))(
 			const replacement = await native.api.getSession({
 				headers: new Headers({ cookie: first.value.cookie }),
 			});
-			expect(replacement?.user.twoFactorEnabled).toBe(true);
+			expect(replacement).toMatchObject({ user: { twoFactorEnabled: true } });
 			for (const cookie of [user.cookie, cookies(sibling)]) {
 				expect(
 					await native.api.getSession({ headers: new Headers({ cookie }) }),
@@ -937,13 +937,11 @@ describe.skipIf(!existsSync(fixturePath))(
 				owned({ failRotation: true }).disable(disable, { password }),
 			).rejects.toThrow("Synthetic rotation failure.");
 			expect(
-				(
-					await native.api.getSession({
-						headers: disable.headers,
-						query: { disableRefresh: true },
-					})
-				)?.user.twoFactorEnabled,
-			).toBe(true);
+				await native.api.getSession({
+					headers: disable.headers,
+					query: { disableRefresh: true },
+				}),
+			).toMatchObject({ user: { twoFactorEnabled: true } });
 			const disabled = await enrollment.disable(disable, { password });
 			expect(disabled).toMatchObject({
 				status: "rotated",
@@ -960,12 +958,10 @@ describe.skipIf(!existsSync(fixturePath))(
 				}),
 			).toBeNull();
 			expect(
-				(
-					await native.api.getSession({
-						headers: new Headers({ cookie: disabled.value.cookie }),
-					})
-				)?.user.twoFactorEnabled,
-			).toBe(false);
+				await native.api.getSession({
+					headers: new Headers({ cookie: disabled.value.cookie }),
+				}),
+			).toMatchObject({ user: { twoFactorEnabled: false } });
 			expect(
 				await native.api.getSession({
 					headers: new Headers({ cookie: siblingCookie }),
