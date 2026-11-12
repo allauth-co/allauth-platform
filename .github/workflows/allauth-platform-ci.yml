@@ -100,6 +100,7 @@ jobs:
           lib/projects/owned-project-scim-management.pg.test.ts lib/projects/owned-project-scim-decommission.pg.test.ts
           lib/projects/owned-project-scim-console.pg.test.ts
           lib/projects/owned-project-sso.pg.test.ts lib/projects/owned-project-sso-saml.pg.test.ts
+          lib/projects/owned-project-sso-management.pg.test.ts
           lib/projects/owned-project-https.test.ts lib/avatars/profile.test.ts
           lib/avatars/lifecycle.pg.test.ts lib/branding/validation.test.ts
           lib/projects/owned-project-support.pg.test.ts lib/projects/support-plugin.test.ts

@@ -83,6 +83,7 @@ import {
 	createOwnedProjectSso,
 	ownedProjectSsoInput,
 } from "./owned-project-sso";
+import { createOwnedProjectSsoManagement } from "./owned-project-sso-management";
 import type { OwnedProjectSupportOptions } from "./owned-project-support";
 import { createOwnedProjectSupportHttp } from "./owned-project-support";
 import { createOwnedRecoveryHttp } from "./owned-recovery-http";
@@ -2094,6 +2095,16 @@ export function createOwnedProjectEngine(
 					: result;
 			},
 		});
+	const ssoManagement =
+		sso &&
+		createOwnedProjectSsoManagement({
+			database: options.database,
+			schemaName: options.project.schemaName,
+			baseURL: `${origin}${options.basePath}`,
+			trustedRequest,
+			readBody: requestBody,
+			readSession: (request, client) => currentSession(request.headers, client),
+		});
 	const scimDiscovery =
 		options.scim &&
 		createOwnedProjectSCIMDiscovery(`${origin}${options.basePath}`);
@@ -2331,6 +2342,10 @@ export function createOwnedProjectEngine(
 		}
 		const supportResponse = await support?.(path, request);
 		if (supportResponse) return supportResponse;
+		if (ssoManagement && path.startsWith("/sso/")) {
+			const response = await ssoManagement(path, request);
+			if (response) return response;
+		}
 		if (sso && request.method === "POST" && path === "/sign-in/sso") {
 			if (!trustedRequest(request.headers, true)) return forbidden();
 			const body = ownedProjectSsoInput.safeParse(await requestBody(request));
