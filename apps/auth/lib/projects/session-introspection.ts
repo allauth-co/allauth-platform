@@ -35,6 +35,7 @@ interface IntrospectionDependencies {
 	coordinator?: SessionCheckCoordinator;
 	diagnostic?: (event: SessionCheckDiagnostic) => void;
 }
+type SessionSigningKey = string | (() => string);
 const coordinator = createSessionCheckCoordinator();
 const scopes = new WeakMap<object, number>();
 let nextScope = 0;
@@ -117,14 +118,14 @@ export async function prepareProjectAuthentication(
 	return {
 		signed,
 		dispatch: (
-			sessionSecret: string,
+			sessionKey: SessionSigningKey,
 			dependencies: IntrospectionDependencies,
 		) =>
 			dispatchProjectAuthentication(
 				verified,
 				project,
 				signed,
-				sessionSecret,
+				sessionKey,
 				dependencies,
 			),
 	};
@@ -151,7 +152,7 @@ async function dispatchProjectAuthentication(
 	verified: Request,
 	project: Project,
 	signed: boolean,
-	sessionSecret: string,
+	sessionKey: SessionSigningKey,
 	dependencies: IntrospectionDependencies,
 ): Promise<Response> {
 	const url = new URL(verified.url);
@@ -159,9 +160,10 @@ async function dispatchProjectAuthentication(
 		signed &&
 		verified.method === "GET" &&
 		url.pathname === `/api/projects/${project.slug}/auth/get-session`;
-	const cookie = introspection
-		? authenticSessionCookie(verified, project, sessionSecret)
-		: null;
+	if (!introspection) return dependencies.fallback(verified);
+	const sessionSecret =
+		typeof sessionKey === "function" ? sessionKey() : sessionKey;
+	const cookie = authenticSessionCookie(verified, project, sessionSecret);
 	if (!cookie) return dependencies.fallback(verified);
 	const digest = createHash("sha256")
 		.update(JSON.stringify([project.id, cookie]))

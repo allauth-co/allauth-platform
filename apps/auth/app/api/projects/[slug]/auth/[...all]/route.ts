@@ -5,6 +5,7 @@ import { json } from "@/lib/api";
 import { getAuthEnvironment } from "@/lib/auth";
 import { recordSdkVersionObservation } from "@/lib/notifications/repository";
 import { backendCredentialRepository } from "@/lib/projects/backend-credentials";
+import { readLegacyProjectKeyring } from "@/lib/projects/legacy-project-keyring";
 import { ownedSCIMError } from "@/lib/projects/owned-project-scim-discovery";
 import { projectEngineSelected } from "@/lib/projects/project-engine-internal-selection";
 import type { ProjectProtocolBody } from "@/lib/projects/project-protocol-body";
@@ -91,7 +92,11 @@ async function handle(
 				}
 				const authentication = prepared ?? (await prepare());
 				const result = await authentication.dispatch(
-					projectSecret(environment, project.id),
+					() =>
+						readLegacyProjectKeyring(
+							projectSecret(environment, project.id),
+							process.env.BETTER_AUTH_SECRETS,
+						).signingSecret,
 					{
 						scope: engine,
 						consume: consumeAdmission,

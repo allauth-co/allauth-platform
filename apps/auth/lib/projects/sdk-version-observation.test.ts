@@ -85,6 +85,7 @@ vi.mock("@/lib/notifications/repository", () => ({
 }));
 afterEach(() => {
 	vi.clearAllMocks();
+	vi.unstubAllEnvs();
 	vi.useRealTimers();
 });
 
@@ -157,6 +158,51 @@ describe("optional SDK observations leave authentication unchanged", () => {
 });
 
 describe("direct proxy verification and the admitted project writer", () => {
+	it("meters signed session reads using the active versioned cookie key", async () => {
+		const active = "isolated-fixture-active-session-signing-key";
+		const previous = "isolated-fixture-previous-session-signing-key";
+		vi.stubEnv("BETTER_AUTH_SECRETS", `4:${active},12:${previous}`);
+		const url = `${auth}/get-session`;
+		const token = "fixture-versioned-session";
+		const value = (secret: string) =>
+			`${token}.${createHmac("sha256", secret).update(token).digest("base64")}`;
+		const cookie = (signedValue: string) =>
+			`__Secure-allauth_project_${state.project.slug}.session_token=${encodeURIComponent(signedValue)}`;
+		const request = (signedValue: string, signed = true) => {
+			const headers = signed ? signedHeaders(url) : new Headers();
+			headers.set("cookie", cookie(signedValue));
+			return new Request(url, { headers });
+		};
+		const activeValue = value(active);
+		const live = { session: { id: "live-fixture-session" } };
+		state.scope.engine.readSession.mockResolvedValueOnce(Response.json(live));
+		const admitted = await GET(request(activeValue), context);
+		expect(admitted.status).toBe(200);
+		expect(await admitted.json()).toEqual(live);
+		const digest = createHash("sha256")
+			.update(JSON.stringify([state.project.id, activeValue]))
+			.digest("hex");
+		expect(state.scope.consumeAdmission).toHaveBeenCalledExactlyOnceWith(
+			`bff-session:v2:${digest}`,
+		);
+		expect(state.scope.engine.readSession).toHaveBeenCalledOnce();
+		expect(state.scope.engine.dispatch).not.toHaveBeenCalled();
+
+		for (const ordinary of [
+			request(activeValue, false),
+			request(value(previous)),
+			request(value("fixture-secret")),
+			request("invalid-fixture-cookie"),
+		]) {
+			const response = await GET(ordinary, context);
+			expect(response.status).toBe(200);
+			expect(await response.json()).toEqual({ ok: true });
+		}
+		expect(state.scope.engine.dispatch).toHaveBeenCalledTimes(4);
+		expect(state.scope.engine.readSession).toHaveBeenCalledOnce();
+		expect(state.scope.consumeAdmission).toHaveBeenCalledOnce();
+	});
+
 	it("verifies once against the exact registry binding before opening the writer and keeps the body", async () => {
 		const url = `${auth}/sign-in/email?source=fixture`;
 		const body = '{"fixture":true}';

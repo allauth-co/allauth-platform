@@ -761,7 +761,11 @@ try {
 					clientIP: fencedSelection ? "" : undefined,
 				});
 	}
-	async function expectArchivedSession(version: "v1" | "v2", cookie: string) {
+	async function expectArchivedSession(
+		version: "v1" | "v2",
+		cookie: string,
+		db: string,
+	) {
 		if (!sdk) return;
 		const response = await sdk[version]("get-session", undefined, cookie);
 		expectStatus(
@@ -770,6 +774,19 @@ try {
 			"The published SDK reads a session through the signed app proxy.",
 		);
 		assert.equal(JSON.parse(response.body)?.user?.id, accountId);
+		const signed = decodeURIComponent(cookie.slice(cookie.indexOf("=") + 1));
+		const digest = createHash("sha256")
+			.update(JSON.stringify([owned.id, signed]))
+			.digest("hex");
+		const schema = `allauth_project_${owned.id.replaceAll("-", "")}`;
+		assert.equal(
+			await query(
+				db,
+				`SELECT count(*) FROM "${schema}"."rateLimit" WHERE "key"='bff-session:v2:${digest}'`,
+			),
+			"1",
+			"The versioned session uses the signed per-cookie admission bucket.",
+		);
 	}
 	async function deviceCount(db: string) {
 		const schema = `allauth_project_${owned.id.replaceAll("-", "")}`;
@@ -786,7 +803,7 @@ try {
 	);
 	const originalCookie = sessionCookie(original);
 	const originalDevice = fencedSelection ? deviceCookie(original, owned) : undefined;
-	await expectArchivedSession("v2", originalCookie);
+	await expectArchivedSession("v2", originalCookie, source);
 	const originalHosted = await request("/api/auth/sign-in/email", {
 		host,
 		body: ownedLogin,
@@ -1224,7 +1241,7 @@ try {
 		return sessionCookie(changed);
 	}
 	const ownedCookie = await switchDirectSession();
-	await expectArchivedSession("v1", ownedCookie);
+	await expectArchivedSession("v1", ownedCookie, restored);
 	const ownedHosted = await request(
 		fencedSelection ? "/api/auth/hosted-ui/sign-in/email" : "/api/auth/sign-in/email",
 		{
@@ -1402,7 +1419,7 @@ try {
 			"Rollback keeps the existing device record.",
 		);
 	}
-	await expectArchivedSession("v2", ownedCookie);
+	await expectArchivedSession("v2", ownedCookie, restored);
 	if (!fencedSelection) {
 		expectStatus(
 			// A second synthetic browser has its own admission bucket.
