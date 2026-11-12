@@ -312,6 +312,46 @@ describe.skipIf(!existsSync(fixturePath))(
 			expect(await capture(engine.dispatch)).toEqual(nativeEvents);
 		});
 
+		it("preserves email change request events without exposing whether the address is already registered", async () => {
+			const account = await user("email-change-event");
+			const existing = await user("email-change-existing");
+			const ip = "192.0.2.57";
+			const events = async () =>
+				(
+					await database.query(
+						`SELECT id,type,outcome,"actorId","userId","targetId","ipAddress","userAgent",metadata
+					 FROM "${schema}"."allauthEvent" WHERE type='user.email-change-requested'
+					 AND "actorId"=$1 ORDER BY outcome,"createdAt",id`,
+						[account.id],
+					)
+				).rows;
+			const capture = async (
+				dispatch: (request: ReturnType<typeof post>) => Promise<Response>,
+			) => {
+				const prior = new Set((await events()).map((event) => event.id));
+				for (const [newEmail, status] of [
+					["email-change-unregistered@fixture.example", 200],
+					[existing.email, 200],
+					[account.email, 400],
+				] as const) {
+					const request = post(
+						"/change-email",
+						{ newEmail, callbackURL: destination },
+						account.cookie,
+					);
+					request.headers.set("x-real-ip", ip);
+					request.headers.set("user-agent", "synthetic-email-change-client");
+					expect((await dispatch(request)).status).toBe(status);
+				}
+				return (await events())
+					.filter((event) => !prior.has(event.id))
+					.map(({ id, ...event }) => event);
+			};
+			const legacyEvents = await capture((request) => native.handler(request));
+			expect(legacyEvents).toHaveLength(3);
+			expect(await capture(owned(ip).dispatch)).toEqual(legacyEvents);
+		});
+
 		it("finishes native two-step email links, retaining the original session and retiring old mailbox proofs", async () => {
 			const account = await user("old-native-change");
 			const decoy = await user("wrong-browser");

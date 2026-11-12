@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { jwtVerify, SignJWT } from "jose";
 import { JWTExpired } from "jose/errors";
 import type { PoolClient } from "pg";
+import type { ControlEventInput } from "../control/types";
 import { DatabaseError } from "pg";
 import * as z from "zod";
 import type {
@@ -48,6 +49,9 @@ type Proof = z.infer<typeof claims>;
 export interface OwnedProjectEmailChangeOptions
 	extends ProjectAccountLinkOptions {
 	signingSecret: string;
+	auditContext?(
+		request: Request,
+	): Pick<ControlEventInput, "ipAddress" | "userAgent">;
 	/** Meter change links after their purpose is authenticated. */
 	admitVerification?(request: Request): Promise<Response | null>;
 	/** Retain the live session or use the project's normal MFA/session admission for a new browser. */
@@ -173,20 +177,34 @@ export function createOwnedProjectEmailChange(
 					"DELETION_PENDING",
 					"Account deletion is already being processed.",
 				);
-			if (newEmail === user.email)
+			const audit = {
+				type: "user.email-change-requested",
+				actorId: user.id,
+				userId: user.id,
+				...options.auditContext?.(request),
+			};
+			if (newEmail === user.email) {
+				await store.recordEvent(client, {
+					...audit,
+					outcome: "failure",
+					metadata: {
+						path: "/change-email",
+						errorCode: "AUTHENTICATION_FAILED",
+					},
+				});
 				return accountLinkError(400, "BAD_REQUEST", "Email is the same");
+			}
+			await store.recordEvent(client, {
+				...audit,
+				outcome: "success",
+				metadata: { path: "/change-email" },
+			});
 			const kind = user.emailVerified
 				? "change-email-confirmation"
 				: "change-email-verification";
 			const token = await issue(user, newEmail, kind);
 			if (await targetExists(client, newEmail)) return null;
-			await store.record(
-				client,
-				"user.email-change-requested",
-				"success",
-				"/change-email",
-				user.id,
-			);
+
 			return {
 				kind,
 				user: {

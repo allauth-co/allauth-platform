@@ -1892,6 +1892,7 @@ export function createOwnedProjectEngine(
 		createOwnedProjectEmailChange({
 			...accountLinks,
 			signingSecret: options.signingSecret,
+			auditContext: browserEventContext,
 			admitVerification: (request) =>
 				factorAdmission(request, "change-email-verification"),
 			async complete(client, { request, user, current, callbackURL }) {
