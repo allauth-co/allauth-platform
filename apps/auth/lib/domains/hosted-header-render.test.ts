@@ -2,8 +2,8 @@
 // @vitest-environment-options {"url":"https://accounts.header-fixture.example"}
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, createElement } from "react";
 import type { ComponentProps, ReactNode } from "react";
+import { act, createElement } from "react";
 import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import Header from "@/components/header";
@@ -15,6 +15,7 @@ const native = vi.hoisted(() => ({
 	provider: vi.fn(),
 	toast: vi.fn(),
 	query: "",
+	pathname: "/organization/people",
 }));
 vi.mock("@/lib/auth-client", () => ({
 	authClient: { useSession: native.session },
@@ -38,7 +39,7 @@ vi.mock("@/lib/configuration-client", () => ({
 	}),
 }));
 vi.mock("next/navigation", () => ({
-	usePathname: () => "/organization/people",
+	usePathname: () => native.pathname,
 	useSearchParams: () => new URLSearchParams(native.query),
 }));
 vi.mock("next/link", () => ({
@@ -90,6 +91,7 @@ beforeEach(() => {
 	native.provider.mockReset();
 	native.toast.mockReset();
 	native.query = "";
+	native.pathname = "/organization/people";
 });
 
 afterEach(async () => {
@@ -243,4 +245,21 @@ it("retains the local authentication callback when the hosted header has no sess
 	expect(url.searchParams.get("callbackUrl")).toBe("/account/security");
 	expect(calls).toHaveBeenCalledOnce();
 	expect(native.session).not.toHaveBeenCalled();
+});
+
+it("leaves retry continuation on the verified error page instead of propagating raw header query fields", async () => {
+	native.pathname = "/auth-error";
+	native.query = new URLSearchParams({
+		client_id: "unverified-client",
+		sig: "unverified-proof",
+		callbackUrl: "//elsewhere.example/account",
+	}).toString();
+	const { container } = await render((path) => {
+		expect(path).toBe("get-session");
+		return null;
+	});
+	const signIn = [...container.querySelectorAll("a")].find(
+		(link) => link.textContent === "Sign in",
+	);
+	expect(signIn?.getAttribute("href")).toBe("/sign-in");
 });

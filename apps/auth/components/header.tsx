@@ -60,8 +60,10 @@ function LegacyHeader() {
 
 function HostedHeader({ client }: { client: AllAuthClient }) {
 	const { data } = client.useSession();
+	const pathname = usePathname();
 	const search = useSearchParams();
-	const params = new URLSearchParams(search.toString());
+	// The error page supplies its own realm-verified retry link.
+	const params = new URLSearchParams(pathname === "/auth-error" ? undefined : search.toString());
 	const signInHref =
 		localNavigation("/sign-in", "https://allauth.invalid", params) ??
 		"/sign-in";

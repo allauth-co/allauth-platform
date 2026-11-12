@@ -24,7 +24,7 @@ export default async function RootLayout({
 			<body
 				className={`${GeistSans.variable} ${GeistMono.variable} font-sans min-h-screen bg-background`}
 			>
-				<Providers>
+				<Providers hostedPreview={preview}>
 					<HostedOrganizationProvider enabled={preview}>
 						<SiteFrame>{children}</SiteFrame>
 					</HostedOrganizationProvider>

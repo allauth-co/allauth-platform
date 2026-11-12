@@ -2,28 +2,9 @@ import {
 	consoleReturnFromSearch,
 	isAccountNavigationPath,
 } from "@/lib/console/user-menu-navigation";
+import { isAuthenticationPath } from "@/lib/hosted-portal-paths";
 
-const authPaths = new Set([
-	"/enterprise-sign-in",
-	"/sign-in",
-	"/sign-up",
-	"/forgot-password",
-	"/reset-password",
-	"/reset-link-sent",
-	"/verify-email",
-	"/magic-link",
-	"/magic-link-sent",
-	"/email-otp",
-	"/two-factor",
-	"/sign-out",
-	"/auth-callback",
-	"/auth-error",
-	"/auth-redirect",
-]);
-
-export function isAuthenticationPath(path: string) {
-	return authPaths.has(path);
-}
+export { isAuthenticationPath } from "@/lib/hosted-portal-paths";
 
 /** Registry links stay on this service; signed authorization parameters survive auth view changes. */
 export function localNavigation(

@@ -5,13 +5,18 @@ import { Auth } from "./auth";
 import { useAllAuthUI } from "./lib/allauth-context";
 import { useAuth } from "./lib/use-auth";
 import { ApplicationLogo } from "@/components/application-brand";
-export function AllAuthAuth({
-	view,
-	path,
-}: {
+import { LegacyAuthUI } from "../legacy-auth-ui";
+
+type AllAuthAuthProps = {
 	view?: AuthView;
 	path?: string;
-}) {
+};
+
+export function AllAuthAuth(props: AllAuthAuthProps) {
+	return <LegacyAuthUI><LegacyAuthView {...props} /></LegacyAuthUI>;
+}
+
+function LegacyAuthView({ view, path }: AllAuthAuthProps) {
 	const context = useAllAuthUI();
 	const { plugins, Link, viewPaths } = useAuth();
 	const blockedSignUp = context?.signUpEnabled === false &&

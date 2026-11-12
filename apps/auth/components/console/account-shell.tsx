@@ -4,7 +4,7 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import type { ReactNode } from "react";
 import Header from "@/components/header";
-import { isAuthenticationPath } from "@/components/better-auth-ui/lib/navigation";
+import { isAuthenticationPath } from "@/lib/hosted-portal-paths";
 import "./account-shell.css";
 import { useConfiguration } from "@/lib/configuration-client";
 import { applicationBrandStyle } from "@/lib/branding/presentation";

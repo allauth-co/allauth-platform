@@ -22,8 +22,8 @@ vi.mock("@/components/console/account-shell", () => ({
 		return createElement("div", { "data-account-shell": true }, children);
 	},
 }));
-vi.mock("@/components/better-auth-ui/allauth-provider", () => ({
-	AllAuthUIProvider: ({ children }: { children: ReactNode }) => {
+vi.mock("@/components/legacy-auth-ui", () => ({
+	LegacyAuthUI: ({ children }: { children: ReactNode }) => {
 		state.authProvider();
 		return createElement("div", { "data-auth-provider": true }, children);
 	},

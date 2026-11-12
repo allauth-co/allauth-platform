@@ -7,6 +7,7 @@ import {
 	setting,
 } from "@/lib/configuration";
 import { portalHeader } from "@/lib/domains/edge";
+import { verifiedHostedOAuthContinuation } from "@/lib/domains/hosted-oauth-continuation";
 import type {
 	HostedSdkSearchParams,
 	HostedSdkView,
@@ -69,25 +70,15 @@ export async function HostedProjectAuthPage({
 				!hostedSdkProjectEnabled(configured, binding.project)
 			)
 				return null;
-			if (request.oauthQuery) {
-				const context = await engine
-					.readOAuthContext(
-						new Request(
-							`https://${binding.hostname}/api/oauth/context?${request.oauthQuery}`,
-							{ headers: { accept: "application/json" } },
-						),
-					)
-					.catch(() => null);
-				if (!context?.ok) return null;
-				const result: unknown = await context.json().catch(() => null);
-				if (
-					!result ||
-					typeof result !== "object" ||
-					!("continueURL" in result) ||
-					result.continueURL !== `/oauth2/continue?${request.oauthQuery}`
-				)
-					return null;
-			}
+			if (
+				request.oauthQuery &&
+				!(await verifiedHostedOAuthContinuation(
+					engine,
+					binding.hostname,
+					request.oauthQuery,
+				))
+			)
+				return null;
 			const config = await engine.dispatch(
 				new Request(`https://${binding.hostname}/api/auth/sdk/config`, {
 					headers: { accept: "application/json" },

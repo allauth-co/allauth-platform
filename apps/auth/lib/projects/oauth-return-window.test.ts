@@ -1,5 +1,5 @@
 import { renderToStaticMarkup } from "react-dom/server";
-import AuthenticationErrorPage from "../../app/(auth)/auth-error/page";
+import { AuthenticationErrorGuidance } from "../../components/hosted-project-auth-error";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { BetterAuthOptions } from "better-auth";
 import { getTestInstance } from "better-auth/test";
@@ -185,7 +185,7 @@ describe("tenant Google return window and safe owning error destination", () => 
 });
 
 it("renders fixed retry guidance with only a local sign-in link and no provider query details", () => {
-	const html = renderToStaticMarkup(AuthenticationErrorPage());
+	const html = renderToStaticMarkup(AuthenticationErrorGuidance());
 	expect(html).toContain("Sign-in did not finish");
 	expect(html).toContain("Close this window");
 	expect(html).toContain('href="/sign-in"');
