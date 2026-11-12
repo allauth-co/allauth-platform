@@ -42,6 +42,8 @@ const rootId = "fixture-webhook-owner";
 const userId = "fixture-webhook-user";
 const ownerEmail = "owner@webhook-management.fixture.example";
 const userEmail = "account@webhook-management.fixture.example";
+const eventUserId = "fixture-webhook-event-user";
+const eventEmail = "event-account@webhook-management.fixture.example";
 const resolver = async () => [{ address: "93.184.216.34", family: 4 }];
 const base = "/control/webhooks";
 const migrations = [
@@ -228,6 +230,7 @@ describe.skipIf(!existsSync(fixture))(
 			for (const [schema, user, email] of [
 				["public", rootId, ownerEmail],
 				[alpha.schemaName, userId, userEmail],
+				[alpha.schemaName, eventUserId, eventEmail],
 			]) {
 				await database.query(
 					`INSERT INTO "${schema}"."user" (id,name,email,"emailVerified",role)
@@ -333,11 +336,15 @@ describe.skipIf(!existsSync(fixture))(
 				? legacy.handler(input)
 				: owned.dispatch(input);
 		}
-		async function endpoint(engine: "legacy" | "owned", label: string) {
+		async function endpoint(
+			engine: "legacy" | "owned",
+			label: string,
+			eventTypes = ["auth.sign-in", "auth.sign-in"],
+		) {
 			const response = await send(engine, `${base}/create`, {
 				url: `https://${label}.webhook.fixture.example/receive?state=1`,
 				description: "  Fixture  ",
-				eventTypes: ["auth.sign-in", "auth.sign-in"],
+				eventTypes,
 			});
 			expect(response.status).toBe(200);
 			expect(response.headers.get("cache-control")).toBe("no-store");
@@ -368,6 +375,83 @@ describe.skipIf(!existsSync(fixture))(
 				offset: number;
 				retentionDays: number;
 			};
+		}
+
+		async function browserSession(email: string) {
+			const signedIn = await send(
+				"legacy",
+				"/sign-in/email",
+				{ email, password },
+				"",
+			);
+			expect(signedIn.status).toBe(200);
+			const cookie =
+				signedIn.headers
+					.getSetCookie()
+					.find((value) =>
+						value.startsWith(
+							`__Secure-allauth_project_${alpha.slug}.session_token=`,
+						),
+					)
+					?.split(";", 1)[0] ?? "";
+			expect(cookie).toBeTruthy();
+			const active = await send("legacy", "/get-session", undefined, cookie);
+			const { session } = (await active.json()) as { session: { id: string } };
+			expect(session.id).toBeTruthy();
+			return { cookie, id: session.id };
+		}
+
+		async function signedEvents(
+			subscription: Awaited<ReturnType<typeof endpoint>>,
+			privateValues: string[],
+			sessionLabels = new Map<string, string>(),
+		) {
+			const delivered: Array<{
+				body: string;
+				headers: Record<string, string>;
+			}> = [];
+			const result = await deliverPendingWebhooks({
+				database: projectDatabase,
+				secret: alpha.secret,
+				resolver,
+				now: () => new Date(Date.now() + 1_000),
+				maxDeliveries: 20,
+				transport: async ({ destination, body, headers }) => {
+					if (destination.url.href === subscription.endpoint.url)
+						delivered.push({ body, headers });
+					return 204;
+				},
+			});
+			expect(result).toMatchObject({
+				claimed: delivered.length,
+				delivered: delivered.length,
+			});
+			const eventIds = new Set<string>();
+			const events = [];
+			for (const { body, headers } of delivered) {
+				const { id, type, timestamp, data } = JSON.parse(
+					body,
+				) as ControlWebhookEnvelope;
+				expect(data.event).toMatchObject({ id, type, createdAt: timestamp });
+				expect(headers["webhook-signature"]).toBe(
+					await webhookSignature(
+						subscription.secret,
+						headers["webhook-id"],
+						headers["webhook-timestamp"],
+						body,
+					),
+				);
+				eventIds.add(id);
+				for (const value of privateValues) expect(body).not.toContain(value);
+				const { id: _id, createdAt: _timestamp, ...event } = data.event;
+				if (event.targetId && sessionLabels.has(event.targetId))
+					event.targetId = sessionLabels.get(event.targetId);
+				events.push({ event, ...(data.user ? { user: data.user } : {}) });
+			}
+			expect(eventIds.size).toBe(delivered.length);
+			return events.sort((a, b) =>
+				JSON.stringify(a).localeCompare(JSON.stringify(b)),
+			);
 		}
 
 		it("preserves each management operation and dispatches through the existing signed worker after either writer", async () => {
@@ -654,59 +738,16 @@ describe.skipIf(!existsSync(fixture))(
 				};
 				expect(session.id).toBeTruthy();
 				expect((await send(writer, "/sign-out", {}, cookie)).status).toBe(200);
-				const delivered: Array<{
-					body: string;
-					headers: Record<string, string>;
-				}> = [];
-				const result = await deliverPendingWebhooks({
-					database: projectDatabase,
-					secret: alpha.secret,
-					resolver,
-					now: () => new Date(Date.now() + 1_000),
-					transport: async ({ body, headers }) => {
-						delivered.push({ body, headers });
-						return 204;
-					},
-				});
-				expect(result).toMatchObject({
-					claimed: delivered.length,
-					delivered: delivered.length,
-				});
-				const events = [];
-				const eventIds = new Set<string>();
-				for (const { body, headers } of delivered) {
-					const { id, type, timestamp, data } = JSON.parse(
-						body,
-					) as ControlWebhookEnvelope;
-					expect(data.event).toMatchObject({ id, type, createdAt: timestamp });
-					expect(headers["webhook-signature"]).toBe(
-						await webhookSignature(
-							secret,
-							headers["webhook-id"],
-							headers["webhook-timestamp"],
-							body,
-						),
-					);
-					eventIds.add(id);
-					expect(data.user).toBeUndefined();
-					for (const privateValue of [
-						userEmail,
-						password,
-						incorrectPassword,
-						cookie,
-					])
-						expect(body).not.toContain(privateValue);
-					const { id: _id, createdAt: _timestamp, ...event } = data.event;
-					if (event.targetId) {
-						expect(event.targetId).toBe(session.id);
-						event.targetId = "session";
-					}
-					events.push(event);
-				}
-				expect(eventIds.size).toBe(delivered.length);
-				return events.sort((a, b) =>
-					`${a.type}:${a.outcome}`.localeCompare(`${b.type}:${b.outcome}`),
+				const events = await signedEvents(
+					{ secret, endpoint },
+					[userEmail, password, incorrectPassword, cookie ?? ""],
+					new Map([[session.id, "session"]]),
 				);
+				for (const { event, user } of events) {
+					expect(user).toBeUndefined();
+					if (event.targetId) expect(event.targetId).toBe("session");
+				}
+				return events.map(({ event }) => event);
 			}
 			const nativeEvents = await exercise("legacy");
 			expect(nativeEvents.map((event) => event.type)).toEqual([
@@ -720,6 +761,209 @@ describe.skipIf(!existsSync(fixture))(
 			expect(
 				(await send("owned", `${base}/delete`, { id: endpoint.id })).status,
 			).toBe(200);
+		});
+
+		it("delivers native profile mutation events and only the public user projection", async () => {
+			const name = "Updated fixture profile";
+			const privateMetadata = "fixture-profile-private-metadata";
+			async function exercise(writer: "legacy" | "owned") {
+				await database.query(
+					`UPDATE "${alpha.schemaName}"."user" SET name='Previous profile', "publicMetadata"=$2::jsonb, "privateMetadata"=$3::jsonb WHERE id=$1`,
+					[
+						eventUserId,
+						JSON.stringify({ category: "fixture" }),
+						JSON.stringify({ note: privateMetadata }),
+					],
+				);
+				const { cookie } = await browserSession(eventEmail);
+				const subscription = await endpoint(
+					"legacy",
+					`profile-payload-${writer}`,
+					["user.*", "user.updated"],
+				);
+				try {
+					expect(
+						(await send(writer, "/update-user", { name }, cookie)).status,
+					).toBe(200);
+					expect(
+						(
+							await send(
+								writer,
+								"/update-user",
+								{ email: "unexpected@fixture.example" },
+								cookie,
+							)
+						).status,
+					).toBe(400);
+					expect((await send(writer, "/update-user", {}, cookie)).status).toBe(
+						400,
+					);
+					expect(
+						(await send(writer, "/update-user", { name }, "")).status,
+					).toBe(401);
+					return await signedEvents(subscription, [
+						password,
+						cookie,
+						privateMetadata,
+						"unexpected@fixture.example",
+					]);
+				} finally {
+					expect(
+						(
+							await send("legacy", `${base}/delete`, {
+								id: subscription.endpoint.id,
+							})
+						).status,
+					).toBe(200);
+				}
+			}
+			const nativeEvents = await exercise("legacy");
+			expect(
+				nativeEvents.filter(({ event }) => event.outcome === "success"),
+			).toHaveLength(2);
+			for (const { event, user } of nativeEvents) {
+				expect(event.type).toBe("user.updated");
+				if (event.userId)
+					expect(user).toEqual({
+						id: eventUserId,
+						name,
+						email: eventEmail,
+						emailVerified: true,
+						publicMetadata: { category: "fixture" },
+					});
+			}
+			expect(await exercise("owned")).toEqual(nativeEvents);
+		});
+
+		it("rolls back the profile and session mutations when their event cannot be recorded", async () => {
+			const active = await browserSession(eventEmail);
+			const sibling = await browserSession(eventEmail);
+			const subscription = await endpoint("legacy", "atomic-payload", [
+				"user.*",
+				"session.*",
+			]);
+			const schema = `"${alpha.schemaName}"`;
+			await database.query(`CREATE FUNCTION ${schema}."rejectFixtureEvent"() RETURNS trigger LANGUAGE plpgsql AS $$
+				BEGIN RAISE EXCEPTION 'fixture event unavailable'; END;
+			$$`);
+			try {
+				await database.query(`CREATE TRIGGER "rejectFixtureEvent" BEFORE INSERT ON ${schema}."allauthEvent"
+					FOR EACH ROW WHEN ((NEW.type = 'user.updated' AND NEW."targetId" IS NULL) OR NEW.type = 'session.revoked-others')
+					EXECUTE FUNCTION ${schema}."rejectFixtureEvent"()`);
+				const currentName = await database.query<{ name: string }>(
+					`SELECT name FROM ${schema}."user" WHERE id=$1`,
+					[eventUserId],
+				);
+				await expect(
+					send(
+						"owned",
+						"/update-user",
+						{ name: "Failed fixture update" },
+						active.cookie,
+					),
+				).rejects.toThrow("fixture event unavailable");
+				await expect(
+					send("owned", "/revoke-other-sessions", {}, active.cookie),
+				).rejects.toThrow("fixture event unavailable");
+				expect(
+					(
+						await database.query(
+							`SELECT name FROM ${schema}."user" WHERE id=$1`,
+							[eventUserId],
+						)
+					).rows,
+				).toEqual(currentName.rows);
+				expect(
+					(
+						await database.query(
+							`SELECT id FROM ${schema}."session" WHERE id=ANY($1::text[])`,
+							[[active.id, sibling.id]],
+						)
+					).rowCount,
+				).toBe(2);
+				expect(
+					(await deliveries("legacy", subscription.endpoint.id)).total,
+				).toBe(0);
+			} finally {
+				await database.query(
+					`DROP FUNCTION ${schema}."rejectFixtureEvent"() CASCADE`,
+				);
+				expect(
+					(
+						await send("legacy", `${base}/delete`, {
+							id: subscription.endpoint.id,
+						})
+					).status,
+				).toBe(200);
+			}
+		});
+
+		it("delivers native bulk session events for the exact deleted sessions and request actor", async () => {
+			async function exercise(writer: "legacy" | "owned") {
+				await database.query(
+					`DELETE FROM "${alpha.schemaName}"."session" WHERE "userId"=$1`,
+					[eventUserId],
+				);
+				const active = await browserSession(eventEmail);
+				const sibling = await browserSession(eventEmail);
+				const expired = await browserSession(eventEmail);
+				await database.query(
+					`UPDATE "${alpha.schemaName}"."session" SET "expiresAt"=statement_timestamp()-interval '1 minute' WHERE id=$1`,
+					[expired.id],
+				);
+				const subscription = await endpoint(
+					"legacy",
+					`bulk-payload-${writer}`,
+					["session.*", "session.deleted"],
+				);
+				try {
+					for (const path of [
+						"/revoke-other-sessions",
+						"/revoke-other-sessions",
+						"/revoke-sessions",
+					])
+						expect((await send(writer, path, {}, active.cookie)).status).toBe(
+							200,
+						);
+					expect((await send(writer, "/revoke-sessions", {}, "")).status).toBe(
+						401,
+					);
+					const sessions = new Map([
+						[active.id, "current"],
+						[sibling.id, "sibling"],
+						[expired.id, "expired"],
+					]);
+					const events = await signedEvents(
+						subscription,
+						[
+							password,
+							eventEmail,
+							active.cookie,
+							sibling.cookie,
+							expired.cookie,
+						],
+						sessions,
+					);
+					for (const { user } of events) expect(user).toBeUndefined();
+					return events;
+				} finally {
+					expect(
+						(
+							await send("legacy", `${base}/delete`, {
+								id: subscription.endpoint.id,
+							})
+						).status,
+					).toBe(200);
+				}
+			}
+			const nativeEvents = await exercise("legacy");
+			expect(
+				nativeEvents
+					.filter(({ event }) => event.type === "session.deleted")
+					.map(({ event }) => event.targetId)
+					.sort(),
+			).toEqual(["current", "expired", "sibling"]);
+			expect(await exercise("owned")).toEqual(nativeEvents);
 		});
 	},
 );

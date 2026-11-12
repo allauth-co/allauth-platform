@@ -1496,23 +1496,36 @@ export function createOwnedProjectEngine(
 		const token =
 			serverSessionBearer(request.headers) ?? tokenFrom(request.headers);
 		const headers = new Headers();
-		const unauthorized = () =>
-			failure(401, "UNAUTHORIZED", "Unauthorized", headers);
-		if (!token) return unauthorized();
+		const event = {
+			type:
+				path === "/revoke-other-sessions"
+					? "session.revoked-others"
+					: "session.revoked-all",
+			...browserEventContext(request),
+		};
+		const unauthorized = async (client: PoolClient) => {
+			await store.recordEvent(client, {
+				...event,
+				outcome: "failure",
+				metadata: { path, errorCode: "UNAUTHORIZED" },
+			});
+			return failure(401, "UNAUTHORIZED", "Unauthorized", headers);
+		};
+		if (!token) return store.transaction(unauthorized);
 		return store.transaction(async (client) => {
 			const observed = await store.session(token, refreshWindow, client);
 			if (!observed) {
 				clearSessionCookies(headers);
-				return unauthorized();
+				return unauthorized(client);
 			}
-			if (!ordinarySession(token, observed)) return unauthorized();
+			if (!ordinarySession(token, observed)) return unauthorized(client);
 			// Serialize this user's sign-ins and authorization mutations before
 			// locking the caller and the set of sessions it may revoke.
 			const user = await store.lockUser(client, observed.user.id);
 			if (!user || !(await store.lockSession(client, token, user.id, false)))
-				return unauthorized();
+				return unauthorized(client);
 			const current = await eligibleSession(token, client);
-			if (!current || current.user.id !== user.id) return unauthorized();
+			if (!current || current.user.id !== user.id) return unauthorized(client);
 
 			await renewAuthorizedSession(request, current, client, headers);
 			const removed = await store.revoke(
@@ -1527,6 +1540,13 @@ export function createOwnedProjectEngine(
 				client,
 			);
 			if (!removed) throw unavailableLogout;
+			await store.recordEvent(client, {
+				...event,
+				outcome: "success",
+				actorId: user.id,
+				userId: user.id,
+				metadata: { path },
+			});
 			deliverLogoutAfterCommit(client, request, removed.targets);
 			return json({ status: true }, 200, headers);
 		});
@@ -2790,18 +2810,18 @@ export function createOwnedProjectEngine(
 		if (request.method === "POST" && path === "/update-user") {
 			if (!trustedRequest(request.headers, true)) return forbidden();
 			const current = await currentSession(request.headers);
-			if (!current) return failure(401, "UNAUTHORIZED", "Unauthorized");
-			const result = await updateProfile(await requestBody(request), {
-				userId: current.user.id,
-				token: current.token,
-			});
+			const result = await updateProfile(
+				current ? await requestBody(request) : undefined,
+				current && { userId: current.user.id, token: current.token },
+				browserEventContext(request),
+			);
 			if (result.status !== 200)
 				return failure(result.status, result.code, result.message);
 			const headers = new Headers();
 			writeCookie(
 				headers,
 				sessionCookie,
-				current.token,
+				result.token,
 				tokenFrom(request.headers, rememberCookie)
 					? undefined
 					: policy.sessionExpiresInSeconds,
