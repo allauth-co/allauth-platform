@@ -49,6 +49,8 @@ const rolePath = "/admin/set-role";
 const banPath = "/admin/ban-user";
 const unbanPath = "/admin/unban-user";
 const passwordPath = "/admin/set-user-password";
+const createRealmUserPath = "/admin/create-user";
+const updateRealmUserPath = "/admin/update-user";
 const clientIP = "192.0.2.9";
 const userAgent = "AllAuth project administrator fixture";
 const platformSecret = "isolated-root-administrator-deletion-fixture-secret";
@@ -1766,6 +1768,387 @@ describe.skipIf(!existsSync(fixturePath))(
 						`UPDATE ${scope}."user" SET role='admin' WHERE id=$1`,
 						[realmAdmin],
 					);
+				}
+			} finally {
+				breachFetch.mockRestore();
+			}
+		});
+
+		it("interchanges supported realm admin user creation and updates with the native writer", async () => {
+			const stock = await stockRealm();
+			const scope = `"${alpha.schemaName}"`;
+			const candidate = localizeProjectErrors(
+				engine(alpha, undefined, undefined, createOwnedProjectPasswordSafety()),
+			);
+			const replacement = "Synthetic-admin-created-credential-9!";
+			const breachFetch = vi
+				.spyOn(globalThis, "fetch")
+				.mockImplementation(async (input) => {
+					const url = new URL(input instanceof Request ? input.url : input);
+					expect(url.origin).toBe("https://api.pwnedpasswords.com");
+					expect(url.pathname).toMatch(/^\/range\/[0-9A-F]{5}$/);
+					return new Response(`${"0".repeat(35)}:0\r\n`);
+				});
+			const metadata = { tier: "synthetic", flags: [true, false] };
+			const relyingParty = "realm-admin-profile-fixture-client";
+			const getUser = (id: string) =>
+				request(`${alpha.path}/admin/get-user?id=${id}`, realmCookie);
+			try {
+				await database.query(
+					`INSERT INTO ${scope}."oauthClient" (id,"clientId","redirectUris") VALUES ($1,$1,'[]')`,
+					[relyingParty],
+				);
+				const cases = [
+					["native", stock.handler, candidate.dispatch],
+					["owned", candidate.dispatch, stock.handler],
+				] as const;
+				for (const [writer, write, rollback] of cases) {
+					const email = `realm-created-by-${writer}@fixture.example`;
+					const data = {
+						name: "Fixture administrator-created account",
+						email: email.toUpperCase(),
+						password: replacement,
+						role: ["user", "synthetic-role"],
+						data: {
+							emailVerified: true,
+							publicMetadata: metadata,
+							image: "https://image.fixture.example/avatar.png",
+							username: `Admin_Created_${writer}`,
+						},
+					};
+					const create = (body: unknown, proof = realmCookie) =>
+						write(request(alpha.path + createRealmUserPath, proof, body));
+					const denied = await create(data, rootCookie);
+					expect(denied.status, await denied.clone().text()).toBe(401);
+					const created = await create(data);
+					expect(created.status, await created.clone().text()).toBe(200);
+					expect(created.headers.getSetCookie()).toEqual([]);
+					const { user } = (await created.json()) as {
+						user: { id: string; [key: string]: unknown };
+					};
+					expect(user).toMatchObject({
+						email,
+						name: data.name,
+						emailVerified: true,
+						role: "user,synthetic-role",
+						publicMetadata: metadata,
+						username: `admin_created_${writer}`,
+						displayUsername: `Admin_Created_${writer}`,
+					});
+					expect(user).not.toHaveProperty("password");
+					expect(await (await rollback(getUser(user.id))).json()).toEqual(user);
+					const signIn = request(`${alpha.path}/sign-in/email`, undefined, {
+						email,
+						password: replacement,
+					});
+					signIn.headers.set("x-real-ip", "198.51.100.137");
+					const signedIn = await rollback(signIn);
+					expect(signedIn.status, await signedIn.clone().text()).toBe(200);
+					const signed = cookie(signedIn);
+					const duplicate = await create(data);
+					expect(duplicate.status).toBe(400);
+					expect(await duplicate.json()).toMatchObject({
+						code: "USER_ALREADY_EXISTS_USE_ANOTHER_EMAIL",
+					});
+					const passwordless = await create({
+						email: `realm-passwordless-by-${writer}@fixture.example`,
+						name: "Fixture passwordless",
+						data: { role: ["user", "synthetic-role"] },
+					});
+					expect(passwordless.status, await passwordless.clone().text()).toBe(
+						200,
+					);
+					const extra = (await passwordless.json()) as { user: { id: string } };
+					expect(extra.user).toMatchObject({
+						emailVerified: false,
+						role: "user,synthetic-role",
+					});
+					expect(
+						(
+							await database.query(
+								`SELECT id FROM ${scope}."account" WHERE "userId"=$1`,
+								[extra.user.id],
+							)
+						).rowCount,
+					).toBe(0);
+
+					const update = (data: unknown, proof = realmCookie) =>
+						write(
+							request(alpha.path + updateRealmUserPath, proof, {
+								userId: user.id,
+								data,
+							}),
+						);
+					for (const [body, code] of [
+						[{}, "NO_DATA_TO_UPDATE"],
+						[
+							{ password: replacement },
+							"PASSWORD_CANNOT_BE_UPDATED_VIA_UPDATE_USER",
+						],
+					] as const) {
+						const rejected = await update(body);
+						expect(rejected.status, await rejected.clone().text()).toBe(400);
+						expect(await rejected.json()).toMatchObject({ code });
+					}
+					const ordinary = await update({ name: "Denied" }, signed);
+					expect(ordinary.status, await ordinary.clone().text()).toBe(403);
+					expect(await ordinary.json()).toMatchObject({
+						code: "YOU_ARE_NOT_ALLOWED_TO_UPDATE_USERS",
+					});
+					const newEmail = `realm-updated-by-${writer}@fixture.example`;
+					const change = {
+						name: "Fixture updated account",
+						email: newEmail.toUpperCase(),
+						emailVerified: true,
+						role: ["user", "new-synthetic-role"],
+						publicMetadata: null,
+						image: null,
+						username: `Admin_Updated_${writer}`,
+						displayUsername: `Updated ${writer}`,
+					};
+					const updated = await update(change);
+					expect(updated.status, await updated.clone().text()).toBe(200);
+					const result = await updated.json();
+					expect(result).toMatchObject({
+						id: user.id,
+						name: change.name,
+						email: newEmail,
+						role: "user,new-synthetic-role",
+						publicMetadata: null,
+						image: null,
+						username: `admin_updated_${writer}`,
+						displayUsername: `Updated ${writer}`,
+					});
+					expect(await (await rollback(getUser(user.id))).json()).toEqual(
+						result,
+					);
+					const current = await rollback(
+						request(`${alpha.path}/get-session`, signed),
+					);
+					expect(await current.json()).toMatchObject({
+						user: { id: user.id, email: newEmail },
+					});
+					const identity = await native.api.getSession({
+						headers: new Headers({ cookie: signed }),
+					});
+					if (!identity) throw new Error("Expected an active fixture account.");
+					for (const [table, scopes] of [
+						["oauthAccessToken", '["openid"]'],
+						["oauthRefreshToken", '["openid","offline_access"]'],
+					] as const)
+						await database.query(
+							`INSERT INTO ${scope}."${table}" (id,token,"clientId","sessionId","userId","expiresAt","createdAt",scopes)
+						 VALUES ($1,$2,$3,$4,$5,now()+interval '1 hour',now(),$6)`,
+							[
+								randomUUID(),
+								randomUUID(),
+								relyingParty,
+								identity.session.id,
+								user.id,
+								scopes,
+							],
+						);
+					await database.query(
+						`INSERT INTO ${scope}."verification" (id,identifier,value,"expiresAt") VALUES ($1,'trust-device-fixture',$2,now()+interval '1 hour')`,
+						[randomUUID(), user.id],
+					);
+					const banned = await update({
+						banned: true,
+						banReason: "Synthetic restriction",
+					});
+					expect(banned.status, await banned.clone().text()).toBe(200);
+					expect(await banned.json()).toMatchObject({
+						banned: true,
+						banReason: "Synthetic restriction",
+					});
+					expect(
+						await (
+							await rollback(request(`${alpha.path}/get-session`, signed))
+						).json(),
+					).toBeNull();
+					expect(
+						(
+							await database.query(
+								`SELECT "sessionId",revoked IS NOT NULL AS revoked FROM ${scope}."oauthAccessToken" WHERE "userId"=$1`,
+								[user.id],
+							)
+						).rows,
+					).toEqual([{ sessionId: null, revoked: true }]);
+					expect(
+						(
+							await database.query(
+								`SELECT "sessionId",revoked FROM ${scope}."oauthRefreshToken" WHERE "userId"=$1`,
+								[user.id],
+							)
+						).rows,
+					).toEqual([{ sessionId: null, revoked: null }]);
+					expect(
+						(
+							await database.query(
+								`SELECT identifier FROM ${scope}."verification" WHERE value=$1`,
+								[user.id],
+							)
+						).rows,
+					).toEqual([{ identifier: "trust-device-fixture" }]);
+					const audit = await database.query(
+						`SELECT action,"actorId","targetId" FROM ${scope}."allauthAudit" WHERE action=ANY($1::text[]) AND ("targetId"=$2 OR "targetId" IS NULL) ORDER BY action`,
+						[[createRealmUserPath, updateRealmUserPath], user.id],
+					);
+					expect(audit.rows).toEqual([
+						{
+							action: createRealmUserPath,
+							actorId: realmAdmin,
+							targetId: null,
+						},
+						{
+							action: createRealmUserPath,
+							actorId: realmAdmin,
+							targetId: null,
+						},
+						{
+							action: updateRealmUserPath,
+							actorId: realmAdmin,
+							targetId: user.id,
+						},
+						{
+							action: updateRealmUserPath,
+							actorId: realmAdmin,
+							targetId: user.id,
+						},
+					]);
+					const childEvents = await database.query(
+						`SELECT type,"actorId",metadata FROM ${scope}."allauthEvent"
+						 WHERE "userId"=$1 AND type IN ('account.linked','user.created','user.updated','session.deleted')
+						 AND metadata->>'path'=ANY($2::text[]) ORDER BY type`,
+						[user.id, [createRealmUserPath, updateRealmUserPath]],
+					);
+					expect(childEvents.rows).toEqual([
+						{
+							type: "account.linked",
+							actorId: realmAdmin,
+							metadata: { path: createRealmUserPath, provider: "credential" },
+						},
+						{
+							type: "session.deleted",
+							actorId: realmAdmin,
+							metadata: { path: updateRealmUserPath },
+						},
+						{
+							type: "user.created",
+							actorId: realmAdmin,
+							metadata: { path: createRealmUserPath },
+						},
+						{
+							type: "user.updated",
+							actorId: realmAdmin,
+							metadata: { path: updateRealmUserPath },
+						},
+						{
+							type: "user.updated",
+							actorId: realmAdmin,
+							metadata: { path: updateRealmUserPath },
+						},
+					]);
+					await database.query(
+						`DELETE FROM ${scope}."allauthAudit" WHERE action=$1`,
+						[createRealmUserPath],
+					);
+				}
+
+				const blockedDomain = "blocked-realm-create.fixture.example";
+				const foreignUser = "foreign-realm-administration-fixture";
+				await seedUser(beta.schemaName, foreignUser);
+				for (const dispatch of [stock.handler, candidate.dispatch]) {
+					const response = await dispatch(
+						request(alpha.path + updateRealmUserPath, realmCookie, {
+							userId: foreignUser,
+							data: { name: "Wrong realm" },
+						}),
+					);
+					expect(response.status).toBe(404);
+					expect(await response.json()).toMatchObject({
+						code: "USER_NOT_FOUND",
+					});
+				}
+				expect(
+					(
+						await database.query(
+							`SELECT name FROM "${beta.schemaName}"."user" WHERE id=$1`,
+							[foreignUser],
+						)
+					).rows,
+				).toEqual([{ name: "Fixture User" }]);
+				await database.query(
+					`INSERT INTO ${scope}."allauthSecurityRule" (id,type,value,reason) VALUES ($1,'email-domain',$2,'Synthetic policy')`,
+					[randomUUID(), blockedDomain],
+				);
+				const provision = (
+					dispatch: typeof candidate.dispatch,
+					email: string,
+					extra: object = {},
+				) =>
+					dispatch(
+						request(alpha.path + createRealmUserPath, realmCookie, {
+							name: "Synthetic guarded creation",
+							email,
+							password: replacement,
+							...extra,
+						}),
+					);
+				const attempts = breachFetch.mock.calls.length;
+				for (const dispatch of [stock.handler, candidate.dispatch]) {
+					const blocked = await provision(dispatch, `fixture@${blockedDomain}`);
+					expect(blocked.status, await blocked.clone().text()).toBe(403);
+					expect(await blocked.json()).toMatchObject({
+						code: "validation_failed",
+						message: "User validation failed",
+					});
+				}
+				expect(breachFetch.mock.calls.length).toBe(attempts);
+				const unsupported = await provision(
+					candidate.dispatch,
+					"unsupported-field@fixture.example",
+					{
+						data: {
+							directoryManaged: true,
+							twoFactorEnabled: true,
+							privateMetadata: { value: "synthetic" },
+						},
+					},
+				);
+				expect(unsupported.status).toBe(400);
+				expect(await unsupported.json()).toMatchObject({
+					code: "FIELD_NOT_ALLOWED",
+				});
+				expect(breachFetch.mock.calls.length).toBe(attempts);
+				const compromised = "Synthetic-rejected-admin-creation-9!";
+				const suffix = createHash("sha1")
+					.update(compromised)
+					.digest("hex")
+					.toUpperCase()
+					.slice(5);
+				for (const [writer, dispatch] of [
+					["native", stock.handler],
+					["owned", candidate.dispatch],
+				] as const) {
+					breachFetch.mockResolvedValueOnce(new Response(`${suffix}:10\r\n`));
+					const email = `rejected-create-${writer}@fixture.example`;
+					const rejected = await provision(dispatch, email, {
+						password: compromised,
+					});
+					expect(rejected.status).toBe(400);
+					expect(await rejected.json()).toMatchObject({
+						code: "PASSWORD_COMPROMISED",
+					});
+					const persisted = await database.query(
+						`SELECT u.id,a.password FROM ${scope}."user" u LEFT JOIN ${scope}."account" a ON a."userId"=u.id WHERE u.email=$1`,
+						[email],
+					);
+					if (writer === "native")
+						expect(persisted.rows).toEqual([
+							{ id: expect.any(String), password: null },
+						]);
+					else expect(persisted.rows).toEqual([]);
 				}
 			} finally {
 				breachFetch.mockRestore();

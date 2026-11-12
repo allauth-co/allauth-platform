@@ -88,7 +88,9 @@ export function createOwnedProjectSecurity(options: SecurityOptions) {
 		policy: SecurityPolicy,
 		email?: string,
 		ip?: string | null,
+		reportMonitor = true,
 	) {
+		if (policy.mode === "monitor" && !reportMonitor) return false;
 		const domain = email?.includes("@")
 			? canonicalDomain(email.slice(email.lastIndexOf("@") + 1))
 			: null;
@@ -314,6 +316,21 @@ export function createOwnedProjectSecurity(options: SecurityOptions) {
 
 	return {
 		admit,
+		async denyAdminProvisioning(
+			client: SecurityDatabase,
+			request: Request,
+			email: string,
+			reportMonitor: boolean,
+		) {
+			return checkRules(
+				client,
+				request,
+				await readPolicy(client),
+				email,
+				trustedIP(request),
+				reportMonitor,
+			);
+		},
 		failed,
 		registerDevice,
 		trustedIP,

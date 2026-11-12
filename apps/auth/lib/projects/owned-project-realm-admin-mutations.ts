@@ -21,6 +21,20 @@ import {
 	realmAdminPasswordUnavailable,
 	writeRealmAdminPassword,
 } from "./owned-project-realm-admin-password";
+import type { RealmAdminUserFailure } from "./owned-project-realm-admin-users";
+import {
+	insertRealmAdminUser,
+	realmAdminCreateUserInput,
+	realmAdminCreateUserPath,
+	realmAdminDuplicateEmail,
+	realmAdminDuplicateUsername,
+	realmAdminEmailInUse,
+	realmAdminUpdateUserInput,
+	realmAdminUpdateUserPath,
+	realmAdminUserFields,
+	realmAdminUsernameInUse,
+	updateRealmAdminUser,
+} from "./owned-project-realm-admin-users";
 import { preserveProjectBeforeHookError } from "./project-error-localization";
 
 const singlePath = "/admin/revoke-user-session";
@@ -55,6 +69,12 @@ const inputs = {
 			newPassword: z.string(),
 		})
 		.transform((data) => ({ ...data, path: realmAdminPasswordPath }) as const),
+	[realmAdminCreateUserPath]: realmAdminCreateUserInput.transform(
+		(data) => ({ ...data, path: realmAdminCreateUserPath }) as const,
+	),
+	[realmAdminUpdateUserPath]: realmAdminUpdateUserInput.transform(
+		(data) => ({ ...data, path: realmAdminUpdateUserPath }) as const,
+	),
 };
 const revokeDenied = [
 	"YOU_ARE_NOT_ALLOWED_TO_REVOKE_USERS_SESSIONS",
@@ -77,13 +97,21 @@ const permissionDenied = {
 		"YOU_ARE_NOT_ALLOWED_TO_SET_USERS_PASSWORD",
 		"You are not allowed to set users password",
 	],
+	[realmAdminCreateUserPath]: [
+		"YOU_ARE_NOT_ALLOWED_TO_CREATE_USERS",
+		"You are not allowed to create users",
+	],
+	[realmAdminUpdateUserPath]: [
+		"YOU_ARE_NOT_ALLOWED_TO_UPDATE_USERS",
+		"You are not allowed to update users",
+	],
 };
 
 type MutationPath = keyof typeof inputs;
 type RevocationSelector = { tokens: string[] } | { userId: string };
 type Store = ReturnType<typeof createProjectEngineStore>;
 type RealmSession = NonNullable<Awaited<ReturnType<Store["session"]>>>;
-type PasswordAuthority = { sessionId: string; targetCreatedAt: number };
+type PasswordAuthority = { sessionId: string; targetCreatedAt: number | null };
 type PasswordAttempt = PasswordAuthority & {
 	result: Awaited<ReturnType<typeof prepareRealmAdminPassword>>;
 };
@@ -106,6 +134,13 @@ export function createOwnedProjectRealmAdminMutations(options: {
 	requireMfa: boolean;
 	passwordPolicy: PasswordPolicy;
 	checkPasswordSafety?: RealmAdminPasswordSafety;
+	primaryOrigin: string;
+	blockAdminCreation(
+		client: PoolClient,
+		request: Request,
+		email: string,
+		reportMonitor: boolean,
+	): Promise<boolean>;
 	clearUserAuthentication(client: PoolClient, userId: string): Promise<void>;
 	revoke(
 		client: PoolClient,
@@ -113,6 +148,7 @@ export function createOwnedProjectRealmAdminMutations(options: {
 		selector: RevocationSelector,
 		path: MutationPath,
 		actorId: string,
+		authentication?: "all" | "linked",
 	): Promise<void>;
 }) {
 	const { store } = options;
@@ -137,10 +173,15 @@ export function createOwnedProjectRealmAdminMutations(options: {
 			);
 		const mutation = input.data;
 		const password =
-			mutation.path === realmAdminPasswordPath ? mutation.newPassword : null;
+			mutation.path === realmAdminPasswordPath
+				? mutation.newPassword
+				: mutation.path === realmAdminCreateUserPath
+					? (mutation.password ?? null)
+					: null;
 		// The native endpoint coerces the selector, but its after-hook audits the raw ID.
 		const targetId =
 			path !== singlePath &&
+			path !== realmAdminCreateUserPath &&
 			typeof body === "object" &&
 			body !== null &&
 			"userId" in body &&
@@ -224,12 +265,14 @@ export function createOwnedProjectRealmAdminMutations(options: {
 			const targetUserId =
 				"userId" in mutation
 					? mutation.userId
-					: (
-							await client.query<{ userId: string }>(
-								'SELECT "userId" FROM "session" WHERE token=$1',
-								[mutation.sessionToken],
-							)
-						).rows[0]?.userId;
+					: mutation.path === singlePath
+						? (
+								await client.query<{ userId: string }>(
+									'SELECT "userId" FROM "session" WHERE token=$1',
+									[mutation.sessionToken],
+								)
+							).rows[0]?.userId
+						: undefined;
 			// Acquire actor and target in a stable order before locking sessions/grants.
 			const users = new Set([current.user.id]);
 			if (targetUserId) users.add(targetUserId);
@@ -255,12 +298,17 @@ export function createOwnedProjectRealmAdminMutations(options: {
 			if (options.requireMfa && !administrator.twoFactorEnabled)
 				return requireEnrollment();
 			if (!administrator.role?.split(",").includes("admin")) return denied();
-			if (password !== null && target && !attempt)
+			if (mutation.path === realmAdminPasswordPath && target && !attempt)
 				return {
 					sessionId: current.session.id,
 					targetCreatedAt: new Date(target.createdAt).getTime(),
 				};
-			await options.renew(request, { ...current, token }, client, headers);
+			const preparingCreation =
+				mutation.path === realmAdminCreateUserPath &&
+				password !== null &&
+				!attempt;
+			if (!preparingCreation)
+				await options.renew(request, { ...current, token }, client, headers);
 			if (mutation.path === singlePath || mutation.path === bulkPath) {
 				const selector =
 					mutation.path === singlePath
@@ -270,10 +318,143 @@ export function createOwnedProjectRealmAdminMutations(options: {
 				await record();
 				return accountLinkJson({ success: true }, 200, headers);
 			}
-			const reject = async (status: number, code: string, message: string) => {
+			const reject = async (
+				status: number,
+				code: string,
+				message: string,
+				exposeCode = true,
+			) => {
 				await record(code);
-				return accountLinkJson({ code, message }, status, headers);
+				return accountLinkJson(
+					exposeCode ? { code, message } : { message },
+					status,
+					headers,
+				);
 			};
+			async function userFailure({
+				status,
+				code,
+				message,
+				exposeCode,
+			}: RealmAdminUserFailure) {
+				return reject(status, code, message, exposeCode);
+			}
+			if (mutation.path === realmAdminCreateUserPath) {
+				const resolved = realmAdminUserFields(mutation, options.primaryOrigin);
+				if (resolved.failure) return userFailure(resolved.failure);
+				const { fields } = resolved;
+				if (!fields.email)
+					throw new Error("A realm administrator creation email was expected.");
+				if (await realmAdminEmailInUse(client, fields.email))
+					return userFailure(realmAdminDuplicateEmail);
+				if (
+					await options.blockAdminCreation(
+						client,
+						request,
+						fields.email,
+						!preparingCreation,
+					)
+				)
+					return reject(403, "validation_failed", "User validation failed");
+				if (
+					fields.username &&
+					(await realmAdminUsernameInUse(client, fields.username))
+				)
+					return userFailure(realmAdminDuplicateUsername);
+				if (preparingCreation)
+					return { sessionId: current.session.id, targetCreatedAt: null };
+				if (attempt && current.session.id !== attempt.sessionId)
+					return reject(
+						409,
+						"PASSWORD_CHANGE_UNAVAILABLE",
+						"The administrator session changed while preparing the password. Try again.",
+					);
+				if (attempt?.result.failure) return userFailure(attempt.result.failure);
+				const id = await insertRealmAdminUser(client, fields);
+				if (!id)
+					return userFailure(
+						fields.username !== undefined &&
+							fields.username !== null &&
+							(await realmAdminUsernameInUse(client, fields.username))
+							? realmAdminDuplicateUsername
+							: realmAdminDuplicateEmail,
+					);
+				await store.record(
+					client,
+					"user.created",
+					"success",
+					path,
+					id,
+					id,
+					administrator.id,
+				);
+				if (
+					attempt?.result.hash &&
+					!(await writeRealmAdminPassword(client, store, {
+						userId: id,
+						actorId: administrator.id,
+						hash: attempt.result.hash,
+						path,
+					}))
+				)
+					throw new Error("The new realm credential could not be written.");
+				const user = await readRealmAdminUser(client, id);
+				if (!user)
+					throw new Error("The created realm account could not be read.");
+				await record();
+				return accountLinkJson({ user }, 200, headers);
+			}
+			if (mutation.path === realmAdminUpdateUserPath) {
+				const resolved = realmAdminUserFields(mutation, options.primaryOrigin);
+				if (resolved.failure) return userFailure(resolved.failure);
+				const { fields } = resolved;
+				if (fields.banned === true && mutation.userId === administrator.id)
+					return reject(
+						400,
+						"YOU_CANNOT_BAN_YOURSELF",
+						"You cannot ban yourself",
+					);
+				if (
+					fields.email &&
+					(await realmAdminEmailInUse(client, fields.email, mutation.userId))
+				)
+					return userFailure(realmAdminDuplicateEmail);
+				if (!target) return reject(404, "USER_NOT_FOUND", "User not found");
+				if (
+					fields.username &&
+					(await realmAdminUsernameInUse(
+						client,
+						fields.username,
+						administrator.id,
+					))
+				)
+					return userFailure(realmAdminDuplicateUsername);
+				const failure = await updateRealmAdminUser(client, target.id, fields);
+				if (failure) return userFailure(failure);
+				await store.record(
+					client,
+					"user.updated",
+					"success",
+					path,
+					target.id,
+					target.id,
+					administrator.id,
+				);
+				if (fields.banned === true)
+					await options.revoke(
+						client,
+						request,
+						{ userId: target.id },
+						path,
+						administrator.id,
+						"linked",
+					);
+				const user = await readRealmAdminUser(client, target.id);
+				if (!user)
+					throw new Error("The updated realm account could not be read.");
+				await record();
+				return accountLinkJson(user, 200, headers);
+			}
 			if (!target) return reject(404, "USER_NOT_FOUND", "User not found");
 			if (mutation.path === realmAdminPasswordPath) {
 				if (!attempt)

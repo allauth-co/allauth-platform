@@ -2009,6 +2009,7 @@ export function createOwnedProjectEngine(
 		selector: { tokens: string[] } | { userId: string },
 		path: string,
 		actorId: string,
+		authentication: "all" | "linked" = "all",
 	) {
 		const removed = await store.revoke(
 			selector,
@@ -2018,7 +2019,7 @@ export function createOwnedProjectEngine(
 			actorId,
 		);
 		if (!removed) throw unavailableLogout;
-		if ("userId" in selector)
+		if (authentication === "all" && "userId" in selector)
 			await clearAdminAuthentication(client, selector.userId);
 		deliverLogoutAfterCommit(client, request, removed.targets);
 	}
@@ -2549,6 +2550,8 @@ export function createOwnedProjectEngine(
 		requireMfa: policy.mfaMode === "required",
 		passwordPolicy: policy.passwordPolicy,
 		checkPasswordSafety: passwordSafety,
+		primaryOrigin: origin,
+		blockAdminCreation: security.denyAdminProvisioning,
 		clearUserAuthentication: clearAdminAuthentication,
 		revoke: revokeAdminSessions,
 	});

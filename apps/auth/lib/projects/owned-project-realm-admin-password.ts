@@ -39,7 +39,12 @@ export async function prepareRealmAdminPassword(
 export async function writeRealmAdminPassword(
 	client: PoolClient,
 	store: Pick<ReturnType<typeof createProjectEngineStore>, "recordEvent">,
-	{ userId, actorId, hash }: { userId: string; actorId: string; hash: string },
+	{
+		userId,
+		actorId,
+		hash,
+		path = realmAdminPasswordPath,
+	}: { userId: string; actorId: string; hash: string; path?: string },
 ) {
 	const { rows } = await client.query<{ id: string; accountId: string }>(
 		`SELECT id,"accountId" FROM "account" WHERE "userId"=$1 AND "providerId"='credential'
@@ -66,7 +71,7 @@ export async function writeRealmAdminPassword(
 			actorId,
 			userId,
 			targetId: id,
-			metadata: { path: realmAdminPasswordPath, provider: "credential" },
+			metadata: { path, provider: "credential" },
 		});
 	}
 	return true;
