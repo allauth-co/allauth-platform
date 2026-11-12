@@ -17,9 +17,18 @@ The session comparison emits only the project ID and the result `match`, `differ
 
 ## Measure a rollout cohort
 
-Set `ALLAUTH_PROJECT_ENGINE_METRICS_IDS` to the same comma-separated immutable project IDs on the legacy baseline and candidate. The service emits one `allauth.project_engine_metrics` record per active project, writer, transport and operation in each process window. Aggregate the outcome counts and latency histogram counts across processes before comparing periods. The last histogram bucket counts requests above the highest reported bound.
+Set `ALLAUTH_PROJECT_ENGINE_METRICS_IDS` to the same comma-separated immutable project IDs on the legacy baseline and candidate. The service emits one `allauth.project_engine_metrics` record per active project, writer, transport and operation in each process window. Export the records from every process once as NDJSON, with one event object per line. Select nonoverlapping UTC intervals during which you verified the respective writer revisions.
 
-The records cover sign-in and second-factor requests, provider callbacks, session reads and refreshes, and OAuth token exchanges and refreshes. HTTP redirects have a separate outcome, while known error redirects count as rejected. Compare these response outcomes with the realm's authentication event counts when assessing completed sign-ins. The metric records contain the project ID and fixed labels and counts.
+```sh
+pnpm --dir apps/auth exec tsx scripts/compare-project-engine-metrics.ts /absolute/path/project-engine.ndjson \
+  --project-id "$PROJECT_ID" \
+  --legacy-start "$LEGACY_START_UTC" --legacy-end "$LEGACY_END_UTC" \
+  --candidate-start "$CANDIDATE_START_UTC" --candidate-end "$CANDIDATE_END_UTC"
+```
+
+The comparison sums counts and histogram buckets for each operation and transport, and reports outcome rates and percentile bucket bounds. An `atMostMs` of `null` means the percentile is above the highest bound. Records that cross an interval boundary or name a different writer inside the interval appear in `excluded`. A group with a nonempty `missingWriters` list lacks observations for comparison.
+
+The records cover sign-in and second-factor requests, provider callbacks, session reads and refreshes, and OAuth token exchanges and refreshes. HTTP redirects have a separate outcome, while known error redirects count as rejected. Compare these response outcomes with the realm's authentication event counts when assessing completed sign-ins. Check gateway and readiness evidence for requests that fail before engine dispatch, and exercise each configured accounts hostname separately. The metric records contain the project ID and fixed labels and counts.
 
 ## Project cutover
 
