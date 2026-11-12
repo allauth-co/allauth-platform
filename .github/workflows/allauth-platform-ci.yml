@@ -25,6 +25,7 @@ jobs:
           POSTGRES_DB: allauth
           POSTGRES_PASSWORD: allauth-ci-only
         ports: ["55445:5432"]
+        ports: ["55447:5432"]
         options: >-
           --health-cmd "pg_isready -U allauth -d allauth"
           --health-interval 5s --health-timeout 5s --health-retries 20
@@ -55,9 +56,20 @@ jobs:
         run: |
           node --input-type=module <<'JS'
           import { mkdirSync, writeFileSync } from 'node:fs';
+          import { createRequire } from 'node:module';
+          const { Client } = createRequire(process.cwd() + '/apps/auth/package.json')('pg');
+          const databaseURL = 'postgresql://allauth:allauth-ci-only@127.0.0.1:55445/allauth';
+          const database = new Client({ connectionString: databaseURL });
+          await database.connect();
+          try {
+            await database.query('CREATE DATABASE security_fixture');
+          } finally {
+            await database.end();
+          }
           mkdirSync('.secrets', { recursive: true });
-          // Historical marker used by the tests' isolated-fixture allowlist.
-          writeFileSync('.secrets/local-postgres.json', JSON.stringify({ container: 'allauth-production-test-20261007', DATABASE_URL: 'postgresql://allauth:allauth-ci-only@127.0.0.1:55445/allauth' }), { mode: 0o600 });
+          // These historical markers require the disposable CI databases and their exact ports.
+          writeFileSync('.secrets/local-postgres.json', JSON.stringify({ container: 'allauth-production-test-20261007', DATABASE_URL: databaseURL }), { mode: 0o600 });
+          writeFileSync('.secrets/security-test-database.json', JSON.stringify({ fixture: 'allauth-security-test-20261007', url: 'postgresql://allauth:allauth-ci-only@127.0.0.1:55447/security_fixture' }), { mode: 0o600 });
           JS
       - name: Test authentication and existing SDK compatibility
         run: >-
