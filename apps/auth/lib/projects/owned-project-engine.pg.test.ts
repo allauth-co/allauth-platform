@@ -358,6 +358,23 @@ describe.skipIf(!existsSync(fixturePath))("isolated PostgreSQL owned project eng
 				),
 			);
 			expect(await privateFilter.json()).toEqual({ users: [], total: 0 });
+			const sessionList = "/admin/list-user-sessions";
+			const expired = await legacySession(member, -60);
+			await database.query(
+				`INSERT INTO "${otherSchema}"."user" (id,email,name,"emailVerified",role)
+				 VALUES ($1,'other-realm-member@fixture.example','Sibling realm member',true,'user')`,
+				[member],
+			);
+			const siblingSession = await legacySession(member, 3600, otherSchema);
+			const sessions = await compare(sessionList, { userId: member }, active.cookie);
+			expect(sessions?.sessions).toEqual(expect.arrayContaining([
+				expect.objectContaining({ id: memberSession.id, token: memberSession.token }),
+				expect.objectContaining({ id: expired.id, token: expired.token }),
+			]));
+			expect(sessions?.sessions).not.toContainEqual(expect.objectContaining({ id: siblingSession.id }));
+			await compare(sessionList, { userId: member }, memberSession.cookie);
+			await compare(sessionList, { userId: member }, foreign.cookie);
+			await compare(sessionList, { userId: randomUUID() }, active.cookie);
 			const permission = "/admin/has-permission";
 			expect(
 				await compare(

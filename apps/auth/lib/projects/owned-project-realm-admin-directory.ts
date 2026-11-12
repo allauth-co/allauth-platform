@@ -80,6 +80,21 @@ export async function readRealmAdminUser(client: PoolClient, userId: string) {
 	return user ? publicUser(user) : null;
 }
 
+/** Existing verified realm administrators use the session handle with the native revoke endpoint. */
+export async function listRealmAdminSessions(
+	client: PoolClient,
+	userId: string,
+) {
+	if (userId.includes("\0")) return [];
+	const result = await client.query(
+		`SELECT id, token, "userId", "createdAt", "updatedAt", "expiresAt", "ipAddress", "userAgent",
+			"activeOrganizationId", "activeTeamId", "impersonatedBy"
+		 FROM "session" WHERE "userId"=$1`,
+		[userId],
+	);
+	return result.rows;
+}
+
 function pattern(operator: (typeof patterns)[number], value: string) {
 	return `${operator === "starts_with" ? "" : "%"}${value}${operator === "ends_with" ? "" : "%"}`;
 }

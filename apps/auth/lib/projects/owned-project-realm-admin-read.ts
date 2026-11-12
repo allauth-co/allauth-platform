@@ -7,6 +7,7 @@ import type { createProjectEngineStore } from "./owned-project-engine-store";
 import { admitOwnedProjectNativeRoute } from "./owned-project-native-admission";
 import { realmAdministratorRequestGuard } from "./owned-project-realm-admin-audit";
 import {
+	listRealmAdminSessions,
 	listRealmAdminUsers,
 	readRealmAdminUser,
 	realmAdminListQuery,
@@ -14,6 +15,8 @@ import {
 
 const userPath = "/admin/get-user";
 const listPath = "/admin/list-users";
+const sessionsPath = "/admin/list-user-sessions";
+const sessionsInput = z.object({ userId: z.coerce.string() });
 const permissionPath = "/admin/has-permission";
 const unauthorized = () =>
 	new Response(null, { status: 401, headers: { "Cache-Control": "no-store" } });
@@ -59,13 +62,16 @@ export function createOwnedProjectRealmAdminRead(options: {
 			(path === userPath || path === listPath) && request.method === "GET";
 		const permissionCheck =
 			path === permissionPath && request.method === "POST";
-		if (!userRead && !permissionCheck) return;
+		const sessionRead = path === sessionsPath && request.method === "POST";
+		if (!userRead && !permissionCheck && !sessionRead) return;
 		if (request.headers.has("authorization"))
 			return accountLinkJson(
 				{ message: "Use your signed-in browser session for this action." },
 				403,
 			);
-		if (!options.trustedRequest(request.headers, permissionCheck))
+		if (
+			!options.trustedRequest(request.headers, permissionCheck || sessionRead)
+		)
 			return accountLinkJson({ message: "Invalid origin" }, 403);
 
 		return store.transaction(async (client) => {
@@ -136,6 +142,24 @@ export function createOwnedProjectRealmAdminRead(options: {
 							),
 					);
 				return accountLinkJson({ error: null, success });
+			}
+			if (sessionRead) {
+				if (!administrator)
+					return accountLinkError(
+						403,
+						"YOU_ARE_NOT_ALLOWED_TO_LIST_USERS_SESSIONS",
+						"You are not allowed to list users sessions",
+					);
+				const parsed = sessionsInput.safeParse(await options.readBody(request));
+				if (!parsed.success)
+					return accountLinkError(
+						400,
+						"VALIDATION_ERROR",
+						"[body] Invalid session query.",
+					);
+				return accountLinkJson({
+					sessions: await listRealmAdminSessions(client, parsed.data.userId),
+				});
 			}
 			const listing = path === listPath;
 			if (!administrator)
