@@ -1,6 +1,10 @@
 import type { PoolClient } from "pg";
 import * as z from "zod";
 import {
+	decideOwnedAgentApproval,
+	listOwnedAgentApprovals,
+} from "./owned-project-agent-approvals";
+import {
 	agentHostCapabilities,
 	agentHostJSON as json,
 	createOwnedAgentHost,
@@ -105,17 +109,21 @@ export function createOwnedProjectAgentHosts(options: BrowserHosts) {
 		path: string,
 		request: Request,
 	): Promise<Response | undefined> => {
+		const decision =
+			request.method === "POST" && path === "/agent/approve-capability";
+		const pending = request.method === "GET" && path === "/agent/ciba/pending";
 		const write =
-			request.method === "POST" &&
-			(path === "/host/revoke" || path === "/host/create");
+			decision ||
+			(request.method === "POST" &&
+				(path === "/host/revoke" || path === "/host/create"));
 		const enroll = request.method === "POST" && path === "/host/enroll";
 		const read =
 			request.method === "GET" &&
 			(path === "/host/get" || path === "/host/list");
-		if (!write && !read && !enroll) return;
+		if (!write && !read && !enroll && !pending) return;
 		const limited = await options.store.transaction((client) =>
 			admitOwnedProjectNativeRoute(client, options.trustedIP(request), path, {
-				max: 100,
+				max: decision ? 5 : pending ? 300 : 100,
 				windowMs: 60_000,
 			}),
 		);
@@ -160,6 +168,8 @@ export function createOwnedProjectAgentHosts(options: BrowserHosts) {
 							"Sign in again with a verified account before approving access.",
 						)
 					: json({ code: "UNAUTHORIZED", message: "Unauthorized" }, 401);
+			if (decision) return decideOwnedAgentApproval(client, userId, body);
+			if (pending) return listOwnedAgentApprovals(client, userId);
 			if (write) {
 				if (path === "/host/create")
 					return createOwnedAgentHost(client, userId, body);

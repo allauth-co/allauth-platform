@@ -93,7 +93,7 @@ async function native(pool: Pool) {
 }
 
 describe.skipIf(!existsSync(fixture))(
-	"isolated PostgreSQL project Agent Auth host management",
+	"isolated PostgreSQL project Agent Auth browser operations",
 	() => {
 		const name = `allauth_hosted_${randomUUID().replaceAll("-", "")}`;
 		let administrator: Pool;
@@ -116,7 +116,7 @@ describe.skipIf(!existsSync(fixture))(
 				basePath: project.basePath,
 				signingSecret: project.signingSecret,
 				trustedOrigins: [],
-				trustedIP: () => "192.0.2.76",
+				trustedIP: (request) => request.headers.get("x-real-ip"),
 				policy: defaultAuthPolicy,
 				agentHosts,
 			});
@@ -716,6 +716,345 @@ describe.skipIf(!existsSync(fixture))(
 					200,
 				),
 			).toMatchObject({ status: "pending_enrollment" });
+		});
+
+		const fixtureDeviceCode = "ABCD-2345";
+		const privateApprovalToken = "disposable-fixture-notification-field";
+
+		async function pendingApproval(
+			hostId: string,
+			method: "ciba" | "device_authorization",
+			actor = owner,
+		) {
+			const agentId = randomUUID();
+			const approvalId = randomUUID();
+			const schema = `"${alpha.schemaName}"`;
+			await database.query(
+				`INSERT INTO ${schema}."agent" (id,name,"userId","hostId",status,mode,"publicKey",metadata,"createdAt","updatedAt")
+				VALUES ($1,'Fixture delegated agent',$2,$3,'pending','delegated',$4,'{"existing":"fixture"}',now(),now())`,
+				[agentId, actor.id, hostId, dependentKey],
+			);
+			await database.query(
+				`INSERT INTO ${schema}."approvalRequest" (id,method,"agentId","hostId","userId",status,"userCodeHash","loginHint","bindingMessage","deliveryMode",interval,"expiresAt","createdAt","updatedAt")
+				VALUES ($1,$2,$3,$4,$5,'pending',$6,$7,'Fixture approval request',$8,5,now()+interval '5 minutes',now(),now())`,
+				[
+					approvalId,
+					method,
+					agentId,
+					hostId,
+					actor.id,
+					method === "device_authorization"
+						? createHash("sha256").update(fixtureDeviceCode).digest("base64url")
+						: null,
+					actor.email,
+					method === "ciba" ? "poll" : null,
+				],
+			);
+			return { agentId, approvalId };
+		}
+
+		function approvalDecision(cookie: string, body: object, ip: string) {
+			const input = request(alpha, "/agent/approve-capability", cookie, body);
+			input.headers.set("x-real-ip", ip);
+			return input;
+		}
+
+		it("lists the owner's live device and CIBA rows with native fields and no delivery credentials", async () => {
+			const host = await createHost("Approval listing host");
+			const ciba = await pendingApproval(host.hostId, "ciba");
+			const device = await pendingApproval(host.hostId, "device_authorization");
+			const expired = await pendingApproval(host.hostId, "ciba");
+			const peerHost = await createHost("Peer approval host", peerCookie);
+			const foreign = await pendingApproval(peerHost.hostId, "ciba", peer);
+			const schema = `"${alpha.schemaName}"`;
+			await database.query(
+				`UPDATE ${schema}."approvalRequest" SET "expiresAt"=now()-interval '1 minute' WHERE id=$1`,
+				[expired.approvalId],
+			);
+			await database.query(
+				`UPDATE ${schema}."approvalRequest" SET "clientNotificationToken"=$2,capabilities='fixture.read' WHERE id=$1`,
+				[ciba.approvalId, privateApprovalToken],
+			);
+			await database.query(
+				`INSERT INTO ${schema}."agentCapabilityGrant" (id,"agentId",capability,status,constraints,reason,"createdAt","updatedAt")
+				VALUES ($1,$2,'fixture.read','pending','{"scope":"fixture"}','Fixture reason',now(),now())`,
+				[randomUUID(), ciba.agentId],
+			);
+			const path = "/agent/ciba/pending";
+			const previous = await legacy.handler(request(alpha, path, ownerCookie));
+			const candidate = await owned.dispatch(request(alpha, path, ownerCookie));
+			expect(previous.status).toBe(200);
+			expect(candidate.status).toBe(200);
+			const reference = (await previous.json()) as {
+				requests: Array<{ approval_id: string; expires_in: number }>;
+			};
+			const returned = (await candidate.json()) as typeof reference;
+			expect(returned.requests.map((row) => row.approval_id)).toEqual([
+				device.approvalId,
+				ciba.approvalId,
+			]);
+			for (const row of returned.requests) {
+				const baseline = reference.requests.find(
+					(item) => item.approval_id === row.approval_id,
+				);
+				expect(baseline).toBeDefined();
+				expect(
+					Math.abs((baseline?.expires_in ?? 0) - row.expires_in),
+				).toBeLessThanOrEqual(1);
+				expect(row).toEqual({ ...baseline, expires_in: row.expires_in });
+			}
+			expect(returned.requests[1]).toMatchObject({
+				capability_constraints: { "fixture.read": { scope: "fixture" } },
+				capability_reasons: { "fixture.read": "Fixture reason" },
+			});
+			for (const value of [
+				privateApprovalToken,
+				fixtureDeviceCode,
+				owner.email,
+				expired.approvalId,
+				foreign.approvalId,
+			])
+				expect(JSON.stringify(returned)).not.toContain(value);
+			await expectSame(path, "", 401);
+			expect(
+				(await outside.dispatch(request(beta, path, ownerCookie))).status,
+			).toBe(401);
+		});
+
+		it("resolves existing owner-bound approvals and preserves outcomes through rollback", async () => {
+			const host = await createHost("Approval decision host");
+			const byNative = await pendingApproval(
+				host.hostId,
+				"device_authorization",
+			);
+			const byOwned = await pendingApproval(
+				host.hostId,
+				"device_authorization",
+			);
+			const deny = await pendingApproval(host.hostId, "ciba");
+			const approveCiba = await pendingApproval(host.hostId, "ciba");
+			const denyDevice = await pendingApproval(
+				host.hostId,
+				"device_authorization",
+			);
+			const approve = { action: "approve", user_code: "abcd 2345" };
+			const before = await legacy.handler(
+				approvalDecision(
+					ownerCookie,
+					{ ...approve, approval_id: byNative.approvalId },
+					"192.0.2.81",
+				),
+			);
+			expect(before.status).toBe(200);
+			expect(await before.json()).toEqual({
+				status: "approved",
+				agentId: byNative.agentId,
+				added: [],
+			});
+			const apply = () =>
+				owned.dispatch(
+					approvalDecision(
+						ownerCookie,
+						{ ...approve, agent_id: byOwned.agentId },
+						"192.0.2.82",
+					),
+				);
+			const race = await Promise.all([apply(), apply()]);
+			expect(race.map(({ status }) => status).sort()).toEqual([200, 412]);
+			expect(await race.find(({ ok }) => ok)?.json()).toEqual({
+				status: "approved",
+				agentId: byOwned.agentId,
+				added: [],
+			});
+			const denied = await owned.dispatch(
+				approvalDecision(
+					ownerCookie,
+					{
+						action: "deny",
+						approval_id: deny.approvalId,
+						reason: "Fixture decline",
+					},
+					"192.0.2.83",
+				),
+			);
+			expect(await denied.json()).toEqual({ status: "denied" });
+			const acceptedCiba = await owned.dispatch(
+				approvalDecision(
+					ownerCookie,
+					{ action: "approve", approval_id: approveCiba.approvalId },
+					"192.0.2.93",
+				),
+			);
+			expect(acceptedCiba.status).toBe(200);
+			expect(await acceptedCiba.json()).toEqual({
+				status: "approved",
+				agentId: approveCiba.agentId,
+				added: [],
+			});
+			const declinedDevice = await owned.dispatch(
+				approvalDecision(
+					ownerCookie,
+					{ action: "deny", approval_id: denyDevice.approvalId },
+					"192.0.2.94",
+				),
+			);
+			expect(declinedDevice.status).toBe(200);
+			expect(await declinedDevice.json()).toEqual({ status: "denied" });
+			const { rows: decisions } = await database.query(
+				`SELECT r.id,r.status,a.status AS "agentStatus",extract(epoch FROM a."expiresAt"-a."activatedAt")::int AS lifetime
+				FROM "${alpha.schemaName}"."approvalRequest" r JOIN "${alpha.schemaName}"."agent" a ON a.id=r."agentId" WHERE r.id=ANY($1::text[])`,
+				[
+					[
+						byNative.approvalId,
+						byOwned.approvalId,
+						deny.approvalId,
+						approveCiba.approvalId,
+						denyDevice.approvalId,
+					],
+				],
+			);
+			expect(decisions).toEqual(
+				expect.arrayContaining([
+					{
+						id: byNative.approvalId,
+						status: "approved",
+						agentStatus: "active",
+						lifetime: 900,
+					},
+					{
+						id: byOwned.approvalId,
+						status: "approved",
+						agentStatus: "active",
+						lifetime: 900,
+					},
+					{
+						id: deny.approvalId,
+						status: "denied",
+						agentStatus: "rejected",
+						lifetime: null,
+					},
+					{
+						id: approveCiba.approvalId,
+						status: "approved",
+						agentStatus: "active",
+						lifetime: 900,
+					},
+					{
+						id: denyDevice.approvalId,
+						status: "denied",
+						agentStatus: "rejected",
+						lifetime: null,
+					},
+				]),
+			);
+			legacy = await native(nativePool);
+			const rejected = await legacy.handler(
+				request(alpha, `/agent/get?agent_id=${deny.agentId}`, ownerCookie),
+			);
+			expect(await rejected.json()).toMatchObject({
+				status: "rejected",
+				metadata: { existing: "fixture", denyReason: "Fixture decline" },
+			});
+			const repeated = await legacy.handler(
+				approvalDecision(
+					ownerCookie,
+					{ ...approve, approval_id: byOwned.approvalId },
+					"192.0.2.84",
+				),
+			);
+			expect(repeated.status).toBe(412);
+			expect(await repeated.json()).toMatchObject({
+				error: "capability_request_already_resolved",
+			});
+		});
+
+		it("leaves approvals pending after stale, mismatched or unavailable browser decisions", async () => {
+			const host = await createHost("Guarded approval host");
+			const device = await pendingApproval(host.hostId, "device_authorization");
+			const body = { approval_id: device.approvalId, action: "approve" };
+			const attempt = async (
+				cookie: string,
+				input: object,
+				ip: string,
+				status = 403,
+			) => {
+				const native = await legacy.handler(
+					approvalDecision(cookie, input, ip),
+				);
+				const candidate = await owned.dispatch(
+					approvalDecision(cookie, input, ip),
+				);
+				expect(native.status).toBe(status);
+				expect(candidate.status).toBe(status);
+				expect(await candidate.json()).toEqual(await native.json());
+			};
+			await attempt(peerCookie, body, "192.0.2.85");
+			await attempt(ownerCookie, body, "192.0.2.86", 400);
+			await attempt(
+				ownerCookie,
+				{ ...body, user_code: "ZZZZ-9999" },
+				"192.0.2.87",
+			);
+			const stale = await signIn(owner.email);
+			const active = await legacy.handler(
+				request(alpha, "/get-session", stale),
+			);
+			const { session } = (await active.json()) as { session: { id: string } };
+			await database.query(
+				`UPDATE "${alpha.schemaName}"."session" SET "createdAt"=now()-interval '6 minutes' WHERE id=$1`,
+				[session.id],
+			);
+			await attempt(
+				stale,
+				{ ...body, user_code: fixtureDeviceCode },
+				"192.0.2.88",
+			);
+			const expired = await pendingApproval(
+				host.hostId,
+				"device_authorization",
+			);
+			await database.query(
+				`UPDATE "${alpha.schemaName}"."approvalRequest" SET "expiresAt"=now()-interval '1 minute' WHERE id=$1`,
+				[expired.approvalId],
+			);
+			await attempt(
+				ownerCookie,
+				{
+					...body,
+					approval_id: expired.approvalId,
+					user_code: fixtureDeviceCode,
+				},
+				"192.0.2.89",
+			);
+			const unbound = await pendingApproval(
+				host.hostId,
+				"device_authorization",
+			);
+			await database.query(
+				`UPDATE "${alpha.schemaName}"."approvalRequest" SET "userId"=NULL WHERE id=$1`,
+				[unbound.approvalId],
+			);
+			const rejected = await owned.dispatch(
+				approvalDecision(
+					ownerCookie,
+					{
+						...body,
+						approval_id: unbound.approvalId,
+						user_code: fixtureDeviceCode,
+					},
+					"192.0.2.90",
+				),
+			);
+			expect(rejected.status).toBe(403);
+			const { rows } = await database.query(
+				`SELECT status FROM "${alpha.schemaName}"."approvalRequest" WHERE id=ANY($1::text[])`,
+				[[device.approvalId, expired.approvalId, unbound.approvalId]],
+			);
+			expect(rows).toEqual([
+				{ status: "pending" },
+				{ status: "pending" },
+				{ status: "pending" },
+			]);
 		});
 	},
 );
