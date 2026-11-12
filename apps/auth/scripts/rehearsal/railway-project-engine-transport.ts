@@ -270,6 +270,23 @@ export async function createRailwayProjectEngineTransport(profilePath: string) {
 
 	return {
 		profile,
+		async internalWriter(args: readonly string[]) {
+			assert.ok(active && active.status === "SUCCESS");
+			assert.deepEqual(
+				(await activeDeployments()).map(({ id }) => id),
+				[active.id],
+			);
+			assert.match(args.join(" "), /^(?:status|switch (?:legacy|allauth) [0-9]{1,10} (?:legacy|allauth))$/);
+			return railway(
+				[
+					"ssh",
+					...appScope,
+					"--",
+					`node scripts/project-engine-writer.mjs ${args.join(" ")}`,
+				],
+				"run the synthetic internal writer operation",
+			);
+		},
 		async query(db: string, sql: string) {
 			assert.ok(db === "postgres" || db === source || db === restored);
 			const escaped = sql.replaceAll("'", "'\\''");

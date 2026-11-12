@@ -12,13 +12,12 @@ import { createRailwayProjectEngineTransport } from "./railway-project-engine-tr
 
 const execute = promisify(execFile);
 const [target, argument] = process.argv.slice(2);
-const internalSelection = target === "--internal";
-if (target === "--railway")
-	assert.ok(argument, "Pass the isolated Railway fixture profile.");
-const railway =
-	target === "--railway" && argument
-		? await createRailwayProjectEngineTransport(argument)
-		: undefined;
+const internalSelection = target === "--internal" || target === "--internal-railway";
+const onRailway = target === "--railway" || target === "--internal-railway";
+if (onRailway) assert.ok(argument, "Pass the isolated Railway fixture profile.");
+const railway = onRailway && argument
+	? await createRailwayProjectEngineTransport(argument)
+	: undefined;
 const [releaseImage, rehearsalImage] = railway
 	? ["release", "candidate"]
 	: internalSelection
@@ -541,9 +540,11 @@ try {
 	}
 
 	async function internalWriter(...args: string[]) {
-		const output = await docker(
-			"exec", application, "node", "scripts/project-engine-writer.mjs", ...args,
-		);
+		const output = railway
+			? await railway.internalWriter(args)
+			: await docker(
+				"exec", application, "node", "scripts/project-engine-writer.mjs", ...args,
+			);
 		return JSON.parse(output) as { writer: string; revision: number };
 	}
 
@@ -577,27 +578,29 @@ try {
 			CLOUDFLARE_ACCOUNT_ID: run,
 			CLOUDFLARE_EMAIL_API_TOKEN: run,
 		};
-		await start(
-			releaseImage,
-			restored,
-			{ ...mail, ALLAUTH_PROJECT_ENGINE_INTERNAL_ID: control.id },
-			503,
-		);
-		expectStatus(
-			await request(`${controlPath}/not-installed`, { realm: control }),
-			404,
-			"An ineligible project fails readiness and retains the legacy writer.",
-		);
-		await stop(restored);
-		await start(
-			releaseImage,
-			restored,
-			{ ALLAUTH_PROJECT_ENGINE_INTERNAL_ID: owned.id },
-			503,
-		);
-		await stop(restored);
+		if (!railway) {
+			await start(
+				releaseImage,
+				restored,
+				{ ...mail, ALLAUTH_PROJECT_ENGINE_INTERNAL_ID: control.id },
+				503,
+			);
+			expectStatus(
+				await request(`${controlPath}/not-installed`, { realm: control }),
+				404,
+				"An ineligible project fails readiness and retains the legacy writer.",
+			);
+			await stop(restored);
+			await start(
+				releaseImage,
+				restored,
+				{ ALLAUTH_PROJECT_ENGINE_INTERNAL_ID: owned.id },
+				503,
+			);
+			await stop(restored);
+		}
 		internalEnvironment = { ...mail, ALLAUTH_PROJECT_ENGINE_INTERNAL_ID: owned.id };
-		await start(releaseImage, restored, internalEnvironment);
+		await start(rehearsalImage, restored, internalEnvironment);
 		assert.deepEqual(await internalWriter("status"), { writer: "legacy", revision: 0 });
 		expectStatus(
 			await request(`${direct}/not-installed`, { realm: owned }),
@@ -618,7 +621,7 @@ try {
 	} else {
 		await start(rehearsalImage, restored, selected);
 	}
-	if (railway) {
+	if (railway && !internalSelection) {
 		const marker = createHash("sha256").update(databaseNonce).digest("hex");
 		await query(
 			restored,
