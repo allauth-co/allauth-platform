@@ -45,15 +45,12 @@ export async function requireDirectoryAdministrator(instance: AuthInstance, head
 	return session;
 }
 
-export async function apiRoute(request: Request, callback: (instance: AuthInstance, env: AuthEnvironment) => Promise<Response>, options?: { platformOnly?: boolean }) {
+export async function apiResponse(callback: (selectWorkspace: (workspace: string) => void) => Promise<Response>) {
 	let upgradeWorkspace: string | undefined;
 	try {
-		const project = new URL(request.url).searchParams.get("project");
-		if (project) {
-			if (options?.platformOnly) throw new APIError("BAD_REQUEST", { message: "This endpoint manages the AllAuth platform." });
-			return await withProjectAuth(project, (instance, env, selected) => { upgradeWorkspace = selected.workspaceId; return callback(instance, env); });
-		}
-		return await withAuth((instance, env) => callback(instance, env));
+		return await callback((workspace) => {
+			upgradeWorkspace = workspace;
+		});
 	}
 	catch (error) {
 		const limit = commercialLimitError(error);
@@ -65,4 +62,23 @@ export async function apiRoute(request: Request, callback: (instance: AuthInstan
 		console.error("AllAuth API request failed", error instanceof Error ? error.name : "UnknownError");
 		return json({ error: "The request could not be completed." }, 500);
 	}
+}
+
+export function apiRoute(
+	request: Request,
+	callback: (instance: AuthInstance, env: AuthEnvironment) => Promise<Response>,
+	options?: { platformOnly?: boolean },
+) {
+	return apiResponse(async (selectWorkspace) => {
+		const project = new URL(request.url).searchParams.get("project");
+		if (!project) return withAuth((instance, env) => callback(instance, env));
+		if (options?.platformOnly)
+			throw new APIError("BAD_REQUEST", {
+				message: "This endpoint manages the AllAuth platform.",
+			});
+		return withProjectAuth(project, (instance, env, selected) => {
+			selectWorkspace(selected.workspaceId);
+			return callback(instance, env);
+		});
+	});
 }

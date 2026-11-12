@@ -71,6 +71,11 @@ export interface OwnedProjectIssuerAuthorizationOptions {
 		request: Request,
 		client: PoolClient,
 	): Promise<ProjectIssuerBrowserSession | null>;
+	/** Separate fresh console authority for the initial GET of a trusted client. */
+	readConsoleOAuthSession?(
+		request: Request,
+		client: PoolClient,
+	): Promise<ProjectIssuerBrowserSession | null>;
 }
 
 interface SavedConsent {
@@ -242,6 +247,7 @@ export function createOwnedProjectIssuerAuthorization(
 		const session = await options.readSession(request, client);
 		return session?.user.id &&
 			session.user.id === session.session.userId &&
+			!session.session.impersonatedBy &&
 			Number.isFinite(authTime(session))
 			? session
 			: null;
@@ -356,7 +362,7 @@ export function createOwnedProjectIssuerAuthorization(
 			query.params,
 		);
 		if (query.resources.length > 1) storedQuery.resource = query.resources;
-		delete storedQuery.max_age;
+		storedQuery.max_age = undefined;
 		const value = {
 			type: "authorization_code",
 			query: storedQuery,
@@ -449,7 +455,22 @@ export function createOwnedProjectIssuerAuthorization(
 						asJSON,
 					);
 				await assertResources(client, registration, query);
-				const session = await liveSession(request, client);
+				const ordinary = await liveSession(request, client);
+				const consoleSession =
+					!ordinary &&
+					!signed &&
+					request.method === "GET" &&
+					registration.skipConsent &&
+					!query.prompt.has("consent")
+						? await options.readConsoleOAuthSession?.(request, client)
+						: null;
+				const session =
+					ordinary ??
+					(consoleSession?.session.impersonatedBy &&
+					consoleSession.session.userId === consoleSession.user.id &&
+					Number.isFinite(authTime(consoleSession))
+						? consoleSession
+						: null);
 				if (signed && !session)
 					return new ProjectOAuthError(
 						"login_required",
@@ -488,6 +509,12 @@ export function createOwnedProjectIssuerAuthorization(
 				requireOrdinaryOffline(session, query);
 				const referenceId = await organizationReference(client, session, query);
 				if (referenceId === null) {
+					if (session.session.impersonatedBy)
+						throw new ProjectOAuthError(
+							"access_denied",
+							"A support session cannot choose an organization.",
+							403,
+						);
 					if (query.prompt.has("none"))
 						throw new ProjectOAuthError(
 							"interaction_required",

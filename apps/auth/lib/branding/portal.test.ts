@@ -70,6 +70,28 @@ describe("hosted application branding boundary", () => {
 		expect(response.headers.get("cache-control")).toBe("no-store");
 	});
 
+	it("uses explicit engine capabilities while preserving the legacy defaults", async () => {
+		const request = new Request("https://origin.example/api/config");
+		expect(await (await configurationGET(request)).json()).toMatchObject({
+			apiKeys: true, enterpriseSSO: true, scim: false,
+		});
+		engine.dispatch.mockResolvedValueOnce(Response.json({
+			apple: false,
+			microsoft: false,
+			googleProvider: null,
+			emailPassword: true,
+			signUpEnabled: false,
+			emailVerificationRequired: true,
+			passwordPolicy: defaultPasswordPolicy,
+			apiKeys: false,
+			enterpriseSSO: false,
+			scim: true,
+		}));
+		expect(await (await configurationGET(request)).json()).toMatchObject({
+			apiKeys: false, enterpriseSSO: false, scim: true, signUpEnabled: false,
+		});
+	});
+
 	it("keeps apex configuration and metadata generic without reading another application's branding", async () => {
 		mocks.withRequest.mockImplementation((_request: Request, callback: (instance: object, environment: typeof mocks.environment, request: Request, selected: null) => Promise<unknown>) => callback({ options: { plugins: [] } }, mocks.environment, _request, null));
 		const configuration = await (await configurationGET(new Request("https://allauth.co/api/config?project=verified-alpha"))).json();

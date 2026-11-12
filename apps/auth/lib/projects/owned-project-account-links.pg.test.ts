@@ -468,6 +468,8 @@ describe.skipIf(!existsSync(fixturePath))(
 				404,
 			);
 			expect((await engine.dispatch(follow(proof))).status).toBe(404);
+			const cleanupStarted = Promise.withResolvers<void>();
+			const finishCleanup = Promise.withResolvers<void>();
 			beforeDelete = async ({ user }) => {
 				const client = await database.connect();
 				try {
@@ -484,13 +486,27 @@ describe.skipIf(!existsSync(fixturePath))(
 					await client.query("ROLLBACK");
 					client.release();
 				}
+				cleanupStarted.resolve();
+				await finishCleanup.promise;
 			};
+			const first = engine.dispatch(follow(proof, account.cookie));
 			try {
-				const replies = await Promise.all(
-					[1, 2].map(() => engine.dispatch(follow(proof, account.cookie))),
-				);
-				expect(replies.map(({ status }) => status).sort()).toEqual([302, 404]);
-				const removed = replies.find(({ status }) => status === 302)!;
+				try {
+					await Promise.race([
+						cleanupStarted.promise,
+						first.then((response) => {
+							throw new Error(
+								`Deletion ended before cleanup with status ${response.status}.`,
+							);
+						}),
+					]);
+					const replay = await engine.dispatch(follow(proof, account.cookie));
+					expect(replay.status).toBe(404);
+				} finally {
+					finishCleanup.resolve();
+				}
+				const removed = await first;
+				expect(removed.status).toBe(302);
 				expect(removed.headers.get("location")).toBe(destination);
 				expect(
 					removed.headers

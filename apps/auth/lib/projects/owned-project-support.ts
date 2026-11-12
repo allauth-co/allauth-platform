@@ -432,89 +432,127 @@ export function createOwnedProjectSupportHttp(
 		return target?.token === token ? target : null;
 	}
 
-	async function readBrowserSession(request: Request) {
-		if (
-			new URL(request.url).origin !== platform ||
-			request.headers.has("authorization") ||
-			request.headers.get("sec-fetch-site") === "cross-site"
-		)
-			return json(null);
+	function supportBrowserTransport(request: Request) {
+		return (
+			new URL(request.url).origin === platform &&
+			!request.headers.has("authorization") &&
+			request.headers.get("sec-fetch-site") !== "cross-site"
+		);
+	}
+
+	async function admittedBrowserSession(
+		request: Request,
+		client: PoolClient,
+		consoleOAuth = false,
+	) {
 		const token = readLegacySessionCookie(
 			request.headers,
 			`${cookiePrefix}session_token`,
 			options.signingSecret,
 		);
 		if (!token) return;
-		return store.transaction(async (client) => {
-			const revoke = options.revokeSession;
-			const realm = projectSupportStore(
-				client,
-				revoke && ((current) => revoke(client, current, request)),
-			);
-			const observed = await realm.session(token, "token");
-			if (!observed) return json(null, 200, clearSession(request));
-			if (!observed.impersonatedBy) return;
-			const stored = await realm.verification(supportSessionKey(observed.id));
-			const binding = decodeBinding(stored);
-			if (
-				stored &&
-				(!binding || !matchingSupport(binding, observed, project.id))
-			)
-				return json(null);
+		const revoke = options.revokeSession;
+		const realm = projectSupportStore(
+			client,
+			revoke && ((current) => revoke(client, current, request)),
+		);
+		const observed = await realm.session(token, "token");
+		if (!observed) return "clear" as const;
+		if (!observed.impersonatedBy) return;
+		const stored = await realm.verification(supportSessionKey(observed.id));
+		if (consoleOAuth && stored) return;
+		const binding = decodeBinding(stored);
+		if (stored && (!binding || !matchingSupport(binding, observed, project.id)))
+			return "deny" as const;
 
-			let proxyVersion: string | undefined;
-			if (request.headers.has("allauth-proxy-signature")) {
-				if (!binding) return json(null);
-				const verified = await options.verifyProxy(request);
-				if (
-					!verified ||
-					!exactOrigin(binding.callbackUrl, verified.origin) ||
-					!browserOrigin(request, verified.origin)
+		let proxyVersion: string | undefined;
+		if (request.headers.has("allauth-proxy-signature")) {
+			if (!binding) return "deny" as const;
+			const verified = await options.verifyProxy(request);
+			if (
+				!verified ||
+				!exactOrigin(binding.callbackUrl, verified.origin) ||
+				!browserOrigin(request, verified.origin)
+			)
+				return "deny" as const;
+			proxyVersion = verified.proxyVersion;
+		} else {
+			const origin = request.headers.get("origin");
+			if (binding?.application || (origin && origin !== platform))
+				return "deny" as const;
+			const actor = await platformActor(request, false);
+			if (actor?.user.id !== observed.impersonatedBy) return "deny" as const;
+		}
+
+		const target = binding
+			? await currentBoundTarget(
+					realm,
+					binding,
+					token,
+					await options.configuration(),
+					proxyVersion,
 				)
-					return json(null);
-				proxyVersion = verified.proxyVersion;
-			} else {
-				const origin = request.headers.get("origin");
-				if (binding?.application || (origin && origin !== platform))
-					return json(null);
-				const actor = await platformActor(request, false);
-				if (actor?.user.id !== observed.impersonatedBy) return json(null);
-			}
-
-			const target = binding
-				? await currentBoundTarget(
-						realm,
-						binding,
-						token,
-						await options.configuration(),
-						proxyVersion,
-					)
+			: consoleOAuth
+				? await realm.session(token, "token", { lock: "write" })
 				: observed;
-			if (!target || !eligibleTarget(target)) {
-				await realm.revokeSession(observed);
-				return json(null, 200, clearSession(request));
-			}
-			const current = await store.session(token, 0, client);
-			if (
-				!current ||
-				current.session.id !== target.id ||
-				current.session.impersonatedBy !== target.impersonatedBy ||
-				current.user.id !== target.userId ||
-				!eligibleTarget(current.user) ||
-				Date.parse(current.session.expiresAt) !== target.expiresAt.getTime()
-			)
-				return json(null, 200, clearSession(request));
+		if (!target || !eligibleTarget(target)) {
+			if (!consoleOAuth) await realm.revokeSession(observed);
+			return "clear" as const;
+		}
+		// The support exchange locks this same session before adding its
+		// connected-app binding. Recheck after taking the console lock.
+		if (
+			consoleOAuth &&
+			(await realm.verification(supportSessionKey(target.id)))
+		)
+			return "deny" as const;
+		const current = await store.session(token, 0, client);
+		if (
+			!current ||
+			current.session.id !== observed.id ||
+			current.session.id !== target.id ||
+			current.session.impersonatedBy !== observed.impersonatedBy ||
+			current.session.impersonatedBy !== target.impersonatedBy ||
+			current.user.id !== target.userId ||
+			!eligibleTarget(current.user) ||
+			Date.parse(current.session.expiresAt) !== target.expiresAt.getTime()
+		)
+			return "clear" as const;
+		return current;
+	}
+
+	async function readBrowserSession(request: Request) {
+		if (!supportBrowserTransport(request)) return json(null);
+		return store.transaction(async (client) => {
+			const current = await admittedBrowserSession(request, client);
+			if (current === "clear") return json(null, 200, clearSession(request));
+			if (!current) return;
+			if (current === "deny") return json(null);
 			const { session, user } = current;
 			return json({
 				session: {
 					...session,
 					createdAt: new Date(session.createdAt).toISOString(),
 					updatedAt: new Date(session.updatedAt).toISOString(),
-					expiresAt: target.expiresAt.toISOString(),
+					expiresAt: new Date(session.expiresAt).toISOString(),
 				},
 				user: projectUserResponse(user),
 			});
 		});
+	}
+
+	/** Read a live, console-only support identity for the issuer's initial browser GET. */
+	async function readConsoleOAuthSession(request: Request, client: PoolClient) {
+		if (
+			!supportBrowserTransport(request) ||
+			request.method !== "GET" ||
+			new URL(request.url).pathname !==
+				`/api/projects/${slug}/auth/oauth2/authorize` ||
+			request.headers.has("allauth-proxy-signature")
+		)
+			return null;
+		const current = await admittedBrowserSession(request, client, true);
+		return current && typeof current !== "string" ? current : null;
 	}
 
 	function supportIdentity(binding: Binding, target: SupportSession) {
@@ -1298,5 +1336,8 @@ export function createOwnedProjectSupportHttp(
 			throw error;
 		}
 	}
-	return Object.assign(dispatch, { readBrowserSession });
+	return Object.assign(dispatch, {
+		readBrowserSession,
+		readConsoleOAuthSession,
+	});
 }

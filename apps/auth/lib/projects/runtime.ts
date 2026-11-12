@@ -61,10 +61,11 @@ import {
 	requireWorkspacePrincipal,
 } from "../workspaces/authorization";
 import { backendCredentialRepository } from "./backend-credentials";
+import { projectBrokerTwoFactor } from "./broker-two-factor";
 import { createBoundedProjectCache } from "./cache";
 import { projectManagement } from "./management-plugin";
-import { projectBrokerTwoFactor } from "./broker-two-factor";
 import { projectOriginFingerprint } from "./origins";
+import type { OwnedProjectSCIMConsole } from "./owned-project-scim-console";
 import { verifiedProjectRequest } from "./proxy";
 import type { Project } from "./registry";
 import {
@@ -515,6 +516,26 @@ export function withProjectAuth<T>(
 		slug,
 		(entry, project) => callback(legacyInstance(entry), entry.env, project),
 		environment,
+	);
+}
+
+/** Use the selected writer for the existing directory console API. */
+export function withProjectSCIMConsole(
+	slug: string,
+	callback: (
+		manage: OwnedProjectSCIMConsole | undefined,
+		readLegacy: () => Instance,
+		env: AuthEnvironment,
+		project: Project,
+	) => Promise<Response>,
+) {
+	return withDirectProjectEntry(slug, (entry, project) =>
+		callback(
+			entry.engine.manageSCIMConsole,
+			() => legacyInstance(entry),
+			entry.env,
+			project,
+		),
 	);
 }
 

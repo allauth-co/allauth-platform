@@ -1,8 +1,9 @@
 import { APIError } from "better-auth";
+import * as z from "zod";
 import { getAuthEnvironment, withAuth, withAuthEngine } from "../auth";
 import type { AuthInstance } from "../api";
 import type { AuthEngine } from "../auth-engine";
-import { setting } from "../configuration";
+import { authOrigin, setting } from "../configuration";
 import type { AuthEnvironment } from "../configuration";
 import { getProject } from "../projects/registry";
 import type { Project } from "../projects/registry";
@@ -136,13 +137,72 @@ export async function withPortalHeaders<T>(
 
 export async function withPortalHeadersEngine<T>(
 	headers: Headers,
-	callback: (engine: AuthEngine, headers: Headers, binding: HostedBinding | null) => Promise<T>,
+	callback: (
+		engine: AuthEngine,
+		headers: Headers,
+		binding: HostedBinding | null,
+		env: AuthEnvironment,
+	) => Promise<T>,
 ): Promise<T> {
 	const bound = await bindPortalHeaders(headers);
-	if (!bound) return withAuthEngine((engine) => callback(engine, headers, null));
+	if (!bound)
+		return withAuthEngine((engine, env) => callback(engine, headers, null, env));
 	const { binding, env } = bound;
-	return withHostedProjectAuthEngine(binding.project, binding.hostname,
-		(engine) => callback(engine, bound.headers, binding), env);
+	return withHostedProjectAuthEngine(
+		binding.project,
+		binding.hostname,
+		(engine, env) => callback(engine, bound.headers, binding, env),
+		env,
+	);
 }
 
-export function portalSession(headers:Headers) {return withPortalHeaders(headers,(instance,bound)=>instance.api.getSession({headers:bound,query:{disableCookieCache:true}}));}
+const portalIdentity = z.object({
+	user: z.object({
+		id: z.string().min(1),
+		name: z.string(),
+		email: z.string(),
+		emailVerified: z.boolean(),
+		banned: z.boolean().nullish(),
+		isAnonymous: z.boolean().nullish(),
+	}),
+	session: z.object({
+		id: z.string().min(1),
+		userId: z.string().min(1),
+		impersonatedBy: z.string().nullish(),
+	}),
+}).nullable();
+
+/** Read the live portal identity from the engine selected by the verified realm. */
+export function portalSessionContext(headers: Headers) {
+	return withPortalHeadersEngine(headers, async (engine, bound, binding, env) => {
+		const origin = binding ? `https://${binding.hostname}` : authOrigin(env);
+		// A browser may navigate here from another site. The server reads only
+		// the cookies already admitted for this realm and session device context.
+		const sessionHeaders = new Headers({ accept: "application/json" });
+		for (const name of ["cookie", "user-agent", "x-real-ip", "cf-connecting-ip"]) {
+			const value = bound.get(name);
+			if (value) sessionHeaders.set(name, value);
+		}
+		const response = await engine.readSession(
+			new Request(`${origin}/api/auth/get-session?disableCookieCache=true`, {
+				headers: sessionHeaders,
+			}),
+		);
+		if (response.status === 401) return { binding, session: null };
+		if (!response.ok) throw new Error("Unable to read the portal session.");
+		const identity = portalIdentity.safeParse(
+			await response.json().catch(() => undefined),
+		);
+		if (
+			!identity.success ||
+			(identity.data && identity.data.session.userId !== identity.data.user.id)
+		)
+			throw new Error("Invalid portal session response.");
+		return { binding, session: identity.data };
+	});
+}
+
+/** Read the current identity for an account or authorization page. */
+export async function portalSession(headers: Headers) {
+	return (await portalSessionContext(headers)).session;
+}

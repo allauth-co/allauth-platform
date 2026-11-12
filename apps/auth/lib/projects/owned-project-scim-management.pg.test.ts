@@ -5,13 +5,14 @@ import { getTestInstance } from "better-auth/test";
 import { Kysely, PostgresDialect } from "kysely";
 import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { defaultAuthPolicy } from "../auth-policy/policy";
 import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
+import { createOwnedProjectEngine } from "./owned-project-engine";
 import {
 	ownedSCIMCredentialDigest,
 	ownedSCIMScopes,
 } from "./owned-project-scim-managed-credentials";
 import { createOwnedProjectSCIMManagement } from "./owned-project-scim-management";
-import { createOwnedProjectSCIMResources } from "./owned-project-scim-resources";
 
 const fixturePath = new URL(
 	"../../../../.secrets/local-postgres.json",
@@ -91,7 +92,7 @@ describe.skipIf(!existsSync(fixturePath))(
 		let legacy: Awaited<ReturnType<typeof legacyFixture>>;
 		let manage: ReturnType<typeof createOwnedProjectSCIMManagement>;
 		let manageOther: ReturnType<typeof createOwnedProjectSCIMManagement>;
-		let owned: ReturnType<typeof createOwnedProjectSCIMResources>;
+		let owned: ReturnType<typeof createOwnedProjectEngine>["dispatch"];
 		let created = false;
 
 		beforeAll(async () => {
@@ -176,13 +177,17 @@ describe.skipIf(!existsSync(fixturePath))(
 				});
 			manage = configured(schema);
 			manageOther = configured(other);
-			owned = createOwnedProjectSCIMResources({
+			owned = createOwnedProjectEngine({
 				database,
-				schemaName: schema,
-				credentialHashSecret: secret,
-				baseURL: authURL,
-				manageCredentialUsage: true,
-			});
+				project: { slug: "scim-catalog-fixture", schemaName: schema },
+				signingSecret: "isolated-scim-catalog-signing-fixture-key",
+				baseURL: connectorOrigin,
+				basePath: "/api/auth",
+				trustedOrigins: [],
+				policy: defaultAuthPolicy,
+				trustedIP: () => "192.0.2.77",
+				scim: { credentialHashSecret: secret },
+			}).dispatch;
 		});
 
 		afterAll(async () => {

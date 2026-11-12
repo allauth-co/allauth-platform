@@ -1,6 +1,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { createServer } from "node:http";
 import { APIError } from "better-auth";
+import { GET as openid } from "../../app/.well-known/openid-configuration/route";
 import * as consoleOrganizations from "../../app/api/admin/organizations/route";
 import * as hosted from "../../app/api/auth/[...all]/route";
 import { GET as config } from "../../app/api/config/route";
@@ -8,16 +9,20 @@ import { GET as health } from "../../app/api/health/route";
 import * as projectAuth from "../../app/api/projects/[slug]/auth/[...all]/route";
 import { GET as brokerLogin } from "../../app/oauth/login/route";
 import { authOrigin } from "../configuration";
-import { createOwnedProjectEngine } from "./owned-project-engine";
-import { projectRegistryPool } from "./registry";
+import { resolveHostedBinding } from "../domains/hosting";
+import { createOwnedProjectRuntimeCandidate } from "./owned-project-runtime-factory";
+import { getProject, projectRegistryPool } from "./registry";
 import {
 	closeProjectInstances,
 	installIsolatedProjectEngineFixture,
+	withHostedProjectAuthEngine,
+	withProjectAuthEngine,
 } from "./runtime";
 
 export interface ProjectRuntimeFixtureBoot {
 	databaseURL: string;
 	projectId: string;
+	projectSlug: string;
 	schemaName: string;
 	owned: boolean;
 }
@@ -52,6 +57,8 @@ async function requestFromHTTP(incoming: IncomingMessage) {
 
 async function dispatch(request: Request) {
 	const path = new URL(request.url).pathname;
+	if (request.method === "GET" && path === "/.well-known/openid-configuration")
+		return openid(request);
 	if (request.method === "GET" && path === "/api/health") return health();
 	if (request.method === "GET" && path === "/api/config")
 		return config(request);
@@ -105,7 +112,22 @@ async function boot(selection: ProjectRuntimeFixtureBoot) {
 	globalThis.fetch = Object.assign(async () => outboundDisabled(), {
 		preconnect: outboundDisabled,
 	});
-	if (selection.owned)
+	const pending = new Set<Promise<void>>();
+	if (selection.owned) {
+		const env = {
+			...process.env,
+			EMAIL: {
+				async send(message: { to: string; subject: string; text: string }) {
+					process.send?.({
+						mail: {
+							to: message.to,
+							subject: message.subject,
+							text: message.text,
+						},
+					});
+				},
+			},
+		};
 		installIsolatedProjectEngineFixture({
 			projectId: selection.projectId,
 			schemaName: selection.schemaName,
@@ -118,19 +140,63 @@ async function boot(selection: ProjectRuntimeFixtureBoot) {
 				basePath,
 				signingSecret,
 			}) =>
-				createOwnedProjectEngine({
+				createOwnedProjectRuntimeCandidate({
 					database,
 					project,
 					policy,
-					baseURL,
-					basePath,
-					trustedOrigins: project.origins,
+					env,
+					transport:
+						basePath === "/api/auth"
+							? { kind: "hosted", origin: baseURL }
+							: { kind: "direct" },
 					signingSecret,
-					trustedIP: () => trustedFixtureIP,
-					security: { requireTrustedIP: true },
-					passwordChange: { checkPasswordSafety: async () => "allowed" },
+					trustedIP: (request) => request.headers.get("x-real-ip"),
+					defer(work) {
+						const operation = Promise.resolve()
+							.then(work)
+							.catch(() => undefined);
+						pending.add(operation);
+						void operation.finally(() => pending.delete(operation));
+					},
+					async fetchPasswordRange(request) {
+						const url = new URL(request.url);
+						if (
+							url.origin !== "https://api.pwnedpasswords.com" ||
+							!/^\/range\/[0-9A-F]{5}$/.test(url.pathname) ||
+							request.headers.get("add-padding") !== "true"
+						)
+							outboundDisabled();
+						return new Response(`${"F".repeat(35)}:0\r\n`);
+					},
+					async postBackchannelLogout(destination, payload) {
+						if (
+							destination.href !== "https://rp.runtime.fixture.example/logout"
+						)
+							outboundDisabled();
+						process.send?.({ logout: payload.get("logout_token") });
+						return 204;
+					},
 				}),
 		});
+		const project = await getProject(selection.projectSlug, env);
+		const host = `${project.slug}-accounts.allauth.co`;
+		const binding = await resolveHostedBinding(host, env);
+		if (
+			project.id !== selection.projectId ||
+			project.schemaName !== selection.schemaName ||
+			binding?.project.id !== project.id
+		)
+			throw new Error(
+				"Fixture project or hosted binding did not match startup authority.",
+			);
+		await withProjectAuthEngine(project.slug, async () => undefined, env);
+		await withHostedProjectAuthEngine(
+			binding.project,
+			host,
+			async () => undefined,
+			env,
+		);
+	}
 	const server = createServer(async (incoming, response) => {
 		try {
 			await reply(response, await dispatch(await requestFromHTTP(incoming)));
@@ -159,6 +225,7 @@ async function boot(selection: ProjectRuntimeFixtureBoot) {
 		if (message !== "stop") return;
 		server.close(async () => {
 			try {
+				await Promise.allSettled(pending);
 				await Promise.all([
 					closeProjectInstances(),
 					projectRegistryPool(process.env).end(),
@@ -176,5 +243,20 @@ if (!process.send)
 		"Start the isolated project HTTP fixture from its PostgreSQL test.",
 	);
 process.once("message", (message: ProjectRuntimeFixtureBoot) => {
-	void boot(message).catch(() => process.exit(1));
+	void boot(message).catch((error: unknown) => {
+		const known =
+			error instanceof Error &&
+			/^(This development project|The development candidate|The selected development project|Invalid project hosted binding|Fixture project or hosted binding)\b/.test(
+				error.message,
+			);
+		console.error(
+			"Project runtime fixture boot failed",
+			error instanceof Error
+				? known
+					? error.message
+					: error.name
+				: "UnknownError",
+		);
+		process.exit(1);
+	});
 });

@@ -3,20 +3,38 @@ import type { SCIMScope } from "@better-auth/scim";
 import { APIError } from "better-auth";
 import * as z from "zod";
 import type { AuthInstance } from "./api";
-import { json, requireDirectoryAdministrator, requireSameOrigin } from "./api";
+import { apiResponse, apiRoute, json, requireDirectoryAdministrator, requireSameOrigin } from "./api";
 import type { AuthEnvironment } from "./configuration";
 import { authOrigin } from "./configuration";
 import type { DirectoryBinding } from "./enterprise";
 import { provisioningDomain, recordAudit } from "./enterprise";
-import { projectInstance } from "./projects/runtime";
+import type { OwnedProjectSCIMConsoleRoute } from "./projects/owned-project-scim-console";
+import { withProjectSCIMConsole } from "./projects/runtime";
 
 const scopes = ["scim.users.read", "scim.users.write", "scim.groups.read", "scim.groups.write"] as const satisfies readonly SCIMScope[];
 const expiry = () => new Date(Date.now() + 90 * 24 * 60 * 60 * 1000);
 const baseURL = (env: AuthEnvironment) => `${authOrigin(env)}/api/auth/scim/v2`;
 
+export function scimConsoleRoute(request: Request, route: OwnedProjectSCIMConsoleRoute) {
+	const { organizationId } = route;
+	const legacy = (instance: AuthInstance, env: AuthEnvironment) => {
+		if ("connectionId" in route)
+			return mutateDirectory(instance, request, env, organizationId, route.connectionId, route.operation);
+		return route.operation === "list"
+			? listDirectories(instance, request, env, organizationId)
+			: createDirectory(instance, request, env, organizationId);
+	};
+	const slug = new URL(request.url).searchParams.get("project");
+	if (!slug) return apiRoute(request, legacy);
+	return apiResponse((selectWorkspace) =>
+		withProjectSCIMConsole(slug, (manage, readLegacy, env, project) => {
+			selectWorkspace(project.workspaceId);
+			return manage ? manage(request, route) : legacy(readLegacy(), env);
+		}),
+	);
+}
+
 export async function listDirectories(instance: AuthInstance, request: Request, env: AuthEnvironment, organizationId: string) {
-	const engine = projectInstance(instance)?.engine;
-	if (engine?.manageSCIMConsole) return engine.manageSCIMConsole(request, { operation: "list", organizationId });
 	await requireDirectoryAdministrator(instance, request.headers, organizationId);
 	const catalog = await instance.api.listSCIMManagedConnections({ body: { provisioningDomainId: provisioningDomain(organizationId) } });
 	const database = (await instance.$context).adapter;
@@ -29,8 +47,6 @@ export async function listDirectories(instance: AuthInstance, request: Request, 
 }
 
 export async function createDirectory(instance: AuthInstance, request: Request, env: AuthEnvironment, organizationId: string) {
-	const engine = projectInstance(instance)?.engine;
-	if (engine?.manageSCIMConsole) return engine.manageSCIMConsole(request, { operation: "create", organizationId });
 	requireSameOrigin(request, env);
 	const actor = await requireDirectoryAdministrator(instance, request.headers, organizationId);
 	const { providerId } = z.object({ providerId: z.string().trim().min(1).max(255) }).strict().parse(await request.json());
@@ -50,8 +66,6 @@ export async function createDirectory(instance: AuthInstance, request: Request, 
 }
 
 export async function mutateDirectory(instance: AuthInstance, request: Request, env: AuthEnvironment, organizationId: string, connectionId: string, action: "rotate" | "revoke" | "decommission") {
-	const engine = projectInstance(instance)?.engine;
-	if (engine?.manageSCIMConsole) return engine.manageSCIMConsole(request, { operation: action, organizationId, connectionId });
 	requireSameOrigin(request, env);
 	const actor = await requireDirectoryAdministrator(instance, request.headers, organizationId);
 	const database = (await instance.$context).adapter;

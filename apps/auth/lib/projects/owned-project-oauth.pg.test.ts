@@ -9,14 +9,14 @@ import { Kysely, PostgresDialect } from "kysely";
 import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { defaultAuthPolicy } from "../auth-policy/policy";
+import { discoveryDocument } from "../discovery";
 import { appleIntegrity } from "../project-providers/apple";
 import { microsoftIntegrity } from "../project-providers/microsoft";
-import { discoveryDocument } from "../discovery";
 import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
 import { createOwnedProjectEngine } from "./owned-project-engine";
 import { createProjectEngineStore } from "./owned-project-engine-store";
-import { createOwnedProjectOAuth } from "./owned-project-oauth";
 import type { OwnedProjectOAuthOptions } from "./owned-project-oauth";
+import { createOwnedProjectOAuth } from "./owned-project-oauth";
 
 const fixturePath = new URL(
 	"../../../../.secrets/local-postgres.json",
@@ -656,7 +656,7 @@ describe.skipIf(!existsSync(fixturePath))(
 			const configuration = await response.json();
 			expect(configuration).toMatchObject({
 				emailPassword: defaultAuthPolicy.emailAndPasswordEnabled,
-				signUpEnabled: defaultAuthPolicy.signUpEnabled,
+				signUpEnabled: false,
 				emailVerificationRequired: defaultAuthPolicy.requireEmailVerification,
 				passwordPolicy: defaultAuthPolicy.passwordPolicy,
 				google: true,
@@ -667,6 +667,9 @@ describe.skipIf(!existsSync(fixturePath))(
 				appleProvider: "apple",
 				organizations: true,
 				twoFactor: true,
+				apiKeys: false,
+				enterpriseSSO: false,
+				scim: false,
 			});
 			expect(JSON.stringify(configuration)).not.toMatch(
 				/clientSecret|signingSecret|tenantId|fixture-secret/,

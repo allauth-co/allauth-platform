@@ -1,9 +1,11 @@
 import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
+import type { OAuthClaimExtensionInput } from "@better-auth/oauth-provider";
+import { oauthProvider } from "@better-auth/oauth-provider";
 import { APIError } from "better-auth";
-import { admin } from "better-auth/plugins";
+import { admin, jwt } from "better-auth/plugins";
 import { getTestInstance } from "better-auth/test";
-import { decodeJwt } from "jose";
+import { createLocalJWKSet, decodeJwt, jwtVerify } from "jose";
 import { Kysely, PostgresDialect } from "kysely";
 import { Pool } from "pg";
 import {
@@ -42,6 +44,7 @@ const otherOrigin = "https://other.support-fixture.example";
 const callbackUrl = `${supportOrigin}/api/allauth/support/callback`;
 const slug = "support-fixture";
 const basePath = `/api/projects/${slug}/auth`;
+const issuer = origin + basePath;
 const cookieName = `__Secure-allauth_project_${slug}.session_token`;
 const platformCookie = "__Secure-allauth_fixture_platform.session_token";
 const signingSecret = "isolated-owned-project-support-pg-signing-secret";
@@ -68,6 +71,29 @@ type BrowserSupport = {
 	};
 	user: Record<string, unknown>;
 };
+
+async function fixtureActorClaims({
+	ctx,
+	sessionId,
+	scopes,
+}: OAuthClaimExtensionInput) {
+	if (!sessionId) return {};
+	const session = await ctx.context.adapter.findOne<{
+		impersonatedBy?: string;
+	}>({
+		model: "session",
+		where: [{ field: "id", value: sessionId }],
+	});
+	if (!session?.impersonatedBy) return {};
+	if (scopes.includes("offline_access"))
+		throw new APIError("FORBIDDEN", {
+			message: "Offline access is unavailable during impersonation.",
+		});
+	return {
+		act: { sub: session.impersonatedBy },
+		[`${origin}/impersonated_by`]: session.impersonatedBy,
+	};
+}
 
 function signedCookie(name: string, token: string) {
 	const signature = createHmac("sha256", signingSecret)
@@ -259,6 +285,22 @@ describe.skipIf(!existsSync(fixturePath))(
 						},
 					},
 					plugins: [
+						jwt({ jwt: { issuer }, jwks: { keyPairConfig: { alg: "RS256" } } }),
+						oauthProvider({
+							loginPage: "/sign-in",
+							consentPage: "/oauth/consent",
+							grantTypes: ["authorization_code", "refresh_token"],
+							scopes: ["openid", "profile", "offline_access"],
+							enforcePerClientResources: true,
+							extensions: [
+								{
+									claims: {
+										accessToken: fixtureActorClaims,
+										idToken: fixtureActorClaims,
+									},
+								},
+							],
+						}),
 						admin(),
 						allauthControl(),
 						projectManagement({
@@ -385,6 +427,7 @@ describe.skipIf(!existsSync(fixturePath))(
 				typeof createOwnedProjectEngine
 			>[0]["backchannelLogout"],
 			transport = { baseURL: origin, basePath },
+			issuerEnabled = false,
 		) {
 			return createOwnedProjectEngine({
 				database,
@@ -395,6 +438,7 @@ describe.skipIf(!existsSync(fixturePath))(
 				policy: defaultAuthPolicy,
 				trustedIP: () => "203.0.113.20",
 				backchannelLogout,
+				issuer: issuerEnabled,
 				support: {
 					projectId: project.id,
 					workspaceId: project.workspaceId,
@@ -1593,6 +1637,178 @@ describe.skipIf(!existsSync(fixturePath))(
 				[original.id, data.session.id],
 			);
 			expect(sessions.rows).toEqual([{ id: original.id }]);
+		});
+
+		it("authorizes a live console support actor only for registered clients with approved consent", async () => {
+			const candidate = ownedEngine(undefined, undefined, true);
+			const actor = await account("admin", "public");
+			const platformSession = await session(actor, "public");
+			const target = await account();
+			const clientId = `fixture-actor-${randomUUID()}`;
+			const redirect = `${applicationOrigin}/oauth/actor-callback`;
+			const resource = `${applicationOrigin}/oauth/actor-resource`;
+			await database.query(
+				`INSERT INTO "${schema}"."oauthClient"(id,"clientId","redirectUris","tokenEndpointAuthMethod","skipConsent","requirePKCE","enableEndSession",scopes)
+				 VALUES($1,$1,$2,'none',TRUE,TRUE,TRUE,'["openid","profile","offline_access"]')`,
+				[clientId, JSON.stringify([redirect])],
+			);
+			await database.query(
+				`INSERT INTO "${schema}"."oauthResource"(id,identifier,name) VALUES($1,$2,'Actor fixture resource')`,
+				[randomUUID(), resource],
+			);
+			await database.query(
+				`INSERT INTO "${schema}"."oauthClientResource"(id,"clientId","resourceId") VALUES($1,$2,$3)`,
+				[randomUUID(), clientId, resource],
+			);
+			const start = await native(
+				request("/project-admin/impersonate-user", {
+					caller: origin,
+					cookie: platformSession.cookie,
+					signed: false,
+					body: { userId: target.id },
+				}),
+			);
+			expect(start.status, await start.clone().text()).toBe(200);
+			const supported = (await start.json()) as BrowserSupport;
+			const cookie = `${platformSession.cookie}; ${cookieOf(start)}`;
+			const verifier = opaque();
+			function authorize(
+				headers = new Headers({ origin, cookie }),
+				extra = {},
+			) {
+				const query = new URLSearchParams({
+					client_id: clientId,
+					redirect_uri: redirect,
+					response_type: "code",
+					scope: "openid profile",
+					prompt: "none",
+					state: "actor-state",
+					code_challenge: sha(verifier),
+					code_challenge_method: "S256",
+					resource,
+					...extra,
+				});
+				headers.set("sec-fetch-mode", "navigate");
+				return new Request(`${issuer}/oauth2/authorize?${query}`, { headers });
+			}
+			async function result(response: Response) {
+				const location = response.headers.get("location");
+				expect(location, await response.clone().text()).toBeTruthy();
+				return new URL(location!, origin);
+			}
+			async function token(
+				dispatch: (input: Request) => Promise<Response>,
+				code: string,
+			) {
+				const response = await dispatch(
+					new Request(`${issuer}/oauth2/token`, {
+						method: "POST",
+						body: new URLSearchParams({
+							grant_type: "authorization_code",
+							client_id: clientId,
+							code,
+							code_verifier: verifier,
+							redirect_uri: redirect,
+						}),
+					}),
+				);
+				expect(response.status, await response.clone().text()).toBe(200);
+				const tokens = (await response.json()) as {
+					access_token: string;
+					id_token: string;
+					refresh_token?: string;
+				};
+				expect(tokens.refresh_token).toBeUndefined();
+				return tokens;
+			}
+			const candidateCode = (
+				await result(await candidate(authorize()))
+			).searchParams.get("code");
+			const nativeCode = (
+				await result(await native(authorize()))
+			).searchParams.get("code");
+			expect(candidateCode).toBeTruthy();
+			expect(nativeCode).toBeTruthy();
+			const issued = [
+				await token(native, candidateCode!),
+				await token(candidate, nativeCode!),
+			];
+			const keys = createLocalJWKSet(
+				await (await native(new Request(`${issuer}/jwks`))).json(),
+			);
+			for (const { access_token, id_token } of issued) {
+				for (const [value, audience] of [
+					[access_token, resource],
+					[id_token, clientId],
+				]) {
+					const { payload } = await jwtVerify(value!, keys, {
+						issuer,
+						audience,
+						subject: target.id,
+					});
+					expect(payload).toMatchObject({
+						act: { sub: actor.id },
+						[`${origin}/impersonated_by`]: actor.id,
+						sid: supported.session.id,
+					});
+				}
+			}
+			const offline = await result(
+				await candidate(
+					authorize(undefined, { scope: "openid profile offline_access" }),
+				),
+			);
+			expect(offline.searchParams.get("error")).toBe("access_denied");
+			expect(offline.searchParams.has("code")).toBe(false);
+			const missingActor = await result(
+				await candidate(
+					authorize(new Headers({ origin, cookie: cookieOf(start) })),
+				),
+			);
+			expect(missingActor.searchParams.get("error")).toBe("login_required");
+			const foreignSite = await result(
+				await candidate(
+					authorize(
+						new Headers({ origin, cookie, "sec-fetch-site": "cross-site" }),
+					),
+				),
+			);
+			expect(foreignSite.searchParams.get("error")).toBe("login_required");
+			const connected = await nativeConsoleSupport();
+			const connectedCookies = `${connected.root.cookie}; ${connected.cookie}`;
+			const connectedResult = await result(
+				await candidate(
+					authorize(new Headers({ origin, cookie: connectedCookies })),
+				),
+			);
+			expect(connectedResult.searchParams.get("error")).toBe("login_required");
+
+			const mutation = await candidate(
+				request("/update-user", {
+					caller: origin,
+					cookie,
+					signed: false,
+					body: { name: "Disallowed change" },
+				}),
+			);
+			expect(mutation.status).toBe(401);
+			await database.query(
+				`UPDATE "${schema}"."oauthClient" SET "skipConsent"=FALSE WHERE "clientId"=$1`,
+				[clientId],
+			);
+			expect(
+				(await result(await candidate(authorize()))).searchParams.get("error"),
+			).toBe("login_required");
+			await database.query(
+				`UPDATE "${schema}"."oauthClient" SET "skipConsent"=TRUE WHERE "clientId"=$1`,
+				[clientId],
+			);
+			await database.query('DELETE FROM public."session" WHERE id=$1', [
+				platformSession.id,
+			]);
+			expect(
+				(await result(await candidate(authorize()))).searchParams.get("error"),
+			).toBe("login_required");
 		});
 
 		it("ends only the supplied native realm support cookie and denies nested, administrator and cross-origin impersonation", async () => {

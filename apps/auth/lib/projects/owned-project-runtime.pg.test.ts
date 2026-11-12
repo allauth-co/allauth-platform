@@ -1,9 +1,11 @@
 import { execFile, fork } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { once } from "node:events";
 import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import type { JSONWebKeySet } from "jose";
+import { createLocalJWKSet, jwtVerify } from "jose";
 import { Pool } from "pg";
 import { describe, expect, it, vi } from "vitest";
 import { clerkCompatiblePasswords } from "../clerk-password";
@@ -28,6 +30,8 @@ const platformOrigin = "https://project-runtime-fixture.example";
 const edgeSecret = "disposable-project-runtime-fixture-edge-signing-secret";
 const platformSecret =
 	"disposable-project-runtime-fixture-platform-signing-secret";
+const oauthClientId = "runtime-issuer-fixture-client";
+const oauthRedirectURI = "https://rp.runtime.fixture.example/callback";
 const credentials = {
 	platform: { id: "fixture-owner", email: "owner@runtime.fixture.example" },
 	project: {
@@ -81,10 +85,20 @@ async function openProcess(
 		if (diagnostics.length < 8_192)
 			diagnostics += Buffer.from(chunk).toString("utf8");
 	});
-	const exited = once(child, "exit");
+	const exited = once(child, "close");
+	const mail: { to: string; subject: string; text: string }[] = [];
+	const logout: string[] = [];
+	child.on(
+		"message",
+		(message: { mail?: (typeof mail)[number]; logout?: string }) => {
+			if (message.mail) mail.push(message.mail);
+			if (message.logout) logout.push(message.logout);
+		},
+	);
 	const boot: ProjectRuntimeFixtureBoot = {
 		databaseURL,
 		projectId: project.id,
+		projectSlug: project.slug,
 		schemaName: project.schemaName,
 		owned,
 	};
@@ -103,11 +117,13 @@ async function openProcess(
 		if (!Number.isInteger(port))
 			throw new Error("Fixture HTTP process did not supply a port.");
 		return {
+			mail,
+			logout,
 			async request(
 				path: string,
 				options: {
 					cookie?: string;
-					body?: Record<string, unknown>;
+					body?: Record<string, unknown> | URLSearchParams;
 					host?: string;
 					origin?: string;
 					clientIP?: string;
@@ -118,9 +134,18 @@ async function openProcess(
 					: platformOrigin;
 				const headers = new Headers({ origin: options.origin ?? origin });
 				if (options.cookie) headers.set("cookie", options.cookie);
+				const form = options.body instanceof URLSearchParams;
 				const body =
-					options.body === undefined ? undefined : JSON.stringify(options.body);
-				if (body) headers.set("content-type", "application/json");
+					options.body === undefined
+						? undefined
+						: form
+							? options.body.toString()
+							: JSON.stringify(options.body);
+				if (body)
+					headers.set(
+						"content-type",
+						form ? "application/x-www-form-urlencoded" : "application/json",
+					);
 				const method = body === undefined ? "GET" : "POST";
 				const forwarded = options.host
 					? await signEdgeRequest(
@@ -157,6 +182,60 @@ async function openProcess(
 		await exited.catch(() => undefined);
 		throw error;
 	}
+}
+
+async function issueFixtureTokens(
+	service: Awaited<ReturnType<typeof openProcess>>,
+	transport: { prefix: string; issuer: string; host?: string; cookie: string },
+) {
+	const verifier = "runtime-restart-fixture-project-issuer-proof-verifier";
+	const state = randomUUID();
+	const query = new URLSearchParams({
+		response_type: "code",
+		client_id: oauthClientId,
+		redirect_uri: oauthRedirectURI,
+		scope: "openid profile",
+		state,
+		code_challenge_method: "S256",
+		code_challenge: createHash("sha256").update(verifier).digest("base64url"),
+	});
+	const authorization = await service.request(
+		`${transport.prefix}/oauth2/authorize?${query}`,
+		transport,
+	);
+	const location =
+		authorization.headers.get("location") ??
+		((await authorization.json()) as { url?: string }).url;
+	expect(location).toBeTruthy();
+	const callback = new URL(location!);
+	expect(callback.origin + callback.pathname).toBe(oauthRedirectURI);
+	expect(callback.searchParams.get("state")).toBe(state);
+	expect(callback.searchParams.get("iss")).toBe(transport.issuer);
+	const response = await service.request(`${transport.prefix}/oauth2/token`, {
+		host: transport.host,
+		body: new URLSearchParams({
+			grant_type: "authorization_code",
+			client_id: oauthClientId,
+			redirect_uri: oauthRedirectURI,
+			code: callback.searchParams.get("code") ?? "",
+			code_verifier: verifier,
+		}),
+	});
+	expect(
+		response.status,
+		response.ok ? undefined : await response.clone().text(),
+	).toBe(200);
+	const tokens = (await response.json()) as { id_token: string };
+	const keyResponse = await service.request(`${transport.prefix}/jwks`, {
+		host: transport.host,
+	});
+	expect(keyResponse.status).toBe(200);
+	const keys = (await keyResponse.json()) as JSONWebKeySet;
+	await jwtVerify(tokens.id_token, createLocalJWKSet(keys), {
+		issuer: transport.issuer,
+		audience: oauthClientId,
+	});
+	return keys;
 }
 
 async function seed(databaseURL: string) {
@@ -231,6 +310,15 @@ async function seed(databaseURL: string) {
 				{ workspaceId: workspace.id, principal: owner },
 			);
 			await insertAccount(project.schemaName, credentials.project);
+			await database.query(
+				`INSERT INTO "${project.schemaName}"."oauthClient" (id,"clientId","redirectUris","grantTypes",scopes,"tokenEndpointAuthMethod","skipConsent","backchannelLogoutUri","createdAt","updatedAt")
+			VALUES ($1,$1,$2::jsonb,'["authorization_code","refresh_token","urn:ietf:params:oauth:grant-type:device_code"]','["openid","profile"]','none',true,$3,now(),now())`,
+				[
+					oauthClientId,
+					JSON.stringify([oauthRedirectURI]),
+					"https://rp.runtime.fixture.example/logout",
+				],
+			);
 			return project;
 		}
 		return {
@@ -272,6 +360,8 @@ describe.skipIf(!existsSync(fixture))(
 				const alphaPath = `/api/projects/${alpha.slug}/auth`;
 				const betaPath = `/api/projects/${beta.slug}/auth`;
 				const alphaHost = `${alpha.slug}-accounts.allauth.co`;
+				const directIssuer = `${platformOrigin}${alphaPath}`;
+				const hostedIssuer = `https://${alphaHost}/api/auth`;
 				const betaHost = `${beta.slug}-accounts.allauth.co`;
 				const login = {
 					email: credentials.project.email,
@@ -312,6 +402,37 @@ describe.skipIf(!existsSync(fixture))(
 
 				service = await openProcess(url(restored), alpha, true);
 				expect((await service.request("/api/health")).status).toBe(200);
+				const directDiscovery = await service.request(
+					`${alphaPath}/.well-known/openid-configuration`,
+				);
+				expect(await directDiscovery.json()).toMatchObject({
+					issuer: directIssuer,
+					token_endpoint: `${directIssuer}/oauth2/token`,
+				});
+				const hostedDiscovery = await service.request(
+					"/.well-known/openid-configuration",
+					{ host: alphaHost },
+				);
+				expect(await hostedDiscovery.json()).toMatchObject({
+					issuer: hostedIssuer,
+					authorization_endpoint: `${hostedIssuer}/oauth2/authorize`,
+					end_session_endpoint: `${hostedIssuer}/oauth2/end-session`,
+					device_authorization_endpoint: `${hostedIssuer}/device/code`,
+				});
+				const device = await service.request("/api/auth/device/code", {
+					host: alphaHost,
+					body: new URLSearchParams({
+						client_id: oauthClientId,
+						scope: "openid",
+					}),
+				});
+				expect(
+					device.status,
+					device.ok ? undefined : await device.clone().text(),
+				).toBe(200);
+				expect(await device.json()).toMatchObject({
+					verification_uri: `${platformOrigin}/device?project=${alpha.slug}`,
+				});
 				expect(
 					await (
 						await service.request(`${alphaPath}/get-session`, {
@@ -376,18 +497,92 @@ describe.skipIf(!existsSync(fixture))(
 						})
 					).status,
 				).toBe(201);
-				expect(
-					(await service.request("/api/config", { host: alphaHost })).status,
-				).toBe(200);
-				expect(
-					(await service.request("/api/config", { host: betaHost })).status,
-				).toBe(200);
+				const ownedConfig = await service.request("/api/config", {
+					host: alphaHost,
+				});
+				expect(ownedConfig.status).toBe(200);
+				expect(await ownedConfig.json()).toMatchObject({
+					apiKeys: false,
+					enterpriseSSO: false,
+					scim: false,
+					signUpEnabled: true,
+				});
+				const legacyConfig = await service.request("/api/config", {
+					host: betaHost,
+				});
+				expect(legacyConfig.status).toBe(200);
+				expect(await legacyConfig.json()).toMatchObject({
+					apiKeys: true,
+					enterpriseSSO: true,
+					scim: true,
+				});
 				expect(
 					(await service.request("/oauth/login", { host: alphaHost })).status,
 				).toBe(503);
 				expect(
 					(await service.request("/oauth/login", { host: betaHost })).status,
 				).toBe(400);
+				const directKeys = await issueFixtureTokens(service, {
+					prefix: alphaPath,
+					issuer: directIssuer,
+					cookie: legacyCookie,
+				});
+				const signupEmail = "new-registered@runtime.fixture.example";
+				const registration = await service.request("/api/auth/sign-up/email", {
+					host: alphaHost,
+					body: {
+						email: signupEmail,
+						name: "Runtime Registration",
+						password: credentials.updated,
+					},
+				});
+				expect(
+					registration.status,
+					registration.ok ? undefined : await registration.clone().text(),
+				).toBe(200);
+				const verificationURL = await vi.waitFor(() => {
+					const verification = service!.mail.find(
+						({ to }) => to === signupEmail,
+					);
+					expect(verification?.subject).toContain("Verify your");
+					const match = verification?.text.match(
+						/https:\/\/[^\s<>\]]+\/verify-email\?[^\s<>\]]+/,
+					);
+					expect(match?.[0]).toBeTruthy();
+					return new URL(match![0]);
+				});
+				expect(verificationURL.origin).toBe(`https://${alphaHost}`);
+				const verified = await service.request(
+					verificationURL.pathname + verificationURL.search,
+					{ host: alphaHost },
+				);
+				expect(verified.status).toBe(302);
+				const verifiedCookie = cookie(verified);
+				expect(verifiedCookie).toContain("session_token=");
+				const hostedKeys = await issueFixtureTokens(service, {
+					prefix: "/api/auth",
+					issuer: hostedIssuer,
+					host: alphaHost,
+					cookie: verifiedCookie,
+				});
+				expect(hostedKeys).toEqual(directKeys);
+				expect(
+					(
+						await service.request("/api/auth/sign-out", {
+							host: alphaHost,
+							cookie: verifiedCookie,
+							body: {},
+						})
+					).status,
+				).toBe(200);
+				const hostedLogout = await vi.waitFor(() => {
+					expect(service!.logout).toHaveLength(1);
+					return service!.logout[0]!;
+				});
+				await jwtVerify(hostedLogout, createLocalJWKSet(hostedKeys), {
+					issuer: hostedIssuer,
+					audience: oauthClientId,
+				});
 				const rotated = await service.request(`${alphaPath}/change-password`, {
 					cookie: legacyCookie,
 					body: {
@@ -469,6 +664,20 @@ describe.skipIf(!existsSync(fixture))(
 						expect.objectContaining({ slug: "fixture-organization" }),
 					],
 				});
+				await service.stop();
+				service = undefined;
+				const changed = new Pool({ connectionString: url(restored), max: 1 });
+				try {
+					await changed.query(
+						`UPDATE "${alpha.schemaName}"."oauthClient" SET "grantTypes" = '["client_credentials"]' WHERE "clientId" = $1`,
+						[oauthClientId],
+					);
+				} finally {
+					await changed.end();
+				}
+				await expect(openProcess(url(restored), alpha, true)).rejects.toThrow(
+					"stored features outside the candidate scope",
+				);
 			} finally {
 				try {
 					try {

@@ -1,3 +1,14 @@
-import { apiRoute } from "@/lib/api";
-import { mutateDirectory } from "@/lib/scim-management";
-export const POST = async (request: Request, context: { params: Promise<{ organizationId: string; connectionId: string }> }) => apiRoute(request, async (instance, env) => { const { organizationId, connectionId } = await context.params; return mutateDirectory(instance, request, env, organizationId, connectionId, "revoke"); });
+import { scimConsoleRoute } from "@/lib/scim-management";
+
+type Context = {
+	params: Promise<{ organizationId: string; connectionId: string }>;
+};
+
+export async function POST(request: Request, { params }: Context) {
+	const { organizationId, connectionId } = await params;
+	return scimConsoleRoute(request, {
+		operation: "revoke",
+		organizationId,
+		connectionId,
+	});
+}

@@ -179,6 +179,7 @@ interface OwnedProjectEngineOptions {
 		| "complete"
 	>;
 	scim?: { credentialHashSecret: string };
+	manageSCIMConsole?: AuthEngine["manageSCIMConsole"];
 	support?: Omit<
 		OwnedProjectSupportOptions,
 		| "database"
@@ -372,6 +373,11 @@ export function createOwnedProjectEngine(
 				},
 			},
 			readSession: (request, client) => currentSession(request.headers, client),
+			async readConsoleOAuthSession(request, client) {
+				return (
+					(await support?.readConsoleOAuthSession(request, client)) ?? null
+				);
+			},
 			keys: options.oauth?.tokenKeys ??
 				options.mfaKeys ?? { secret: options.signingSecret },
 		});
@@ -1705,29 +1711,21 @@ export function createOwnedProjectEngine(
 	const scimDiscovery =
 		options.scim &&
 		createOwnedProjectSCIMDiscovery(`${origin}${options.basePath}`);
+	const scimAuthority = options.scim && {
+		database: options.database,
+		schemaName: options.project.schemaName,
+		baseURL: `${origin}${options.basePath}`,
+		credentialHashSecret: options.scim.credentialHashSecret,
+		manageCredentialUsage: true,
+	};
 	const scimResources =
-		options.scim &&
-		createOwnedProjectSCIMResources({
-			database: options.database,
-			schemaName: options.project.schemaName,
-			baseURL: `${origin}${options.basePath}`,
-			credentialHashSecret: options.scim.credentialHashSecret,
-		});
+		scimAuthority && createOwnedProjectSCIMResources(scimAuthority);
 	const scimGroupWrites =
-		options.scim &&
-		createOwnedProjectSCIMGroupWrites({
-			database: options.database,
-			schemaName: options.project.schemaName,
-			baseURL: `${origin}${options.basePath}`,
-			credentialHashSecret: options.scim.credentialHashSecret,
-		});
+		scimAuthority && createOwnedProjectSCIMGroupWrites(scimAuthority);
 	const scimUserWrites =
-		options.scim &&
+		scimAuthority &&
 		createOwnedProjectSCIMUserWrites({
-			database: options.database,
-			schemaName: options.project.schemaName,
-			baseURL: `${origin}${options.basePath}`,
-			credentialHashSecret: options.scim.credentialHashSecret,
+			...scimAuthority,
 			async admitProfile({ client, request, email }) {
 				return (await security.admit(client, request, {
 					email,
@@ -1807,7 +1805,11 @@ export function createOwnedProjectEngine(
 				android: false,
 			},
 			emailPassword: policy.emailAndPasswordEnabled,
-			signUpEnabled: policy.signUpEnabled,
+			signUpEnabled: Boolean(
+				options.signUp &&
+					policy.emailAndPasswordEnabled &&
+					policy.signUpEnabled,
+			),
 			emailVerificationRequired: policy.requireEmailVerification,
 			passwordPolicy: policy.passwordPolicy,
 			google: googleProvider !== null,
@@ -1816,6 +1818,9 @@ export function createOwnedProjectEngine(
 			appleProvider: apple ? "apple" : null,
 			microsoft,
 			microsoftProvider: microsoft ? "microsoft" : null,
+			apiKeys: false,
+			enterpriseSSO: Boolean(sso),
+			scim: Boolean(scimAuthority && options.manageSCIMConsole),
 			organizations: true,
 			twoFactor: true,
 			profileImageUpload: false,
@@ -2136,6 +2141,7 @@ export function createOwnedProjectEngine(
 				: unsupported(),
 		readOAuthContext: async (request) =>
 			issuer ? issuer.readContext(request) : unsupported(),
+		manageSCIMConsole: options.manageSCIMConsole,
 		listAccountSessions,
 		revokeAccountSession,
 		readDirectory: async (operation, headers, query) =>

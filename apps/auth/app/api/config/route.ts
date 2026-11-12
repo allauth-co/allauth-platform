@@ -23,6 +23,9 @@ const projectCapabilities = z.object({
 	signUpEnabled: z.boolean(),
 	emailVerificationRequired: z.boolean(),
 	passwordPolicy: passwordPolicySchema,
+	apiKeys: z.boolean().optional(),
+	enterpriseSSO: z.boolean().optional(),
+	scim: z.boolean().optional(),
 	branding: z.unknown().optional(),
 });
 
@@ -77,6 +80,9 @@ export function GET(request: Request) {
 			(await readPublicApplicationBranding(binding.project.id, env));
 		return json({
 			...available,
+			apiKeys: capability.apiKeys ?? available.apiKeys,
+			enterpriseSSO: capability.enterpriseSSO ?? available.enterpriseSSO,
+			scim: capability.scim ?? available.scim,
 			apple: capability.apple,
 			appleProvider: capability.apple ? "apple" : null,
 			microsoft: capability.microsoft,

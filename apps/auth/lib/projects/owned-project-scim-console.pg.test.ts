@@ -43,14 +43,26 @@ vi.mock("./runtime", async (load) => {
 	const runtime = await load<typeof import("./runtime")>();
 	return {
 		...runtime,
-		projectInstance(instance: AuthInstance) {
-			const selected = runtime.projectInstance(instance);
-			const manageSCIMConsole =
-				selected && fixtureConsoles.get(selected.project.id);
-			return selected && manageSCIMConsole
-				? { ...selected, engine: { ...selected.engine, manageSCIMConsole } }
-				: selected;
-		},
+		withProjectSCIMConsole: (
+			slug: string,
+			callback: Parameters<typeof runtime.withProjectSCIMConsole>[1],
+		) =>
+			runtime.withProjectSCIMConsole(
+				slug,
+				(manage, readLegacy, env, project) => {
+					const fixture = fixtureConsoles.get(project.id);
+					return fixture
+						? callback(
+								fixture,
+								() => {
+									throw new Error("SCIM console selected an inactive writer.");
+								},
+								env,
+								project,
+							)
+						: callback(manage, readLegacy, env, project);
+				},
+			),
 	};
 });
 
