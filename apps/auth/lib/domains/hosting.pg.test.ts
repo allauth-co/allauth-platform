@@ -20,6 +20,7 @@ import { projectRegistryPool, provisionProject } from "../projects/registry";
 import type { Project } from "../projects/registry";
 import { closeProjectInstances, projectSecret, withHostedProjectAuth, withProjectAuth, withProjectAuthEngine } from "../projects/runtime";
 import { readProjectSessionPrincipal } from "../projects/session-principal";
+import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
 import { requireWorkspacePrincipal } from "../workspaces/authorization";
 import { createWorkspace } from "../workspaces/repository";
 import { proxy } from "../../proxy";
@@ -53,13 +54,16 @@ interface PublicSession { user: { id: string; email: string; name: string }; ses
 /** Actual native instances and PostgreSQL schemas; ingress/provider/network calls are local mocks only. */
 describe.skipIf(!existsSync(fixturePath))("real PostgreSQL hosted authentication gateway and portal", () => {
 	const databaseName = `allauth_hosted_${randomUUID().replaceAll("-", "")}`;
-	let operator: Pool; let env: AuthEnvironment; let database: ControlDatabase;
+	let operator: Pool | undefined;
+	let registry: Pool | undefined;
+	let platformDatabase: ControlDatabase | undefined;
+	let env: AuthEnvironment;
+	let database: ControlDatabase;
 	let native: Awaited<ReturnType<typeof setupNative>>;
 	let alpha: Project; let beta: Project;
 	let rootCookie: string; let rootUserId: string;
 	let alphaUserId: string; let betaUserId: string;
 	let alphaCookie: string; let betaCookie: string; let alphaSessionId: string;
-	let rootUsed = false;
 	const host = (project: Project, kind: "accounts" | "api" = "accounts") => `${project.slug}-${kind}.allauth.co`;
 	async function setupNative() {
 		return getTestInstance({ baseURL: platformOrigin, secret: String(env.BETTER_AUTH_SECRET), database: { db: database, type: "postgres", transaction: true }, logger: { disabled: true }, emailAndPassword: { enabled: true }, plugins: [admin()] }, { disableTestUser: true });
@@ -99,16 +103,20 @@ describe.skipIf(!existsSync(fixturePath))("real PostgreSQL hosted authentication
 		env = { AUTH_RUNTIME: "node", DATABASE_URL: url.toString(), BETTER_AUTH_URL: platformOrigin, BETTER_AUTH_SECRET: "isolated-hosted-native-secret-longer-than-thirty-two", SCIM_CREDENTIAL_HASH_SECRET: "isolated-hosted-scim-secret-longer-than-thirty-two", ALLAUTH_EDGE_SECRET: secret, ALLAUTH_ORIGIN_HOSTNAME: "fixture-origin.up.railway.app", ALLAUTH_HOSTING_BASE_DOMAIN: "allauth.co", CLOUDFLARE_SAAS_READY: "true", CLOUDFLARE_SAAS_ZONE_ID: "a".repeat(32), CLOUDFLARE_SAAS_API_TOKEN: "local-mock-only-never-contacted", CLOUDFLARE_SAAS_CNAME_TARGET: "frontend-api.allauth.co" };
 		for (const [key, value] of Object.entries(env)) vi.stubEnv(key, String(value));
 		for (const key of ["GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "GITHUB_CLIENT_ID", "GITHUB_CLIENT_SECRET", "MICROSOFT_CLIENT_ID", "MICROSOFT_CLIENT_SECRET", "CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_EMAIL_API_TOKEN", "EMAIL_FROM"]) vi.stubEnv(key, "");
-		const pool = projectRegistryPool(env);
-		for (const name of readdirSync(new URL("../../migrations", import.meta.url)).filter((name) => name.endsWith(".sql")).sort()) await pool.query(readFileSync(new URL(`../../migrations/${name}`, import.meta.url), "utf8"));
+		registry = projectRegistryPool(env);
+		for (const name of readdirSync(new URL("../../migrations", import.meta.url)).filter((name) => name.endsWith(".sql")).sort()) await registry.query(readFileSync(new URL(`../../migrations/${name}`, import.meta.url), "utf8"));
 		database = new Kysely({ dialect: new PostgresDialect({ pool: new Pool({ connectionString: String(env.DATABASE_URL), max: 2 }) }) });
 		vi.spyOn(process, "cwd").mockReturnValue(fileURLToPath(new URL("../..", import.meta.url)));
 		vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
 			const request = input instanceof Request ? input : new Request(input, init);
 			const url = new URL(request.url);
-			if (url.origin === platformOrigin && url.pathname === "/.well-known/openid-configuration") { rootUsed = true; return discoveryGET(request); }
+			if (url.origin === platformOrigin && url.pathname === "/.well-known/openid-configuration") return discoveryGET(request);
 			throw new Error("The hosted fixture prohibits all external HTTP and provider operations.");
 		});
+		const platformStorage = (await auth.$context).options.database;
+		if (platformStorage && typeof platformStorage === "object" && "db" in platformStorage) {
+			platformDatabase = platformStorage.db as ControlDatabase;
+		}
 		native = await setupNative();
 		const root = await native.auth.api.signUpEmail({ body: { email: sharedEmail, name: "Platform identity", password } }); rootUserId = root.user.id;
 		await (await native.auth.$context).adapter.update({ model: "user", where: [{ field: "id", value: rootUserId }], update: { emailVerified: true } });
@@ -119,17 +127,31 @@ describe.skipIf(!existsSync(fixturePath))("real PostgreSQL hosted authentication
 		alpha = await provisionProject({ name: "Alpha hosted realm", slug: "alpha-hosted", primaryOrigin: "https://alpha-app.fixture.example", origins: [], environment: "production" }, broker, principal.user.id, env, { workspaceId: workspace.id, principal });
 		beta = await provisionProject({ name: "Beta hosted realm", slug: "beta-hosted", primaryOrigin: "https://beta-app.fixture.example", origins: [], environment: "production" }, broker, principal.user.id, env, { workspaceId: workspace.id, principal });
 		for (const project of [alpha, beta]) {
-			await pool.query(`INSERT INTO "${project.schemaName}"."allauthSecurityPolicy" (id,policy) VALUES ('default',$1::jsonb)`, [JSON.stringify({ ...defaultSecurityPolicy, newDeviceNotifications: false })]);
+			await registry.query(`INSERT INTO "${project.schemaName}"."allauthSecurityPolicy" (id,policy) VALUES ('default',$1::jsonb)`, [JSON.stringify({ ...defaultSecurityPolicy, newDeviceNotifications: false })]);
 			const id = await withHostedProjectAuth(project, host(project), (instance) => seed(instance, project.name), env);
 			if (project.id === alpha.id) alphaUserId = id; else betaUserId = id;
 		}
 	}, 60000);
 	afterAll(async () => {
-		await closeProjectInstances();
-		if (rootUsed) { const configured = (await auth.$context).options.database; if (configured && typeof configured === "object" && "db" in configured) await (configured.db as ControlDatabase).destroy(); }
-		if (database) await database.destroy(); if (env) await projectRegistryPool(env).end();
-		if (operator) { await operator.query(`DROP DATABASE IF EXISTS "${databaseName}" WITH (FORCE)`); await operator.end(); }
-		vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.unstubAllEnvs();
+		try {
+			const results = await Promise.allSettled([
+				closeProjectInstances(),
+				platformDatabase?.destroy(),
+				database?.destroy(),
+				registry?.end(),
+			]);
+			const failure = results.find((result) => result.status === "rejected");
+			if (failure?.status === "rejected") throw failure.reason;
+			if (operator) await dropClosedFixtureDatabase(operator, databaseName);
+		} finally {
+			try {
+				await operator?.end();
+			} finally {
+				vi.restoreAllMocks();
+				vi.unstubAllGlobals();
+				vi.unstubAllEnvs();
+			}
+		}
 	}, 30000);
 
 	it("resolves exact stored default realms only when hosting is ready and fails closed for unknown hosts", async () => {
