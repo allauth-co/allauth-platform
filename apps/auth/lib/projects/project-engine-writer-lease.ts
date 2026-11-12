@@ -2,8 +2,12 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { Pool, PoolClient } from "pg";
 import * as z from "zod";
-import { platformWorkspaceId } from "../workspaces/types";
-import type { Project } from "./registry";
+import { projectEngineIdPattern } from "../../scripts/project-engine-rollout-selection.mjs";
+import type { ProjectEngineBinding } from "./project-engine-binding";
+import {
+	projectEngineEnrollment,
+	protectedInternalProject,
+} from "./project-engine-binding";
 
 const writer = z.enum(["legacy", "allauth"]);
 const state = z
@@ -12,8 +16,6 @@ const state = z
 		revision: z.number().int().min(0).max(2_147_483_647),
 	})
 	.refine(({ writer, revision }) => revision > 0 || writer === "legacy");
-const projectId = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/;
-
 /** A revision distinguishes successive cutovers, including a return to the original writer. */
 export type ProjectEngineWriterState = z.infer<typeof state>;
 export type ProjectEngineWriter = z.infer<typeof writer>;
@@ -23,14 +25,10 @@ export interface ProjectEngineWriterLease extends ProjectEngineWriterState {
 	readonly signal: AbortSignal;
 }
 
-type Binding = Pick<
-	Project,
-	"id" | "schemaName" | "workspaceId" | "environment" | "projectEngineFenced"
->;
 type Database = Pick<Pool, "connect">;
 interface Options {
 	database: Database;
-	project: Binding;
+	project: ProjectEngineBinding;
 	selectedProjectId: string;
 }
 
@@ -127,7 +125,7 @@ export function projectEngineWriterConnectionOptions(
 	id: string,
 	admitted: ProjectEngineWriterState,
 ) {
-	if (!projectId.test(id)) throw scopeFailure();
+	if (!projectEngineIdPattern.test(id)) throw scopeFailure();
 	const { writer, revision } = state.parse(admitted);
 	return `-c allauth.project_engine_writer=${writer} -c allauth.project_engine_project_id=${id} -c allauth.project_engine_writer_revision=${revision}`;
 }
@@ -140,23 +138,9 @@ export function projectEngineWriterConnectionOptions(
 export function createProjectEngineWriterLease(options: Options) {
 	const { database, selectedProjectId } = options;
 	const project = Object.freeze({ ...options.project });
-	const enrolled =
-		project.projectEngineFenced === true &&
-		(project.environment === "production" ||
-			(project.environment === "development" &&
-				project.workspaceId !== platformWorkspaceId));
-	const internal =
-		project.environment === "development" &&
-		project.workspaceId === platformWorkspaceId &&
-		project.projectEngineFenced !== true;
-	if (
-		!projectId.test(selectedProjectId) ||
-		project.id !== selectedProjectId ||
-		!projectId.test(project.workspaceId) ||
-		(!enrolled && !internal) ||
-		project.schemaName !==
-			`allauth_project_${selectedProjectId.replaceAll("-", "")}`
-	)
+	const enrolled = projectEngineEnrollment(project) !== undefined;
+	const internal = protectedInternalProject(project);
+	if (project.id !== selectedProjectId || (!enrolled && !internal))
 		throw scopeFailure();
 
 	async function read(client: PoolClient) {

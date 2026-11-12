@@ -13,7 +13,7 @@ import type { ActivitySource } from "../control/analytics-activity";
 import {
 	controlResponseFailure,
 	isPrimaryAuthenticationPath,
-} from "../control/events";
+} from "../control/event-contract";
 import { discoveryHeaders } from "../discovery";
 import { emailConfigured } from "../email/send";
 import { freshFeatureSession, isServerTokenRequest } from "../features/helpers";
@@ -522,7 +522,10 @@ export function createOwnedProjectEngine(
 		Request,
 		ProjectBackchannelTarget[]
 	>();
-	const completedGuestUpgrades = new WeakMap<Request, ProjectGuestProof>();
+	const completedGuestUpgrades = new WeakMap<
+		Request,
+		{ proof: ProjectGuestProof; path: string }
+	>();
 	const unavailableLogout = Symbol(
 		"Existing session requires a configured logout handler",
 	);
@@ -1003,7 +1006,11 @@ export function createOwnedProjectEngine(
 			);
 			if (proof)
 				afterOwnedProjectCommit(client, () =>
-					completedGuestUpgrades.set(request, proof),
+					completedGuestUpgrades.set(request, {
+						proof,
+						path:
+							path === "/sign-in/email" ? path : "/guest/account-upgraded",
+					}),
 				);
 		}
 		if (device?.setCookie) headers.append("Set-Cookie", device.setCookie);
@@ -3776,7 +3783,7 @@ export function createOwnedProjectEngine(
 				const upgradedGuest = completedGuestUpgrades.get(request);
 				if (response.status < 400 && guest && upgradedGuest)
 					await guest
-						.erase(request, upgradedGuest, "/guest/account-upgraded")
+						.erase(request, upgradedGuest.proof, upgradedGuest.path)
 						.catch(() => undefined);
 				const notify = notifications.get(request);
 				if (response.status < 400 && notify && newDevice)

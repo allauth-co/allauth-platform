@@ -1,10 +1,10 @@
 import type { AuthEnvironment } from "../configuration";
 import { setting } from "../configuration";
+import { projectEngineEnrollment } from "../projects/project-engine-binding";
 import {
 	developmentProjectEngineRevisions,
 	internalProjectEngineIdSetting,
 	productionProjectEngineRevisions,
-	projectEngineEnrollment,
 	projectEnginePreparedForWriter,
 	projectEngineSelected,
 } from "../projects/project-engine-internal-selection";

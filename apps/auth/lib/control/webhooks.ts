@@ -8,7 +8,7 @@ import {
 	openLegacyUnversionedRecord,
 	sealLegacyUnversionedRecord,
 } from "../legacy-encrypted-record";
-import { publicControlEvent } from "./events";
+import { publicControlEvent } from "./event-contract";
 import type { ControlDatabase, ControlEvent, ControlEventInput, ControlPrincipal } from "./types";
 
 import type { Resolver } from "./webhook-contract";

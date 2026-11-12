@@ -6,7 +6,7 @@ import { verifyProjectEncryptedSamlEvidence } from "../../lib/projects/owned-pro
 import {
 	projectEngineEnrollment,
 	protectedInternalProject,
-} from "../../lib/projects/project-engine-internal-selection";
+} from "../../lib/projects/project-engine-binding";
 import { getProject, projectRegistryPool } from "../../lib/projects/registry";
 import { projectEngineIdPattern } from "../project-engine-rollout-selection.mjs";
 

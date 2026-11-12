@@ -1,6 +1,6 @@
 import { sql } from "kysely";
 import type { AnalyticsEntity } from "./analytics-types";
-import { mutationEventType } from "./events";
+import { mutationEventType } from "./event-contract";
 import type { ControlDatabase } from "./types";
 
 export type ActivitySource = 1 | 2 | 4;

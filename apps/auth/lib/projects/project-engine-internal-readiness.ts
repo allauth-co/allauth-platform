@@ -4,10 +4,8 @@ import { setting } from "../configuration";
 import { resolveHostedBinding } from "../domains/hosting";
 import { listStoredActiveProjectAccountsHostnames } from "../domains/repository";
 import { domainDefaults } from "../domains/validation";
-import {
-	projectEngineEnrollment,
-	projectEngineSelected,
-} from "./project-engine-internal-selection";
+import { projectEngineEnrollment } from "./project-engine-binding";
+import { projectEngineSelected } from "./project-engine-internal-selection";
 import { projectWriterLease } from "./project-engine-internal-writer";
 import type { Project } from "./registry";
 import { getProject } from "./registry";

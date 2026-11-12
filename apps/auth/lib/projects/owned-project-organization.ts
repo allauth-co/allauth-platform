@@ -2,7 +2,7 @@ import type { Pool, PoolClient } from "pg";
 import * as z from "zod";
 import type { AuthPolicy } from "../auth-policy/policy";
 import { isPlatformAdmin } from "../configuration";
-import { mutationEventType } from "../control/events";
+import { mutationEventType } from "../control/event-contract";
 import type { ControlEventInput } from "../control/types";
 import {
 	activityOrganizationTarget,

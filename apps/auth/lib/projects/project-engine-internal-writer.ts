@@ -1,7 +1,7 @@
 import { Pool } from "pg";
 import type { AuthEnvironment } from "../configuration";
 import { setting } from "../configuration";
-import { protectedInternalProject } from "./project-engine-internal-selection";
+import { protectedInternalProject } from "./project-engine-binding";
 import { createProjectEngineWriterLease } from "./project-engine-writer-lease";
 import type { Project } from "./registry";
 

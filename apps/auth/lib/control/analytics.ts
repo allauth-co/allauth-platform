@@ -4,7 +4,8 @@ import { createAuthEndpoint, createAuthMiddleware } from "better-auth/api";
 import { sql } from "kysely";
 import * as z from "zod";
 import { activityOrganizationTarget, createAuthenticatedActivityCollector, isControlActivityMutation } from "./analytics-activity";
-import { controlResponseFailure, isPrimaryAuthenticationPath } from "./events";
+import { isPrimaryAuthenticationPath } from "./event-contract";
+import { controlResponseFailure } from "./events";
 import type { ControlDatabase, ControlPrincipal } from "./types";
 import type { AnalyticsCohort, AnalyticsCohortCounts, AnalyticsCoverage, AnalyticsEntitiesFilters, AnalyticsEntity, AnalyticsFilters, AnalyticsPoint, AnalyticsWindow, ControlAnalytics, ControlAnalyticsEntities } from "./analytics-types";
 

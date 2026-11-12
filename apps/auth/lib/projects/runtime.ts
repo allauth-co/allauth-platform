@@ -68,13 +68,13 @@ import { observeProjectEngine, projectEngineMetricsSelected } from "./engine-met
 import { projectManagement } from "./management-plugin";
 import { projectOriginFingerprint } from "./origins";
 import type { OwnedProjectSCIMConsole } from "./owned-project-scim-console";
+import { projectSamlApprovalValue } from "./project-engine-binding";
 import {
 	projectAgentReplayApprovalValue,
 	projectAgentReplayApproved,
 	projectAgentReplayBridgeSelected,
 	projectEnginePreparationRevision,
 	projectEngineSelected,
-	projectSamlApprovalValue,
 	selectProjectEngine,
 } from "./project-engine-internal-selection";
 import { projectWriterLease } from "./project-engine-internal-writer";

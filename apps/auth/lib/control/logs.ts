@@ -5,7 +5,7 @@ import { createAuthEndpoint } from "better-auth/api";
 import { sql } from "kysely";
 import * as z from "zod";
 import { rolesInclude } from "../configuration";
-import { publicControlEvent } from "./events";
+import { publicControlEvent } from "./event-contract";
 import { canonicalIP } from "./security";
 import type { ControlDatabase, ControlEventFilters, ControlEventsResponse, ControlPrincipal } from "./types";
 

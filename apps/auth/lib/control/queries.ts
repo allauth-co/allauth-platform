@@ -1,7 +1,7 @@
 import type { DBAdapter, Where } from "@better-auth/core/db/adapter";
 import { APIError } from "better-auth";
 import { sql } from "kysely";
-import { publicControlEvent } from "./events";
+import { publicControlEvent } from "./event-contract";
 import type { ControlDatabase, ControlEventFilters, ControlEventsResponse, ControlOverview, ControlSession, ControlSessionsResponse } from "./types";
 
 export const DEFAULT_RETENTION_DAYS = 90;

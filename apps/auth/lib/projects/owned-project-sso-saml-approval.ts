@@ -8,8 +8,8 @@ import { setting } from "../configuration";
 import type { ProjectCustomSamlTransport } from "./owned-project-sso-saml-eligibility";
 import { configureProjectSamlTransport } from "./owned-project-sso-saml-eligibility";
 import type { SsoProvider } from "./owned-project-sso-store";
-import { projectSamlApprovalValue } from "./project-engine-internal-selection";
-import type { Project } from "./registry";
+import type { ProjectEngineBinding } from "./project-engine-binding";
+import { projectSamlApprovalValue } from "./project-engine-binding";
 
 export { encryptedSamlConfigurationFingerprint };
 function invalidApproval(): never {
@@ -19,10 +19,7 @@ function invalidApproval(): never {
 /** Parse deployment authority for exactly one pending or already active fenced revision. */
 export function readProjectEncryptedSamlApproval(
 	env: AuthEnvironment,
-	binding: Pick<
-		Project,
-		"id" | "schemaName" | "workspaceId" | "environment" | "projectEngineFenced"
-	>,
+	binding: ProjectEngineBinding,
 	writer: { revision: number; preparing: boolean },
 	now = Date.now,
 ) {

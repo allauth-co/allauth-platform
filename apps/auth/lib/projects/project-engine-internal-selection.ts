@@ -11,18 +11,17 @@ import {
 	verifyAgentReplayDrainEvidence,
 } from "../../scripts/project-agent-replay-evidence.mjs";
 import {
-	developmentEncryptedSamlApprovalsSetting,
 	developmentProjectEngineRevisionsSetting,
-	encryptedSamlApprovalSetting,
-	productionEncryptedSamlApprovalsSetting,
 	productionProjectEngineRevisionsSetting,
-	projectEngineIdPattern,
-	readProjectEngineApprovalValue,
 	readProjectEngineRevisions,
 } from "../../scripts/project-engine-rollout-selection.mjs";
 import type { AuthEnvironment } from "../configuration";
 import { setting } from "../configuration";
-import { platformWorkspaceId } from "../workspaces/types";
+import type { ProjectEngineBinding } from "./project-engine-binding";
+import {
+	projectEngineEnrollment,
+	protectedInternalProject,
+} from "./project-engine-binding";
 import type { Project } from "./registry";
 import type { ProjectEngineBuilder } from "./runtime";
 
@@ -40,51 +39,15 @@ export function internalProjectPreparationRevision(env: AuthEnvironment) {
 	return Number(revision);
 }
 
-type ProjectBinding = Pick<
-	Project,
-	"id" | "environment" | "workspaceId" | "schemaName" | "projectEngineFenced"
->;
-
-function exactProjectSchema(project: ProjectBinding) {
-	return (
-		projectEngineIdPattern.test(project.id) &&
-		project.schemaName === `allauth_project_${project.id.replaceAll("-", "")}`
-	);
-}
-
-export function protectedInternalProject(project: ProjectBinding) {
-	return (
-		project.environment === "development" &&
-		project.workspaceId === platformWorkspaceId &&
-		project.projectEngineFenced !== true &&
-		exactProjectSchema(project)
-	);
-}
-
 /** The first release cohort is a single immutable development realm in the protected platform workspace. */
 export function internalProjectEngineSelected(
 	env: AuthEnvironment,
-	project: ProjectBinding,
+	project: ProjectEngineBinding,
 ) {
 	return (
 		setting(env, internalProjectEngineIdSetting).trim() === project.id &&
 		protectedInternalProject(project)
 	);
-}
-
-export function projectEngineEnrollment(project: ProjectBinding) {
-	if (
-		project.projectEngineFenced !== true ||
-		!projectEngineIdPattern.test(project.workspaceId) ||
-		!exactProjectSchema(project)
-	)
-		return;
-	if (project.environment === "production") return "production";
-	if (
-		project.environment === "development" &&
-		project.workspaceId !== platformWorkspaceId
-	)
-		return "development";
 }
 
 export function productionProjectEngineRevisions(env: AuthEnvironment) {
@@ -102,7 +65,7 @@ export function developmentProjectEngineRevisions(env: AuthEnvironment) {
 
 export function projectEngineSelected(
 	env: AuthEnvironment,
-	project: ProjectBinding,
+	project: ProjectEngineBinding,
 ) {
 	if (internalProjectEngineSelected(env, project)) return true;
 	const enrollment = projectEngineEnrollment(project);
@@ -115,7 +78,7 @@ export function projectEngineSelected(
 
 export function projectEnginePreparationRevision(
 	env: AuthEnvironment,
-	project: ProjectBinding,
+	project: ProjectEngineBinding,
 ) {
 	if (internalProjectEngineSelected(env, project))
 		return internalProjectPreparationRevision(env);
@@ -128,7 +91,7 @@ export function projectEnginePreparationRevision(
 
 export function projectEnginePreparedForWriter(
 	env: AuthEnvironment,
-	project: ProjectBinding,
+	project: ProjectEngineBinding,
 	writer: { revision: number; preparing: boolean },
 ) {
 	const expected = writer.preparing ? writer.revision : writer.revision - 1;
@@ -139,7 +102,7 @@ export function projectEnginePreparedForWriter(
 
 /** Scope the legacy Agent bridge independently of candidate selection. */
 export function projectAgentReplayBridgeSelected(
-	project: ProjectBinding,
+	project: ProjectEngineBinding,
 	env: AuthEnvironment,
 ) {
 	if (protectedInternalProject(project))
@@ -159,7 +122,7 @@ export function projectAgentReplayBridgeSelected(
 }
 
 export function projectAgentReplayApprovalValue(
-	project: ProjectBinding,
+	project: ProjectEngineBinding,
 	env: AuthEnvironment,
 ) {
 	if (protectedInternalProject(project))
@@ -177,27 +140,9 @@ export function projectAgentReplayApprovalValue(
 	);
 }
 
-export function projectSamlApprovalValue(
-	project: ProjectBinding,
-	env: AuthEnvironment,
-) {
-	if (protectedInternalProject(project))
-		return setting(env, encryptedSamlApprovalSetting).trim();
-	const enrollment = projectEngineEnrollment(project);
-	if (!enrollment) return "";
-	return readProjectEngineApprovalValue(
-		setting(
-			env,
-			enrollment === "production"
-				? productionEncryptedSamlApprovalsSetting
-				: developmentEncryptedSamlApprovalsSetting,
-		),
-		project.id,
-	);
-}
 /** Check the operator's exact revision and drain window, including cached preparation. */
 export function projectAgentReplayApproved(
-	project: ProjectBinding,
+	project: ProjectEngineBinding,
 	env: AuthEnvironment,
 	writer: { revision: number; preparing: boolean },
 ) {

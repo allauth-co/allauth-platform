@@ -15,7 +15,7 @@ import type {
 	AnalyticsEntitiesFilters,
 	AnalyticsFilters,
 } from "../control/analytics-types";
-import { isPrimaryAuthenticationPath } from "../control/events";
+import { isPrimaryAuthenticationPath } from "../control/event-contract";
 import { canonicalIP } from "../control/security-policy";
 import type { ControlDatabase, ControlPrincipal } from "../control/types";
 import { accountLinkJson } from "./owned-project-account-links";

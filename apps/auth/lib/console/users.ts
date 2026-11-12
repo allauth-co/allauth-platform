@@ -2,7 +2,7 @@ import { APIError } from "better-auth";
 import { sql } from "kysely";
 import * as z from "zod";
 import type { ControlDatabase } from "../control/types";
-import { publicControlEvent } from "../control/events";
+import { publicControlEvent } from "../control/event-contract";
 import { defaultSecurityPolicy, securityPolicySchema } from "../control/security";
 import { publicProjectUser } from "../projects/management-plugin";
 

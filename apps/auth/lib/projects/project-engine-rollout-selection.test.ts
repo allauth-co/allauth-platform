@@ -13,6 +13,7 @@ import {
 	readProjectEngineApprovalValue,
 } from "../../scripts/project-engine-rollout-selection.mjs";
 import { platformWorkspaceId } from "../workspaces/types";
+import { projectSamlApprovalValue } from "./project-engine-binding";
 import {
 	internalProjectEngineIdSetting,
 	productionProjectEngineRevisionsSetting,
@@ -21,7 +22,6 @@ import {
 	projectEnginePreparationRevision,
 	projectEnginePreparedForWriter,
 	projectEngineSelected,
-	projectSamlApprovalValue,
 } from "./project-engine-internal-selection";
 
 const firstId = "2462e18a-4970-4e12-821a-780814a5a0cf";

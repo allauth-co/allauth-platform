@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { runWithAdapter } from "@better-auth/core/context";
 import { oauthProvider } from "@better-auth/oauth-provider";
-import { APIError } from "better-auth";
+import { APIError, betterAuth } from "better-auth";
 import { symmetricDecrypt } from "better-auth/crypto";
 import {
 	admin,
@@ -16,6 +16,7 @@ import { getTestInstance } from "better-auth/test";
 import { Kysely, PostgresDialect } from "kysely";
 import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { createAuthOptions } from "../auth";
 import { authPolicyPlugin } from "../auth-policy/plugin";
 import { defaultAuthPolicy } from "../auth-policy/policy";
 import { clerkCompatiblePasswords } from "../clerk-password";
@@ -1674,6 +1675,202 @@ describe.skipIf(!existsSync(fixture))(
 					},
 				},
 			]);
+			expect(await exercise("owned")).toEqual(native);
+		});
+
+		it("delivers the native guest deletion events on sign-in to an existing account", async () => {
+			const path = "/sign-in/email";
+			const ip = "192.0.2.122";
+			const policy = { ...defaultAuthPolicy, requireEmailVerification: false };
+			const legacyOptions = createAuthOptions(
+				{ db: projectDatabase, type: "postgres", transaction: true },
+				{
+					ALLAUTH_AUTH_URL: origin,
+					ALLAUTH_AUTH_SECRET: alpha.secret,
+					AUTH_RUNTIME: "node",
+					SCIM_CREDENTIAL_HASH_SECRET: "synthetic-guest-upgrade-fixture-key",
+					EMAIL_PROVIDER: "cloudflare",
+					CLOUDFLARE_ACCOUNT_ID: "",
+					CLOUDFLARE_EMAIL_API_TOKEN: "",
+				},
+				{
+					name: "Webhook guest fixture",
+					basePath: alpha.path,
+					cookiePrefix: `allauth_project_${alpha.slug}`,
+					primaryOrigin: origin,
+					publicOrigin: origin,
+					origins: [],
+					broker: {
+						clientId: "fixture-broker",
+						clientSecret: "synthetic-broker-secret",
+					},
+					authorizeAdmin: readRoot,
+					management: { id: "guest-upgrade-fixture" },
+				},
+				policy,
+			);
+			const installed = betterAuth({
+				...legacyOptions,
+				logger: { disabled: true },
+			});
+			const candidate = createOwnedProjectEngine({
+				database,
+				project: alpha,
+				baseURL: origin,
+				basePath: alpha.path,
+				signingSecret: alpha.secret,
+				policy,
+				trustedOrigins: [],
+				trustedIP: () => ip,
+				accountLinks: {
+					publicLinkBaseURL: `${origin}${alpha.path}`,
+					defer: () => {},
+					deliver: async () => {},
+					beforeDelete: async () => undefined,
+				},
+			});
+			const scope = `"${alpha.schemaName}"`;
+			const otherScope = `"${beta.schemaName}"`;
+			const responseCookies = (response: Response) =>
+				response.headers
+					.getSetCookie()
+					.filter((cookie) => !/;\s*Max-Age=0(?:;|$)/i.test(cookie))
+					.map((cookie) => cookie.split(";", 1)[0])
+					.join("; ");
+			async function exercise(writer: "legacy" | "owned") {
+				const startRequest = request(`${alpha.path}/sign-in/anonymous`, {});
+				startRequest.headers.set("x-real-ip", ip);
+				const start = await installed.handler(startRequest);
+				expect(start.status).toBe(200);
+				const guestCookie = responseCookies(start);
+				const guest = await installed.api.getSession({
+					headers: new Headers({ cookie: guestCookie }),
+				});
+				expect(guest?.user).toMatchObject({ role: "guest", isAnonymous: true });
+				if (!guest) throw new Error("Expected an active guest session.");
+				const sibling = randomUUID();
+				const siblingToken = randomUUID();
+				const clientId = randomUUID();
+				const grantId = randomUUID();
+				const existing = await browserSession(eventEmail);
+				await database.query(
+					`INSERT INTO ${otherScope}."user" (id,name,email,role,"isAnonymous","emailVerified") VALUES ($1,'Guest',$2,'guest',true,false)`,
+					[guest.user.id, guest.user.email],
+				);
+				for (const realm of [scope, otherScope])
+					await database.query(
+						`INSERT INTO ${realm}.session (id,token,"userId","expiresAt","updatedAt") VALUES ($1,$2,$3,now()+interval '1 day',now())`,
+						[sibling, siblingToken, guest.user.id],
+					);
+				await database.query(
+					`INSERT INTO ${scope}."oauthClient" (id,"clientId","redirectUris") VALUES ($1,$1,'[]')`,
+					[clientId],
+				);
+				await database.query(
+					`INSERT INTO ${scope}."oauthRefreshToken" (id,token,"sessionId","userId","clientId","expiresAt","createdAt",scopes) VALUES ($1,$1,$2,$3,$4,now()+interval '1 day',now(),'["offline_access"]')`,
+					[grantId, sibling, guest.user.id, clientId],
+				);
+				const subscription = await endpoint(
+					"legacy",
+					`guest-upgrade-${writer}`,
+					["session.deleted", "user.deleted"],
+				);
+				let replacement: string | undefined;
+				try {
+					const incoming = request(
+						`${alpha.path}${path}`,
+						{ email: eventEmail, password },
+						guestCookie,
+					);
+					incoming.headers.set("x-real-ip", ip);
+					const signedIn = await (writer === "legacy"
+						? installed.handler(incoming)
+						: candidate.dispatch(incoming));
+					expect(signedIn.status).toBe(200);
+					const active = await installed.api.getSession({
+						headers: new Headers({ cookie: responseCookies(signedIn) }),
+					});
+					expect(active?.user.id).toBe(eventUserId);
+					replacement = active?.session.id;
+					const { rows } = await database.query(
+						`SELECT EXISTS (SELECT 1 FROM ${scope}."user" WHERE id=$1) AS guest,
+						 EXISTS (SELECT 1 FROM ${scope}.session WHERE "userId"=$1) AS guest_session,
+						 EXISTS (SELECT 1 FROM ${scope}."oauthRefreshToken" WHERE id=$2) AS guest_grant,
+						 EXISTS (SELECT 1 FROM ${scope}.session WHERE id=$3) AS existing_account_session,
+						 EXISTS (SELECT 1 FROM ${otherScope}.session WHERE id=$4 AND "userId"=$1) AS other_realm`,
+						[guest.user.id, grantId, existing.id, sibling],
+					);
+					expect(rows).toEqual([
+						{
+							guest: false,
+							guest_session: false,
+							guest_grant: false,
+							existing_account_session: true,
+							other_realm: true,
+						},
+					]);
+					const events = await signedEvents(
+						subscription,
+						[
+							password,
+							guest.user.email,
+							eventEmail,
+							guest.session.token,
+							siblingToken,
+							grantId,
+						],
+						new Map([
+							[guest.session.id, "guest-session"],
+							[sibling, "guest-sibling"],
+							[guest.user.id, "guest"],
+						]),
+					);
+					for (const { event, user } of events) {
+						expect(event.actorId).toBe(guest.user.id);
+						expect(event.userId).toBe(guest.user.id);
+						expect(user).toBeUndefined();
+					}
+					return events.map(({ event }) => ({
+						...event,
+						actorId: "guest",
+						userId: "guest",
+					}));
+				} finally {
+					await database.query(
+						`DELETE FROM ${scope}."oauthClient" WHERE id=$1`,
+						[clientId],
+					);
+					await database.query(
+						`DELETE FROM ${scope}.session WHERE id=ANY($1::text[])`,
+						[[existing.id, replacement ?? ""]],
+					);
+					for (const realm of [scope, otherScope])
+						await database.query(`DELETE FROM ${realm}."user" WHERE id=$1`, [
+							guest.user.id,
+						]);
+					expect(
+						(
+							await send("legacy", `${base}/delete`, {
+								id: subscription.endpoint.id,
+							})
+						).status,
+					).toBe(200);
+				}
+			}
+			const native = await exercise("legacy");
+			expect(native).toEqual(
+				[
+					{ type: "session.deleted", targetId: "guest-session" },
+					{ type: "session.deleted", targetId: "guest-sibling" },
+					{ type: "user.deleted", targetId: "guest" },
+				].map((event) => ({
+					...event,
+					outcome: "success",
+					actorId: "guest",
+					userId: "guest",
+					metadata: { path },
+				})),
+			);
 			expect(await exercise("owned")).toEqual(native);
 		});
 
