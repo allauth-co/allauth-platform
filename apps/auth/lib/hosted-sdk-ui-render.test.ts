@@ -5,6 +5,7 @@ import { act, createElement, StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { afterEach, expect, it, vi } from "vitest";
 import { HostedProjectAuth } from "@/components/hosted-project-auth";
+import { HostedProjectIssuerNavigation } from "@/components/hosted-project-auth-status";
 import type {
 	HostedAuthCallbackStatus,
 	HostedPasswordResetStatus,
@@ -54,6 +55,33 @@ afterEach(async () => {
 	native.signOut.mockReset();
 	native.sendVerificationEmail.mockReset();
 	native.onChallenge = undefined;
+});
+
+it("navigates to the issuer as a document once and renders an ordinary link", async () => {
+	vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+	const replace = vi
+		.spyOn(window.location, "replace")
+		.mockImplementation(() => {});
+	const continuation =
+		"/api/auth/oauth2/authorize?client_id=fixture&state=one%2Btwo";
+	const container = document.createElement("div");
+	const root = createRoot(container);
+	dispose = async () => {
+		await act(async () => root.unmount());
+	};
+	await act(async () => {
+		root.render(
+			createElement(
+				StrictMode,
+				null,
+				createElement(HostedProjectIssuerNavigation, {
+					destination: continuation,
+				}),
+			),
+		);
+	});
+	expect(replace).toHaveBeenCalledExactlyOnceWith(continuation);
+	expect(container.querySelector("a")?.getAttribute("href")).toBe(continuation);
 });
 
 it.each([

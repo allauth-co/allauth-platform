@@ -4,7 +4,10 @@ import { jwt } from "better-auth/plugins";
 import { getTestInstance } from "better-auth/test";
 import { afterEach, expect, it, vi } from "vitest";
 import { localNavigation } from "./auth-navigation";
-import { hostedSdkViewRequest } from "./domains/hosted-sdk-policy";
+import {
+	hostedAuthRedirectRequest,
+	hostedSdkViewRequest,
+} from "./domains/hosted-sdk-policy";
 import { authenticationCallback } from "./shared";
 
 const origin = "http://localhost:3000";
@@ -65,14 +68,33 @@ it("preserves a native signed browser continuation when a reset callback returns
 		state: "reset+fixture",
 	});
 	for (const resource of resources) authorization.append("resource", resource);
-	const prompt = await instance.auth.handler(
-		new Request(`${origin}/api/auth/oauth2/authorize?${authorization}`),
+	const authorizationPath = `/api/auth/oauth2/authorize?${authorization}`;
+	const fromRedirect = hostedAuthRedirectRequest(
+		{ redirectTo: authorizationPath },
+		origin,
 	);
+	expect(fromRedirect).toEqual({
+		destination: authorizationPath,
+		issuer: true,
+	});
+	const prompt = await instance.auth.handler(
+		new Request(new URL(fromRedirect!.destination, origin), {
+			headers: { "sec-fetch-mode": "navigate" },
+		}),
+	);
+	expect(prompt.status).toBe(302);
 	const login = new URL(prompt.headers.get("location")!, origin);
 	expect(login.pathname).toBe("/sign-in");
 	const signed = login.searchParams;
 	expect(signed.getAll("ba_param")).toContain("resource");
 	const destination = `/oauth2/continue?${signed}`;
+	expect(
+		hostedAuthRedirectRequest({ redirectTo: destination }, origin),
+	).toEqual({
+		destination,
+		signIn: `/sign-in?${new URLSearchParams({ returnTo: destination })}`,
+		oauthQuery: signed.toString(),
+	});
 	async function readContext(path: string) {
 		const query = new URL(path, origin).searchParams.toString();
 		const verified = await instance.auth.handler(

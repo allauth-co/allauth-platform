@@ -12,6 +12,7 @@ import type {
 	HostedSdkView,
 } from "@/lib/domains/hosted-sdk-policy";
 import {
+	hostedAuthRedirectRequest,
 	hostedSdkBasePath,
 	hostedSdkViewRequest,
 } from "@/lib/domains/hosted-sdk-policy";
@@ -23,6 +24,7 @@ import { portalSession, withPortalHeadersEngine } from "@/lib/domains/hosting";
 import { emailConfigured } from "@/lib/email/send";
 import { AllAuthAuth } from "./better-auth-ui/allauth-auth";
 import { HostedProjectAuth } from "./hosted-project-auth";
+import { HostedProjectIssuerNavigation } from "./hosted-project-auth-status";
 
 export type HostedProjectAuthPageProps = {
 	searchParams: Promise<HostedSdkSearchParams>;
@@ -58,7 +60,47 @@ export async function HostedProjectAuthPage({
 
 	const env = await getAuthEnvironment();
 	if (!hasHostedSdkSelection(env)) return standardForm;
-	const request = hostedSdkViewRequest(view, await searchParams);
+	const params = await searchParams;
+	if (view === "authRedirect") {
+		if (params.interface !== undefined) return standardForm;
+		const navigation = await withPortalHeadersEngine(
+			requestHeaders,
+			async (engine, _bound, binding) => {
+				if (
+					!binding ||
+					binding.kind !== "accounts" ||
+					!(await hostedSdkSelected(env, binding.project))
+				)
+					return null;
+				const request = hostedAuthRedirectRequest(
+					params,
+					`https://${binding.hostname}`,
+				);
+				if (
+					!request ||
+					(request.oauthQuery &&
+						!(await verifiedHostedOAuthContinuation(
+							engine,
+							binding.hostname,
+							request.oauthQuery,
+						)))
+				)
+					return null;
+				if (request.issuer) return request;
+				const destination = (await portalSession(requestHeaders))
+					? request.destination
+					: request.signIn;
+				return { destination };
+			},
+		);
+		if (!navigation) return standardForm;
+		if ("issuer" in navigation && navigation.issuer)
+			return (
+				<HostedProjectIssuerNavigation destination={navigation.destination} />
+			);
+		redirect(navigation.destination);
+	}
+	const request = hostedSdkViewRequest(view, params);
 	if (!request) return standardForm;
 
 	const project = await withPortalHeadersEngine(
@@ -119,10 +161,6 @@ export async function HostedProjectAuthPage({
 	);
 
 	if (!project) return standardForm;
-	if (view === "authRedirect") {
-		const session = await portalSession(requestHeaders);
-		redirect(session ? "/" : "/sign-in");
-	}
 	return (
 		<HostedProjectAuth
 			view={request.username ? "username" : view}

@@ -2,6 +2,7 @@ import { beforeEach, expect, it, vi } from "vitest";
 import { AllAuthAuth } from "@/components/better-auth-ui/allauth-auth";
 import { HostedProjectAuth } from "@/components/hosted-project-auth";
 import { HostedProjectAuthPage } from "@/components/hosted-project-auth-page";
+import { HostedProjectIssuerNavigation } from "@/components/hosted-project-auth-status";
 import type { HostedProjectAuthPageProps } from "@/components/hosted-project-auth-page";
 import { portalHeader } from "./domains/edge";
 import { platformWorkspaceId } from "./workspaces/types";
@@ -148,7 +149,6 @@ it("shows supported callback results with verified local destinations and keeps 
 		["authCallback", { result: "email_verified", returnTo: "//other.example/path" }],
 		["authCallback", { result: "email_verified", returnTo: "/api/auth/callback" }],
 		["authCallback", { result: "email_verified", code: "opaque" }],
-		["authRedirect", { redirectTo: "/account/security" }],
 	] as const) {
 		const fallback = await HostedProjectAuthPage({
 			view,
@@ -166,6 +166,111 @@ it("shows supported callback results with verified local destinations and keeps 
 	await expect(redirect()).rejects.toThrow("redirect:/sign-in");
 	runtime.portalSession.mockResolvedValueOnce({ user: { id: "fixture" } });
 	await expect(redirect()).rejects.toThrow("redirect:/");
+});
+
+function redirectFixture() {
+	runtime.headers.mockResolvedValue(
+		new Headers({ [portalHeader]: "fixture-proof" }),
+	);
+	const engine = engineConfiguration({ emailPassword: true });
+	runtime.withPortalHeadersEngine.mockImplementation(async (_headers, select) =>
+		select(engine, new Headers(), {
+			kind: "accounts",
+			project,
+			hostname: accountsHostname,
+		}),
+	);
+	return {
+		engine,
+		read: (params: Awaited<HostedProjectAuthPageProps["searchParams"]>) =>
+			HostedProjectAuthPage({
+				view: "authRedirect",
+				searchParams: Promise.resolve(params),
+			}),
+	};
+}
+
+it("keeps a same-origin redirect intact through hosted sign-in", async () => {
+	const { engine, read } = redirectFixture();
+	const path = "/account/security?state=one%2Btwo#sessions";
+	runtime.portalSession.mockResolvedValueOnce({ user: { id: "fixture" } });
+	await expect(
+		read({ redirectTo: `https://${accountsHostname}${path}` }),
+	).rejects.toThrow(`redirect:${path}`);
+	runtime.portalSession.mockResolvedValueOnce(null);
+	const signIn = new URLSearchParams({ returnTo: path });
+	await expect(read({ redirectTo: path })).rejects.toThrow(
+		`redirect:/sign-in?${signIn}`,
+	);
+	expect(engine.dispatch).not.toHaveBeenCalled();
+
+	const next = await HostedProjectAuthPage({
+		view: "signIn",
+		searchParams: Promise.resolve({ returnTo: signIn.get("returnTo")! }),
+	});
+	expect(next.type).toBe(HostedProjectAuth);
+	expect(next.props).toMatchObject({ destination: path });
+});
+
+it("hands an existing GET authorization continuation back to the verified hosted issuer", async () => {
+	const { engine, read } = redirectFixture();
+	const request =
+		"/api/auth/oauth2/authorize?client_id=fixture&response_type=code&state=one%2Btwo";
+	const navigation = await read({ redirectTo: request });
+	expect(navigation.type).toBe(HostedProjectIssuerNavigation);
+	expect(navigation.props).toEqual({ destination: request });
+	expect(runtime.portalSession).not.toHaveBeenCalled();
+	expect(engine.readOAuthContext).not.toHaveBeenCalled();
+	expect(engine.dispatch).not.toHaveBeenCalled();
+});
+
+it("verifies a signed redirect continuation and carries it through signed-out login", async () => {
+	const { engine, read } = redirectFixture();
+	const params = {
+		client_id: "fixture",
+		resource: ["one", "two"],
+		sig: "fixture",
+	};
+	const query = "client_id=fixture&resource=one&resource=two&sig=fixture";
+	const path = `/oauth2/continue?${query}`;
+	engine.readOAuthContext.mockResolvedValueOnce(
+		Response.json({ continueURL: path }),
+	);
+	runtime.portalSession.mockResolvedValueOnce(null);
+	await expect(read({ redirectTo: path })).rejects.toThrow(
+		`redirect:/sign-in?${new URLSearchParams({ returnTo: path })}`,
+	);
+	expect(engine.readOAuthContext.mock.calls[0]?.[0].url).toBe(
+		`https://${accountsHostname}/api/oauth/context?${query}`,
+	);
+	engine.readOAuthContext.mockResolvedValueOnce(
+		Response.json({ continueURL: path }),
+	);
+	runtime.portalSession.mockResolvedValueOnce({ user: { id: "fixture" } });
+	await expect(read(params)).rejects.toThrow(`redirect:${path}`);
+
+	runtime.portalSession.mockClear();
+	expect((await read({ redirectTo: path })).type).toBe(AllAuthAuth);
+	expect(runtime.portalSession).not.toHaveBeenCalled();
+});
+
+it("keeps explicit legacy fallback and refuses unsafe or ambiguous auth redirects", async () => {
+	const { engine, read } = redirectFixture();
+	for (const params of [
+		{ interface: "legacy", redirectTo: "/account" },
+		{ redirectTo: ["/account", "/console"] },
+		{ redirectTo: "//elsewhere.example/account" },
+		{ redirectTo: `https://${accountsHostname}//elsewhere.example/account` },
+		{ redirectTo: "https://elsewhere.example/account" },
+		{ redirectTo: "/auth-redirect?redirectTo=%2Faccount" },
+		{ redirectTo: "/%61uth-redirect?redirectTo=%2Faccount" },
+		{ redirectTo: "/api/auth/verify-email?token=opaque" },
+		{ redirectTo: "/api/auth/oauth2/authorize?client_id=fixture#unsupported" },
+	]) {
+		expect((await read(params)).type).toBe(AllAuthAuth);
+	}
+	expect(runtime.portalSession).not.toHaveBeenCalled();
+	expect(engine.readOAuthContext).not.toHaveBeenCalled();
 });
 
 it("uses the standard page for an unverified account hostname without looking up project configuration", async () => {

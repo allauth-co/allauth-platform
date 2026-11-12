@@ -70,6 +70,7 @@ export function hostedSdkReturnPath(value: string | undefined) {
 	);
 	if (!destination) return "/account";
 	const target = new URL(destination, localOrigin);
+	if (destination === "/") return destination;
 	if (target.pathname === "/console" && !target.hash) return destination;
 	if (
 		/^\/(account|organizations|accept-invitation)(\/|$)/.test(target.pathname)
@@ -167,21 +168,93 @@ function hostedCallbackRequest(params: HostedSdkSearchParams): HostedViewRequest
 	return { destination, legacyPath: "/auth-callback?interface=legacy", callbackStatus };
 }
 
+type HostedAuthRedirectRequest =
+	| { destination: string; signIn: string; oauthQuery?: string; issuer?: false }
+	| { destination: string; issuer: true; oauthQuery?: never };
+
+function signInForRedirect(
+	destination: string,
+	oauthQuery?: string,
+): HostedAuthRedirectRequest {
+	return {
+		destination,
+		signIn: `/sign-in?${new URLSearchParams({ returnTo: destination })}`,
+		oauthQuery,
+	};
+}
+
+/** Resolve a browser redirect against the verified accounts hostname, with separate issuer continuations. */
+export function hostedAuthRedirectRequest(
+	params: HostedSdkSearchParams,
+	origin: string,
+): HostedAuthRedirectRequest | null {
+	const raw = params.redirectTo;
+	if (raw === undefined && params.client_id !== undefined) {
+		const oauth = hostedOAuthRequest("authRedirect", params);
+		return oauth
+			? signInForRedirect(oauth.destination, oauth.oauthQuery)
+			: null;
+	}
+	if (
+		Object.entries(params).some(
+			([name, value]) =>
+				value !== undefined &&
+				(name !== "redirectTo" || typeof value !== "string"),
+		)
+	)
+		return null;
+	if (!raw) return { destination: "/", signIn: "/sign-in" };
+	if (
+		typeof raw !== "string" ||
+		raw.length > 16_384 ||
+		/[\\\u0000-\u001f\u007f]/.test(raw)
+	)
+		return null;
+	const requested = raw.trim();
+	if (
+		requested.startsWith("//") ||
+		(!requested.startsWith("/") && !/^https?:\/\//i.test(requested))
+	)
+		return null;
+	try {
+		const target = new URL(requested, origin);
+		if (
+			target.origin !== origin ||
+			target.username ||
+			target.password ||
+			target.pathname.startsWith("//")
+		)
+			return null;
+		const destination = `${target.pathname}${target.search}${target.hash}`;
+		if (target.pathname === "/oauth2/continue") {
+			const continuation = oauthBrowserReturnPath(destination);
+			if (!continuation) return null;
+			return signInForRedirect(
+				continuation,
+				new URL(continuation, origin).search.slice(1),
+			);
+		}
+		if (
+			target.pathname === "/api/auth/oauth2/authorize" &&
+			!target.hash &&
+			target.searchParams.getAll("client_id").length === 1 &&
+			target.searchParams.get("client_id")
+		)
+			return { destination, issuer: true };
+		return hostedSdkReturnPath(destination) === destination
+			? signInForRedirect(destination)
+			: null;
+	} catch {
+		return null;
+	}
+}
+
 /** Signed project continuations are verified against the selected issuer before rendering. */
 export function hostedSdkViewRequest(
-	view: HostedSdkView,
+	view: Exclude<HostedSdkView, "authRedirect">,
 	params: HostedSdkSearchParams,
 ): HostedViewRequest | null {
 	if (view === "authCallback") return hostedCallbackRequest(params);
-	if (view === "authRedirect") {
-		if (Object.values(params).some((value) => value !== undefined)) return null;
-		return {
-			destination: "/sign-in",
-			legacyPath: `${views[view]}?interface=legacy`,
-			oauthQuery: undefined,
-			username: false,
-		};
-	}
 	if (
 		(view === "verifyEmail" ||
 			view === "resetLinkSent" ||

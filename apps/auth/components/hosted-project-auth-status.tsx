@@ -5,6 +5,25 @@ import type { HostedAuthCallbackStatus, HostedPasswordResetStatus } from "@/lib/
 import { useAllAuth, withAuthReturnTo } from "@/sdk/react";
 import { HostedProjectCard } from "./hosted-project-forms";
 
+/** A top-level navigation lets the issuer return its browser redirect instead of a JSON response. */
+export function HostedProjectIssuerNavigation({
+	destination,
+}: {
+	destination: string;
+}) {
+	const navigated = useRef<string | null>(null);
+	useEffect(() => {
+		if (navigated.current === destination) return;
+		navigated.current = destination;
+		window.location.replace(destination);
+	}, [destination]);
+	return (
+		<a className="text-sm underline" href={destination}>
+			Continue authorization
+		</a>
+	);
+}
+
 /** Sign out once, then replace this page with the realm's sign-in page. */
 export function HostedProjectSignOut({ destination }: { destination: string }) {
 	const { client } = useAllAuth();
