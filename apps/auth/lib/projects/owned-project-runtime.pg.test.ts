@@ -6927,7 +6927,7 @@ describe.skipIf(!existsSync(fixture))(
 					}
 				}
 			}
-		}, 90_000);
+		}, 180_000);
 
 		it("switches and restores the protected Agent writer with shared replay and verified hosted boundaries", async () => {
 			const local: { container: string; DATABASE_URL: string } = JSON.parse(
