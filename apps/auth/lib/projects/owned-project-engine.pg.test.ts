@@ -315,6 +315,49 @@ describe.skipIf(!existsSync(fixturePath))("isolated PostgreSQL owned project eng
 				active.cookie,
 			);
 			await compare("/admin/get-user", undefined, active.cookie);
+			const list = "/admin/list-users";
+			await compare(`${list}?sortBy=email`, undefined, memberSession.cookie);
+			const page = await compare(
+				`${list}?searchValue=realm-reads-&searchOperator=starts_with&sortBy=email&sortDirection=desc&limit=1&offset=1`,
+				undefined,
+				active.cookie,
+			);
+			expect(page).toMatchObject({
+				total: 3,
+				limit: 1,
+				offset: 1,
+				users: [{ id: member }],
+			});
+			await compare(
+				`${list}?searchValue=realm-reads-&searchOperator=starts_with&offset=100`,
+				undefined,
+				active.cookie,
+			);
+			await compare(
+				`${list}?searchValue=REALM-READS&searchField=email`,
+				undefined,
+				active.cookie,
+			);
+			await compare(
+				`${list}?filterField=emailVerified&filterOperator=eq&filterValue=false&sortBy=id`,
+				undefined,
+				active.cookie,
+			);
+			await compare(
+				`${list}?filterField=id&filterOperator=in&filterValue=${administrator}&filterValue=${member}&sortBy=id`,
+				undefined,
+				active.cookie,
+			);
+			await compare(`${list}?sortBy=unknownField`, undefined, active.cookie);
+			await compare(`${list}?searchField=id`, undefined, active.cookie);
+			const privateFilter = await candidate.dispatch(
+				request(
+					`${list}?filterField=privateMetadata&filterValue=${encodeURIComponent('{"neverReturn":"private"}')}`,
+					undefined,
+					{ cookie: active.cookie },
+				),
+			);
+			expect(await privateFilter.json()).toEqual({ users: [], total: 0 });
 			const permission = "/admin/has-permission";
 			expect(
 				await compare(

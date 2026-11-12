@@ -138,26 +138,6 @@ export function createProjectEngineStore(database: Pool, schemaName: string) {
 		return result.rows[0] ?? null;
 	}
 
-	async function realmAdminUser(client: PoolClient, userId: string) {
-		const {
-			rows: [user],
-		} = await client.query<
-			ProjectUser & {
-				banReason: string | null;
-				banExpires: Date | null;
-			}
-		>(
-			`SELECT ${userFields}, u."banReason", u."banExpires" FROM "user" u WHERE u.id=$1`,
-			[userId],
-		);
-		if (!user) return null;
-		return {
-			...projectUserResponse(user),
-			banReason: user.banReason,
-			banExpires: user.banExpires?.toISOString() ?? null,
-		};
-	}
-
 	async function lockProviderIdentity(
 		client: PoolClient,
 		provider: string,
@@ -422,7 +402,6 @@ export function createProjectEngineStore(database: Pool, schemaName: string) {
 		lockProviderIdentity,
 		lockSession,
 		lockUser,
-		realmAdminUser,
 		record,
 		recordEvent,
 		refresh,

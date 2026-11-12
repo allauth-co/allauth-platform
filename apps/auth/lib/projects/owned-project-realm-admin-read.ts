@@ -6,8 +6,14 @@ import {
 import type { createProjectEngineStore } from "./owned-project-engine-store";
 import { admitOwnedProjectNativeRoute } from "./owned-project-native-admission";
 import { realmAdministratorRequestGuard } from "./owned-project-realm-admin-audit";
+import {
+	listRealmAdminUsers,
+	readRealmAdminUser,
+	realmAdminListQuery,
+} from "./owned-project-realm-admin-directory";
 
 const userPath = "/admin/get-user";
+const listPath = "/admin/list-users";
 const permissionPath = "/admin/has-permission";
 const unauthorized = () =>
 	new Response(null, { status: 401, headers: { "Cache-Control": "no-store" } });
@@ -49,7 +55,8 @@ export function createOwnedProjectRealmAdminRead(options: {
 }) {
 	const { store } = options;
 	return async (path: string, request: Request) => {
-		const userRead = path === userPath && request.method === "GET";
+		const userRead =
+			(path === userPath || path === listPath) && request.method === "GET";
 		const permissionCheck =
 			path === permissionPath && request.method === "POST";
 		if (!userRead && !permissionCheck) return;
@@ -130,13 +137,41 @@ export function createOwnedProjectRealmAdminRead(options: {
 					);
 				return accountLinkJson({ error: null, success });
 			}
+			const listing = path === listPath;
 			if (!administrator)
-				return accountLinkError(
-					403,
-					"YOU_ARE_NOT_ALLOWED_TO_GET_USER",
-					"You are not allowed to get user",
+				return listing
+					? accountLinkError(
+							403,
+							"YOU_ARE_NOT_ALLOWED_TO_LIST_USERS",
+							"You are not allowed to list users",
+						)
+					: accountLinkError(
+							403,
+							"YOU_ARE_NOT_ALLOWED_TO_GET_USER",
+							"You are not allowed to get user",
+						);
+			const query = new URL(request.url).searchParams;
+			if (listing) {
+				const parameters = Object.fromEntries(
+					[...new Set(query.keys())].map((key) => {
+						const values = query.getAll(key);
+						return [key, values.length === 1 ? values[0] : values];
+					}),
 				);
-			const id = new URL(request.url).searchParams.get("id");
+				const parsed = realmAdminListQuery.safeParse(parameters);
+				if (!parsed.success)
+					return accountLinkError(
+						400,
+						"VALIDATION_ERROR",
+						parsed.error.issues
+							.map(
+								({ path, message }) => `[query.${path.join(".")}] ${message}`,
+							)
+							.join("; "),
+					);
+				return accountLinkJson(await listRealmAdminUsers(client, parsed.data));
+			}
+			const id = query.get("id");
 			if (id === null)
 				return accountLinkError(
 					400,
@@ -144,9 +179,7 @@ export function createOwnedProjectRealmAdminRead(options: {
 					"[query.id] Invalid input: expected string, received undefined",
 				);
 			const user =
-				id && !id.includes("\0")
-					? await store.realmAdminUser(client, id)
-					: null;
+				id && !id.includes("\0") ? await readRealmAdminUser(client, id) : null;
 			return user
 				? accountLinkJson(user)
 				: accountLinkError(404, "USER_NOT_FOUND", "User not found");
