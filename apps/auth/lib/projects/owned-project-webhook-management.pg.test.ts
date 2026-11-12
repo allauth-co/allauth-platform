@@ -3103,6 +3103,237 @@ describe.skipIf(!existsSync(fixture))(
 			}
 		});
 
+		it.each([
+			["eligible replacement", "Replacement-for-expired-caller-6!", 401],
+			["policy rejection", "short", 400],
+		] as const)("preserves expired password-change cleanup before %s", async (scenario, replacement, status) => {
+			const path = "/change-password";
+			const realm = `"${alpha.schemaName}"`;
+			const installed = installedNative(
+				defaultAuthPolicy,
+				readRoot,
+				undefined,
+				true,
+			);
+			const breach = vi
+				.spyOn(globalThis, "fetch")
+				.mockImplementation(async (input) => {
+					const url = new URL(input instanceof Request ? input.url : input);
+					expect(url.origin).toBe("https://api.pwnedpasswords.com");
+					return new Response(`${"0".repeat(35)}:0\r\n`);
+				});
+			async function exercise(
+				writer: "legacy" | "owned",
+				dispatch: (request: Request) => Promise<Response>,
+			) {
+				const expired = await browserSession(eventEmail);
+				const sibling = await browserSession(eventEmail);
+				const client = randomUUID();
+				const grants = [
+					{ id: randomUUID(), session: expired.id, scopes: ["openid"] },
+					{
+						id: randomUUID(),
+						session: expired.id,
+						scopes: ["openid", "offline_access"],
+					},
+					{ id: randomUUID(), session: sibling.id, scopes: ["openid"] },
+				];
+				const subscription = await endpoint(
+					"legacy",
+					`password-expiry-${status}-${writer}`,
+					["session.deleted", "user.*"],
+				);
+				const address = `192.0.2.${(status === 401 ? 226 : 228) + (writer === "legacy" ? 0 : 1)}`;
+				const credential = async () =>
+					(
+						await database.query(
+							`SELECT password,"updatedAt" FROM ${realm}.account WHERE "userId"=$1 AND "providerId"='credential'`,
+							[eventUserId],
+						)
+					).rows;
+				const original = await credential();
+				try {
+					await database.query(
+						`UPDATE ${realm}.session SET "expiresAt"=now()-interval '1 minute' WHERE id=$1`,
+						[expired.id],
+					);
+					await database.query(
+						`INSERT INTO ${realm}."oauthClient" (id,"clientId","redirectUris") VALUES ($1,$1,'[]')`,
+						[client],
+					);
+					for (const grant of grants)
+						await database.query(
+							`INSERT INTO ${realm}."oauthRefreshToken" (id,token,"sessionId","userId","clientId","expiresAt","createdAt",scopes)
+							 VALUES ($1,$1,$2,$3,$4,now()+interval '1 day',now(),$5)`,
+							[
+								grant.id,
+								grant.session,
+								eventUserId,
+								client,
+								JSON.stringify(grant.scopes),
+							],
+						);
+					if (status === 401) {
+						const requestHeaders = request(
+							alpha.path + path,
+							{},
+							expired.cookie,
+						).headers;
+						requestHeaders.set("x-real-ip", address);
+						const malformed = await dispatch(
+							new Request(origin + alpha.path + path, {
+								method: "POST",
+								headers: requestHeaders,
+								body: "{",
+							}),
+						);
+						expect(malformed.status).toBe(400);
+						expect(
+							(
+								await database.query(
+									`SELECT 1 FROM ${realm}.session WHERE id=$1`,
+									[expired.id],
+								)
+							).rowCount,
+						).toBe(1);
+						expect(await signedEvents(subscription, [expired.token])).toEqual(
+							[],
+						);
+					}
+					const outcomes = [];
+					for (let attempt = 0; attempt < 2; attempt++) {
+						const input = request(
+							alpha.path + path,
+							{
+								currentPassword: password,
+								newPassword: replacement,
+								revokeOtherSessions: true,
+							},
+							expired.cookie,
+						);
+						input.headers.set("x-real-ip", address);
+						const response = await dispatch(input);
+						expect(response.status, `${writer} ${scenario}`).toBe(status);
+						outcomes.push({
+							body: await response.json(),
+							clears: response.headers
+								.getSetCookie()
+								.some((value) => /\.session_token=;.*Max-Age=0/.test(value)),
+						});
+					}
+					const events = await signedEvents(
+						subscription,
+						[
+							password,
+							replacement,
+							expired.token,
+							sibling.token,
+							...grants.map(({ id }) => id),
+						],
+						new Map([[expired.id, "expired-caller"]]),
+					);
+					expect(
+						events.filter(({ event }) => event.type === "session.deleted"),
+						writer,
+					).toEqual([
+						{
+							event: {
+								type: "session.deleted",
+								outcome: "success",
+								actorId: eventUserId,
+								userId: eventUserId,
+								targetId: "expired-caller",
+								metadata: { path },
+							},
+						},
+					]);
+					expect(await credential()).toEqual(original);
+					expect(
+						(
+							await database.query(
+								`SELECT id FROM ${realm}.session WHERE id=ANY($1::text[])`,
+								[[expired.id, sibling.id]],
+							)
+						).rows,
+					).toEqual([{ id: sibling.id }]);
+					const { rows: remaining } = await database.query(
+						`SELECT id,"sessionId",revoked IS NOT NULL AS revoked FROM ${realm}."oauthRefreshToken" WHERE "clientId"=$1`,
+						[client],
+					);
+					expect(remaining).toHaveLength(3);
+					for (const grant of grants) {
+						expect(remaining.find(({ id }) => id === grant.id)).toEqual({
+							id: grant.id,
+							sessionId: grant.session === sibling.id ? sibling.id : null,
+							revoked:
+								grant.session === expired.id && grant.scopes.length === 1,
+						});
+					}
+					return {
+						outcomes,
+						events: events.map(
+							({ event: { ipAddress, ...event }, ...payload }) => {
+								if (ipAddress) expect(ipAddress).toBe(address);
+								return { ...payload, event };
+							},
+						),
+					};
+				} finally {
+					await database.query(
+						`DELETE FROM ${realm}."oauthClient" WHERE id=$1`,
+						[client],
+					);
+					await database.query(
+						`DELETE FROM ${realm}.session WHERE id=ANY($1::text[])`,
+						[[expired.id, sibling.id]],
+					);
+					expect(
+						(
+							await send("legacy", `${base}/delete`, {
+								id: subscription.endpoint.id,
+							})
+						).status,
+					).toBe(200);
+				}
+			}
+			try {
+				const legacy = await exercise("legacy", installed.handler);
+				expect(legacy.outcomes).toEqual(
+					Array.from({ length: 2 }, () =>
+						status === 401
+							? {
+									body: { code: "UNAUTHORIZED", message: "Unauthorized" },
+									clears: true,
+								}
+							: {
+									body: {
+										code: "PASSWORD_TOO_SHORT",
+										message: "Password must be at least 8 characters.",
+									},
+									clears: false,
+								},
+					),
+				);
+				expect(
+					legacy.events.filter(
+						({ event }) => event.type === "user.password-changed",
+					),
+				).toEqual(
+					Array.from({ length: status === 401 ? 2 : 0 }, () => ({
+						event: {
+							type: "user.password-changed",
+							outcome: "failure",
+							userAgent: "webhook-management-fixture",
+							metadata: { path, errorCode: "UNAUTHORIZED" },
+						},
+					})),
+				);
+				expect(await exercise("owned", owned.dispatch)).toEqual(legacy);
+			} finally {
+				breach.mockRestore();
+			}
+		});
+
 		it("rolls back the profile and session mutations when their event cannot be recorded", async () => {
 			const active = await browserSession(eventEmail);
 			const sibling = await browserSession(eventEmail);

@@ -98,6 +98,7 @@ export interface RecoveryHttpOptions {
 			| EmailOTPRecoveryIssueOperation,
 	): void;
 	completeVerification?: CompleteOwnedEmailVerification;
+	prepareEmailOtpReset?: Parameters<typeof createOwnedEmailOTPRecovery>[0]["prepareEmailOtpReset"];
 }
 
 function privateHeaders(headers = new Headers()) {

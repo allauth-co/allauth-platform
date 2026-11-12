@@ -72,10 +72,11 @@ export async function writeOwnedPasswordReset(
 				linkIdentifier: string;
 				auditContext?: Pick<ControlEventInput, "ipAddress" | "userAgent">;
 		  }
-		| { path: "/email-otp/reset-password" }
+		| { path: "/email-otp/reset-password"; actorId?: string }
 	),
 ) {
 	const { userId, email, passwordHash, path } = input;
+	const actorId = path === "/email-otp/reset-password" ? input.actorId : undefined;
 	const accounts = await client.query<{ id: string; accountId: string }>(
 		`SELECT id, "accountId" FROM "account" WHERE "userId" = $1 AND "providerId" = 'credential'
 		ORDER BY id LIMIT 2 FOR UPDATE`,
@@ -146,6 +147,7 @@ export async function writeOwnedPasswordReset(
 		await store.recordEvent(client, {
 			type: "session.deleted",
 			outcome: "success",
+			actorId,
 			userId,
 			targetId: session.id,
 			metadata: { path },

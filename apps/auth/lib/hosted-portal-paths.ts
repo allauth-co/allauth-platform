@@ -23,6 +23,7 @@ export function isAuthenticationPath(path: string) {
 const previewPaths = new Set([
 	"/console",
 	"/account",
+	"/account/device",
 	"/account/security",
 	"/account/organizations",
 	"/organizations",

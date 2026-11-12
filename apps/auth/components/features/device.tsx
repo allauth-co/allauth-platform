@@ -1,9 +1,8 @@
 "use client";
 
-import { oauthDeviceAuthorizationClient } from "@better-auth/oauth-provider/client";
-import { createAuthClient } from "better-auth/react";
 import Link from "next/link";
 import { useMemo, useState } from "react";
+import * as z from "zod";
 import { Button } from "@/components/ui/button";
 import {
 	Card,
@@ -15,35 +14,63 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { deviceRequestError, deviceReviewPath } from "@/lib/features/device";
+import { createAllAuthClient } from "@/sdk/client";
 
-interface DeviceRequest {
-	user_code: string;
-	status: string;
-	client_id?: string;
-	scope?: string;
-	resource?: string | string[];
+const deviceRequest = z.object({
+	user_code: z.string().min(1),
+	status: z.string(),
+	client_id: z.string().min(1),
+	scope: z.string().optional(),
+	resource: z.union([z.string(), z.array(z.string())]).optional(),
+});
+
+async function requestDevice(url: string, userCode?: string): Promise<unknown> {
+	const response = await fetch(url, {
+		method: userCode === undefined ? "GET" : "POST",
+		headers: {
+			accept: "application/json",
+			...(userCode === undefined ? {} : { "content-type": "application/json" }),
+		},
+		body: userCode === undefined ? undefined : JSON.stringify({ userCode }),
+		credentials: "same-origin",
+		cache: "no-store",
+		redirect: "error",
+	});
+	const body: unknown = await response.json().catch(() => null);
+	if (!response.ok)
+		throw new Error(
+			deviceRequestError({
+				...(body && typeof body === "object" ? body : {}),
+				status: response.status,
+			}),
+		);
+	return body;
 }
 
-/** Review and approve only the native request belonging to the signed-in realm account. */
+/** Review and approve the request belonging to the signed-in realm account. */
 export function DeviceApproval({
 	project,
 	initialCode,
+	basePath = project ? `/api/projects/${project}/auth` : "/api/auth",
+	reauthentication,
 }: {
 	project?: string;
 	initialCode: string;
+	basePath?: string;
+	reauthentication?: { signInURL: string; returnPath: "/account/device" };
 }) {
 	const client = useMemo(
-		() =>
-			createAuthClient({
-				basePath: project ? `/api/projects/${project}/auth` : "/api/auth",
-				fetchOptions: { credentials: "include", cache: "no-store" },
-				plugins: [oauthDeviceAuthorizationClient()],
-			}),
-		[project],
+		() => createAllAuthClient(basePath, () => {}),
+		[basePath],
 	);
 	const { data: session, isPending } = client.useSession();
 	const [code, setCode] = useState(initialCode);
-	const [request, setRequest] = useState<DeviceRequest>();
+	const [reviewed, setReviewed] = useState<{
+		sessionId: string;
+		request: z.infer<typeof deviceRequest>;
+	}>();
+	const request =
+		reviewed?.sessionId === session?.session.id ? reviewed?.request : undefined;
 	const [busy, setBusy] = useState(false);
 	const [error, setError] = useState("");
 	const [notice, setNotice] = useState("");
@@ -65,32 +92,38 @@ export function DeviceApproval({
 	};
 	const review = (event: React.FormEvent) => {
 		event.preventDefault();
-		setRequest(undefined);
+		if (!session) return;
+		setReviewed(undefined);
 		void run(async () => {
-			const result = await client.device({ query: { user_code: code.trim() } });
-			if (result.error) throw new Error(deviceRequestError(result.error));
-			if (!result.data?.client_id)
+			const query = new URLSearchParams({ user_code: code.trim() });
+			const result = deviceRequest.safeParse(
+				await requestDevice(`${basePath}/device?${query}`),
+			);
+			if (!result.success)
 				throw new Error("This request is unavailable for your account.");
-			setRequest(result.data);
+			setReviewed({ sessionId: session.session.id, request: result.data });
 		});
 	};
 	const decide = (approve: boolean) =>
 		run(async () => {
 			if (!request || request.status !== "pending")
 				throw new Error("Review a pending request first.");
-			const body = { userCode: request.user_code };
-			const result = approve
-				? await client.device.approve(body)
-				: await client.device.deny(body);
-			if (result.error) throw new Error(deviceRequestError(result.error));
-			setRequest(undefined);
+			await requestDevice(
+				`${basePath}/device/${approve ? "approve" : "deny"}`,
+				request.user_code,
+			);
+			setReviewed(undefined);
 			setNotice(
 				approve
 					? "Device access approved. Return to your device to finish signing in."
 					: "Device access denied.",
 			);
 		});
-	const login = `/sign-in?callbackUrl=${encodeURIComponent(deviceReviewPath(code, project))}${project ? `&project=${encodeURIComponent(project)}` : ""}`;
+	const signIn =
+		reauthentication?.signInURL ?? (project ? undefined : "/sign-in");
+	const login = signIn
+		? `${signIn}?${new URLSearchParams({ callbackUrl: deviceReviewPath(code.trim(), undefined, reauthentication?.returnPath) })}`
+		: undefined;
 	return (
 		<Card className="max-w-xl mx-auto">
 			<CardHeader>
@@ -108,30 +141,38 @@ export function DeviceApproval({
 					<p role="status">Loading your account…</p>
 				) : !session ? (
 					<div className="space-y-3">
-						{project ? (
-							<p>
-								Device review requires an existing verified project session.
-								Sign in through the project's application. Hosted project
-								sign-in on this page is not active.
-							</p>
-						) : (
+						{login ? (
 							<>
 								<p>
-									Sign in to AllAuth with a verified account before reviewing a
-									device.
+									Sign in {project ? "to this project" : "to AllAuth"} with a
+									verified account before reviewing a device.
 								</p>
 								<Button asChild>
-									<Link href={login}>Sign in</Link>
+									<Link href={login} prefetch={false}>
+										Sign in
+									</Link>
 								</Button>
 							</>
+						) : (
+							<p>
+								Sign in through this project's application with a verified
+								account, then return here to review the device.
+							</p>
 						)}
 					</div>
 				) : (
 					<>
 						<p className="text-sm">
 							Signed in as <strong>{session.user.email}</strong>. A recent
-							sign-in is required to approve access.{" "}
-							<Link href={login} className="underline">Sign in again</Link>.
+							sign-in is required to approve access.
+							{login && (
+								<>
+									{" "}
+									<Link href={login} className="underline" prefetch={false}>
+										Sign in again
+									</Link>
+								</>
+							)}
 						</p>
 						<form onSubmit={review} className="space-y-3">
 							<Label htmlFor="device-code">Device code</Label>
@@ -140,7 +181,7 @@ export function DeviceApproval({
 								value={code}
 								onChange={(event) => {
 									setCode(event.target.value);
-									setRequest(undefined);
+									setReviewed(undefined);
 									setNotice("");
 								}}
 								autoComplete="off"
@@ -176,7 +217,8 @@ export function DeviceApproval({
 								<dd>
 									{!project && request.client_id === "allauth-mcp"
 										? "Sign in on the requesting computer with your existing workspace and application management access."
-										: request.scope?.split(" ").filter(Boolean).join(", ") || "No additional permissions"}
+										: request.scope?.split(" ").filter(Boolean).join(", ") ||
+											"No additional permissions"}
 								</dd>
 							</div>
 							{request.resource && (

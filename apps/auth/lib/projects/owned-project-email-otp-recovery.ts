@@ -71,6 +71,9 @@ interface Options {
 	): Promise<Response | null>;
 	defer(delivery: () => Promise<void>): void;
 	onDeliveryFailure?(operation: EmailOTPRecoveryIssueOperation): void;
+	prepareEmailOtpReset?(
+		request: Request,
+	): Promise<string | Response | undefined>;
 }
 
 function json(value: unknown, status = 200) {
@@ -185,6 +188,7 @@ export function createOwnedEmailOTPRecovery(options: Options) {
 	}
 
 	async function reset(
+		request: Request,
 		entered: string,
 		identity: ProjectEmailIdentity | null,
 		input: z.infer<typeof resetInput>,
@@ -202,6 +206,8 @@ export function createOwnedEmailOTPRecovery(options: Options) {
 						: "PASSWORD_REQUIREMENTS_NOT_MET",
 				policyError,
 			);
+		const actor = await options.prepareEmailOtpReset?.(request);
+		if (actor instanceof Response) return actor;
 		if (!identity) return failure(...otpErrors.invalid);
 		const identifier = projectEmailOtpIdentifier(
 			"forget-password",
@@ -244,6 +250,7 @@ export function createOwnedEmailOTPRecovery(options: Options) {
 				email: user.email,
 				passwordHash,
 				path: "/email-otp/reset-password",
+				actorId: actor,
 			}))
 				? "reset"
 				: "unavailable";
@@ -305,7 +312,7 @@ export function createOwnedEmailOTPRecovery(options: Options) {
 				"Password authentication is disabled for this application.",
 			);
 		if (parsed.data.operation === resetOperation)
-			return reset(entered, identity, parsed.data.body);
+			return reset(request, entered, identity, parsed.data.body);
 		return issue(entered, identity, parsed.data.operation);
 	};
 }

@@ -1,27 +1,34 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, createHmac, randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { getCurrentAdapter } from "@better-auth/core/context";
 import { oauthProvider } from "@better-auth/oauth-provider";
 import type { BetterAuthPlugin } from "better-auth";
+import { betterAuth } from "better-auth";
 import { emailOTP, jwt } from "better-auth/plugins";
 import { getTestInstance } from "better-auth/test";
 import { Kysely, PostgresDialect } from "kysely";
 import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { createAuthOptions } from "../auth";
 import { authPolicyPlugin } from "../auth-policy/plugin";
 import type { AuthPolicy } from "../auth-policy/policy";
 import { defaultAuthPolicy } from "../auth-policy/policy";
 import { clerkCompatiblePasswords } from "../clerk-password";
 import { allauthControl } from "../control";
+import { newWebhookSigningSecret } from "../control/webhook-contract";
+import type { ControlWebhookEnvelope } from "../control/webhooks";
+import { deliverPendingWebhooks } from "../control/webhooks";
 import {
 	recordAudit,
 	revokeAuthenticationChallenges,
 	revokeUserGrants,
 } from "../enterprise";
+import { sealLegacyUnversionedRecord } from "../legacy-encrypted-record";
 import type { ProjectEmailAliasMap } from "../project-email-alias-config";
 import { projectEmailAliases } from "../project-email-aliases";
 import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
 import { createOwnedProjectEmailAliases } from "./owned-project-email-aliases";
+import { createOwnedProjectEngine } from "./owned-project-engine";
 import type { RecoveryHttpOptions } from "./owned-recovery-http";
 import { createOwnedRecoveryHttp } from "./owned-recovery-http";
 
@@ -160,7 +167,9 @@ describe.skipIf(!existsSync(fixturePath))(
 					for (const name of [
 						"001-initial-auth",
 						"002-control-plane",
+						"004-webhooks",
 						"005-free-plugins",
+						"006-analytics",
 					])
 						await client.query(
 							readFileSync(
@@ -278,6 +287,190 @@ describe.skipIf(!existsSync(fixturePath))(
 			expect(response?.headers.has("set-cookie")).toBe(false);
 			expect(await response?.json()).toEqual({ success: true });
 		}
+
+		it.each([
+			["no browser", "192.0.2.76"],
+			["eligible browser", "192.0.2.77"],
+			["expired browser", "192.0.2.78"],
+			["unenrolled browser", "192.0.2.79"],
+		] as const)(
+			"preserves signed OTP reset deletion with %s",
+			async (scenario, address) => {
+				const policy: AuthPolicy = {
+					...defaultAuthPolicy,
+					...(scenario !== "no browser" && {
+						mfaMode: "required",
+						requireEmailVerification: true,
+						signUpEnabled: false,
+					}),
+				};
+				const nativeDatabase = nativeDb!;
+				const installed = betterAuth({
+					...createAuthOptions(
+						{ db: nativeDatabase, type: "postgres", transaction: true },
+						{
+							AUTH_RUNTIME: "node",
+							ALLAUTH_AUTH_URL: origin,
+							ALLAUTH_AUTH_SECRET: secret,
+							SCIM_CREDENTIAL_HASH_SECRET: "synthetic-otp-recovery-fixture-scim",
+						},
+						{
+							name: "OTP recovery webhook fixture",
+							slug,
+							basePath,
+							cookiePrefix: `allauth_project_${slug}`,
+							primaryOrigin: browser,
+							origins: [browser],
+							broker: { clientId: "fixture-broker-id", clientSecret: "fixture-broker-secret" },
+							authorizeAdmin: async () => null,
+							management: { id: "otp-webhook-fixture" },
+						},
+						policy,
+					),
+					logger: { disabled: true },
+				});
+				const candidate = createOwnedProjectEngine({
+					database,
+					project: { slug, schemaName: schema },
+					baseURL: origin,
+					basePath,
+					signingSecret: secret,
+					policy,
+					trustedOrigins: [browser],
+					trustedIP: (request) => request.headers.get("x-real-ip"),
+					recovery: {
+						publicLinkBaseURL: `${browser}/api/allauth`,
+						resetCallbackURLs: [`${browser}/reset-password`],
+						verificationCallbackURLs: [`${browser}/account`],
+						email: { environment: {} },
+						checkPasswordSafety: async () => "allowed",
+						admit: async () => ({ allowed: true, retryAfter: 0 }),
+						defer() {},
+					},
+				});
+				const email = `${randomUUID()}@otp-recovery.fixture.example`;
+				const target = await seed(email);
+				const actor = await seed(`${randomUUID()}@otp-recovery.fixture.example`);
+				await database.query(
+					`UPDATE ${scope}."user" SET "emailVerified"=true,
+					 "twoFactorEnabled"=(id=$1 AND $3::boolean) WHERE id IN ($1,$2)`,
+					[actor, target, scenario !== "unenrolled browser"],
+				);
+				const targetSession = randomUUID();
+				const actorSession = randomUUID();
+				const recipient = "https://otp-reset-hook.fixture.example/events";
+				const signing = newWebhookSigningSecret();
+				const endpoint = randomUUID();
+				const network = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+					const url = new URL(input instanceof Request ? input.url : input);
+					expect(url.origin).toBe("https://api.pwnedpasswords.com");
+					return new Response("00000000000000000000000000000000000:0");
+				});
+				try {
+					for (const [writer, dispatch] of [
+						["legacy", installed.handler],
+						["allauth", candidate.dispatch],
+					] as const) {
+						const targetToken = randomUUID();
+						const actorToken = randomUUID();
+						await database.query(
+							`INSERT INTO ${scope}."session"(id,token,"userId","createdAt","updatedAt","expiresAt")
+							 VALUES ($1,$2,$3,now(),now(),now()+interval '1 hour'),
+							 ($4,$5,$6,now(),now(),now()+$7::interval)`,
+							[targetSession, targetToken, target, actorSession, actorToken, actor,
+								scenario === "expired browser" ? "-1 minute" : `${policy.sessionExpiresInSeconds} seconds`],
+						);
+						const otp = await issueNative(email);
+						await database.query(
+							`INSERT INTO ${scope}."allauthWebhookEndpoint"(id,url,"eventTypes","encryptedSecret")
+							 VALUES ($1,$2,'["session.deleted"]',$3)`,
+							[endpoint, recipient, sealLegacyUnversionedRecord(signing, secret)],
+						);
+						const request = (submitted: string) => {
+							const reset = post(resetPath, { email, otp: submitted, password: replacement });
+							reset.headers.set("x-real-ip", address);
+							if (scenario !== "no browser") {
+								const signature = createHmac("sha256", secret).update(actorToken).digest("base64");
+								reset.headers.set("cookie", `__Secure-allauth_project_${slug}.session_token=${encodeURIComponent(`${actorToken}.${signature}`)}`);
+							}
+							return reset;
+						};
+						const events: Omit<ControlWebhookEnvelope["data"]["event"], "id" | "createdAt">[] = [];
+						const drain = async () => {
+							await deliverPendingWebhooks({
+								database: nativeDatabase,
+								secret,
+								resolver: async () => [{ address: "93.184.216.34", family: 4 }],
+								now: () => new Date(Date.now() + 1_000),
+								async transport({ destination, body, headers }) {
+									expect(destination.url.href).toBe(recipient);
+									const signature = createHmac("sha256", Buffer.from(signing.slice(6), "base64"))
+										.update(`${headers["webhook-id"]}.${headers["webhook-timestamp"]}.${body}`)
+										.digest("base64");
+									expect(headers["webhook-signature"]).toBe(`v1,${signature}`);
+									for (const value of [targetToken, actorToken, replacement])
+										expect(body).not.toContain(value);
+									const { id, createdAt, ...event } = (JSON.parse(body) as ControlWebhookEnvelope).data.event;
+									expect(id).toBeTruthy();
+									expect(createdAt).toBeTruthy();
+									events.push(event);
+									return 204;
+								},
+							});
+						};
+						const event = (userId: string, targetId: string, actorId?: string) => ({
+							type: "session.deleted",
+							outcome: "success",
+							userId,
+							targetId,
+							...(actorId ? { actorId } : {}),
+							metadata: { path: resetPath },
+						});
+						try {
+							if (scenario === "expired browser") {
+								const badCode = otp === "000000" ? "111111" : "000000";
+								const invalid = await dispatch(request(badCode));
+								expect(invalid.status, writer).toBe(400);
+								expect(await invalid.json()).toEqual({ code: "INVALID_OTP", message: "Invalid OTP" });
+								expect(invalid.headers.getSetCookie()).toEqual([]);
+								await drain();
+								expect(events.splice(0), writer).toEqual([event(actor, actorSession, actor)]);
+							}
+							const result = await dispatch(request(otp));
+							await drain();
+							if (scenario === "unenrolled browser") {
+								expect(result.status, writer).toBe(403);
+								expect(await result.json()).toMatchObject({
+									message: "This application requires an already verified account enrolled in MFA.",
+								});
+								expect((await proof(email)).rows, writer).toHaveLength(1);
+								expect(events, writer).toEqual([]);
+							} else {
+								await assertReset(result);
+								expect((await proof(email)).rows, writer).toHaveLength(0);
+								expect(events, writer).toEqual([
+									event(target, targetSession, scenario === "eligible browser" ? actor : undefined),
+								]);
+							}
+							const { rows } = await database.query<{ id: string }>(
+								`SELECT id FROM ${scope}."session" WHERE id=ANY($1::text[])`,
+								[[targetSession, actorSession]],
+							);
+							expect(new Set(rows.map(({ id }) => id)), writer).toEqual(new Set(
+								scenario === "unenrolled browser" ? [targetSession, actorSession]
+									: scenario === "expired browser" ? [] : [actorSession],
+							));
+						} finally {
+							await database.query(`DELETE FROM ${scope}."allauthWebhookEndpoint" WHERE id=$1`, [endpoint]);
+							await database.query(`DELETE FROM ${scope}."session" WHERE id=ANY($1::text[])`, [[targetSession, actorSession]]);
+							await database.query(`DELETE FROM ${scope}."verification" WHERE identifier=$1`, [`forget-password-otp-${email}`]);
+						}
+					}
+				} finally {
+					network.mockRestore();
+				}
+			},
+		);
 
 		it("consumes native-issued proof and atomically verifies email, creates credentials and revokes access", async () => {
 			const email = "native-issued@otp-recovery.fixture.example";

@@ -25,6 +25,7 @@ jobs:
           POSTGRES_DB: allauth
           POSTGRES_PASSWORD: allauth-ci-only
         ports: ["55445:5432", "55447:5432"]
+        # cspell:ignore isready
         options: >-
           --health-cmd "pg_isready -U allauth -d allauth"
           --health-interval 5s --health-timeout 5s --health-retries 20
@@ -87,6 +88,7 @@ jobs:
           lib/domains/hosted-organization-preview.test.ts lib/hosted-organization-ui-render.test.ts
           lib/domains/hosted-header-render.test.ts lib/domains/hosted-account-profile-render.test.ts
           lib/domains/hosted-account-security-render.test.ts
+          lib/features/device-render.test.ts lib/features/project-device-page.test.ts
           lib/domains/hosted-auth-error.test.ts lib/hosted-provider-render.test.ts lib/projects/oauth-return-window.test.ts lib/hosted-reset-continuation.test.ts lib/hosted-invitation-route-render.test.ts
           lib/projects/owned-project-agent-hosts.pg.test.ts lib/projects/engine-metrics.test.ts
           lib/projects/engine-metrics-comparison.test.ts

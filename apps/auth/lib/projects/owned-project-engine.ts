@@ -337,6 +337,7 @@ interface OwnedProjectEngineOptions {
 		| "trustedOrigins"
 		| "auditContext"
 		| "completeVerification"
+		| "prepareEmailOtpReset"
 		| "verifyHostedVerificationContinuation"
 	>;
 	emailAliases?: ProjectEmailAliasMap;
@@ -2736,6 +2737,29 @@ export function createOwnedProjectEngine(
 			basePath: options.basePath,
 			trustedOrigins: options.trustedOrigins,
 			auditContext: browserEventContext,
+			prepareEmailOtpReset: policy.mfaMode === "required"
+				? async (request) => {
+						const token = tokenFrom(request.headers);
+						if (!token) return;
+						const current = await store.transaction(async (client) => {
+							const observed = await store.session(token, refreshWindow, client, {
+								includeExpired: true,
+							});
+							return observed?.expired
+								? cleanupExpiredSession(client, request, token, "/email-otp/reset-password")
+								: observed;
+						});
+						if (!current) return;
+						const { user, session } = current;
+						if (!session.impersonatedBy && (!user.emailVerified || !user.twoFactorEnabled))
+							return failure(
+								403,
+								"FORBIDDEN",
+								"This application requires an already verified account enrolled in MFA.",
+							);
+						return user.id;
+					}
+				: undefined,
 			verifyHostedVerificationContinuation: issuer
 				? (target) =>
 						verifiedHostedOAuthContinuation(
@@ -4099,7 +4123,17 @@ export function createOwnedProjectEngine(
 			if (limited) return limited;
 			const denied = await factorAdmission(request, "change-password");
 			if (denied) return denied;
-			return passwordChange.change(request, await requestBody(request));
+			const input = request.body ? await requestBody(request) : undefined;
+			// The installed identity hook checks the caller before password policy.
+			const missing =
+				input === undefined
+					? null
+					: await missingBrowserSessionHeaders(request, path);
+			const response = await passwordChange.change(request, input);
+			if (missing && response.status === 401)
+				for (const cookie of missing.getSetCookie())
+					response.headers.append("set-cookie", cookie);
+			return response;
 		}
 		if (request.method === "POST" && path === "/update-user") {
 			const direct = options.basePath === `/api/projects/${slug}/auth`;

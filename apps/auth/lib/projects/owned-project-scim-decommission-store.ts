@@ -64,8 +64,8 @@ export function ownedSCIMDecommissionStore(
 	);
 	const domain = `organization:${organizationId}`;
 	const connectionKey = ownedSCIMScopedKey(["scim-connection", connectionId]);
-	const path =
-		"/api/organizations/:organizationId/scim/:connectionId/decommission";
+	// Native decommission reconciles sessions in a pathless server endpoint.
+	const path = "virtual:";
 
 	async function lockOrganization() {
 		const organization = await client.query(

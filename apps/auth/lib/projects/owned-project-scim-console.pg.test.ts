@@ -27,7 +27,10 @@ import type { AuthEnvironment } from "../configuration";
 import { setting } from "../configuration";
 import { consoleDatabase } from "../console/database";
 import type { ControlDatabase, ControlPrincipal } from "../control/types";
-import { newWebhookSigningSecret } from "../control/webhook-contract";
+import {
+	newWebhookSigningSecret,
+	webhookSignature,
+} from "../control/webhook-contract";
 import type { ControlWebhookEnvelope } from "../control/webhooks";
 import { deliverPendingWebhooks } from "../control/webhooks";
 import { signEdgeRequest } from "../domains/edge";
@@ -37,6 +40,7 @@ import { createWorkspace } from "../workspaces/repository";
 import { ownedSCIMScopedKey } from "./owned-project-scim-authority";
 import type { OwnedProjectSCIMConsole } from "./owned-project-scim-console";
 import { createOwnedProjectSCIMConsole } from "./owned-project-scim-console";
+import { createOwnedProjectSCIMUserWrites } from "./owned-project-scim-user-writes";
 import type { Project } from "./registry";
 import { projectRegistryPool, provisionProject } from "./registry";
 import {
@@ -1121,6 +1125,272 @@ describe.skipIf(!existsSync(fixturePath))(
 					`DELETE FROM ${otherScope}."allauthWebhookEndpoint" WHERE id=$1`,
 					[endpointId],
 				);
+			}
+		});
+
+		it.each([
+			"decommission",
+			"PATCH",
+			"DELETE",
+		] as const)("preserves signed SCIM session deletion metadata on %s", async (operation) => {
+			const scope = `"${alpha.schemaName}"`;
+			const sibling = `"${beta.schemaName}"`;
+			const callback = "https://session-webhook.scim-fixture.net/events";
+			const signing = newWebhookSigningSecret();
+			const endpoint = randomUUID();
+			const resourceBase = new URL(`/api/projects/${alpha.slug}/auth`, origin);
+			const siblingSecret = await withProjectAuth(
+				beta.slug,
+				async (instance) => (await instance.$context).secret,
+				env,
+			);
+			const native = await withProjectAuth(
+				alpha.slug,
+				async (instance, settings) => {
+					const entry = projectInstance(instance)!;
+					return {
+						database: await consoleDatabase(instance),
+						secret: (await instance.$context).secret,
+						selected: createOwnedProjectSCIMUserWrites({
+							database: entry.pool,
+							schemaName: alpha.schemaName,
+							credentialHashSecret: setting(
+								settings,
+								"SCIM_CREDENTIAL_HASH_SECRET",
+							),
+							baseURL: resourceBase.href,
+							manageCredentialUsage: true,
+							admitProfile: async () => null,
+						}),
+					};
+				},
+				env,
+			);
+			for (const [realm, secret] of [
+				[scope, native.secret],
+				[sibling, siblingSecret],
+			] as const)
+				await registry!.query(
+					`INSERT INTO ${realm}."allauthWebhookEndpoint" (id,url,"eventTypes","encryptedSecret") VALUES ($1,$2,'["session.deleted"]',$3)`,
+					[
+						endpoint,
+						callback,
+						await symmetricEncrypt({ key: secret, data: signing }),
+					],
+				);
+
+			try {
+				for (const writer of ["native", "selected"] as const) {
+					if (writer === "selected")
+						fixtureConsoles.set(alpha.id, alphaConsole);
+					else fixtureConsoles.delete(alpha.id);
+					const provider = randomUUID();
+					await registry!.query(
+						`INSERT INTO ${scope}."ssoProvider" (id,issuer,"oidcConfig","userId","providerId","organizationId",domain,"domainVerified")
+							 VALUES ($1,'https://issuer.scim-fixture.net','{}',$2,$1,$3,'scim-fixture.net',true)`,
+						[provider, localAdmin, organizationId],
+					);
+					const created = await create(
+						consoleRequest(alpha.slug, {
+							method: "POST",
+							cookie: rootCookie,
+							body: JSON.stringify({ providerId: provider }),
+						}),
+						collection,
+					);
+					expect(created.status, writer).toBe(201);
+					const { connection, token } = (await created.json()) as Issued;
+					const connectionId = connection.connectionId;
+					const identity = `${randomUUID()}@scim-fixture.net`;
+					const scimRequest = (method: string, path = "", body?: object) =>
+						new Request(`${resourceBase.href}/scim/v2/Users${path}`, {
+							method,
+							headers: {
+								authorization: `Bearer ${token}`,
+								"x-real-ip": "203.0.113.19",
+								...(body ? { "content-type": "application/scim+json" } : {}),
+							},
+							body: body && JSON.stringify(body),
+						});
+					const project = { params: Promise.resolve({ slug: alpha.slug }) };
+					const provisioned = await projectPOST(
+						scimRequest("POST", "", {
+							schemas: ["urn:ietf:params:scim:schemas:core:2.0:User"],
+							userName: identity,
+							emails: [{ value: identity, primary: true }],
+							active: true,
+						}),
+						project,
+					);
+					expect(provisioned.status).toBe(201);
+					const resourceId = ((await provisioned.json()) as { id: string }).id;
+					const {
+						rows: [linked],
+					} = await registry!.query<{ userId: string }>(
+						`SELECT "userId" FROM ${scope}."scimUser" WHERE id=$1`,
+						[resourceId],
+					);
+					expect(linked).toBeDefined();
+					const userId = linked!.userId;
+					const session = randomUUID();
+					const sessionToken = randomUUID();
+					const client = randomUUID();
+					const access = randomUUID();
+					const online = randomUUID();
+					const offline = randomUUID();
+					await registry!.query(
+						`INSERT INTO ${sibling}."user" (id,name,email,"emailVerified") VALUES ($1,$1,$2,true)`,
+						[userId, identity],
+					);
+					for (const realm of [scope, sibling]) {
+						await registry!.query(
+							`INSERT INTO ${realm}.session (id,token,"userId","expiresAt","updatedAt") VALUES ($1,$2,$3,now()+interval '1 day',now())`,
+							[session, sessionToken, userId],
+						);
+						await registry!.query(
+							`INSERT INTO ${realm}."oauthClient" (id,"clientId","redirectUris") VALUES ($1,$1,'[]')`,
+							[client],
+						);
+						await registry!.query(
+							`INSERT INTO ${realm}."oauthAccessToken" (id,token,"clientId","sessionId","userId","expiresAt","createdAt",scopes)
+								 VALUES ($1,$1,$2,$3,$4,now()+interval '1 day',now(),'["openid"]')`,
+							[access, client, session, userId],
+						);
+						await registry!.query(
+							`INSERT INTO ${realm}."oauthRefreshToken" (id,token,"clientId","sessionId","userId","expiresAt","createdAt",scopes)
+								 VALUES ($1,$1,$3,$4,$5,now()+interval '1 day',now(),'["openid"]'), ($2,$2,$3,$4,$5,now()+interval '1 day',now(),'["openid","offline_access"]')`,
+							[online, offline, client, session, userId],
+						);
+					}
+					const change = () => {
+						if (operation === "decommission")
+							return retire(
+								consoleRequest(alpha.slug, {
+									path: `/${connectionId}/decommission`,
+									method: "POST",
+									cookie: rootCookie,
+									body: "{}",
+								}),
+								detail(connectionId),
+							);
+						const path = `/${encodeURIComponent(resourceId)}`;
+						const request =
+							operation === "PATCH"
+								? scimRequest(operation, path, {
+										schemas: ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+										Operations: [
+											{ op: "replace", path: "active", value: false },
+										],
+									})
+								: scimRequest(operation, path);
+						if (writer === "selected") return native.selected(request);
+						return (operation === "PATCH" ? projectPATCH : projectDELETE)(
+							request,
+							project,
+						);
+					};
+					const response = await change();
+					expect(
+						response?.status,
+						`${writer} ${await response?.clone().text()}`,
+					).toBe(operation === "DELETE" ? 204 : 200);
+					if (operation === "decommission")
+						expect(await response?.json()).toMatchObject({
+							connection: { status: "decommissioned" },
+							decommission: { status: "complete" },
+						});
+					else if (operation === "PATCH")
+						expect(await response?.json()).toMatchObject({ active: false });
+					const replay = await change();
+					expect(replay?.status).toBe(operation === "DELETE" ? 404 : 200);
+					const state = async (realm: string) =>
+						(
+							await registry!.query(
+								`SELECT id,id AS "sessionId",false AS revoked FROM ${realm}.session WHERE id=$1
+								 UNION ALL SELECT id,"sessionId",revoked IS NOT NULL FROM ${realm}."oauthAccessToken" WHERE "clientId"=$2
+								 UNION ALL SELECT id,"sessionId",revoked IS NOT NULL FROM ${realm}."oauthRefreshToken" WHERE "clientId"=$2 ORDER BY id`,
+								[session, client],
+							)
+						).rows;
+					expect(await state(scope)).toEqual([]);
+					expect(await state(sibling)).toEqual(
+						[session, access, online, offline].sort().map((id) => ({
+							id,
+							sessionId: session,
+							revoked: false,
+						})),
+					);
+					const events: ControlWebhookEnvelope[] = [];
+					expect(
+						await deliverPendingWebhooks({
+							database: native.database,
+							secret: native.secret,
+							now: () => new Date(Date.now() + 2000),
+							resolver: async () => [{ address: "93.184.216.34", family: 4 }],
+							async transport({ destination, body, headers }) {
+								expect(destination.url.href).toBe(callback);
+								expect(headers["webhook-signature"]).toBe(
+									await webhookSignature(
+										signing,
+										headers["webhook-id"],
+										headers["webhook-timestamp"],
+										body,
+									),
+								);
+								for (const value of [
+									token,
+									sessionToken,
+									access,
+									online,
+									offline,
+									identity,
+									signing,
+								])
+									expect(body).not.toContain(value);
+								events.push(JSON.parse(body));
+								return 204;
+							},
+						}),
+					).toMatchObject({ claimed: 1, delivered: 1 });
+					expect(events).toEqual([
+						{
+							id: expect.any(String),
+							type: "session.deleted",
+							timestamp: expect.any(String),
+							data: {
+								event: {
+									id: events[0]?.id,
+									type: "session.deleted",
+									outcome: "success",
+									userId,
+									targetId: session,
+									createdAt: events[0]?.timestamp,
+									metadata: {
+										path:
+											operation === "decommission"
+												? "virtual:"
+												: "/scim/v2/Users/:userId",
+									},
+								},
+							},
+						},
+					]);
+					expect(
+						(
+							await registry!.query(
+								`SELECT 1 FROM ${sibling}."allauthWebhookDelivery" WHERE "endpointId"=$1`,
+								[endpoint],
+							)
+						).rowCount,
+					).toBe(0);
+				}
+			} finally {
+				fixtureConsoles.set(alpha.id, alphaConsole);
+				for (const realm of [scope, sibling])
+					await registry!.query(
+						`DELETE FROM ${realm}."allauthWebhookEndpoint" WHERE id=$1`,
+						[endpoint],
+					);
 			}
 		});
 

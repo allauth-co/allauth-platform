@@ -88,6 +88,7 @@ const accountId = randomUUID();
 const accountEmail = "account@project-engine-rehearsal.invalid";
 const alternateEmail = "alias@project-engine-rehearsal.invalid";
 const ownedSlug = "compiled-engine-owned";
+const deviceGrant = "urn:ietf:params:oauth:grant-type:device_code";
 
 interface Realm {
 	id: string;
@@ -330,7 +331,7 @@ async function startConnectedApplication(realm: Realm, cookie: string) {
 	await query(source, `
 		INSERT INTO "${schema}"."oauthClient"
 		(id,"clientId","redirectUris","grantTypes",scopes,"tokenEndpointAuthMethod","skipConsent","requirePKCE","createdAt","updatedAt")
-		VALUES ('${client}','${client}','["${redirect}"]','["authorization_code","refresh_token"]',
+		VALUES ('${client}','${client}','["${redirect}"]','["authorization_code","refresh_token","${deviceGrant}"]',
 		'["openid","profile","offline_access"]','none',true,true,now(),now());
 	`);
 	const state = randomUUID();
@@ -382,12 +383,272 @@ async function startConnectedApplication(realm: Realm, cookie: string) {
 	});
 	assert.ok(grant.keyId);
 	return {
+		client,
 		queryString,
 		async rotate() {
 			const updated = await exchange({ grant_type: "refresh_token", refresh_token: grant.refresh });
 			assert.equal(updated.keyId, grant.keyId, "The project issuer retains the signing key.");
 			assert.ok(updated.refresh !== grant.refresh, "The issuer rotates the offline grant.");
 			grant = updated;
+		},
+	};
+}
+
+async function startConnectedDevice(realm: Realm, client: string) {
+	const schema = `allauth_project_${realm.id.replaceAll("-", "")}`;
+	const scope = "openid profile offline_access";
+	const response = await request("/api/auth/device/code", {
+		host,
+		body: new URLSearchParams({ client_id: client, scope }),
+	});
+	expectStatus(
+		response,
+		200,
+		"The native project issuer starts device authorization.",
+	);
+	assert.deepEqual(response.cookies, []);
+	const codes = JSON.parse(response.body) as {
+		device_code: string;
+		user_code: string;
+		verification_uri: string;
+		verification_uri_complete: string;
+	};
+	assert.match(codes.device_code, /^[A-Za-z0-9]{40}$/);
+	assert.match(codes.user_code, /^[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{8}$/);
+	const verification = new URL(codes.verification_uri_complete);
+	const apex = new URL("/device", platform);
+	apex.searchParams.set("project", realm.slug);
+	assert.equal(codes.verification_uri, apex.href);
+	apex.searchParams.set("user_code", codes.user_code);
+	assert.equal(verification.href, apex.href);
+
+	function persisted(db: string) {
+		return query(
+			db,
+			`
+			SELECT json_build_object('status',status,'userId',"userId")::text
+			FROM "${schema}"."deviceCode" WHERE "oauthClientId"='${client}'
+			AND "deviceCode"='${codes.device_code}' AND "userCode"='${codes.user_code}'
+		`,
+		);
+	}
+	async function expectPending(db: string, userId: string | null) {
+		assert.deepEqual(JSON.parse(await persisted(db)), {
+			status: "pending",
+			userId,
+		});
+	}
+	await expectPending(source, null);
+
+	return {
+		async review(
+			platformCookie: string,
+			projectCookie: string,
+			credentials: { email: string; password: string },
+			managedHostname: string,
+		) {
+			const publicPath = verification.pathname + verification.search;
+			const apexCookies = `${platformCookie}; ${projectCookie}`;
+			const direct = await request(publicPath, { cookie: apexCookies });
+			expectStatus(
+				direct,
+				200,
+				"A fresh project session can review on the original platform URL.",
+			);
+			assert.match(direct.body, /Approve a device/);
+			await expectPending(restored, null);
+			const directSession = await request(
+				`/api/projects/${realm.slug}/auth/get-session?disableRefresh=true`,
+				{
+					realm,
+					cookie: projectCookie,
+				},
+			);
+			expectStatus(
+				directSession,
+				200,
+				"Read the exact fresh apex project session.",
+			);
+			const { session } = JSON.parse(directSession.body) as {
+				session: { id: string };
+			};
+			assert.match(session.id, /^[A-Za-z0-9_-]+$/);
+			const originalCreatedAt = await query(
+				restored,
+				`SELECT "createdAt"::text FROM "${schema}"."session" WHERE id='${session.id}'`,
+			);
+			assert.match(originalCreatedAt, /^[\d:. +Z-]+$/);
+			let handoff: Awaited<ReturnType<typeof request>>;
+			await query(
+				restored,
+				`UPDATE "${schema}"."session" SET "createdAt"=now()-interval '6 minutes' WHERE id='${session.id}'`,
+			);
+			try {
+				handoff = await request(publicPath, { cookie: apexCookies });
+			} finally {
+				await query(
+					restored,
+					`UPDATE "${schema}"."session" SET "createdAt"='${originalCreatedAt}' WHERE id='${session.id}'`,
+				);
+			}
+			expectStatus(
+				handoff,
+				307,
+				"The original platform link opens verified project device review.",
+			);
+			assert.deepEqual(handoff.cookies, []);
+			assert.ok(handoff.location);
+			const destination = new URL(handoff.location);
+			const userCode = new URLSearchParams({ user_code: codes.user_code });
+			const reviewPath = `/account/device?${userCode}`;
+			assert.equal(destination.href, `https://${managedHostname}${reviewPath}`);
+			const browser = { host: destination.hostname, clientIP: "192.0.2.65" };
+			const page = await request(reviewPath, browser);
+			expectStatus(
+				page,
+				200,
+				"The verified accounts host renders device review.",
+			);
+			assert.match(page.body, /Approve a device/);
+			assert.ok(!page.body.includes(codes.device_code));
+			await expectPending(restored, null);
+
+			const signInQuery = new URLSearchParams({ callbackUrl: reviewPath });
+			const signIn = await request(`/sign-in?${signInQuery}`, browser);
+			expectStatus(
+				signIn,
+				200,
+				"Device reauthentication uses the project's hosted sign-in.",
+			);
+			assert.ok(signIn.body.includes("/api/auth/hosted-ui"));
+			const signedIn = await request("/api/auth/hosted-ui/sign-in/email", {
+				...browser,
+				accept: "application/json",
+				body: { ...credentials, callbackURL: destination.href },
+			});
+			expectStatus(
+				signedIn,
+				200,
+				"AllAuth signs in the project account on the review hostname.",
+			);
+			const signedInBody = JSON.parse(signedIn.body) as {
+				url: string;
+				user: { id: string };
+			};
+			assert.equal(signedInBody.url, destination.href);
+			assert.equal(signedInBody.user.id, accountId);
+			const cookie = frontendSessionCookie(signedIn, destination.hostname);
+			expectStatus(
+				await request(reviewPath, { ...browser, cookie }),
+				200,
+				"Sign-in returns to the same-host review page.",
+			);
+			await expectPending(restored, null);
+
+			const readDevice = () =>
+				request(`/api/auth/device?${userCode}`, {
+					...browser,
+					cookie,
+					accept: "application/json",
+				});
+			const review = await readDevice();
+			expectStatus(
+				review,
+				200,
+				"The verified project account explicitly reviews the native device code.",
+			);
+			const expectedReview = {
+				user_code: codes.user_code,
+				status: "pending",
+				client_id: client,
+				scope,
+			};
+			assert.deepEqual(JSON.parse(review.body), expectedReview);
+			await expectPending(restored, accountId);
+			return async () => {
+				const restoredPage = await request(reviewPath, { ...browser, cookie });
+				expectStatus(
+					restoredPage,
+					200,
+					"The open review URL remains available after rollback.",
+				);
+				assert.match(restoredPage.body, /Approve a device/);
+				const restoredReview = await readDevice();
+				expectStatus(
+					restoredReview,
+					200,
+					"The native writer recognizes the same project session and reviewed code.",
+				);
+				assert.deepEqual(JSON.parse(restoredReview.body), expectedReview);
+				await expectPending(restored, accountId);
+				const approval = await request("/api/auth/device/approve", {
+					...browser,
+					cookie,
+					body: { userCode: codes.user_code },
+				});
+				expectStatus(
+					approval,
+					200,
+					"The restored native writer approves the reviewed device code.",
+				);
+				assert.deepEqual(JSON.parse(approval.body), { success: true });
+				assert.deepEqual(JSON.parse(await persisted(restored)), {
+					status: "approved",
+					userId: accountId,
+				});
+
+				const exchange = () =>
+					request("/api/auth/oauth2/token", {
+						host,
+						body: new URLSearchParams({
+							grant_type: deviceGrant,
+							client_id: client,
+							device_code: codes.device_code,
+						}),
+					});
+				const redeemed = await exchange();
+				expectStatus(
+					redeemed,
+					200,
+					"The original project issuer exchanges the approved grant.",
+				);
+				assert.deepEqual(redeemed.cookies, []);
+				const tokens = JSON.parse(redeemed.body) as {
+					access_token: string;
+					refresh_token: string;
+					id_token: string;
+					token_type: string;
+					scope: string;
+				};
+				assert.ok(
+					tokens.access_token && tokens.refresh_token && tokens.id_token,
+				);
+				assert.equal(tokens.token_type, "Bearer");
+				assert.equal(tokens.scope, scope);
+				const jwks = await request("/api/auth/jwks", { host });
+				expectStatus(
+					jwks,
+					200,
+					"The original project issuer still publishes its keys.",
+				);
+				await jwtVerify(
+					tokens.id_token,
+					createLocalJWKSet(JSON.parse(jwks.body) as JSONWebKeySet),
+					{
+						issuer: `https://${host}/api/auth`,
+						audience: client,
+						subject: accountId,
+					},
+				);
+				assert.equal(await persisted(restored), "");
+				const replay = await exchange();
+				expectStatus(
+					replay,
+					400,
+					"The original device code is consumed only once.",
+				);
+				assert.equal(JSON.parse(replay.body).error, "invalid_grant");
+			};
 		},
 	};
 }
@@ -928,6 +1189,9 @@ try {
 		expectStatus(await request(`${direct}/not-installed`, { realm: owned }), 404,
 			`Registering a ${cohortEnvironment} project keeps its legacy writer.`);
 	}
+	const connectedDevice = connected
+		? await startConnectedDevice(owned, connected.client)
+		: undefined;
 	await stop(source);
 	await query(
 		"postgres",
@@ -1477,6 +1741,12 @@ try {
 	}
 	await checkKey(direct, { realm: owned, cookie: ownedCookie });
 	await checkKey("/api/auth", { host, cookie: ownedHostedCookie });
+	const finishDevice = await connectedDevice?.review(
+		rootCookie,
+		ownedCookie,
+		ownedLogin,
+		managedHost,
+	);
 	await stop(restored);
 
 	if (fencedSelection) {
@@ -1531,6 +1801,7 @@ try {
 		404,
 		"The restored hosted route rolls back to native.",
 	);
+	await finishDevice?.();
 	assert.equal(
 		await currentSession(`${direct}/get-session`, {
 			realm: owned,
