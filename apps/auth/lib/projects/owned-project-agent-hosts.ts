@@ -30,9 +30,10 @@ import {
 } from "./owned-project-agent-enrollment";
 import {
 	agentGrantRevokePath,
+	agentRevokePath,
 	ownedAgentGrantRevokeInput,
 	revokeOwnedAgentGrants,
-	revokeOwnSignedAgentGrants,
+	revokeOwnSignedAgent,
 } from "./owned-project-agent-grant-revocation";
 import {
 	agentHostRotationPath,
@@ -76,7 +77,6 @@ const listInput = z.object({
 const detailInput = z.object({ host_id: z.string() });
 const revokeInput = z.object({ host_id: z.string().optional() });
 const revokePath = "/host/revoke";
-const agentRevokePath = "/agent/revoke";
 type SignedHostRevocationPath =
 	| typeof revokePath
 	| typeof agentRevokePath
@@ -411,10 +411,15 @@ export function createOwnedProjectAgentHosts(options: BrowserHosts) {
 				hostRevoke || agentRevoke || grantRevoke
 					? signedRevocationType(request)
 					: undefined;
-			if (grantRevoke && signedType === "agent+jwt") {
+			if ((agentRevoke || grantRevoke) && signedType === "agent+jwt") {
 				const body = await options.readBody(request);
 				return options.store.transaction((client) =>
-					revokeOwnSignedAgentGrants(client, request, body),
+					revokeOwnSignedAgent(
+						client,
+						request,
+						body,
+						grantRevoke ? agentGrantRevokePath : agentRevokePath,
+					),
 				);
 			}
 			if (

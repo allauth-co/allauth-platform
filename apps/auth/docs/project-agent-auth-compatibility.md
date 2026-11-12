@@ -18,7 +18,7 @@ The platform installs `@better-auth/agent-auth` 0.6.2. The endpoint inventory be
 | Signed agent status | `GET /agent/status` | Known inline Ed25519 host or active delegated agent. Keeps native status and grant fields and the normal active-agent heartbeat. |
 | Agent listing and detail | `GET /agent/list`, `GET /agent/get` | Current owner’s signed browser session. |
 | Agent profile | `POST /agent/update` | Current agent owner’s signed browser session, with native name and metadata updates. |
-| Agent revocation | `POST /agent/revoke` | Signed browser session of the agent or host owner, or an active signed host selecting an agent on that host. Direct agent JWT revocation is pending. |
+| Agent revocation | `POST /agent/revoke` | Signed browser session of the agent or host owner, an active signed host selecting its agent, or an active signed delegated agent disconnecting itself. |
 | Agent expiry cleanup | `POST /agent/cleanup` | Live browser owner can expire their overdue active agents and pending approval records. |
 | Agent reactivation | `POST /agent/reactivate` | Active signed host and eligible owner, existing delegated inline agent, and empty host defaults for expired-agent renewal. |
 | Agent key rotation | `POST /agent/rotate-key` | Active signed inline host can rotate an active owned delegated agent’s inline key. |
@@ -50,6 +50,8 @@ Signed status accepts a host ID or unique key ID and scopes the requested agent 
 Delegated registration binds the new agent to the same owner and host, retains its inline public key and native 15-minute lifetime, and updates the host heartbeat on success. The fixture serializes the five-active-agent limit across an owner’s hosts and consumes registration JWT IDs separately from repeatable host status reads. Legacy reads recognize the owned rows. Forced or pending enrollment and registration retries that create a new approval remain outside this slice.
 
 Browser agent list and detail accept the current owner’s signed session and expose the native grant projections. List preserves status, mode, and host filters and pagination. Browser revocation locks the live session and target authority, clears the agent’s inline signing key and key ID, and revokes its grants in one realm-scoped transaction. The persisted host owner can revoke an agent on that host even when the agent is unbound. The installed client’s disconnect operation uses an active signed host and an explicit agent ID. This operation remains repeatable under the same valid host proof and leaves the host and other agents usable. Legacy reads after rollback recognize the updated rows.
+
+A signed delegated agent can disconnect itself with its own active credential. The target defaults to the verified agent when the request omits `agent_id`. The fixture checks the realm audience, any request binding and the single-use JWT ID before retiring the key and revoking grants in the same transaction. The native browser route reads the resulting revoked agent and grants after rollback.
 
 Browser profile updates require the agent owner’s live session. The native metadata map accepts string, number, boolean and null values. A supplied map replaces the stored map, and a request containing only the name retains the previous metadata. The write changes the profile and update time under the same agent ID.
 

@@ -1880,6 +1880,134 @@ describe.skipIf(!existsSync(fixture))(
 			});
 		});
 
+		it("disconnects a signed delegated agent only from its own realm, preserving native rollback reads", async () => {
+			const path = "/agent/revoke";
+			const scope = `"${alpha.schemaName}"`;
+			const nativeAgent = await nativeMachine(
+				"Native self-disconnect",
+				registrationCookie,
+			);
+			const ownedAgent = await nativeMachine(
+				"Owned self-disconnect",
+				registrationCookie,
+			);
+			for (const { agentId } of [nativeAgent, ownedAgent]) {
+				await database.query(
+					`INSERT INTO ${scope}."agentCapabilityGrant" (id,"agentId",capability,status,"createdAt","updatedAt") VALUES
+					($1,$3,'fixture.read','active',now(),now()),($2,$3,'fixture.write','pending',now(),now())`,
+					[randomUUID(), randomUUID(), agentId],
+				);
+			}
+			async function sign(agent: typeof ownedAgent, body: object) {
+				return `Bearer ${await new SignJWT({
+					htm: "POST",
+					htu: `${agentAudience}${path}`,
+					ath: createHash("sha256")
+						.update(JSON.stringify(body))
+						.digest("base64url"),
+				})
+					.setProtectedHeader({ alg: "EdDSA", typ: "agent+jwt" })
+					.setIssuer(agent.hostId)
+					.setSubject(agent.agentId)
+					.setAudience(agentAudience)
+					.setIssuedAt()
+					.setExpirationTime("45s")
+					.setJti(randomUUID())
+					.sign(agent.agentKey.privateKey)}`;
+			}
+			const foreign = { agent_id: nativeAgent.agentId };
+			await expectSame(
+				path,
+				registrationCookie,
+				403,
+				foreign,
+				await sign(ownedAgent, foreign),
+			);
+			await expectSame(path, "", 401, foreign, await sign(ownedAgent, {}));
+			const explicit = { agent_id: ownedAgent.agentId };
+			const implicit = {};
+			const beforeOwned = await persisted(ownedAgent.hostId);
+			const beforeNative = await persisted(nativeAgent.hostId);
+			const ownedProof = await sign(ownedAgent, implicit);
+			expect(
+				(await outside.dispatch(request(beta, path, "", implicit, ownedProof)))
+					.status,
+			).toBe(401);
+			expect(
+				(
+					await disabled.dispatch(
+						request(alpha, path, "", implicit, ownedProof),
+					)
+				).status,
+			).toBe(501);
+			await database.query(
+				`ALTER TABLE ${scope}."agentCapabilityGrant" ADD CONSTRAINT fixture_reject_self_revoke CHECK (status<>'revoked') NOT VALID`,
+			);
+			try {
+				await expect(
+					owned.dispatch(request(alpha, path, "", implicit, ownedProof)),
+				).rejects.toMatchObject({ code: "23514" });
+			} finally {
+				await database.query(
+					`ALTER TABLE ${scope}."agentCapabilityGrant" DROP CONSTRAINT fixture_reject_self_revoke`,
+				);
+			}
+			expect(await persisted(ownedAgent.hostId)).toEqual(beforeOwned);
+			const next = await owned.dispatch(
+				request(alpha, path, "", implicit, ownedProof),
+			);
+			expect(next.status).toBe(200);
+			expect(await next.json()).toEqual({
+				agent_id: ownedAgent.agentId,
+				status: "revoked",
+			});
+			expect(await persisted(nativeAgent.hostId)).toEqual(beforeNative);
+			const previous = await legacy.handler(
+				request(alpha, path, "", {}, await sign(nativeAgent, {})),
+			);
+			expect(previous.status).toBe(200);
+			expect(await previous.json()).toEqual({
+				agent_id: nativeAgent.agentId,
+				status: "revoked",
+			});
+			for (const machine of [nativeAgent, ownedAgent]) {
+				const saved = await persisted(machine.hostId);
+				expect(saved.hosts).toEqual(
+					machine === ownedAgent ? beforeOwned.hosts : beforeNative.hosts,
+				);
+				expect(saved.agents).toHaveLength(2);
+				for (const row of saved.agents)
+					expect(row).toMatchObject({
+						status: "revoked",
+						publicKey: "",
+						kid: null,
+						grantStatus: "revoked",
+					});
+			}
+			const retiredProof = await sign(ownedAgent, explicit);
+			const retired = await candidate(alpha, true).dispatch(
+				request(alpha, path, "", explicit, retiredProof),
+			);
+			expect(retired.ok).toBe(false);
+			legacy = await native(nativePool);
+			const rollback = await legacy.handler(
+				request(
+					alpha,
+					`/agent/get?agent_id=${ownedAgent.agentId}`,
+					registrationCookie,
+				),
+			);
+			expect(rollback.status).toBe(200);
+			expect(await rollback.json()).toMatchObject({
+				agent_id: ownedAgent.agentId,
+				status: "revoked",
+				agent_capability_grants: expect.arrayContaining([
+					{ capability: "fixture.read", status: "revoked" },
+					{ capability: "fixture.write", status: "revoked" },
+				]),
+			});
+		});
+
 		it.each([
 			"browser",
 			"host",

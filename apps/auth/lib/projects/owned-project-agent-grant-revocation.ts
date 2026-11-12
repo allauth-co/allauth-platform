@@ -2,6 +2,10 @@ import type { PoolClient } from "pg";
 import * as z from "zod";
 import { hasRemoteAgentKeys } from "../features/helpers";
 import {
+	ownedAgentRevokeInput,
+	revokeLockedOwnedAgent,
+} from "./owned-project-agent-browser";
+import {
 	agentHostJSON as json,
 	invalidAgentBody,
 } from "./owned-project-agent-enrollment";
@@ -17,6 +21,7 @@ import {
 } from "./owned-project-agent-status";
 
 export const agentGrantRevokePath = "/agent/revoke-capability";
+export const agentRevokePath = "/agent/revoke";
 const input = z.object({
 	agent_id: z.string(),
 	capabilities: z.array(z.string()).min(1),
@@ -65,13 +70,17 @@ export async function revokeOwnedAgentGrants(
 	});
 }
 
-/** Accept a verified agent proof for a revocation limited to its own grants. */
-export async function revokeOwnSignedAgentGrants(
+/** Allow the verified agent to retire its own credential or selected grants. */
+export async function revokeOwnSignedAgent(
 	client: PoolClient,
 	request: Request,
 	body: unknown,
+	path: typeof agentGrantRevokePath | typeof agentRevokePath,
 ) {
-	const parsed = ownedAgentGrantRevokeInput(body);
+	const parsed: Response | { agent_id?: string; capabilities?: string[] } =
+		path === agentGrantRevokePath
+			? ownedAgentGrantRevokeInput(body)
+			: ownedAgentRevokeInput(body);
 	if (parsed instanceof Response) return parsed;
 	const url = new URL(request.url);
 	const decoded = decodeAgentMachineJWT(request);
@@ -80,7 +89,7 @@ export async function revokeOwnSignedAgentGrants(
 		client,
 		request,
 		url,
-		agentMachineAudience(url, agentGrantRevokePath),
+		agentMachineAudience(url, path),
 		decoded,
 		body,
 	);
@@ -91,13 +100,20 @@ export async function revokeOwnSignedAgentGrants(
 		url.origin,
 	);
 	if (active instanceof Response) return active;
-	if (parsed.agent_id !== active.id) {
-		if (parsed.agent_id.includes("\0"))
+	const target = parsed.agent_id ?? active.id;
+	if (path === agentRevokePath && !target)
+		return problem(
+			400,
+			"invalid_request",
+			"Malformed request, missing required fields, or invalid parameter types",
+		);
+	if (target !== active.id) {
+		if (target.includes("\0"))
 			return problem(404, "agent_not_found", "Agent not found");
-		const target = await client.query(`SELECT 1 FROM "agent" WHERE id=$1`, [
-			parsed.agent_id,
+		const exists = await client.query(`SELECT 1 FROM "agent" WHERE id=$1`, [
+			target,
 		]);
-		return target.rowCount
+		return exists.rowCount
 			? problem(
 					403,
 					"unauthorized",
@@ -105,5 +121,7 @@ export async function revokeOwnSignedAgentGrants(
 				)
 			: problem(404, "agent_not_found", "Agent not found");
 	}
-	return revokeOwnedAgentGrants(client, active, parsed.capabilities);
+	return path === agentGrantRevokePath
+		? revokeOwnedAgentGrants(client, active, parsed.capabilities ?? [])
+		: revokeLockedOwnedAgent(client, active.id);
 }
