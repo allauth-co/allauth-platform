@@ -20,6 +20,7 @@ export type OwnedProjectOAuthUnlink = z.infer<
 export type LinkedAccountOperation =
 	| "list"
 	| "info"
+	| "provider-token"
 	| "link"
 	| "link-callback"
 	| "unlink";
@@ -102,6 +103,14 @@ type RotatedAccountGrant = Pick<
 	| "idToken"
 >;
 
+interface LinkedAccountReadOptions {
+	operation?: "info" | "provider-token";
+	refresh?(
+		account: LinkedAccountGrant,
+	): Promise<RotatedAccountGrant | undefined>;
+	forceRefresh?: boolean;
+}
+
 export function linkedAccountScopes(scope: string | null) {
 	return (
 		scope
@@ -155,6 +164,7 @@ export function createOwnedProjectLinkedAccounts(
 		if (
 			operation !== "list" &&
 			operation !== "info" &&
+			operation !== "provider-token" &&
 			(user.directoryManaged || user.isAnonymous)
 		)
 			return rejected("forbidden");
@@ -191,12 +201,14 @@ export function createOwnedProjectLinkedAccounts(
 		request: Request,
 		token: string | null,
 		accountId: string | null,
-		refresh?: (
-			account: LinkedAccountGrant,
-		) => Promise<RotatedAccountGrant | undefined>,
+		{
+			operation = "info",
+			refresh,
+			forceRefresh,
+		}: LinkedAccountReadOptions = {},
 	) {
 		return store.transaction(async (client) => {
-			const authority = await lockAuthority(client, request, token, "info");
+			const authority = await lockAuthority(client, request, token, operation);
 			if (authority.status === "rejected") return authority;
 			const read = await client.query<LinkedAccountGrant>(
 				`SELECT id,"providerId","accountId",scope,"accessToken","accessTokenExpiresAt","refreshToken","refreshTokenExpiresAt","idToken"
@@ -205,7 +217,7 @@ export function createOwnedProjectLinkedAccounts(
 			);
 			let account = read.rows[0];
 			if (!account) return rejected("notFound");
-			if (refresh && linkedAccessTokenNearExpiry(account)) {
+			if (refresh && (forceRefresh || linkedAccessTokenNearExpiry(account))) {
 				const rotated = await refresh(account);
 				if (!rotated) return { status: "found" as const, account };
 				const persisted = await client.query(

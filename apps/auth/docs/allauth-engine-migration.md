@@ -34,7 +34,7 @@ The records cover sign-in and second-factor requests, provider callbacks, sessio
 
 Baseline metrics also count the legacy project `/get-access-token` and `/refresh-token` operations on direct and hosted transports. The comparison shows these groups when it observes them. Investigate successful calls and confirm the project's configured clients before selecting its writer. Missing observations describe the sampled interval only.
 
-The candidate preserves `/get-access-token` for owning browser sessions on the direct project and verified signed proxy routes. It selects the stored local account ID, returns the provider access and ID token fields with `Cache-Control: no-store`, and retains the refresh token in encrypted storage. Isolated PostgreSQL checks cover Google and the project broker, including concurrent refresh and rollback. Check for callers that use server bearer authentication or `/refresh-token` before enrolling a project.
+The candidate preserves `/get-access-token` and `/refresh-token` for the owning session and exact local account ID. The direct project route accepts existing signed server session bearers and preserves session renewal, including `disableRefresh=true`. Browser and verified signed proxy calls use the owning cookie. Both responses use `Cache-Control: no-store`. The explicit refresh route retains the legacy response fields and writes encrypted grants with the stored scopes. The stock SDK proxy and hosted sign-in form allowlists omit these two operations. Isolated PostgreSQL checks cover Google and the project broker, concurrent account writes, credential rotation and rollback.
 
 ## Project cutover
 

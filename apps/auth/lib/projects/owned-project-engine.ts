@@ -521,6 +521,7 @@ export function createOwnedProjectEngine(
 		Request,
 		{ session: ProjectSession; source: ActivitySource }
 	>();
+	const providerSessionRenewals = new WeakMap<Request, Headers>();
 	const committedLogoutTargets = new WeakMap<
 		Request,
 		ProjectBackchannelTarget[]
@@ -1663,6 +1664,12 @@ export function createOwnedProjectEngine(
 
 	function serverSessionBearer(headers: Headers) {
 		return readLegacyServerSessionBearer(headers, options.signingSecret);
+	}
+
+	function providerSessionBearer(request: Request) {
+		return options.basePath === `/api/projects/${slug}/auth`
+			? serverSessionBearer(request.headers)
+			: null;
 	}
 
 	function sessionMutationOrigin(request: Request) {
@@ -2924,9 +2931,29 @@ export function createOwnedProjectEngine(
 						emailConfigured(options.emailSignIn.email.environment),
 				);
 			},
-			async authorizeLinkedAccounts(client, { request, user }) {
-				const active = await currentSession(request.headers, client);
-				return active?.user.id === user.id;
+			async authorizeLinkedAccounts(client, { request, user, operation }) {
+				const bearer =
+					operation === "provider-token"
+						? providerSessionBearer(request)
+						: null;
+				const active = bearer
+					? await eligibleSession(bearer, client)
+					: await currentSession(request.headers, client);
+				if (active?.user.id !== user.id) return false;
+				if (operation !== "provider-token") return true;
+				const headers = new Headers();
+				await renewAuthorizedSession(
+					request,
+					active,
+					client,
+					headers,
+					Boolean(bearer),
+				);
+				if (headers.has("set-cookie"))
+					afterOwnedProjectCommit(client, () =>
+						providerSessionRenewals.set(request, headers),
+					);
+				return true;
 			},
 			async complete(
 				client,
@@ -3599,17 +3626,36 @@ export function createOwnedProjectEngine(
 			return oauth.listAccounts(request);
 		if (oauth && path === "/account-info" && request.method === "GET")
 			return oauth.accountInfo(request);
-		if (oauth && path === "/get-access-token" && request.method === "POST") {
+		if (
+			oauth &&
+			(path === "/get-access-token" || path === "/refresh-token") &&
+			request.method === "POST"
+		) {
 			const limited = await store.transaction((client) =>
 				admitOwnedProjectNativeRoute(client, options.trustedIP(request), path, {
 					max: 100,
 					windowMs: 60_000,
 				}),
 			);
-			return (
-				limited ??
-				oauth.providerAccessToken(request, () => requestBody(request, 8192))
+			if (limited) return limited;
+			const bearer = providerSessionBearer(request);
+			if (bearer) {
+				const originFailure = sessionMutationOrigin(request);
+				if (originFailure) return originFailure;
+			}
+			const response = await oauth.providerToken(
+				request,
+				() => requestBody(request, 8192),
+				path,
+				bearer,
 			);
+			const renewal = providerSessionRenewals.get(request);
+			if (renewal) {
+				providerSessionRenewals.delete(request);
+				for (const [name, value] of renewal)
+					response.headers.append(name, value);
+			}
+			return response;
 		}
 		if (oauth && path === "/unlink-account" && request.method === "POST") {
 			if (!trustedRequest(request.headers, true)) return forbidden();

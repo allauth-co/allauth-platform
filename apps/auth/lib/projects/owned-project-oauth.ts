@@ -481,12 +481,13 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 		request: Request,
 		path: string,
 		method: "GET" | "POST",
+		ignoreAuthorization = false,
 	) {
 		const caller = request.headers.get("origin");
 		return (
 			request.method === method &&
 			route(request, path) &&
-			!request.headers.has("authorization") &&
+			(ignoreAuthorization || !request.headers.has("authorization")) &&
 			request.headers.get("sec-fetch-site") !== "cross-site" &&
 			(caller === null ? method === "GET" : origins.has(caller))
 		);
@@ -1233,7 +1234,7 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 		};
 	}
 
-	const accessTokenSelection = z.union([
+	const providerTokenSelection = z.union([
 		z.strictObject({
 			accountId: z.string(),
 			userId: z.string().optional(),
@@ -1243,10 +1244,6 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 			userId: z.string().optional(),
 		}),
 	]);
-	const accessTokenRefreshFailed = Symbol(
-		"Linked provider access token refresh failed",
-	);
-
 	function configuredLinkedProvider(account: LinkedAccountGrant) {
 		const provider = projectOAuthProvider.safeParse(account.providerId);
 		if (!provider.success) return;
@@ -1262,50 +1259,74 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 		);
 	}
 
-	async function providerAccessToken(
+	async function providerToken(
 		request: Request,
 		readBody: () => Promise<unknown>,
-	) {
-		if (!browserRequest(request, "get-access-token", "POST"))
+		path: "/get-access-token" | "/refresh-token",
+		bearer: string | null,
+	): Promise<Response> {
+		// Browser authority comes from the owning session cookie. The direct bearer has its own origin check.
+		const routeName = path.slice(1);
+		if (
+			!browserRequest(request, routeName, "POST", true) &&
+			!(bearer && request.method === "POST" && route(request, routeName))
+		)
 			return publicFailure(
 				"FORBIDDEN",
 				"This authentication request is not permitted.",
 				403,
 			);
-		const selection = accessTokenSelection.safeParse(await readBody());
+		const selection = providerTokenSelection.safeParse(await readBody());
 		if (!selection.success)
 			return publicFailure("VALIDATION_ERROR", "[body] Invalid input", 400);
 		// This PostgreSQL realm uses the owning live session and local row ID. Its
 		// native engine did not enable the stateless provider account cookie.
 		const accountId =
 			"accountId" in selection.data ? selection.data.accountId : null;
-		const loaded = await linked
-			.info(request, browserToken(request), accountId, async (account) => {
-				const configured = configuredLinkedProvider(account);
-				if (!configured) return;
-				try {
-					const { provider, config } = configured;
-					const rotated = await refreshLinkedAccount(
-						provider,
-						config,
-						await metadata(provider),
-						account,
-					);
-					return {
-						...rotated,
-						accessTokenExpiresAt:
-							rotated.accessTokenExpiresAt ?? account.accessTokenExpiresAt,
-					};
-				} catch {
-					throw accessTokenRefreshFailed;
-				}
-			})
-			.catch((error: unknown) => {
-				if (error === accessTokenRefreshFailed) return null;
-				throw error;
-			});
-		if (!loaded) return accessTokenFailure();
+		const forceRefresh = path === "/refresh-token";
+		function tokenFailure() {
+			return forceRefresh
+				? publicFailure(
+						"FAILED_TO_REFRESH_ACCESS_TOKEN",
+						"Failed to refresh access token",
+						400,
+					)
+				: accessTokenFailure();
+		}
+		let issuedExpiry: Date | undefined;
+		let refreshFailed = false;
+		const loaded = await linked.info(
+			request,
+			bearer ?? browserToken(request),
+			accountId,
+			{
+				operation: "provider-token",
+				forceRefresh,
+				async refresh(account) {
+					const configured = configuredLinkedProvider(account);
+					if (!configured || !account.refreshToken) return;
+					try {
+						const { provider, config } = configured;
+						const rotated = await refreshLinkedAccount(
+							provider,
+							config,
+							await metadata(provider),
+							account,
+						);
+						issuedExpiry = rotated.accessTokenExpiresAt ?? undefined;
+						return {
+							...rotated,
+							accessTokenExpiresAt:
+								issuedExpiry ?? account.accessTokenExpiresAt,
+						};
+					} catch {
+						refreshFailed = true;
+					}
+				},
+			},
+		);
 		if (loaded.status === "rejected") return rejectedResponse(loaded);
+		if (refreshFailed) return tokenFailure();
 		const { account } = loaded;
 		if (!configuredLinkedProvider(account))
 			return publicFailure(
@@ -1313,20 +1334,43 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 				`Provider ${account.providerId} is not supported.`,
 				400,
 			);
+		if (forceRefresh && !account.refreshToken)
+			return publicFailure(
+				"REFRESH_TOKEN_NOT_FOUND",
+				"Refresh token not found",
+				400,
+			);
 		try {
+			const accessToken =
+				readLinkedOAuthToken(account.accessToken, tokenKeys) ?? "";
+			const headers = new Headers({ "referrer-policy": "no-referrer" });
+			if (forceRefresh)
+				return publicJSON(
+					{
+						accessToken,
+						refreshToken: readLinkedOAuthToken(account.refreshToken, tokenKeys),
+						accessTokenExpiresAt: issuedExpiry,
+						refreshTokenExpiresAt: account.refreshTokenExpiresAt,
+						scope: account.scope,
+						idToken: account.idToken,
+						providerId: account.providerId,
+						accountId: account.id,
+					},
+					200,
+					headers,
+				);
 			return publicJSON(
 				{
-					accessToken:
-						readLinkedOAuthToken(account.accessToken, tokenKeys) ?? "",
+					accessToken,
 					accessTokenExpiresAt: account.accessTokenExpiresAt ?? undefined,
 					scopes: linkedAccountScopes(account.scope),
 					idToken: account.idToken ?? undefined,
 				},
 				200,
-				new Headers({ "referrer-policy": "no-referrer" }),
+				headers,
 			);
 		} catch {
-			return accessTokenFailure();
+			return tokenFailure();
 		}
 	}
 
@@ -1366,11 +1410,8 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 		try {
 			as = await metadata(provider.data);
 			if (linkedAccessTokenNearExpiry(account)) {
-				const refreshed = await linked.info(
-					request,
-					token,
-					accountId,
-					(current) => {
+				const refreshed = await linked.info(request, token, accountId, {
+					refresh(current) {
 						if (
 							current.providerId !== account.providerId ||
 							current.accountId !== account.accountId
@@ -1378,7 +1419,7 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 							throw new Error("Linked provider account changed.");
 						return refreshLinkedAccount(provider.data, config, as, current);
 					},
-				);
+				});
 				if (refreshed.status === "rejected") return rejectedResponse(refreshed);
 				account = refreshed.account;
 			}
@@ -1749,7 +1790,7 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 		startLink,
 		listAccounts,
 		accountInfo,
-		providerAccessToken,
+		providerToken,
 		unlinkAccount,
 		callback,
 	};

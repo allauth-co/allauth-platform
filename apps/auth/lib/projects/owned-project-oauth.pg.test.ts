@@ -1,6 +1,7 @@
 import { createHash, createHmac, randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { oauthProvider } from "@better-auth/oauth-provider";
+import { betterAuth } from "better-auth";
 import { symmetricDecrypt, symmetricEncrypt } from "better-auth/crypto";
 import { genericOAuth, jwt } from "better-auth/plugins";
 import { getTestInstance } from "better-auth/test";
@@ -15,6 +16,7 @@ import {
 	securitySubject,
 } from "../control/security-policy";
 import { discoveryDocument } from "../discovery";
+import { extraServerPlugins } from "../features/server";
 import { productionTwoFactor } from "../mfa";
 import { appleIntegrity, microsoftIntegrity } from "../project-providers/legacy-provider-integrity";
 import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
@@ -1899,7 +1901,7 @@ describe.skipIf(!existsSync(fixturePath))(
 			expect((await owned().listAccounts(bearer)).status).toBe(403);
 		});
 
-		it("serves only the owning account's provider access token through either browser and signed project route", async () => {
+		it("preserves provider token access and refresh for the owning account across the project writers", async () => {
 			const owner = await accountOwner();
 			const peer = await accountOwner();
 			const providerAccounts = await Promise.all([
@@ -1936,8 +1938,9 @@ describe.skipIf(!existsSync(fixturePath))(
 				cookie: string,
 				signed: boolean,
 				writer: "legacy" | "owned" = "legacy",
+				operation: "get-access-token" | "refresh-token" = "get-access-token",
 			) {
-				const path = `${basePath}/get-access-token`;
+				const path = `${basePath}/${operation}`;
 				const body = JSON.stringify(input);
 				const headers = new Headers({
 					cookie,
@@ -2175,6 +2178,132 @@ describe.skipIf(!existsSync(fixturePath))(
 				expect(rollback.status).toBe(200);
 				expect(await rollback.json()).toEqual(responses[0]);
 				expect(providerFetch).toHaveBeenCalledOnce();
+			} finally {
+				externalNetwork = undefined;
+			}
+
+			const refreshExpiry = new Date(Date.now() + 3_600_000).toISOString();
+			const storedExpiry = (
+				await database.query<{ accessTokenExpiresAt: Date }>(
+					`UPDATE "${schema}"."account" SET "refreshTokenExpiresAt"=$2 WHERE id=$1 RETURNING "accessTokenExpiresAt"`,
+					[account.id, refreshExpiry],
+				)
+			).rows[0]!.accessTokenExpiresAt;
+			expect(storedExpiry.getTime()).toBeGreaterThan(Date.now() + 5_000);
+			const inputs = [
+				"fixture-rotated-refresh",
+				"fixture-native-forced-refresh",
+				"fixture-owned-forced-refresh",
+			];
+			const outputs = [
+				"fixture-native-forced-refresh",
+				"fixture-owned-forced-refresh",
+				undefined,
+			];
+			let refreshCount = 0;
+			const explicitRefresh = vi.fn(
+				async (input: URL | RequestInfo, init?: RequestInit) => {
+					const index = refreshCount++;
+					const request = new Request(input, init);
+					expect(request.url).toBe("https://oauth2.googleapis.com/token");
+					const form = new URLSearchParams(await request.text());
+					expect(form.get("grant_type")).toBe("refresh_token");
+					expect(form.get("refresh_token")).toBe(inputs[index]);
+					return Response.json({
+						token_type: "Bearer",
+						access_token: `fixture-forced-access-${index}`,
+						refresh_token: outputs[index],
+						scope: "narrow",
+					});
+				},
+			);
+			externalNetwork = explicitRefresh;
+			try {
+				const empty = await persistedAccount(owner.userId, "google");
+				await database.query(
+					`UPDATE "${schema}"."account" SET "refreshToken"=NULL WHERE id=$1`,
+					[empty.id],
+				);
+				const foreign = await accountOwner(foreignSchema);
+				for (const writer of ["legacy", "owned"] as const) {
+					const crossAccount = await send(
+						{ accountId: account.id, userId: owner.userId },
+						peer.cookie,
+						true,
+						writer,
+						"refresh-token",
+					);
+					expect(crossAccount.status).toBe(400);
+					expect(await crossAccount.json()).toMatchObject({
+						code: "ACCOUNT_NOT_FOUND",
+					});
+					expect(
+						(
+							await send(
+								{ accountId: account.id },
+								foreign.cookie,
+								true,
+								writer,
+								"refresh-token",
+							)
+						).status,
+					).toBe(401);
+					const missing = await send(
+						{ accountId: empty.id },
+						owner.cookie,
+						false,
+						writer,
+						"refresh-token",
+					);
+					expect(missing.status).toBe(400);
+					expect(await missing.json()).toMatchObject({
+						code: "REFRESH_TOKEN_NOT_FOUND",
+					});
+				}
+				expect(explicitRefresh).not.toHaveBeenCalled();
+				const attempts = [
+					{ writer: "legacy", signed: false },
+					{ writer: "owned", signed: true },
+					{ writer: "legacy", signed: true },
+				] as const;
+				for (const [index, { writer, signed }] of attempts.entries()) {
+					const refreshed = await send(
+						{ accountId: account.id },
+						owner.cookie,
+						signed,
+						writer,
+						"refresh-token",
+					);
+					expect(refreshed.status, await refreshed.clone().text()).toBe(200);
+					if (writer === "owned")
+						expect(refreshed.headers.get("cache-control")).toBe("no-store");
+					expect(await refreshed.json()).toEqual({
+						accessToken: `fixture-forced-access-${index}`,
+						refreshToken: outputs[index] ?? inputs[index],
+						refreshTokenExpiresAt: refreshExpiry,
+						scope: "openid, profile",
+						idToken: "fixture-callback-id-token",
+						providerId: "google",
+						accountId: account.id,
+					});
+				}
+				expect(explicitRefresh).toHaveBeenCalledTimes(3);
+				const persisted = (
+					await database.query<{
+						refreshToken: string;
+						accessTokenExpiresAt: Date;
+						scope: string;
+					}>(
+						`SELECT "refreshToken","accessTokenExpiresAt",scope FROM "${schema}"."account" WHERE id=$1`,
+						[account.id],
+					)
+				).rows[0]!;
+				expect(persisted.accessTokenExpiresAt).toEqual(storedExpiry);
+				expect(persisted.scope).toBe("openid, profile");
+				expect(persisted.refreshToken).not.toBe("fixture-owned-forced-refresh");
+				expect(
+					await symmetricDecrypt({ key, data: persisted.refreshToken }),
+				).toBe("fixture-owned-forced-refresh");
 			} finally {
 				externalNetwork = undefined;
 			}
@@ -2568,6 +2697,277 @@ describe.skipIf(!existsSync(fixturePath))(
 			).toBe("account_not_linked");
 			expect(await record()).toEqual(stored);
 			expect(await sessionCount()).toEqual(before);
+		});
+
+		it("reads linked provider access with a direct native server bearer and renews only a due owning session", async () => {
+			const basePath = `/api/projects/${slug}/auth`;
+			const fixture = await legacyProject(nativeDatabase!, config, {
+				policy: defaultAuthPolicy,
+				brokerOnly: false,
+				basePath,
+			});
+			const expiresIn = defaultAuthPolicy.sessionExpiresInSeconds;
+			const legacy = betterAuth({
+				...fixture.options,
+				session: {
+					expiresIn,
+					updateAge: Math.min(86400, Math.floor(expiresIn / 2)),
+					cookieCache: { enabled: false },
+				},
+				advanced: { ...fixture.options.advanced, disableOriginCheck: false },
+				// The test helper installs a generic bearer. Exercise the production project plugin instead.
+				plugins: [
+					...(fixture.options.plugins?.slice(1) ?? []),
+					...extraServerPlugins(
+						{ ALLAUTH_AUTH_SECRET: key, ALLAUTH_AUTH_URL: origin },
+						{ project: true, origin, projectSlug: slug },
+					).filter((plugin) =>
+						["bearer", "allauth-feature-boundaries"].includes(plugin.id),
+					),
+				],
+			});
+			const candidate = ownedProviderEngine(defaultAuthPolicy, false, basePath);
+			const hosted = ownedProviderEngine();
+			const password = "synthetic-provider-bearer-password";
+			const email = `bearer-owner-${randomUUID()}@fixture.example`;
+			const { user } = await legacy.api.signUpEmail({
+				body: { name: "Bearer owner", email, password },
+			});
+			await (await legacy.$context).internalAdapter.updateUser(user.id, {
+				emailVerified: true,
+			});
+			const nativeSignIn = await legacy.handler(
+				new Request(`${origin}${basePath}/sign-in/email`, {
+					method: "POST",
+					headers: { "content-type": "application/json" },
+					body: JSON.stringify({ email, password }),
+				}),
+			);
+			expect(nativeSignIn.status, await nativeSignIn.clone().text()).toBe(200);
+			const signed = nativeSignIn.headers.get("set-auth-token");
+			expect(signed).toBeTruthy();
+			const authorization = `Bearer ${signed}`;
+			const active = await legacy.api.getSession({
+				headers: new Headers({ cookie: cookiePairs(nativeSignIn) }),
+				query: { disableRefresh: true },
+			});
+			expect(active?.session.id).toBeTruthy();
+			const account = await persistedAccount(user.id, "google");
+			const foreign = await accountOwner(foreignSchema);
+			const peer = await accountOwner();
+			const accessToken = "synthetic-owning-provider-access";
+			const refreshToken = "synthetic-owning-provider-refresh";
+			const accessTokenExpiresAt = new Date(Date.now() + 600_000).toISOString();
+			await database.query(
+				`UPDATE "${schema}"."account" SET "accessToken"=$2,"accessTokenExpiresAt"=$3,"refreshToken"=$4,"idToken"=NULL WHERE id=$1`,
+				[
+					account.id,
+					await symmetricEncrypt({ key, data: accessToken }),
+					accessTokenExpiresAt,
+					await symmetricEncrypt({ key, data: refreshToken }),
+				],
+			);
+			const expected = {
+				accessToken,
+				accessTokenExpiresAt,
+				scopes: ["openid", "profile"],
+			};
+			function request(
+				headers: Record<string, string> = { authorization },
+				query = "",
+				path = basePath,
+				userId: string = peer.userId,
+				operation: "get-access-token" | "refresh-token" = "get-access-token",
+			) {
+				return new Request(`${origin}${path}/${operation}${query}`, {
+					method: "POST",
+					headers: { "content-type": "application/json", ...headers },
+					body: JSON.stringify({ accountId: account.id, userId }),
+				});
+			}
+			const bearerFromCookie = (cookie: string) =>
+				`Bearer ${decodeURIComponent(cookie.slice(cookie.indexOf("=") + 1))}`;
+			const due = new Date(Date.now() + 60_000);
+			const sessionExpiry = async () =>
+				(
+					await database.query<{ expiresAt: Date }>(
+						`SELECT "expiresAt" FROM "${schema}"."session" WHERE id=$1`,
+						[active!.session.id],
+					)
+				).rows[0]!.expiresAt;
+			for (const dispatch of [legacy.handler, candidate.dispatch]) {
+				await database.query(
+					`UPDATE "${schema}"."session" SET "expiresAt"=$2 WHERE id=$1`,
+					[active!.session.id, due],
+				);
+				const disabled = await dispatch(
+					request(undefined, "?disableRefresh=true"),
+				);
+				expect(disabled.status).toBe(200);
+				expect(await disabled.json()).toEqual(expected);
+				expect(disabled.headers.getSetCookie()).toEqual([]);
+				expect(disabled.headers.has("set-auth-token")).toBe(false);
+				expect(await sessionExpiry()).toEqual(due);
+				const renewed = await dispatch(request());
+				expect(renewed.status).toBe(200);
+				expect(await renewed.json()).toEqual(expected);
+				expect(
+					renewed.headers
+						.getSetCookie()
+						.some((cookie) => cookie.startsWith(`${sessionCookie}=`)),
+				).toBe(true);
+				expect(decodeURIComponent(renewed.headers.get("set-auth-token")!)).toBe(
+					decodeURIComponent(signed!),
+				);
+				expect(renewed.headers.get("access-control-expose-headers")).toContain(
+					"set-auth-token",
+				);
+				expect((await sessionExpiry()).getTime()).toBeGreaterThan(
+					due.getTime(),
+				);
+				const otherOwner = await dispatch(
+					request(
+						{ authorization: bearerFromCookie(peer.cookie) },
+						"",
+						basePath,
+						user.id,
+					),
+				);
+				expect(otherOwner.status).toBe(400);
+				expect(await otherOwner.json()).toMatchObject({
+					code: "ACCOUNT_NOT_FOUND",
+				});
+				expect(
+					(
+						await dispatch(
+							request({ authorization: bearerFromCookie(foreign.cookie) }),
+						)
+					).status,
+				).toBe(401);
+				expect(
+					(await dispatch(request({ authorization, cookie: peer.cookie })))
+						.status,
+				).toBe(403);
+				const withReferer = await dispatch(
+					request({
+						authorization,
+						cookie: peer.cookie,
+						referer: `${origin}/account`,
+					}),
+				);
+				expect(withReferer.status).toBe(200);
+				expect(await withReferer.json()).toEqual(expected);
+				const withBrowserPeer = await dispatch(
+					request({ authorization, origin, cookie: peer.cookie }),
+				);
+				expect(withBrowserPeer.status).toBe(400);
+				expect(await withBrowserPeer.json()).toMatchObject({
+					code: "ACCOUNT_NOT_FOUND",
+				});
+				await database.query(
+					`UPDATE "${schema}"."session" SET "expiresAt"=$2 WHERE id=$1`,
+					[active!.session.id, due],
+				);
+				const withBrowserOwner = await dispatch(
+					request({
+						authorization: bearerFromCookie(peer.cookie),
+						origin,
+						cookie: cookiePairs(nativeSignIn),
+					}),
+				);
+				expect(withBrowserOwner.status).toBe(200);
+				expect(await withBrowserOwner.json()).toEqual(expected);
+				expect(
+					withBrowserOwner.headers
+						.getSetCookie()
+						.some((value) => value.startsWith(`${sessionCookie}=`)),
+				).toBe(true);
+				expect(withBrowserOwner.headers.has("set-auth-token")).toBe(false);
+				expect((await sessionExpiry()).getTime()).toBeGreaterThan(
+					due.getTime(),
+				);
+			}
+			const excludedTransports: { headers: Record<string, string>; ownedStatus: number }[] = [
+				{ headers: { authorization, origin }, ownedStatus: 401 },
+				{
+					headers: { authorization, "sec-fetch-site": "same-origin" },
+					ownedStatus: 403,
+				},
+				{
+					headers: {
+						authorization,
+						"allauth-proxy-signature": "fixture-forwarded-proxy-envelope",
+					},
+					ownedStatus: 403,
+				},
+			];
+			for (const { headers, ownedStatus } of excludedTransports) {
+				expect((await legacy.handler(request(headers))).status).toBe(401);
+				expect((await candidate.dispatch(request(headers))).status).toBe(
+					ownedStatus,
+				);
+			}
+			const refresh = vi.fn(
+				async (input: URL | RequestInfo, init?: RequestInit) => {
+					const request = new Request(input, init);
+					expect(request.url).toBe("https://oauth2.googleapis.com/token");
+					expect(
+						new URLSearchParams(await request.text()).get("refresh_token"),
+					).toBe(refreshToken);
+					return Response.json({
+						token_type: "Bearer",
+						access_token: accessToken,
+					});
+				},
+			);
+			externalNetwork = refresh;
+			try {
+				for (const dispatch of [legacy.handler, candidate.dispatch]) {
+					const response = await dispatch(
+						request(
+							undefined,
+							"?disableRefresh=true",
+							basePath,
+							peer.userId,
+							"refresh-token",
+						),
+					);
+					expect(response.status).toBe(200);
+					expect(await response.json()).toEqual({
+						accessToken,
+						refreshToken,
+						refreshTokenExpiresAt: null,
+						scope: "openid, profile",
+						idToken: null,
+						providerId: "google",
+						accountId: account.id,
+					});
+				}
+				expect(refresh).toHaveBeenCalledTimes(2);
+			} finally {
+				externalNetwork = undefined;
+			}
+			expect(
+				(await hosted.dispatch(request(undefined, "", "/api/auth"))).status,
+			).toBe(403);
+			await database.query(
+				`UPDATE "${schema}"."session" SET "expiresAt"=now()-interval '1 second' WHERE id=$1`,
+				[active!.session.id],
+			);
+			expect((await candidate.dispatch(request())).status).toBe(401);
+			expect((await legacy.handler(request())).status).toBe(401);
+			const revoked = await persistedSession(user.id);
+			await database.query(`DELETE FROM "${schema}"."session" WHERE id=$1`, [
+				revoked.id,
+			]);
+			for (const dispatch of [legacy.handler, candidate.dispatch])
+				expect(
+					(
+						await dispatch(
+							request({ authorization: bearerFromCookie(revoked.cookie) }),
+						)
+					).status,
+				).toBe(401);
 		});
 	},
 );
