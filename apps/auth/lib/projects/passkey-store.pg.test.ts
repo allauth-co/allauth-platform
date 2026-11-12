@@ -6,6 +6,8 @@ import { getTestInstance } from "better-auth/test";
 import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { postgresDatabase } from "../auth";
+import { defaultAuthPolicy } from "../auth-policy/policy";
+import { createOwnedProjectEngine } from "./owned-project-engine";
 import { readLegacySessionCookie } from "./legacy-session-cookie";
 import { projectPasskeyStore } from "./passkey-store";
 import type { StoredProjectPasskey } from "./passkey-store";
@@ -16,6 +18,7 @@ import { checkedProjectSchema } from "./validation";
 const fixturePath = new URL("../../../../.secrets/local-postgres.json", import.meta.url);
 const origin = "https://passkey-storage.fixture.example";
 const rpId = new URL(origin).hostname;
+const projectSlug = "passkey-fixture";
 const primary = checkedProjectSchema(`allauth_project_${randomUUID().replaceAll("-", "")}`);
 const other = checkedProjectSchema(`allauth_project_${randomUUID().replaceAll("-", "")}`);
 const ownerEmail = "owner@passkey-storage.fixture.example";
@@ -80,6 +83,7 @@ function legacyFixture(database: ReturnType<typeof postgresDatabase>) {
 	return getTestInstance({
 		database,
 		baseURL: origin,
+		advanced: { cookiePrefix: `allauth_project_${projectSlug}` },
 		logger: { disabled: true },
 		plugins: [passkey({ rpID: rpId, origin, requireUserVerification: true })],
 	}, { disableTestUser: true });
@@ -131,6 +135,71 @@ describe.skipIf(!existsSync(fixturePath))("project passkey PostgreSQL interopera
 		});
 	}
 
+	it("interoperates on in-flight HTTP ceremonies and issues a legacy-readable session", async () => {
+		const { secret } = await legacy.auth.$context;
+		const owner = createOwnedProjectEngine({
+			database: pool!, project: { slug: projectSlug, schemaName: primary },
+			baseURL: origin, basePath: "/api/auth", trustedOrigins: [], signingSecret: secret,
+			policy: defaultAuthPolicy, trustedIP: () => "192.0.2.19",
+			passkeys: { id: rpId, name: "Passkey fixture", origins: [origin], requireUserVerification: true },
+		});
+		const existing = headers.get("cookie")!;
+		const cookieFrom = (response: Response) => response.headers.getSetCookie()
+			.filter((value) => !value.includes("Max-Age=0")).map((value) => value.split(";", 1)[0]).join("; ");
+		function call(path: string, cookie = "", body?: unknown) {
+			return owner.dispatch(new Request(`${origin}/api/auth/${path}`, {
+				method: body ? "POST" : "GET",
+				headers: { origin, cookie, ...(body ? { "content-type": "application/json" } : {}) },
+				body: body ? JSON.stringify(body) : undefined,
+			}));
+		}
+
+		const issuedByLegacy = await challenge("register", existing);
+		const credential = virtualCredential();
+		const enrolled = await call("passkey/verify-registration", `${existing}; ${issuedByLegacy.cookie}`, {
+			response: credential.registration(issuedByLegacy.challenge), name: "Existing credential",
+		});
+		expect(enrolled.status).toBe(200);
+		const enrolledBody = await enrolled.json() as StoredProjectPasskey;
+		expect(enrolledBody.credentialID).toBe(credential.id);
+		const issuedByOwned = await call("passkey/generate-register-options", existing);
+		expect(issuedByOwned.status).toBe(200);
+		const otherCredential = virtualCredential();
+		const ownedChallenge = await issuedByOwned.json() as { challenge: string };
+		const legacyRegistered = await legacyCall("verify-registration", `${existing}; ${cookieFrom(issuedByOwned)}`, {
+			response: otherCredential.registration(ownedChallenge.challenge),
+		});
+		expect(legacyRegistered.status).toBe(200);
+		const rollbackRegistration = await legacyRegistered.json() as StoredProjectPasskey;
+
+		const pending = await challenge("authenticate");
+		const assertion = { response: credential.assertion(pending.challenge, 1) };
+		const signedIn = await call("passkey/verify-authentication", pending.cookie, assertion);
+		expect(signedIn.status).toBe(200);
+		const session = await signedIn.json() as { session: { id: string; userId: string }; user: { id: string } };
+		expect(session).toMatchObject({ user: { id: ownerId }, session: { userId: ownerId } });
+		expect(session.session).not.toHaveProperty("token");
+		expect(await legacy.auth.api.getSession({ headers: new Headers({ cookie: cookieFrom(signedIn) }) }))
+			.toMatchObject({ user: { id: ownerId }, session: { id: session.session.id } });
+		const replay = await call("passkey/verify-authentication", pending.cookie, assertion);
+		expect(replay.status).toBe(400);
+		const rollbackOptions = await call("passkey/generate-authenticate-options");
+		const rollbackChallenge = await rollbackOptions.json() as { challenge: string };
+		const rolledBack = await legacyCall("verify-authentication", cookieFrom(rollbackOptions), {
+			response: credential.assertion(rollbackChallenge.challenge, 2),
+		});
+		expect(rolledBack.status).toBe(200);
+		expect((await store.findCredential(credential.id))?.counter).toBe(2);
+
+		const renamed = await call("passkey/update-passkey", existing, { id: enrolledBody.id, name: "Updated" });
+		expect(await renamed.json()).toMatchObject({ passkey: { id: enrolledBody.id, name: "Updated" } });
+		expect(await (await call("passkey/list-user-passkeys", existing)).json()).toEqual(expect.arrayContaining([
+			expect.objectContaining({ id: enrolledBody.id, name: "Updated" }),
+		]));
+		expect(await (await call("passkey/delete-passkey", existing, { id: enrolledBody.id })).json()).toEqual({ status: true });
+		expect(await store.removeForUser(ownerId, rollbackRegistration.id)).toBe(true);
+	});
+
 	beforeAll(async () => {
 		const fixture: { container: string; DATABASE_URL: string } = JSON.parse(
 			readFileSync(fixturePath, "utf8"),
@@ -142,17 +211,16 @@ describe.skipIf(!existsSync(fixturePath))("project passkey PostgreSQL interopera
 			url.port !== "55445"
 		) throw new Error("Passkey interoperability requires the isolated PostgreSQL fixture.");
 		pool = new Pool({ connectionString: fixture.DATABASE_URL, max: 4 });
-		const migration = readFileSync(
-			new URL("../../migrations/001-initial-auth.sql", import.meta.url),
-			"utf8",
-		);
+		const migrations = ["001-initial-auth.sql", "002-control-plane.sql", "005-free-plugins.sql"].map((name) =>
+			readFileSync(new URL(`../../migrations/${name}`, import.meta.url), "utf8"));
+
 		for (const schema of [primary, other]) {
 			await pool.query(`CREATE SCHEMA "${schema}"`);
 			const setup = await pool.connect();
 			try {
 				await setup.query("BEGIN");
 				await setup.query(`SET LOCAL search_path TO "${schema}"`);
-				await setup.query(migration);
+				for (const migration of migrations) await setup.query(migration);
 				await setup.query("COMMIT");
 			} catch (error) {
 				await setup.query("ROLLBACK");
@@ -173,6 +241,7 @@ describe.skipIf(!existsSync(fixturePath))("project passkey PostgreSQL interopera
 		const foreign = await legacy.auth.api.signUpEmail({ body: { name: "Other", email: foreignEmail, password } });
 		ownerId = owner.user.id;
 		foreignId = foreign.user.id;
+		await pool.query(`UPDATE "${primary}"."user" SET "emailVerified" = TRUE WHERE id = ANY($1::text[])`, [[ownerId, foreignId]]);
 		const signedIn = await legacy.auth.api.signInEmail({
 			body: { email: ownerEmail, password },
 			asResponse: true,

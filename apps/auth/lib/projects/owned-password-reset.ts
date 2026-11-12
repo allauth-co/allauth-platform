@@ -21,6 +21,28 @@ interface PasswordResetOptions {
 	checkPasswordSafety(password: string): Promise<PasswordSafety>;
 }
 
+export function isLegacyPasswordResetToken(token: string) {
+	return /^[A-Za-z0-9]{24}$/.test(token);
+}
+
+/** Look up the latest live row without consuming it or exposing it to the caller. */
+export async function findOwnedPasswordResetUser(
+	database: Pool,
+	schemaName: string,
+	token: string,
+) {
+	const schema = checkedProjectSchema(schemaName);
+	if (!isLegacyPasswordResetToken(token)) return null;
+	const verification = await database.query<{ value: string }>(
+		`SELECT value FROM (
+			SELECT value, "expiresAt" FROM "${schema}"."verification" WHERE identifier = $1
+			ORDER BY "createdAt" DESC, id DESC LIMIT 1
+		) v WHERE "expiresAt" > statement_timestamp()`,
+		[`reset-password:${token}`],
+	);
+	return verification.rows[0]?.value ?? null;
+}
+
 /** A transaction-only candidate for consuming legacy password reset links. */
 export function createOwnedPasswordReset(options: PasswordResetOptions) {
 	const schema = checkedProjectSchema(options.schemaName);
@@ -32,21 +54,18 @@ export function createOwnedPasswordReset(options: PasswordResetOptions) {
 		newPassword: string;
 	}): Promise<PasswordResetResult> {
 		if (!policy.emailAndPasswordEnabled) return { status: "unavailable" };
-		if (!/^[A-Za-z0-9]{24}$/.test(input.token))
+		if (!isLegacyPasswordResetToken(input.token))
 			return { status: "invalid-token" };
 		const error = passwordPolicyError(input.newPassword, policy.passwordPolicy);
 		if (error) return { status: "password-policy", message: error };
 
 		const identifier = `reset-password:${input.token}`;
 		// Only a current token can trigger the breach check and password KDF.
-		const verification = await options.database.query<{ value: string }>(
-			`SELECT value FROM (
-				SELECT value, "expiresAt" FROM "${schema}"."verification" WHERE identifier = $1
-				ORDER BY "createdAt" DESC, id DESC LIMIT 1
-			) v WHERE "expiresAt" > statement_timestamp()`,
-			[identifier],
+		const userId = await findOwnedPasswordResetUser(
+			options.database,
+			schema,
+			input.token,
 		);
-		const userId = verification.rows[0]?.value;
 		if (!userId) return { status: "invalid-token" };
 
 		const safe = await options

@@ -2,6 +2,8 @@ import { hostedSdkReturnPath } from "./hosted-sdk-policy";
 
 const privateFields = new Set([
 	"token",
+	"otp",
+	"backupcodes",
 	"sessiontoken",
 	"accesstoken",
 	"refreshtoken",
@@ -85,6 +87,8 @@ export async function hostedSdkResponse(
 		response.status === 302 &&
 		location &&
 		(endpoint === "sign-in/email" ||
+			endpoint === "sign-in/username" ||
+			endpoint === "sign-in/email-otp" ||
 			endpoint === "passkey/verify-authentication") &&
 		hasPendingFactor(cookies, slug)
 	) {

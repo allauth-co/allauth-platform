@@ -10,17 +10,26 @@ import {
 	useAllAuth,
 	withAuthReturnTo,
 } from "@/sdk/react";
-import type { HostedSdkView } from "@/lib/domains/hosted-sdk-policy";
-import { ApplicationBrandFooter } from "./application-brand";
+import type { HostedSdkForm } from "@/lib/domains/hosted-sdk-policy";
+import {
+	HostedProjectCard,
+	HostedProjectEmail,
+	HostedProjectMfa,
+	HostedProjectSso,
+	HostedProjectUsername,
+} from "./hosted-project-forms";
 import "@/sdk/styles.css";
 
 type HostedProjectAuthProps = {
-	view: HostedSdkView;
+	view: HostedSdkForm;
 	basePath: string;
 	destination: string;
 	legacyPath: string;
 	showRecovery: boolean;
 	showBroker: boolean;
+	showPassword: boolean;
+	showEmail: boolean;
+	showSso: boolean;
 };
 
 function HostedProjectChoices({
@@ -28,10 +37,16 @@ function HostedProjectChoices({
 	destination,
 	legacyPath,
 	showBroker,
+	showPassword,
+	showEmail,
+	showSso,
 }: Pick<
 	HostedProjectAuthProps,
 	"view" | "destination" | "legacyPath" | "showBroker"
->) {
+> &
+	Partial<
+		Pick<HostedProjectAuthProps, "showPassword" | "showEmail" | "showSso">
+	>) {
 	const { capabilities, challenge, client } = useAllAuth();
 	const [busy, setBusy] = useState(false);
 	const [error, setError] = useState("");
@@ -46,7 +61,7 @@ function HostedProjectChoices({
 					Back to sign in
 				</a>
 				<a className="underline" href={`/two-factor?${challengeQuery}`}>
-					Use the standard verification form
+					More verification options
 				</a>
 			</div>
 		);
@@ -95,6 +110,45 @@ function HostedProjectChoices({
 					{error}
 				</p>
 			)}
+			{view === "signIn" && capabilities && (
+				<nav
+					className="flex flex-wrap justify-center gap-x-4 gap-y-2 text-sm"
+					aria-label="Sign-in methods"
+				>
+					{showPassword && (
+						<a
+							className="underline"
+							href={withAuthReturnTo("/sign-in?method=username", destination)}
+						>
+							Sign in with a username
+						</a>
+					)}
+					{showEmail && (
+						<>
+							<a
+								className="underline"
+								href={withAuthReturnTo("/magic-link", destination)}
+							>
+								Use an email link
+							</a>
+							<a
+								className="underline"
+								href={withAuthReturnTo("/email-otp", destination)}
+							>
+								Use an email code
+							</a>
+						</>
+					)}
+					{showSso && (
+						<a
+							className="underline"
+							href={withAuthReturnTo("/enterprise-sign-in", destination)}
+						>
+							Sign in with your organization
+						</a>
+					)}
+				</nav>
+			)}
 			<a className="text-sm underline" href={legacyPath}>
 				{view === "signIn"
 					? "Other sign-in options"
@@ -109,7 +163,7 @@ function HostedProjectSignUp({
 	legacyPath,
 	showBroker,
 }: Pick<HostedProjectAuthProps, "destination" | "legacyPath" | "showBroker">) {
-	const { capabilities, branding, publicBranding } = useAllAuth();
+	const { capabilities, branding } = useAllAuth();
 	const choices = (
 		<HostedProjectChoices
 			view="signUp"
@@ -128,31 +182,22 @@ function HostedProjectSignUp({
 		!capabilities.microsoft
 	) {
 		return (
-			<section
-				className="allauth allauth-card allauth-auth-card"
-				aria-label="Create an account"
-			>
-				<header className="allauth-auth-header">
-					{branding?.logo && (
-						<div className="allauth-brand">{branding.logo}</div>
-					)}
-					<h2 className="allauth-title">
-						{branding?.name
-							? `Create your ${branding.name} account`
-							: "Create your account"}
-					</h2>
-				</header>
-				<div className="allauth-auth-body">{choices}</div>
-				<footer className="allauth-auth-footer">
+			<HostedProjectCard
+				showBrandName={false}
+				title={
+					branding?.name
+						? `Create your ${branding.name} account`
+						: "Create your account"
+				}
+				footer={
 					<p>
 						Already have an account?{" "}
 						<a href={withAuthReturnTo("/sign-in", destination)}>Sign in</a>
 					</p>
-					{publicBranding && (
-						<ApplicationBrandFooter branding={publicBranding} />
-					)}
-				</footer>
-			</section>
+				}
+			>
+				{choices}
+			</HostedProjectCard>
 		);
 	}
 	return (
@@ -171,7 +216,13 @@ export function HostedProjectAuth({
 	legacyPath,
 	showRecovery,
 	showBroker,
+	showPassword,
+	showEmail,
+	showSso,
 }: HostedProjectAuthProps) {
+	const mainForm =
+		view === "signIn" || view === "forgotPassword" || view === "resetPassword";
+	const continuation = { destination, legacyPath };
 	return (
 		<div className="mx-auto w-full max-w-lg space-y-4">
 			<AllAuthProvider
@@ -204,12 +255,23 @@ export function HostedProjectAuth({
 				{view === "resetPassword" && (
 					<ResetPassword afterSignInUrl={destination} />
 				)}
-				{view !== "signUp" && (
+				{view === "username" && <HostedProjectUsername {...continuation} />}
+				{(view === "magicLink" || view === "emailOtp") && (
+					<HostedProjectEmail method={view} {...continuation} />
+				)}
+				{view === "enterpriseSignIn" && (
+					<HostedProjectSso showPassword={showPassword} {...continuation} />
+				)}
+				{view === "twoFactor" && <HostedProjectMfa {...continuation} />}
+				{mainForm && (
 					<HostedProjectChoices
 						view={view}
 						destination={destination}
 						legacyPath={legacyPath}
 						showBroker={showBroker}
+						showPassword={showPassword}
+						showEmail={showEmail}
+						showSso={showSso}
 					/>
 				)}
 			</AllAuthProvider>

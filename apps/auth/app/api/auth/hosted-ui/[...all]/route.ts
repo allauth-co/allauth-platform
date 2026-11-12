@@ -46,6 +46,20 @@ async function handle(request: Request) {
 				"A same-origin authentication request is required.",
 			);
 
+		if (endpoint === "email-otp/send-verification-otp") {
+			const input: unknown = await bound
+				.clone()
+				.json()
+				.catch(() => null);
+			if (
+				!input ||
+				typeof input !== "object" ||
+				!("type" in input) ||
+				input.type !== "sign-in"
+			)
+				return hostedSdkFailure(400, "A sign-in code must be requested.");
+		}
+
 		// The gateway verifies the original URL and body before this dispatch.
 		url.pathname = `/api/auth/${endpoint}`;
 		const nativeRequest = new Request(url, {

@@ -1,6 +1,10 @@
 import { headers } from "next/headers";
 import { getAuthEnvironment } from "@/lib/auth";
-import { setting, projectEmailEnvironment } from "@/lib/configuration";
+import {
+	authConfiguration,
+	setting,
+	projectEmailEnvironment,
+} from "@/lib/configuration";
 import { portalHeader } from "@/lib/domains/edge";
 import { withPortalHeaders } from "@/lib/domains/hosting";
 import {
@@ -26,7 +30,16 @@ export async function HostedProjectAuthPage({
 	view,
 	searchParams,
 }: HostedProjectAuthPageProps & { view: HostedSdkView }) {
-	const standardForm = <AllAuthAuth view={view} />;
+	const standardForm =
+		view === "enterpriseSignIn" ? (
+			<AllAuthAuth path="enterprise-sign-in" />
+		) : view === "magicLink" ? (
+			<AllAuthAuth path="magic-link" />
+		) : view === "emailOtp" ? (
+			<AllAuthAuth path="email-otp" />
+		) : (
+			<AllAuthAuth view={view} />
+		);
 	const requestHeaders = await headers();
 	if (!requestHeaders.has(portalHeader)) return standardForm;
 
@@ -45,9 +58,18 @@ export async function HostedProjectAuthPage({
 				!hostedSdkProjectEnabled(configured, binding.project)
 			)
 				return null;
-			const showRecovery =
-				instance.options.emailAndPassword?.enabled === true &&
-				emailConfigured(projectEmailEnvironment(env, binding.project.slug));
+			const showPassword = instance.options.emailAndPassword?.enabled === true;
+			const showEmail = emailConfigured(
+				projectEmailEnvironment(env, binding.project.slug),
+			);
+			const showSso = authConfiguration(env).enterpriseSSO;
+			const showRecovery = showPassword && showEmail;
+			if (
+				(request.username && !showPassword) ||
+				((view === "magicLink" || view === "emailOtp") && !showEmail) ||
+				(view === "enterpriseSignIn" && !showSso)
+			)
+				return null;
 			if (
 				(view === "forgotPassword" || view === "resetPassword") &&
 				!showRecovery
@@ -55,6 +77,9 @@ export async function HostedProjectAuthPage({
 				return null;
 			return {
 				showRecovery,
+				showPassword,
+				showEmail,
+				showSso,
 				showBroker: !instance.options.socialProviders?.google,
 			};
 		},
@@ -63,9 +88,10 @@ export async function HostedProjectAuthPage({
 	if (!project) return standardForm;
 	return (
 		<HostedProjectAuth
-			view={view}
+			view={request.username ? "username" : view}
 			basePath={hostedSdkBasePath}
-			{...request}
+			destination={request.destination}
+			legacyPath={request.legacyPath}
 			{...project}
 		/>
 	);

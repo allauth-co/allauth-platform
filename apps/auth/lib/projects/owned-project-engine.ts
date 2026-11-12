@@ -1,13 +1,21 @@
 import { createHmac, randomUUID } from "node:crypto";
 import { isIP } from "node:net";
-import type { Pool } from "pg";
+import type { Pool, PoolClient } from "pg";
 import * as z from "zod";
 import type { AuthEngine } from "../auth-engine";
 import { defaultPasswordPolicy } from "../auth-policy/password";
 import type { AuthPolicy } from "../auth-policy/policy";
 import { authPolicySchema } from "../auth-policy/policy";
 import { clerkCompatiblePasswords } from "../clerk-password";
+import { applicationMfaCallback } from "../mfa-continuation";
 import { readLegacySessionCookie } from "./legacy-session-cookie";
+import type { LegacyMfaKeys } from "./legacy-mfa-record";
+import { createOwnedProjectMfa } from "./owned-mfa";
+import { createOwnedMfaEnrollment } from "./owned-mfa-enrollment";
+import { createOwnedProjectPasskeyHttp } from "./owned-passkey-http";
+import { createOwnedRecoveryHttp } from "./owned-recovery-http";
+import { createOwnedSignUpHttp } from "./owned-sign-up";
+import type { ProjectSession, ProjectUser } from "./owned-project-engine-store";
 import {
 	createProjectEngineStore,
 	projectUserResponse,
@@ -16,12 +24,22 @@ import type { Project } from "./registry";
 import { consumeProxySessionCheck } from "./session-introspection-admission";
 import { projectOrigin, projectSlug } from "./validation";
 
-const passwordInput = z
+const passwordFields = {
+	password: z.string().min(1).max(defaultPasswordPolicy.maxLength),
+	callbackURL: z.string().max(2048).optional(),
+	rememberMe: z.boolean().optional(),
+};
+const emailInput = z
+	.object({ ...passwordFields, email: z.email().max(320) })
+	.strict();
+const usernameInput = z
 	.object({
-		email: z.email().max(320),
-		password: z.string().min(1).max(defaultPasswordPolicy.maxLength),
-		callbackURL: z.string().max(2048).optional(),
-		rememberMe: z.boolean().optional(),
+		...passwordFields,
+		username: z
+			.string()
+			.min(3)
+			.max(30)
+			.regex(/^[A-Za-z0-9_.]+$/),
 	})
 	.strict();
 const sessionIdInput = z.object({ id: z.string().min(1).max(160) }).strict();
@@ -37,6 +55,29 @@ interface OwnedProjectEngineOptions {
 	trustedOrigins: readonly string[];
 	signingSecret: string;
 	policy: AuthPolicy;
+	mfaKeys?: LegacyMfaKeys;
+	appName?: string;
+	signUp?: Omit<
+		Parameters<typeof createOwnedSignUpHttp>[0],
+		| "database"
+		| "project"
+		| "policy"
+		| "baseURL"
+		| "basePath"
+		| "trustedOrigins"
+	>;
+	passkeys?: Parameters<typeof createOwnedProjectPasskeyHttp>[0]["rp"];
+	recovery?: Omit<
+		Parameters<typeof createOwnedRecoveryHttp>[0],
+		| "database"
+		| "project"
+		| "policy"
+		| "signingSecret"
+		| "baseURL"
+		| "basePath"
+		| "trustedOrigins"
+		| "completeVerification"
+	>;
 	/** Only an already authenticated ingress may supply the client IP. */
 	trustedIP(request: Request): string | null;
 }
@@ -72,7 +113,10 @@ function forbidden() {
 	);
 }
 
-async function requestBody(request: Request): Promise<unknown> {
+async function requestBody(
+	request: Request,
+	limit = maximumBodyBytes,
+): Promise<unknown> {
 	if (!request.body) return {};
 	if (
 		request.headers
@@ -91,7 +135,7 @@ async function requestBody(request: Request): Promise<unknown> {
 			const { done, value } = await reader.read();
 			if (done) break;
 			length += value.byteLength;
-			if (length > maximumBodyBytes) {
+			if (length > limit) {
 				void reader.cancel().catch(() => {});
 				return undefined;
 			}
@@ -137,6 +181,14 @@ export function createOwnedProjectEngine(
 	);
 	const refreshWindow = policy.sessionExpiresInSeconds - updateAge;
 	const revocationOrigins = new Set([origin]);
+	const mfa = createOwnedProjectMfa({
+		database: options.database,
+		project: options.project,
+		signingSecret: options.signingSecret,
+		secureCookies: secure,
+		keys: options.mfaKeys,
+	});
+	const changedMfaOwner = Symbol("MFA account no longer eligible");
 
 	function trustedRequest(
 		headers: Headers,
@@ -189,15 +241,19 @@ export function createOwnedProjectEngine(
 		);
 	}
 
-	async function currentSession(headers: Headers) {
+	async function currentSession(headers: Headers, client?: PoolClient) {
 		const token = tokenFrom(headers);
-		const current = token ? await store.session(token, refreshWindow) : null;
+		const current = token
+			? await store.session(token, refreshWindow, client)
+			: null;
 		if (
 			!token ||
 			!current ||
 			current.user.banned ||
 			current.user.directoryDisabled ||
-			current.session.impersonatedBy
+			current.session.impersonatedBy ||
+			(policy.mfaMode === "required" &&
+				(!current.user.emailVerified || !current.user.twoFactorEnabled))
 		)
 			return null;
 		return { token, ...current };
@@ -225,7 +281,357 @@ export function createOwnedProjectEngine(
 		}
 	}
 
-	async function signIn(request: Request) {
+	function activeUser(user: ProjectUser | null): user is ProjectUser {
+		return Boolean(
+			user && !user.banned && !user.directoryDisabled && !user.isAnonymous,
+		);
+	}
+
+	function verifiedUser(user: ProjectUser) {
+		return (
+			user.emailVerified ||
+			(!policy.requireEmailVerification && policy.mfaMode !== "required")
+		);
+	}
+
+	function rememberPreference(headers: Headers, rememberMe: boolean) {
+		writeCookie(
+			headers,
+			rememberCookie,
+			rememberMe ? "" : "true",
+			rememberMe ? 0 : undefined,
+		);
+	}
+
+	async function createSession(
+		client: PoolClient,
+		user: ProjectUser,
+		request: Request,
+		rememberMe: boolean,
+		path: string,
+		prior?: ProjectSession,
+	) {
+		const id = randomUUID();
+		const token = btoa(
+			String.fromCharCode(...crypto.getRandomValues(new Uint8Array(24))),
+		)
+			.replaceAll("+", "-")
+			.replaceAll("/", "_");
+		const session = await store.createSession(client, {
+			id,
+			token,
+			userId: user.id,
+			expiresIn: rememberMe || prior ? policy.sessionExpiresInSeconds : 86400,
+			ip: options.trustedIP(request) ?? "",
+			userAgent: request.headers.get("user-agent")?.slice(0, 512) ?? "",
+			activeOrganizationId: prior?.activeOrganizationId,
+			activeTeamId: prior?.activeTeamId,
+		});
+		await store.record(client, "session.created", "success", path, user.id, id);
+		if (!prior)
+			await store.record(client, "auth.sign-in", "success", path, user.id, id);
+		const headers = new Headers();
+		const maxAge = rememberMe ? policy.sessionExpiresInSeconds : undefined;
+		writeCookie(headers, sessionCookie, token, maxAge);
+		writeCookie(
+			headers,
+			`${multiCookiePrefix}${token.toLowerCase()}`,
+			token,
+			maxAge,
+		);
+		rememberPreference(headers, rememberMe);
+		return { headers, session, user: projectUserResponse(user) };
+	}
+
+	function mfaContinuation(callback: string): string {
+		const { origin: callbackOrigin } = new URL(callback);
+		const projectProxy = options.basePath !== "/api/auth";
+		const target = new URL(
+			projectProxy ? "/sign-in?challenge=two-factor" : "/two-factor",
+			callbackOrigin,
+		);
+		const destination = applicationMfaCallback(
+			callback,
+			callbackOrigin,
+			projectProxy ? "/api/allauth" : "/api/auth",
+		);
+		if (destination) target.searchParams.set("callbackUrl", destination);
+		return target.href;
+	}
+
+	function redirect(headers: Headers, location: string) {
+		headers.set("Location", location);
+		headers.set("Cache-Control", "no-store");
+		headers.set("Referrer-Policy", "no-referrer");
+		return new Response(null, { status: 302, headers });
+	}
+
+	async function primaryResult(
+		client: PoolClient,
+		user: ProjectUser | null,
+		request: Request,
+		rememberMe: boolean,
+		path: string,
+		callback?: string,
+	): Promise<Response> {
+		if (!activeUser(user) || user.directoryManaged) return forbidden();
+		if (!verifiedUser(user))
+			return failure(403, "EMAIL_NOT_VERIFIED", "Email not verified");
+		if (
+			policy.supportAccess?.enabled ||
+			!(await store.passwordPolicySupported(client, user.id))
+		)
+			return unsupported();
+		if (policy.mfaMode === "required" && !user.twoFactorEnabled)
+			return forbidden();
+		const device = user.twoFactorEnabled
+			? await mfa.rotateTrustedDevice(client, user.id, request.headers)
+			: null;
+		if (user.twoFactorEnabled && !device?.trusted) {
+			const challenge = await mfa.issue(client, user.id);
+			if (!challenge) return unsupported();
+			const headers = new Headers();
+			headers.append("Set-Cookie", challenge.setCookie);
+			if (device?.setCookie) headers.append("Set-Cookie", device.setCookie);
+			rememberPreference(headers, rememberMe);
+			// Pending sign-in is never authenticated by a previous active cookie.
+			if (tokenFrom(request.headers)) {
+				writeCookie(headers, sessionCookie, "", 0);
+				writeCookie(headers, `${prefix}session_data`, "", 0);
+			}
+			if (callback) return redirect(headers, mfaContinuation(callback));
+			return json(
+				{
+					twoFactorRedirect: true,
+					twoFactorMethods: challenge.twoFactorMethods,
+				},
+				200,
+				headers,
+			);
+		}
+		const {
+			headers,
+			session,
+			user: value,
+		} = await createSession(client, user, request, rememberMe, path);
+		if (device?.setCookie) headers.append("Set-Cookie", device.setCookie);
+		if (path === "/sign-in/email" || path === "/sign-in/username") {
+			if (callback) headers.set("Location", callback);
+			return json(
+				{
+					redirect: Boolean(callback),
+					...(callback ? { url: callback } : {}),
+					user: value,
+				},
+				200,
+				headers,
+			);
+		}
+		if (path === "/verify-email") {
+			return callback
+				? redirect(headers, callback)
+				: json({ status: true, user: null }, 200, headers);
+		}
+		return json({ session, user: value }, 200, headers);
+	}
+
+	async function factorAdmission(request: Request, operation: string) {
+		const ip = options.trustedIP(request);
+		if (!ip || !isIP(ip)) return forbidden();
+		const key = createHmac("sha256", options.signingSecret)
+			.update(`owned-mfa:v1:${operation}\0${ip}`)
+			.digest("hex");
+		const admission = await store.transaction((client) =>
+			consumeProxySessionCheck(client, `owned-mfa:v1:${key}`, {
+				max: 30,
+				window: 60,
+				burst: 10,
+			}),
+		);
+		return admission.allowed
+			? null
+			: failure(
+					429,
+					"TOO_MANY_REQUESTS",
+					"Too many requests.",
+					new Headers({ "Retry-After": String(admission.retryAfter) }),
+				);
+	}
+
+	const mfaEnrollment = createOwnedMfaEnrollment({
+		database: options.database,
+		project: options.project,
+		keys: options.mfaKeys ?? { secret: options.signingSecret },
+		issuer: options.appName ?? options.passkeys?.name ?? "AllAuth",
+		secureCookies: secure,
+		mfaRequired: policy.mfaMode === "required",
+		async lockAuthority(client, request, { fresh }) {
+			const current = await currentSession(request.headers, client);
+			if (!current) return null;
+			const user = await store.lockUser(client, current.user.id);
+			if (
+				!activeUser(user) ||
+				!verifiedUser(user) ||
+				!(await store.lockSession(client, current.token, user.id, fresh))
+			)
+				return null;
+			const locked = await store.session(current.token, refreshWindow, client);
+			if (!locked) return null;
+			return { user, session: locked.session };
+		},
+		async rotateSession(client, request, authority, path) {
+			const user = await store.lockUser(client, authority.user.id);
+			if (!activeUser(user)) throw changedMfaOwner;
+			const value = await createSession(
+				client,
+				user,
+				request,
+				!tokenFrom(request.headers, rememberCookie),
+				path,
+				authority.session,
+			);
+			const previous = tokenFrom(request.headers);
+			if (previous)
+				writeCookie(
+					value.headers,
+					`${multiCookiePrefix}${previous.toLowerCase()}`,
+					"",
+					0,
+				);
+			return { sessionId: value.session.id, value };
+		},
+	});
+
+	async function manageMfa(
+		request: Request,
+		operation: "enable" | "disable" | "get-totp-uri" | "generate-backup-codes",
+	) {
+		if (!trustedRequest(request.headers, true)) return forbidden();
+		const refused = await factorAdmission(request, operation);
+		if (refused) return refused;
+		const input = z
+			.object({
+				password: z.string().max(128).optional(),
+				issuer: z.string().max(128).optional(),
+				method: z.enum(["totp", "otp"]).optional(),
+			})
+			.safeParse(await requestBody(request));
+		if (!input.success)
+			return failure(400, "INVALID_BODY", "Invalid two-factor request.");
+		const result = await {
+			enable: mfaEnrollment.enable,
+			disable: mfaEnrollment.disable,
+			"get-totp-uri": mfaEnrollment.readTotp,
+			"generate-backup-codes": mfaEnrollment.rotateBackupCodes,
+		}[operation](request, input.data);
+		if (result.status === "rejected")
+			return failure(result.httpStatus, result.code, result.message);
+		if (result.status === "setup")
+			return json({
+				totpURI: result.totpURI,
+				backupCodes: result.backupCodes,
+				method: result.method,
+			});
+		if (result.status === "uri") return json({ totpURI: result.totpURI });
+		if (result.status === "codes")
+			return json({ status: true, backupCodes: result.backupCodes });
+		for (const cookie of result.setCookies)
+			result.value.headers.append("Set-Cookie", cookie);
+		return json({ status: true }, 200, result.value.headers);
+	}
+
+	async function completeMfa(request: Request, method: "totp" | "backup") {
+		if (!trustedRequest(request.headers, true)) return forbidden();
+		const body = z
+			.object({
+				code: z.string().min(1).max(128),
+				trustDevice: z.boolean().optional(),
+				disableSession: z.boolean().optional(),
+			})
+			.safeParse(await requestBody(request));
+		if (!body.success)
+			return failure(400, "INVALID_BODY", "Supply a verification code.");
+		const refused = await factorAdmission(request, method);
+		if (refused) return refused;
+		if (await currentSession(request.headers)) {
+			const result = await mfaEnrollment.verify(request, {
+				method,
+				code: body.data.code,
+			});
+			if (result.status === "rejected")
+				return failure(result.httpStatus, result.code, result.message);
+			if (result.status === "rotated") {
+				for (const cookie of result.setCookies)
+					result.value.headers.append("Set-Cookie", cookie);
+				return json(
+					{ session: result.value.session, user: result.value.user },
+					200,
+					result.value.headers,
+				);
+			}
+			return body.data.disableSession
+				? json({ status: true })
+				: json({
+						session: result.authority.session,
+						user: projectUserResponse(result.authority.user),
+					});
+		}
+		if (body.data.disableSession) return unsupported();
+		try {
+			const result = await mfa.complete(
+				request.headers,
+				{ method, ...body.data },
+				async (client, pending) => {
+					const user = await store.lockUser(client, pending.userId);
+					if (
+						!activeUser(user) ||
+						!verifiedUser(user) ||
+						user.directoryManaged ||
+						!user.twoFactorEnabled ||
+						policy.supportAccess?.enabled ||
+						!(await store.passwordPolicySupported(client, user.id))
+					)
+						throw changedMfaOwner;
+					return createSession(
+						client,
+						user,
+						request,
+						!pending.dontRememberMe,
+						method === "totp"
+							? "/two-factor/verify-totp"
+							: "/two-factor/verify-backup-code",
+					);
+				},
+			);
+			if (result.status === "rejected") {
+				const headers = new Headers();
+				for (const cookie of result.setCookies)
+					headers.append("Set-Cookie", cookie);
+				return failure(result.httpStatus, result.code, result.message, headers);
+			}
+			const { session, user, headers } = result.session;
+			for (const cookie of result.setCookies)
+				headers.append("Set-Cookie", cookie);
+			return json({ session, user }, 200, headers);
+		} catch (error) {
+			if (error === changedMfaOwner) return forbidden();
+			throw error;
+		}
+	}
+
+	async function signIn(
+		request: Request,
+		field: "email" | "username" = "email",
+	) {
+		const path = `/sign-in/${field}`;
+		const invalidCode =
+			field === "email"
+				? "INVALID_EMAIL_OR_PASSWORD"
+				: "INVALID_USERNAME_OR_PASSWORD";
+		const invalidMessage =
+			field === "email"
+				? "Invalid email or password"
+				: "Invalid username or password";
 		if (!trustedRequest(request.headers, true)) return forbidden();
 		if (!policy.emailAndPasswordEnabled)
 			return failure(
@@ -233,11 +639,18 @@ export function createOwnedProjectEngine(
 				"EMAIL_PASSWORD_DISABLED",
 				"Email and password is not enabled",
 			);
-		if (policy.mfaMode !== "optional" || policy.supportAccess?.enabled)
-			return unsupported();
-		const body = passwordInput.safeParse(await requestBody(request));
+		if (policy.supportAccess?.enabled) return unsupported();
+		const raw = await requestBody(request);
+		const body =
+			field === "email"
+				? emailInput.safeParse(raw)
+				: usernameInput.safeParse(raw);
 		if (!body.success)
-			return failure(400, "INVALID_BODY", "Supply a valid email and password.");
+			return failure(
+				400,
+				"INVALID_BODY",
+				"Supply a valid identifier and password.",
+			);
 		const callback = callbackURL(body.data.callbackURL, request);
 		if (callback === null) return forbidden();
 		if (multiCookies(request.headers).length > 0 || tokenFrom(request.headers))
@@ -266,8 +679,10 @@ export function createOwnedProjectEngine(
 				new Headers({ "Retry-After": String(admission.retryAfter) }),
 			);
 
-		const email = body.data.email.toLowerCase();
-		const credential = await store.credential(email);
+		const login = (
+			"email" in body.data ? body.data.email : body.data.username
+		).toLowerCase();
+		const credential = await store.credential(login, undefined, field);
 		const hash = credential?.password;
 		if (
 			!credential ||
@@ -279,100 +694,29 @@ export function createOwnedProjectEngine(
 		) {
 			if (!hash) await clerkCompatiblePasswords.hash(body.data.password);
 			await store.transaction((client) =>
-				store.record(client, "auth.sign-in", "failure", "/sign-in/email"),
+				store.record(client, "auth.sign-in", "failure", path),
 			);
-			return failure(
-				401,
-				"INVALID_EMAIL_OR_PASSWORD",
-				"Invalid email or password",
-			);
+			return failure(401, invalidCode, invalidMessage);
 		}
 
-		const sessionId = randomUUID();
-		const token = btoa(
-			String.fromCharCode(...crypto.getRandomValues(new Uint8Array(24))),
-		)
-			.replaceAll("+", "-")
-			.replaceAll("/", "_");
-		const rememberMe = body.data.rememberMe !== false;
-		const result = await store.transaction(async (client) => {
-			const current = await store.credential(email, client);
-			if (!current || current.id !== credential.id || current.password !== hash)
-				return "changed";
+		return store.transaction(async (client) => {
+			const current = await store.credential(login, client, field);
 			if (
-				current.banned ||
-				current.directoryDisabled ||
-				current.directoryManaged ||
-				current.isAnonymous
-			)
-				return "blocked";
-			if (!current.emailVerified) return "unverified";
-			if (current.twoFactorEnabled || current.enrolledFactor)
-				return "unsupported";
-			if (!(await store.passwordPolicySupported(client, current.id)))
-				return "unsupported";
-			await store.createSession(client, {
-				id: sessionId,
-				token,
-				userId: current.id,
-				expiresIn: rememberMe ? policy.sessionExpiresInSeconds : 86400,
-				ip,
-				userAgent: request.headers.get("user-agent")?.slice(0, 512) ?? "",
-			});
-			await store.record(
+				!current ||
+				current.id !== credential.id ||
+				current.password !== hash
+			) {
+				return failure(401, invalidCode, invalidMessage);
+			}
+			return primaryResult(
 				client,
-				"session.created",
-				"success",
-				"/sign-in/email",
-				current.id,
-				sessionId,
+				current,
+				request,
+				body.data.rememberMe !== false,
+				path,
+				callback,
 			);
-			await store.record(
-				client,
-				"auth.sign-in",
-				"success",
-				"/sign-in/email",
-				current.id,
-				sessionId,
-			);
-			return projectUserResponse(current);
 		});
-		if (result === "changed")
-			return failure(
-				401,
-				"INVALID_EMAIL_OR_PASSWORD",
-				"Invalid email or password",
-			);
-		if (result === "blocked") return forbidden();
-		if (result === "unverified")
-			return failure(403, "EMAIL_NOT_VERIFIED", "Email not verified");
-		if (result === "unsupported") return unsupported();
-
-		const headers = new Headers();
-		const maxAge = rememberMe ? policy.sessionExpiresInSeconds : undefined;
-		writeCookie(headers, sessionCookie, token, maxAge);
-		writeCookie(
-			headers,
-			`${multiCookiePrefix}${token.toLowerCase()}`,
-			token,
-			maxAge,
-		);
-		writeCookie(
-			headers,
-			rememberCookie,
-			rememberMe ? "" : "true",
-			rememberMe ? 0 : undefined,
-		);
-		if (callback) headers.set("Location", callback);
-		return json(
-			{
-				redirect: Boolean(callback),
-				...(callback ? { url: callback } : {}),
-				user: result,
-			},
-			200,
-			headers,
-		);
 	}
 
 	async function readSession(request: Request) {
@@ -482,6 +826,130 @@ export function createOwnedProjectEngine(
 		return json({ success: true }, 200, responseHeaders);
 	}
 
+	const passkeyHttp =
+		options.passkeys &&
+		createOwnedProjectPasskeyHttp({
+			database: options.database,
+			schemaName: options.project.schemaName,
+			cookiePrefix: prefix,
+			signingSecret: options.signingSecret,
+			rp: options.passkeys,
+			readBody: requestBody,
+			writeCookie,
+			async readSession(request, fresh) {
+				const current = await currentSession(request.headers);
+				if (
+					!current ||
+					(fresh &&
+						Date.now() - new Date(current.session.createdAt).getTime() >=
+							86400000)
+				)
+					return null;
+				return { userId: current.user.id, email: current.user.email };
+			},
+			async withSession(request, userId, fresh, work) {
+				const token = tokenFrom(request.headers);
+				if (!token) return null;
+				return store.transaction(async (client) => {
+					const user = await store.lockUser(client, userId);
+					if (
+						!activeUser(user) ||
+						!verifiedUser(user) ||
+						!(await store.lockSession(client, token, userId, fresh))
+					)
+						return null;
+					return work(client);
+				});
+			},
+			async admit(request, operation) {
+				const ip = options.trustedIP(request);
+				if (!ip || !isIP(ip)) return forbidden();
+				const key = createHmac("sha256", options.signingSecret)
+					.update(`owned-passkey:v1:${operation}\0${ip}`)
+					.digest("hex");
+				const admission = await store.transaction((client) =>
+					consumeProxySessionCheck(
+						client,
+						`owned-passkey:v1:${operation}:${key}`,
+						{ max: 30, window: 60, burst: 10 },
+					),
+				);
+				return admission.allowed
+					? null
+					: failure(
+							429,
+							"TOO_MANY_REQUESTS",
+							"Too many requests.",
+							new Headers({ "Retry-After": String(admission.retryAfter) }),
+						);
+			},
+			async completeSignIn(request, userId, record) {
+				return store.transaction(async (client) => {
+					const user = await store.lockUser(client, userId);
+					if (!activeUser(user) || user.directoryManaged || !verifiedUser(user))
+						return null;
+					if (!(await record(client))) return null;
+					return primaryResult(
+						client,
+						user,
+						request,
+						true,
+						"/passkey/verify-authentication",
+					);
+				});
+			},
+			async completeRegistration(client, request, userId) {
+				return primaryResult(
+					client,
+					await store.lockUser(client, userId),
+					request,
+					true,
+					"/passkey/verify-registration",
+				);
+			},
+		});
+
+	const signUpHttp =
+		options.signUp &&
+		createOwnedSignUpHttp({
+			...options.signUp,
+			database: options.database,
+			project: options.project,
+			policy,
+			baseURL: origin,
+			basePath: options.basePath,
+			trustedOrigins: options.trustedOrigins,
+		});
+	const recoveryHttp =
+		options.recovery &&
+		createOwnedRecoveryHttp({
+			...options.recovery,
+			database: options.database,
+			project: options.project,
+			policy,
+			signingSecret: options.signingSecret,
+			baseURL: origin,
+			basePath: options.basePath,
+			trustedOrigins: options.trustedOrigins,
+			async completeVerification({
+				client,
+				user,
+				request,
+				callbackURL: callback,
+			}) {
+				const active = await currentSession(request.headers, client);
+				if (active?.user.id === user.id) return undefined;
+				return primaryResult(
+					client,
+					await store.lockUser(client, user.id),
+					request,
+					true,
+					"/verify-email",
+					callback,
+				);
+			},
+		});
+
 	async function dispatch(request: Request) {
 		const url = new URL(request.url);
 		if (
@@ -490,8 +958,35 @@ export function createOwnedProjectEngine(
 		)
 			return forbidden();
 		const path = url.pathname.slice(options.basePath.length);
+		const recovery = await recoveryHttp?.(request);
+		if (recovery) return recovery;
+		const registration = await signUpHttp?.(request);
+		if (registration) return registration;
+		if (passkeyHttp && path.startsWith("/passkey/")) {
+			if (!trustedRequest(request.headers, request.method !== "GET"))
+				return forbidden();
+			const response = await passkeyHttp(path, request);
+			if (response) return response;
+		}
+		if (request.method === "POST" && path === "/two-factor/enable")
+			return manageMfa(request, "enable");
+		if (request.method === "POST" && path === "/two-factor/disable")
+			return manageMfa(request, "disable");
+		if (request.method === "POST" && path === "/two-factor/get-totp-uri")
+			return manageMfa(request, "get-totp-uri");
+		if (
+			request.method === "POST" &&
+			path === "/two-factor/generate-backup-codes"
+		)
+			return manageMfa(request, "generate-backup-codes");
+		if (request.method === "POST" && path === "/two-factor/verify-totp")
+			return completeMfa(request, "totp");
+		if (request.method === "POST" && path === "/two-factor/verify-backup-code")
+			return completeMfa(request, "backup");
 		if (request.method === "POST" && path === "/sign-in/email")
 			return signIn(request);
+		if (request.method === "POST" && path === "/sign-in/username")
+			return signIn(request, "username");
 		if (request.method === "GET" && path === "/get-session")
 			return readSession(request);
 		if (request.method === "POST" && path === "/sign-out")

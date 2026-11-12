@@ -1,3 +1,5 @@
+import { sso } from "@better-auth/sso";
+import { emailOTP, magicLink, username } from "better-auth/plugins";
 import { symmetricDecrypt } from "better-auth/crypto";
 import { getTestInstance } from "better-auth/test";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -30,11 +32,17 @@ vi.mock("./hosting", () => ({
 function request(
 	path: string,
 	method = "GET",
-	options: { origin?: string; signed?: boolean; accept?: string } = {},
+	options: {
+		origin?: string;
+		signed?: boolean;
+		accept?: string;
+		body?: object;
+	} = {},
 ) {
 	const headers = new Headers({
 		accept: options.accept ?? "application/json",
 		...(options.origin ? { origin: options.origin } : {}),
+		...(options.body ? { "content-type": "application/json" } : {}),
 	});
 	if (options.signed !== false)
 		for (const name of edgeHeaders) headers.set(name, "fixture");
@@ -43,7 +51,9 @@ function request(
 		{
 			method,
 			headers,
-			...(method === "POST" ? { body: "{}" } : {}),
+			...(method === "POST"
+				? { body: JSON.stringify(options.body ?? {}) }
+				: {}),
 		},
 	);
 }
@@ -330,6 +340,180 @@ describe("hosted SDK transport", () => {
 		expect(await (await nativeRequest("get-session")).json()).toMatchObject({
 			user: { id: user.user.id },
 		});
+	});
+
+	it("scopes email code creation to sign-in", async () => {
+		verifiedFixture();
+		const response = await POST(
+			request("email-otp/send-verification-otp", "POST", {
+				origin,
+				body: { email: "fixture@example.com", type: "forget-password" },
+			}),
+		);
+		expect(response.status).toBe(400);
+		expect(gateway.dispatch).not.toHaveBeenCalled();
+		expect(
+			hostedSdkEndpoint(`${hostedSdkBasePath}/two-factor/send-otp`, "POST"),
+		).toBeNull();
+	});
+
+	it("retains native username, email code, magic-link and configured enterprise sign-in contracts", async () => {
+		const email = "alternate@fixture.example";
+		const password = "synthetic-hosted-password";
+		const callbackURL = `${origin}/account/security?from=portal%2Bauth`;
+		const identityProvider = "https://sso.fixture.example";
+		let receivedCode = "";
+		let receivedLink = "";
+		const { auth } = await getTestInstance(
+			{
+				baseURL: origin,
+				basePath: "/api/auth",
+				trustedOrigins: [identityProvider],
+				advanced: { cookiePrefix: `allauth_project_${slug}` },
+				emailAndPassword: { enabled: true },
+				plugins: [
+					productionTwoFactor(origin),
+					username(),
+					emailOTP({
+						storeOTP: "hashed",
+						async sendVerificationOTP({ otp }) {
+							receivedCode = otp;
+						},
+					}),
+					magicLink({
+						storeToken: "hashed",
+						async sendMagicLink({ url }) {
+							receivedLink = url;
+						},
+					}),
+					sso({
+						domainVerification: { enabled: true },
+						defaultSSO: [
+							{
+								domain: "fixture.example",
+								providerId: "fixture",
+								oidcConfig: {
+									issuer: identityProvider,
+									clientId: "synthetic-client",
+									clientSecret: "synthetic-secret",
+									pkce: true,
+									discoveryEndpoint: `${identityProvider}/.well-known/openid-configuration`,
+									authorizationEndpoint: `${identityProvider}/authorize`,
+									tokenEndpoint: `${identityProvider}/token`,
+									jwksEndpoint: `${identityProvider}/jwks`,
+								},
+							},
+						],
+					}),
+				],
+			},
+			{ disableTestUser: true },
+		);
+		await auth.api.signUpEmail({
+			body: { email, password, name: "Fixture user", username: "fixture_user" },
+		});
+		verifiedFixture();
+		gateway.dispatch.mockImplementation((incoming: Request) =>
+			auth.handler(incoming),
+		);
+		const bridge = (endpoint: string, body: object) =>
+			POST(request(endpoint, "POST", { origin, body }));
+		const credentials = await bridge("sign-in/username", {
+			username: "fixture_user",
+			password,
+			callbackURL,
+		});
+		expect(credentials.status).toBe(200);
+		expect(
+			credentials.headers
+				.getSetCookie()
+				.some((value) =>
+					value.startsWith(`__Secure-allauth_project_${slug}.session_token=`),
+				),
+		).toBe(true);
+		const signedIn = await credentials.json();
+		expect(signedIn).toMatchObject({
+			redirect: true,
+			url: callbackURL,
+			user: { email },
+		});
+		expect(signedIn).not.toHaveProperty("token");
+
+		const requested = await bridge("email-otp/send-verification-otp", {
+			email,
+			type: "sign-in",
+		});
+		expect(await requested.json()).toEqual({ success: true });
+		expect(receivedCode).toMatch(/^\d{6}$/);
+		const emailCode = await bridge("sign-in/email-otp", {
+			email,
+			otp: receivedCode,
+		});
+		expect(emailCode.status).toBe(200);
+		expect(await emailCode.json()).toMatchObject({ user: { email } });
+
+		const errorCallback = new URL("/auth-error", origin);
+		errorCallback.searchParams.set(
+			"callbackUrl",
+			new URL(callbackURL).pathname + new URL(callbackURL).search,
+		);
+		const magic = await bridge("sign-in/magic-link", {
+			email,
+			callbackURL,
+			errorCallbackURL: errorCallback.href.replaceAll("%", "%25"),
+		});
+		expect(await magic.json()).toEqual({ status: true });
+		const link = new URL(receivedLink);
+		expect(link.origin).toBe(origin);
+		expect(link.pathname).toBe("/api/auth/magic-link/verify");
+		expect(link.searchParams.get("callbackURL")).toBe(callbackURL);
+		const clicked = await auth.handler(new Request(link));
+		expect(clicked.status).toBe(302);
+		expect(clicked.headers.get("location")).toBe(callbackURL);
+		const replayed = await auth.handler(new Request(link));
+		expect(replayed.status).toBe(302);
+		errorCallback.searchParams.set("error", "INVALID_TOKEN");
+		expect(replayed.headers.get("location")).toBe(errorCallback.href);
+		const newUserCallbackURL = `${origin}/account/profile`;
+		const registrationLink = await bridge("sign-in/magic-link", {
+			email: "new-user@fixture.example",
+			callbackURL,
+			newUserCallbackURL,
+		});
+		expect(registrationLink.status).toBe(200);
+		const registered = await auth.handler(new Request(receivedLink));
+		expect(registered.status).toBe(302);
+		expect(registered.headers.get("location")).toBe(newUserCallbackURL);
+
+		const noSso = await bridge("sign-in/sso", {
+			email: "unknown@other.example",
+			callbackURL,
+		});
+		expect(noSso.status).toBe(404);
+		const enterprise = await bridge("sign-in/sso", {
+			email,
+			loginHint: email,
+			callbackURL,
+		});
+		expect(enterprise.status).toBe(200);
+		const provider: unknown = await enterprise.json();
+		expect(provider).toMatchObject({ redirect: true });
+		if (
+			!provider ||
+			typeof provider !== "object" ||
+			!("url" in provider) ||
+			typeof provider.url !== "string"
+		)
+			throw new Error(
+				"Expected the configured provider to return an authorization URL.",
+			);
+		const authorize = new URL(provider.url);
+		expect(authorize.origin).toBe(identityProvider);
+		expect(authorize.pathname).toBe("/authorize");
+		expect(authorize.searchParams.get("login_hint")).toBe(email);
+		expect(authorize.searchParams.get("redirect_uri")).toBe(
+			`${origin}/api/auth/sso/callback/fixture`,
+		);
 	});
 
 	it.each([

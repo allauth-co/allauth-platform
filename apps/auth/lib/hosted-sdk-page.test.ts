@@ -101,3 +101,67 @@ it("keeps production on the standard page even when the immutable ID appears in 
 	});
 	expect(result.type).toBe(AllAuthAuth);
 });
+
+it("only selects alternate sign-in methods when the verified project can offer them", async () => {
+	runtime.headers.mockResolvedValue(
+		new Headers({ [portalHeader]: "fixture-proof" }),
+	);
+	runtime.withPortalHeaders.mockImplementation(async (_headers, select) =>
+		select(
+			{ options: { emailAndPassword: { enabled: false } } },
+			new Headers(),
+			{ kind: "accounts", project },
+		),
+	);
+	const username = await HostedProjectAuthPage({
+		view: "signIn",
+		searchParams: Promise.resolve({ method: "username" }),
+	});
+	expect(username.type).toBe(AllAuthAuth);
+	const unconfigured = await HostedProjectAuthPage({
+		view: "emailOtp",
+		searchParams: Promise.resolve({}),
+	});
+	expect(unconfigured.type).toBe(AllAuthAuth);
+	runtime.getAuthEnvironment.mockResolvedValue({
+		ALLAUTH_PROJECT_HOSTED_UI_PROJECT_IDS: project.id,
+		EMAIL: { send: vi.fn() },
+	});
+	const emailOtp = await HostedProjectAuthPage({
+		view: "emailOtp",
+		searchParams: Promise.resolve({ returnTo: "/account/security" }),
+	});
+	expect(emailOtp.type).toBe(HostedProjectAuth);
+	expect(emailOtp.props).toMatchObject({
+		view: "emailOtp",
+		destination: "/account/security",
+		showEmail: true,
+		showPassword: false,
+	});
+});
+
+it("selects project MFA for a local callback and keeps signed broker MFA on the standard page", async () => {
+	runtime.headers.mockResolvedValue(
+		new Headers({ [portalHeader]: "fixture-proof" }),
+	);
+	runtime.withPortalHeaders.mockImplementation(async (_headers, select) =>
+		select({ options: {} }, new Headers(), { kind: "accounts", project }),
+	);
+	const local = await HostedProjectAuthPage({
+		view: "twoFactor",
+		searchParams: Promise.resolve({ callbackUrl: "/account/security" }),
+	});
+	expect(local.type).toBe(HostedProjectAuth);
+	expect(local.props).toMatchObject({
+		view: "twoFactor",
+		destination: "/account/security",
+	});
+	const signed = await HostedProjectAuthPage({
+		view: "twoFactor",
+		searchParams: Promise.resolve({
+			allauth_mfa: "app-v1",
+			client_id: "broker",
+		}),
+	});
+	expect(signed.type).toBe(AllAuthAuth);
+});

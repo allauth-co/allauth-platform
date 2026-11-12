@@ -1,7 +1,7 @@
 import type { Pool, PoolClient } from "pg";
 import { checkedProjectSchema } from "./validation";
 
-interface ProjectUser {
+export interface ProjectUser {
 	id: string;
 	name: string;
 	email: string;
@@ -20,7 +20,7 @@ interface ProjectUser {
 	displayUsername: string | null;
 }
 
-interface ProjectSession {
+export interface ProjectSession {
 	id: string;
 	userId: string;
 	expiresAt: string;
@@ -88,22 +88,53 @@ export function createProjectEngineStore(database: Pool, schemaName: string) {
 		}
 	}
 
-	async function credential(email: string, client?: PoolClient) {
+	async function credential(
+		value: string,
+		client?: PoolClient,
+		field: "email" | "username" = "email",
+	) {
 		const result = await (client ?? database).query<Credential>(
 			`SELECT ${userFields}, a.password, EXISTS (
 				SELECT 1 FROM "${schema}"."twoFactor" f WHERE f."userId" = u.id
 			) AS "enrolledFactor"
 			FROM "${schema}"."user" u
 			JOIN "${schema}"."account" a ON a."userId" = u.id
-			WHERE u.email = $1 AND a."providerId" = 'credential' AND a."accountId" = u.id
+			WHERE u.${field === "email" ? "email" : "username"} = $1 AND a."providerId" = 'credential' AND a."accountId" = u.id
 			ORDER BY a.id LIMIT 2${client ? " FOR UPDATE OF u, a" : ""}`,
-			[email],
+			[value],
 		);
 		return result.rows.length === 1 ? result.rows[0] : null;
 	}
 
-	async function session(token: string, refreshWindow: number) {
-		const result = await database.query<{
+	async function lockUser(client: PoolClient, userId: string) {
+		const result = await client.query<ProjectUser>(
+			`SELECT ${userFields} FROM "${schema}"."user" u WHERE u.id = $1 FOR UPDATE OF u`,
+			[userId],
+		);
+		return result.rows[0] ?? null;
+	}
+
+	async function lockSession(
+		client: PoolClient,
+		token: string,
+		userId: string,
+		fresh: boolean,
+	) {
+		const result = await client.query(
+			`SELECT id FROM "${schema}"."session" WHERE token = $1 AND "userId" = $2
+				AND "expiresAt" > statement_timestamp() AND "impersonatedBy" IS NULL
+				AND (NOT $3::boolean OR "createdAt" > statement_timestamp() - interval '1 day') FOR UPDATE`,
+			[token, userId, fresh],
+		);
+		return result.rowCount === 1;
+	}
+
+	async function session(
+		token: string,
+		refreshWindow: number,
+		client?: PoolClient,
+	) {
+		const result = await (client ?? database).query<{
 			session: ProjectSession;
 			user: ProjectUser;
 			refreshDue: boolean;
@@ -127,12 +158,16 @@ export function createProjectEngineStore(database: Pool, schemaName: string) {
 			expiresIn: number;
 			ip: string;
 			userAgent: string;
+			activeOrganizationId?: string | null;
+			activeTeamId?: string | null;
 		},
 	) {
-		await client.query(
-			`INSERT INTO "session" (id, token, "userId", "createdAt", "updatedAt", "expiresAt", "ipAddress", "userAgent")
+		const result = await client.query<{ session: ProjectSession }>(
+			`WITH inserted AS (INSERT INTO "session" (id, token, "userId", "createdAt", "updatedAt", "expiresAt", "ipAddress", "userAgent",
+				"activeOrganizationId", "activeTeamId")
 			 VALUES ($1, $2, $3, statement_timestamp(), statement_timestamp(),
-				statement_timestamp() + $4::int * interval '1 second', $5, $6)`,
+				statement_timestamp() + $4::int * interval '1 second', $5, $6, $7, $8) RETURNING *)
+			 SELECT row_to_json(s) AS session FROM (SELECT ${sessionFields} FROM inserted s) s`,
 			[
 				data.id,
 				data.token,
@@ -140,8 +175,11 @@ export function createProjectEngineStore(database: Pool, schemaName: string) {
 				data.expiresIn,
 				data.ip,
 				data.userAgent,
+				data.activeOrganizationId ?? null,
+				data.activeTeamId ?? null,
 			],
 		);
+		return result.rows[0]!.session;
 	}
 
 	async function refresh(token: string, expiresIn: number, updateAge: number) {
@@ -269,6 +307,8 @@ export function createProjectEngineStore(database: Pool, schemaName: string) {
 		credential,
 		createSession,
 		list,
+		lockSession,
+		lockUser,
 		passwordPolicySupported,
 		record,
 		refresh,

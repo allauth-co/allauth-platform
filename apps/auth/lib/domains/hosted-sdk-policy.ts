@@ -1,4 +1,4 @@
-import { applicationMfaCallback } from "../mfa";
+import { applicationMfaCallback } from "../mfa-continuation";
 
 export const hostedSdkBasePath = "/api/auth/hosted-ui";
 export const hostedSdkProjectIdsSetting =
@@ -11,8 +11,13 @@ const views = {
 	signUp: "/sign-up",
 	forgotPassword: "/forgot-password",
 	resetPassword: "/reset-password",
+	magicLink: "/magic-link",
+	emailOtp: "/email-otp",
+	enterpriseSignIn: "/enterprise-sign-in",
+	twoFactor: "/two-factor",
 } as const;
 export type HostedSdkView = keyof typeof views;
+export type HostedSdkForm = HostedSdkView | "username";
 export type HostedSdkSearchParams = Record<
 	string,
 	string | string[] | undefined
@@ -60,6 +65,7 @@ export function hostedSdkViewRequest(
 		"returnTo",
 		"callbackUrl",
 		...(view === "resetPassword" ? ["token"] : []),
+		...(view === "signIn" ? ["method"] : []),
 	]);
 	if (
 		Object.entries(params).some(
@@ -69,6 +75,7 @@ export function hostedSdkViewRequest(
 	)
 		return null;
 	if (view === "resetPassword" && !params.token) return null;
+	if (params.method !== undefined && params.method !== "username") return null;
 	const raw = params.returnTo ?? params.callbackUrl;
 	const destination = hostedSdkReturnPath(
 		typeof raw === "string" ? raw : undefined,
@@ -78,7 +85,11 @@ export function hostedSdkViewRequest(
 	fallback.searchParams.set("callbackUrl", destination);
 	if (view === "resetPassword" && typeof params.token === "string")
 		fallback.searchParams.set("token", params.token);
-	return { destination, legacyPath: fallback.pathname + fallback.search };
+	return {
+		destination,
+		legacyPath: fallback.pathname + fallback.search,
+		...(params.method === "username" ? { username: true } : {}),
+	};
 }
 
 const getEndpoints = new Set([
@@ -89,6 +100,11 @@ const getEndpoints = new Set([
 const postEndpoints = new Set([
 	"get-session",
 	"sign-in/email",
+	"sign-in/username",
+	"sign-in/magic-link",
+	"sign-in/email-otp",
+	"email-otp/send-verification-otp",
+	"sign-in/sso",
 	"sign-in/social",
 	"sign-up/email",
 	"request-password-reset",

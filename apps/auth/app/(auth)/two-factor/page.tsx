@@ -1,4 +1,4 @@
-import { AllAuthAuth } from "@/components/better-auth-ui/allauth-auth";
+import { HostedProjectAuthPage } from "@/components/hosted-project-auth-page";
 import { headers } from "next/headers";
 import { redirect } from "next/navigation";
 import { withPortalHeaders } from "@/lib/domains/hosting";
@@ -28,5 +28,5 @@ export default async function Page({
 		);
 		if (handoff?.url) redirect(handoff.url);
 	}
-	return <AllAuthAuth view="twoFactor" />;
+	return <HostedProjectAuthPage view="twoFactor" searchParams={searchParams} />;
 }

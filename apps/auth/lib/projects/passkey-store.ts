@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { Pool } from "pg";
+import type { Pool, PoolClient } from "pg";
 import { checkedProjectSchema } from "./validation";
 
 export interface StoredProjectPasskey {
@@ -17,7 +17,7 @@ export interface StoredProjectPasskey {
 	aaguid: string | null;
 }
 
-interface RegisteredProjectPasskey {
+export interface RegisteredProjectPasskey {
 	id: string;
 	publicKey: Uint8Array;
 	counter: number;
@@ -49,7 +49,9 @@ export function projectPasskeyStore(
 	const table = `"${schema}"."passkey"`;
 	return {
 		/** Return no credential when legacy data has more than one matching owner or row. */
-		async findCredential(credentialId: string): Promise<StoredProjectPasskey | null> {
+		async findCredential(
+			credentialId: string,
+		): Promise<StoredProjectPasskey | null> {
 			const { rows } = await database.query<StoredProjectPasskey>(
 				`SELECT ${columns} FROM ${table} WHERE "credentialID" = $1 LIMIT 2`,
 				[credentialId],
@@ -69,66 +71,107 @@ export function projectPasskeyStore(
 		async registerForUser(
 			userId: string,
 			credential: RegisteredProjectPasskey,
+			transaction?: PoolClient,
 		): Promise<StoredProjectPasskey | null> {
 			if (!supportedCounter(credential.counter))
 				throw new Error("Passkey counter is outside the stored range.");
-			const key = btoa(Array.from(credential.publicKey, (byte) => String.fromCharCode(byte)).join(""));
-			const client = await database.connect();
+			const key = btoa(
+				Array.from(credential.publicKey, (byte) =>
+					String.fromCharCode(byte),
+				).join(""),
+			);
+			const client = transaction ?? (await database.connect());
 			try {
-				await client.query("BEGIN ISOLATION LEVEL READ COMMITTED");
+				if (!transaction)
+					await client.query("BEGIN ISOLATION LEVEL READ COMMITTED");
 				// The legacy schema indexes the credential ID without a uniqueness
 				// constraint. AllAuth writers serialize duplicate checks per realm.
-				await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
-					JSON.stringify(["allauth-passkey", schema, credential.id]),
-				]);
+				await client.query(
+					"SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+					[JSON.stringify(["allauth-passkey", schema, credential.id])],
+				);
 				const { rows } = await client.query<StoredProjectPasskey>(
 					`INSERT INTO ${table} (${columns})
 					SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, statement_timestamp(), $10
 					WHERE NOT EXISTS (SELECT 1 FROM ${table} WHERE "credentialID" = $4)
 					RETURNING ${columns}`,
 					[
-						randomUUID(), credential.name?.trim() || null, userId, credential.id,
-						key, credential.counter, credential.deviceType, credential.backedUp,
-						credential.transports?.join(",") ?? "", credential.aaguid ?? null,
+						randomUUID(),
+						credential.name?.trim() || null,
+						userId,
+						credential.id,
+						key,
+						credential.counter,
+						credential.deviceType,
+						credential.backedUp,
+						credential.transports?.join(",") ?? "",
+						credential.aaguid ?? null,
 					],
 				);
-				await client.query("COMMIT");
+				if (!transaction) await client.query("COMMIT");
 				return rows[0] ?? null;
 			} catch (error) {
-				await client.query("ROLLBACK");
+				if (!transaction) await client.query("ROLLBACK");
 				throw error;
 			} finally {
-				client.release();
+				if (!transaction) client.release();
 			}
 		},
 
 		/** Apply a verified assertion only while the credential still matches what was verified. */
-		async recordAssertion(credential: CheckedCredential, nextCounter: number): Promise<boolean> {
+		async recordAssertion(
+			credential: CheckedCredential,
+			nextCounter: number,
+			transaction?: PoolClient,
+		): Promise<boolean> {
 			const priorCounter = credential.counter;
-			if (!supportedCounter(priorCounter) || !supportedCounter(nextCounter)) return false;
-			if ((priorCounter !== 0 || nextCounter !== 0) && nextCounter <= priorCounter) return false;
+			if (!supportedCounter(priorCounter) || !supportedCounter(nextCounter))
+				return false;
+			if (
+				(priorCounter !== 0 || nextCounter !== 0) &&
+				nextCounter <= priorCounter
+			)
+				return false;
 			// Counterless authenticators legitimately remain at zero. Single-use
 			// challenge consumption is still required before recording an assertion.
-			const result = await database.query(
+			const result = await (transaction ?? database).query(
 				`UPDATE ${table} SET counter = $6
 				WHERE id = $1 AND "userId" = $2 AND "credentialID" = $3 AND "publicKey" = $4 AND counter = $5`,
-				[credential.id, credential.userId, credential.credentialID, credential.publicKey, priorCounter, nextCounter],
+				[
+					credential.id,
+					credential.userId,
+					credential.credentialID,
+					credential.publicKey,
+					priorCounter,
+					nextCounter,
+				],
 			);
 			return result.rowCount === 1;
 		},
 
-		async renameForUser(userId: string, id: string, name: string): Promise<StoredProjectPasskey | null> {
+		async renameForUser(
+			userId: string,
+			id: string,
+			name: string,
+			transaction?: PoolClient,
+		): Promise<StoredProjectPasskey | null> {
 			const trimmed = name.trim();
 			if (!trimmed) throw new Error("A passkey name is required.");
-			const { rows } = await database.query<StoredProjectPasskey>(
+			const { rows } = await (
+				transaction ?? database
+			).query<StoredProjectPasskey>(
 				`UPDATE ${table} SET name = $3 WHERE id = $1 AND "userId" = $2 RETURNING ${columns}`,
 				[id, userId, trimmed],
 			);
 			return rows[0] ?? null;
 		},
 
-		async removeForUser(userId: string, id: string): Promise<boolean> {
-			const result = await database.query(
+		async removeForUser(
+			userId: string,
+			id: string,
+			transaction?: PoolClient,
+		): Promise<boolean> {
+			const result = await (transaction ?? database).query(
 				`DELETE FROM ${table} WHERE id = $1 AND "userId" = $2`,
 				[id, userId],
 			);
