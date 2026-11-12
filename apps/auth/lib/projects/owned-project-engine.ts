@@ -2289,6 +2289,7 @@ export function createOwnedProjectEngine(
 		createOwnedProjectGuest({
 			store,
 			emailAliases,
+			denyProvisioning: security.denyStandaloneSignup,
 			beforeDelete: beforeGuestDelete,
 			async revoke(client, request, userId, path) {
 				const removed = await store.revoke(
@@ -2364,15 +2365,16 @@ export function createOwnedProjectEngine(
 					"ANONYMOUS_USERS_CANNOT_SIGN_IN_AGAIN_ANONYMOUSLY",
 					"Anonymous users cannot sign in again anonymously",
 				);
-			if (await security.admit(client, request)) return securityBlocked();
-			const user = await guest.create(client);
-			if (!user)
+			const guestAccount = await guest.create(client, request);
+			if (guestAccount.status === "blocked")
+				return failure(403, "validation_failed", "User validation failed");
+			if (guestAccount.status === "reserved")
 				return failure(
 					reservedProjectEmailError.status,
 					reservedProjectEmailError.code,
 					reservedProjectEmailError.message,
 				);
-			const signedIn = await createSession(client, user, request, true, path);
+			const signedIn = await createSession(client, guestAccount.user, request, true, path);
 			return json(
 				{ token: signedIn.token, user: signedIn.user },
 				200,

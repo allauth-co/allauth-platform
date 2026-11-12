@@ -20,6 +20,11 @@ type Erasure =
 export function createOwnedProjectGuest(options: {
 	store: Store;
 	emailAliases?: Pick<OwnedProjectEmailAliases, "reserved">;
+	denyProvisioning(
+		client: PoolClient,
+		request: Request,
+		email: string,
+	): Promise<boolean>;
 	beforeDelete: OwnedProjectAccountDeletionOptions["beforeDelete"];
 	revoke(
 		client: PoolClient,
@@ -56,10 +61,13 @@ export function createOwnedProjectGuest(options: {
 	}
 
 	return {
-		async create(client: PoolClient) {
+		async create(client: PoolClient, request: Request) {
 			const id = randomUUID();
 			const email = `${id}@anonymous.placeholder.invalid`;
-			if (options.emailAliases?.reserved(email)) return null;
+			if (await options.denyProvisioning(client, request, email))
+				return { status: "blocked" } as const;
+			if (options.emailAliases?.reserved(email))
+				return { status: "reserved" } as const;
 			await client.query(
 				`INSERT INTO "user" (id,name,email,role,"emailVerified","isAnonymous")
 				 VALUES ($1,'Anonymous',$2,'guest',FALSE,TRUE)`,
@@ -68,7 +76,7 @@ export function createOwnedProjectGuest(options: {
 			const user = await store.lockUser(client, id);
 			if (!user)
 				throw new Error("The project guest account could not be created.");
-			return user;
+			return { status: "created", user } as const;
 		},
 		async erase(
 			request: Request,

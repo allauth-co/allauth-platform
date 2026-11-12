@@ -344,6 +344,20 @@ export function createOwnedProjectSecurity(options: SecurityOptions) {
 
 	return {
 		admit,
+		async denyStandaloneSignup(
+			client: SecurityDatabase,
+			request: Request,
+			email: string,
+		) {
+			const policy = await readPolicy(client);
+			const ip = trustedIP(request);
+			if (await checkRules(client, request, policy, email, ip)) return true;
+			if (!ip && options.requireTrustedIP)
+				return blocked(client, request, policy, "missing-trusted-ip");
+			if (ip && (await signupVelocityExceeded(client, policy, ip)))
+				return blocked(client, request, policy, "signup-velocity");
+			return false;
+		},
 		async prepareProviderSignup(
 			client: PoolClient,
 			request: Request,

@@ -1030,5 +1030,146 @@ describe.skipIf(!existsSync(fixturePath))(
 				network.mockRestore();
 			}
 		});
+
+		it("keeps guest creation on the native provisioning rules and signup counter", async () => {
+			const guestIp = "192.0.2.181";
+			const domainIp = "192.0.2.182";
+			const nativeEngine = native(nativeDatabase);
+			const candidate = createOwnedProjectEngine({
+				database,
+				project: { schemaName: schema, slug },
+				baseURL: origin,
+				basePath,
+				trustedOrigins: [],
+				signingSecret: secret,
+				trustedIP: (request) => request.headers.get("x-real-ip"),
+				policy: defaultAuthPolicy,
+				accountLinks: {
+					publicLinkBaseURL: `${origin}${basePath}`,
+					defer: () => {},
+					deliver: async () => {},
+					beforeDelete: async () => undefined,
+				},
+			});
+			await database.query(
+				`INSERT INTO ${scope}."allauthSecurityPolicy" (id,policy) VALUES ('default',$1)`,
+				[{ ...defaultSecurityPolicy, maxSignUpsPerIp: 2 }],
+			);
+			const failures = await securitySubject(secret, "fail-ip", guestIp);
+			await database.query(
+				`INSERT INTO ${scope}."allauthSecurityCounter" (key,scope,count,"windowStartedAt","blockedUntil") VALUES ($1,'fail-ip',20,statement_timestamp(),statement_timestamp()+interval '10 minutes')`,
+				[failures],
+			);
+			const signIn = (address: string) =>
+				new Request(`${origin}${basePath}/sign-in/anonymous`, {
+					method: "POST",
+					headers: { origin, "x-real-ip": address, "user-agent": userAgent },
+				});
+			const signupCount = async (address: string) =>
+				(
+					await database.query<{ count: number }>(
+						`SELECT count FROM ${scope}."allauthSecurityCounter" WHERE key=$1`,
+						[await securitySubject(secret, "signup-ip", address)],
+					)
+				).rows[0]?.count ?? 0;
+			const realReaders: [Dispatch, Dispatch][] = [
+				[nativeEngine.handler, candidate.dispatch],
+				[candidate.dispatch, nativeEngine.handler],
+			];
+			for (const [index, [create, read]] of realReaders.entries()) {
+				const session = await create(signIn(guestIp));
+				expect(session.status).toBe(200);
+				const { user } = (await session.json()) as {
+					user: {
+						id: string;
+						role: string;
+						isAnonymous: boolean;
+						emailVerified: boolean;
+					};
+				};
+				expect(user).toMatchObject({
+					role: "guest",
+					isAnonymous: true,
+					emailVerified: false,
+				});
+				const cookie = session.headers
+					.getSetCookie()
+					.find((value) => value.includes(".session_token="))
+					?.split(";", 1)[0];
+				expect(cookie).toBeTruthy();
+				const restored = await read(
+					new Request(`${origin}${basePath}/get-session`, {
+						headers: { cookie: cookie!, "x-real-ip": guestIp },
+					}),
+				);
+				expect(await restored.json()).toMatchObject({
+					user: { id: user.id, role: "guest", isAnonymous: true },
+				});
+				expect(await signupCount(guestIp)).toBe(index + 1);
+			}
+			const expected = {
+				code: "validation_failed",
+				message: "User validation failed",
+			};
+			for (const dispatch of [nativeEngine.handler, candidate.dispatch]) {
+				const denied = await dispatch(signIn(guestIp));
+				expect(denied.status).toBe(403);
+				expect(await denied.json()).toEqual(expected);
+				expect(
+					denied.headers
+						.getSetCookie()
+						.some((value) => value.includes(".session_token=")),
+				).toBe(false);
+			}
+			expect(await signupCount(guestIp)).toBe(4);
+			expect(
+				(
+					await database.query(
+						`SELECT count FROM ${scope}."allauthSecurityCounter" WHERE key=$1`,
+						[failures],
+					)
+				).rows,
+			).toEqual([{ count: 20 }]);
+			const rule = randomUUID();
+			await database.query(
+				`INSERT INTO ${scope}."allauthSecurityRule" (id,type,value,reason) VALUES ($1,'email-domain','anonymous.placeholder.invalid','Synthetic guest rule')`,
+				[rule],
+			);
+			for (const dispatch of [nativeEngine.handler, candidate.dispatch]) {
+				const denied = await dispatch(signIn(domainIp));
+				expect(denied.status).toBe(403);
+				expect(await denied.json()).toEqual(expected);
+			}
+			expect(await signupCount(domainIp)).toBe(0);
+			const audit = await database.query(
+				`SELECT "ipAddress",outcome,metadata FROM ${scope}."allauthEvent"
+				 WHERE type='security.blocked' AND "ipAddress"=ANY($1::text[]) ORDER BY "ipAddress"`,
+				[[guestIp, domainIp]],
+			);
+			expect(audit.rows).toEqual([
+				...Array.from({ length: 2 }, () => ({
+					ipAddress: guestIp,
+					outcome: "blocked",
+					metadata: { signal: "signup-velocity", monitor: false },
+				})),
+				...Array.from({ length: 2 }, () => ({
+					ipAddress: domainIp,
+					outcome: "blocked",
+					metadata: {
+						signal: "explicit-rule",
+						monitor: false,
+						ruleId: rule,
+						ruleType: "email-domain",
+					},
+				})),
+			]);
+			expect(
+				(
+					await database.query(
+						`SELECT id FROM ${scope}."user" WHERE "isAnonymous"`,
+					)
+				).rowCount,
+			).toBe(2);
+		});
 	},
 );
