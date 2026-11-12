@@ -68,6 +68,7 @@ import { projectManagement } from "./management-plugin";
 import { projectOriginFingerprint } from "./origins";
 import type { OwnedProjectSCIMConsole } from "./owned-project-scim-console";
 import { selectRehearsalProjectEngine } from "./project-engine-rehearsal-selection";
+import { localizeProjectErrors } from "./project-error-localization";
 import { verifiedProjectRequest } from "./proxy";
 import type { Project } from "./registry";
 import {
@@ -272,9 +273,12 @@ async function build(
 				signingSecret: secret,
 				credentialHashSecret: env.SCIM_CREDENTIAL_HASH_SECRET,
 			});
+			const boundEngine = publicOrigin
+				? engine
+				: bindOwnedDirectTransport(engine, baseURL);
 			return {
 				kind: "owned",
-				engine: observe(publicOrigin ? engine : bindOwnedDirectTransport(engine, baseURL), "allauth"),
+				engine: observe(localizeProjectErrors(boundEngine), "allauth"),
 				env,
 				project,
 				pool,
