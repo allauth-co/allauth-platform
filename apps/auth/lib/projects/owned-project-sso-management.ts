@@ -16,13 +16,17 @@ import {
 } from "./owned-project-sso-domain";
 import type { SsoFetch } from "./owned-project-sso-network";
 import type { StoredProjectSsoProvider } from "./owned-project-sso-projection";
-import { projectSsoProviderResponse } from "./owned-project-sso-projection";
+import {
+	projectSsoProviderResponse,
+	readStoredSsoConfiguration,
+} from "./owned-project-sso-projection";
 import {
 	authorizeProjectSsoRegistration,
 	prepareProjectSsoRegistration,
 	projectSsoRegistrationInput,
 	registerProjectSsoProvider,
 } from "./owned-project-sso-register";
+import { projectSamlServiceMetadata } from "./owned-project-sso-saml-protocol";
 import { ssoProviderId } from "./owned-project-sso-store";
 import {
 	projectSsoUpdateInput,
@@ -33,6 +37,7 @@ const paths = {
 	"/sso/providers": "GET",
 	"/sso/register": "POST",
 	"/sso/get-provider": "GET",
+	"/sso/saml2/sp/metadata": "GET",
 	"/sso/delete-provider": "POST",
 	"/sso/update-provider": "POST",
 	"/sso/request-domain-verification": "POST",
@@ -58,6 +63,7 @@ export interface OwnedProjectSsoManagementOptions {
 	baseURL: string;
 	trustedOrigins: ReadonlySet<string>;
 	fetch?: SsoFetch;
+	saml?: boolean;
 	trustedRequest(headers: Headers, mutation: boolean): boolean;
 	readBody(request: Request): Promise<unknown>;
 	readSession(
@@ -258,12 +264,55 @@ export function createOwnedProjectSsoManagement(
 		});
 	}
 
+	async function metadata(request: Request) {
+		const id = ssoProviderId.safeParse(
+			new URL(request.url).searchParams.get("providerId"),
+		);
+		if (!id.success)
+			return failure(400, "BAD_REQUEST", "Invalid SSO provider request.");
+		const provider = await store.transaction((client) =>
+			readProvider(client, id.data, false),
+		);
+		if (!provider)
+			return failure(
+				404,
+				"NOT_FOUND",
+				"No provider found for the given providerId",
+			);
+		const config = readStoredSsoConfiguration(provider.samlConfig);
+		try {
+			const acs = `${options.baseURL}/sso/saml2/sp/acs/${encodeURIComponent(id.data)}`;
+			return new Response(projectSamlServiceMetadata(config, acs), {
+				headers: {
+					"Content-Type": "application/xml",
+					"Cache-Control": "no-store",
+					"Content-Security-Policy": "default-src 'none'; sandbox",
+					"X-Content-Type-Options": "nosniff",
+				},
+			});
+		} catch {
+			return failure(400, "BAD_REQUEST", "Invalid SAML configuration");
+		}
+	}
+
 	return async (
 		path: string,
 		request: Request,
 	): Promise<Response | undefined> => {
 		if (!Object.hasOwn(paths, path) || request.method !== paths[path as Path])
 			return;
+		if (path === "/sso/saml2/sp/metadata") {
+			if (!options.saml) return;
+			try {
+				return await metadata(request);
+			} catch {
+				return failure(
+					503,
+					"SSO_MANAGEMENT_UNAVAILABLE",
+					"SSO provider management is temporarily unavailable.",
+				);
+			}
+		}
 		const mutation = request.method === "POST";
 		if (!options.trustedRequest(request.headers, mutation))
 			return failure(

@@ -234,9 +234,17 @@ export function configureOwnedSaml(
 		idp: idpEntity,
 		wantAssertion,
 		requestsSigned,
+		postLocations,
 		recipients: new Set([...postLocations, acs]),
 		saved,
 	};
+}
+
+/** Publish only the SP metadata for the callback served by the selected realm transport. */
+export function projectSamlServiceMetadata(value: unknown, acs: string) {
+	const configured = configureOwnedSaml(value, acs);
+	if (!configured.postLocations.includes(acs)) invalid();
+	return configured.service.getMetadata();
 }
 
 type ConfiguredSaml = ReturnType<typeof configureOwnedSaml>;

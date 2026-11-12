@@ -700,6 +700,105 @@ describe.skipIf(!existsSync(fixturePath))(
 			});
 		});
 
+		it("serves native SP metadata for the configured transport before domain verification", async () => {
+			const metadataPath = "/sso/saml2/sp/metadata";
+			const provider = "metadata-pending";
+			const id = randomUUID();
+			const configured = configuration();
+			await database.query(
+				`INSERT INTO "${schema}"."ssoProvider" (id,"providerId",issuer,"samlConfig","userId",domain,"domainVerified")
+				VALUES ($1,$2,$3,$4,$5,'corp.example',FALSE)`,
+				[id, provider, sp, JSON.stringify(configured), decoy],
+			);
+			const engine = (baseURL: string, basePath: string, saml = true) =>
+				createOwnedProjectEngine({
+					database,
+					project: { schemaName: schema, slug },
+					baseURL,
+					basePath,
+					trustedOrigins: [],
+					signingSecret: secret,
+					policy: defaultAuthPolicy,
+					trustedIP: () => "192.0.2.31",
+					sso: { defaultErrorURL: `${baseURL}/auth-error`, saml },
+				});
+			const path = `${metadataPath}?providerId=${provider}`;
+			const hostedRequest = () => new Request(`${origin}/api/auth${path}`);
+			const hosted = engine(origin, "/api/auth");
+			const directOrigin = "https://api.saml-fixture.example";
+			const directBasePath = `/api/projects/${slug}/auth`;
+			const direct = engine(directOrigin, directBasePath);
+			const directRequest = () =>
+				new Request(`${directOrigin}${directBasePath}${path}`);
+			const nativeMetadata = await native.handler(hostedRequest());
+			const hostedMetadata = await hosted.dispatch(hostedRequest());
+			expect(nativeMetadata.status).toBe(200);
+			expect(hostedMetadata.status, await hostedMetadata.clone().text()).toBe(
+				200,
+			);
+			expect(hostedMetadata.headers.get("content-type")).toBe(
+				"application/xml",
+			);
+			expect(await hostedMetadata.text()).toBe(await nativeMetadata.text());
+			const directMetadata = await direct.dispatch(directRequest());
+			expect(directMetadata.status, await directMetadata.clone().text()).toBe(
+				200,
+			);
+			const directXML = await directMetadata.text();
+			expect(directXML).toContain(
+				`Location="${directOrigin}${directBasePath}/sso/saml2/sp/acs/${provider}"`,
+			);
+			expect(directXML).toContain(`entityID="${sp}"`);
+			expect(directXML).toContain('WantAssertionsSigned="true"');
+			expect(
+				(
+					await hosted.dispatch(
+						new Request(`${origin}/api/auth${metadataPath}?providerId=missing`),
+					)
+				).status,
+			).toBe(404);
+			expect(
+				(await engine(origin, "/api/auth", false).dispatch(hostedRequest()))
+					.status,
+			).not.toBe(200);
+
+			const differentTransport = saml
+				.SPMetadata({
+					entityID: sp,
+					assertionConsumerService: [
+						{
+							Binding: "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST",
+							Location: `${origin}/api/auth/sso/saml2/sp/acs/${provider}`,
+						},
+					],
+					wantAssertionsSigned: true,
+				})
+				.getMetadata();
+			await database.query(
+				`UPDATE "${schema}"."ssoProvider" SET "samlConfig"=$1 WHERE id=$2`,
+				[
+					JSON.stringify({
+						...configured,
+						spMetadata: { metadata: differentTransport },
+					}),
+					id,
+				],
+			);
+			expect((await hosted.dispatch(hostedRequest())).status).toBe(200);
+			expect((await direct.dispatch(directRequest())).status).toBe(400);
+			await database.query(
+				`UPDATE "${schema}"."ssoProvider" SET "samlConfig"=$1 WHERE id=$2`,
+				[
+					JSON.stringify({
+						...configured,
+						spMetadata: { isAssertionEncrypted: true },
+					}),
+					id,
+				],
+			);
+			expect((await hosted.dispatch(hostedRequest())).status).toBe(400);
+		});
+
 		it("requires an active directory identity and consumes a valid denied assertion without email fallback", async () => {
 			const state = await startOwned();
 			const signed = signedResponse(state.requestId);
