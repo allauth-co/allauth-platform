@@ -169,6 +169,105 @@ describe("hosted SDK transport", () => {
 		expect(gateway.dispatch).toHaveBeenCalledTimes(1);
 	});
 
+	it("limits hosted profile operations to the verified realm and returns issued API keys once", async () => {
+		verifiedFixture();
+		const secret = "fixture-issued-api-key";
+		gateway.dispatch.mockImplementation(async (incoming: Request) => {
+			const endpoint = new URL(incoming.url).pathname;
+			if (endpoint.endsWith("/api-key/list"))
+				return Response.json({
+					apiKeys: [
+						{ id: "key-id", key: secret, api_key: secret, token: secret },
+					],
+				});
+			if (endpoint.endsWith("/api-key/create")) {
+				const body: unknown = await incoming.json();
+				const accepted = Boolean(
+					body &&
+						typeof body === "object" &&
+						"name" in body &&
+						body.name === "integration",
+				);
+				return Response.json(
+					{
+						id: "key-id",
+						key: secret,
+						privateMetadata: { key: secret },
+						nested: { Key: secret, ok: accepted },
+					},
+					{ status: accepted ? 200 : 400 },
+				);
+			}
+			if (endpoint.endsWith("/api-key/delete"))
+				return Response.json({ success: true, key: secret });
+			return Response.json({ path: endpoint, body: await incoming.json() });
+		});
+		for (const operation of [
+			"update-user",
+			"change-email",
+			"is-username-available",
+		]) {
+			const body = { username: null };
+			const result = await POST(request(operation, "POST", { origin, body }));
+			expect(await result.json()).toEqual({
+				path: `/api/auth/${operation}`,
+				body,
+			});
+		}
+		expect(
+			(
+				await POST(
+					request("api-key/create", "POST", {
+						origin: "https://other.example",
+						body: { name: "integration" },
+					}),
+				)
+			).status,
+		).toBe(403);
+		expect(
+			(
+				await POST(
+					request("api-key/create", "POST", {
+						origin,
+						signed: false,
+						body: { name: "integration" },
+					}),
+				)
+			).status,
+		).toBe(404);
+		expect((await GET(request("api-key/create"))).status).toBe(404);
+		expect(await (await GET(request("api-key/list"))).json()).toEqual({
+			apiKeys: [{ id: "key-id" }],
+		});
+		const created = await POST(
+			request("api-key/create", "POST", {
+				origin,
+				body: { name: "integration" },
+			}),
+		);
+		expect(created.headers.get("cache-control")).toBe("no-store");
+		expect(await created.json()).toEqual({
+			id: "key-id",
+			key: secret,
+			nested: { ok: true },
+		});
+		const failed = await POST(
+			request("api-key/create", "POST", { origin, body: { name: "" } }),
+		);
+		expect(failed.status).toBe(400);
+		expect(await failed.text()).not.toContain(secret);
+		expect(
+			await (
+				await POST(
+					request("api-key/delete", "POST", {
+						origin,
+						body: { keyId: "key-id" },
+					}),
+				)
+			).json(),
+		).toEqual({ success: true });
+	});
+
 	it("dispatches only the manager's hosted organization operations for the verified project and origin", async () => {
 		verifiedFixture();
 		gateway.dispatch.mockImplementation(async (incoming: Request) =>

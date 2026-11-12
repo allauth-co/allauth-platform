@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { APIError } from "better-auth";
 import { symmetricDecrypt, symmetricEncrypt } from "better-auth/crypto";
-import { admin, jwt, multiSession, organization } from "better-auth/plugins";
+import { admin, jwt, multiSession, organization, username } from "better-auth/plugins";
 import { createAccessControl } from "better-auth/plugins/access";
 import type { Statements } from "better-auth/plugins/access";
 import { defaultRoles, defaultStatements } from "better-auth/plugins/organization/access";
@@ -131,6 +131,7 @@ describe.skipIf(!existsSync(fixturePath))("isolated PostgreSQL owned project eng
 				{ id: "fixture-control-security", hooks: nativeSecurity.hooks },
 				jwt({ jwt: { issuer: `${origin}${basePath}` }, jwks: { keyPairConfig: { alg: "RS256" }, gracePeriod: 7 * 86400 } }),
 				multiSession({ maximumSessions: 5 }),
+				username(),
 				serviceDirectory({ project: slug, projectId: directoryProjectId, environment: "development", authorize: authorizeDirectory }),
 			],
 			emailAndPassword: { enabled: true, password: clerkCompatiblePasswords },
@@ -196,6 +197,23 @@ describe.skipIf(!existsSync(fixturePath))("isolated PostgreSQL owned project eng
 		const signature = createHmac("sha256", signingSecret).update(token).digest("base64");
 		return { id, token, cookie: `${cookieName}=${encodeURIComponent(`${token}.${signature}`)}` };
 	}
+
+	it("preserves nullable username profile updates across both engines", async () => {
+		const id = await seed("profile-username@fixture.example");
+		const { cookie } = await legacySession(id, 3600);
+		const owned = engine();
+		const legacy = await nativeRequest(request("/update-user", { username: "Legacy.Name" }, { cookie }));
+		expect(legacy.status).toBe(200);
+		expect(await (await owned.dispatch(request("/get-session", undefined, { cookie }))).json()).toMatchObject({ user: { username: "legacy.name" } });
+		const clear = await owned.dispatch(request("/update-user", { name: "Updated name", username: null }, { cookie }));
+		expect(clear.status).toBe(200);
+		expect(await nativeGetSession(new Headers({ cookie }))).toMatchObject({ user: { name: "Updated name", username: null } });
+		const restored = await owned.dispatch(request("/update-user", { username: "Owned.Name" }, { cookie }));
+		expect(restored.status).toBe(200);
+		expect(await nativeGetSession(new Headers({ cookie }))).toMatchObject({ user: { username: "owned.name" } });
+		expect((await nativeRequest(request("/update-user", { username: null }, { cookie }))).status).toBe(200);
+		expect(await (await owned.dispatch(request("/get-session", undefined, { cookie }))).json()).toMatchObject({ user: { username: null } });
+	});
 
 	it("uploads a profile draft for the live project account and keeps the native storage capability contract", async () => {
 		const ownerId = await seed("avatar-owner@fixture.example");

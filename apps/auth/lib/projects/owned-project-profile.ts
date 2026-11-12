@@ -8,7 +8,7 @@ const profile = z.looseObject({
 	email: z.unknown().optional(),
 	name: z.string().optional(),
 	image: z.string().nullable().optional(),
-	username: z.string().optional(),
+	username: z.string().nullish(),
 	displayUsername: z.string().optional(),
 });
 
@@ -44,7 +44,7 @@ export function createOwnedProjectProfile(store: Store, baseURL: string) {
 				code: "EMAIL_CAN_NOT_BE_UPDATED",
 				message: "Email can not be updated",
 			} as const;
-		if (username !== undefined) {
+		if (typeof username === "string") {
 			const error = ownedProjectUsernameError(username);
 			if (error) return { status: 400, ...error } as const;
 		}
@@ -67,7 +67,8 @@ export function createOwnedProjectProfile(store: Store, baseURL: string) {
 		const fields = Object.entries({
 			name,
 			image,
-			username: username?.toLowerCase(),
+			username:
+				typeof username === "string" ? username.toLowerCase() : username,
 			displayUsername,
 		}).filter(([, value]) => value !== undefined);
 		if (!fields.length)

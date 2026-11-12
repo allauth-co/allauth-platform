@@ -20,18 +20,35 @@ const privateFields = new Set([
 	"apikey",
 ]);
 
-function browserValue(value: unknown, depth = 0): unknown {
+function browserValue(value: unknown, depth = 0, stripKey = false): unknown {
 	if (depth > 64) return null;
 	if (Array.isArray(value))
-		return value.map((entry) => browserValue(entry, depth + 1));
+		return value.map((entry) => browserValue(entry, depth + 1, stripKey));
 	if (!value || typeof value !== "object") return value;
 	return Object.fromEntries(
 		Object.entries(value)
-			.filter(
-				([key]) => !privateFields.has(key.toLowerCase().replace(/[-_]/g, "")),
-			)
-			.map(([key, entry]) => [key, browserValue(entry, depth + 1)]),
+			.filter(([key]) => {
+				const field = key.toLowerCase().replace(/[-_]/g, "");
+				return !privateFields.has(field) && (!stripKey || field !== "key");
+			})
+			.map(([key, entry]) => [key, browserValue(entry, depth + 1, stripKey)]),
 	);
+}
+
+function hostedPersonalKeyValue(data: unknown, issued: boolean) {
+	const clean = browserValue(data, 0, true);
+	if (
+		!issued ||
+		!data ||
+		typeof data !== "object" ||
+		!("key" in data) ||
+		typeof data.key !== "string" ||
+		!data.key ||
+		!clean ||
+		typeof clean !== "object"
+	)
+		return clean;
+	return { ...clean, key: data.key };
 }
 
 export function hostedSdkFailure(status: number, message: string) {
@@ -144,7 +161,13 @@ export async function hostedSdkResponse(
 				{ status: response.status, headers },
 			);
 		}
-		return Response.json(browserValue(data), {
+		const value = endpoint.startsWith("api-key/")
+			? hostedPersonalKeyValue(
+					data,
+					endpoint === "api-key/create" && response.ok,
+				)
+			: browserValue(data);
+		return Response.json(value, {
 			status: response.status,
 			headers,
 		});
