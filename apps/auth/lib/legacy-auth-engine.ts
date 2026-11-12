@@ -39,8 +39,8 @@ export function legacyAuthEngine(instance: LegacyInstance): AuthEngine {
 		return response;
 	}
 
-	const verifyApiKey = instance.api.verifyApiKey;
-	const deleteAllExpiredApiKeys = instance.api.deleteAllExpiredApiKeys;
+	const verifyApiKey = instance.api?.verifyApiKey;
+	const deleteAllExpiredApiKeys = instance.api?.deleteAllExpiredApiKeys;
 	const engine: AuthEngine = {
 		dispatch: (request) => instance.handler(request),
 		verifyApiKey:
