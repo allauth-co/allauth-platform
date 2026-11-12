@@ -1,5 +1,11 @@
 import { execFile } from "node:child_process";
-import { createHash, createHmac, createVerify, randomUUID } from "node:crypto";
+import {
+	createHash,
+	createHmac,
+	createPrivateKey,
+	createVerify,
+	randomUUID,
+} from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -13,7 +19,7 @@ import { getTestInstance } from "better-auth/test";
 import { Kysely, PostgresDialect } from "kysely";
 import { Pool } from "pg";
 import samlifyDefault, * as samlifyNamespace from "samlify";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { defaultAuthPolicy } from "../auth-policy/policy";
 import { resolveEnterpriseUser } from "../enterprise";
 import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
@@ -62,6 +68,7 @@ async function generateSamlKeys() {
 }
 
 let fixtureKeys: Awaited<ReturnType<typeof generateSamlKeys>>;
+let fixtureEncryptionKeys: Awaited<ReturnType<typeof generateSamlKeys>>;
 
 const fixturePath = new URL(
 	"../../../../.secrets/local-postgres.json",
@@ -232,30 +239,110 @@ function signedResponse(
 			<saml:AttributeStatement><saml:Attribute Name="corpEmail"><saml:AttributeValue>${decoyEmail}</saml:AttributeValue></saml:Attribute></saml:AttributeStatement>
 		</saml:Assertion>
 	</samlp:Response>`;
-	function sign(assertion: boolean) {
-		const node = assertion
-			? "/*[local-name(.)='Response']/*[local-name(.)='Assertion']"
-			: "/*[local-name(.)='Response']";
-		return saml.SamlLib.constructSAMLSignature({
-			rawSamlMessage: xml,
-			referenceTagXPath: assertion ? node : undefined,
-			privateKey: fixtureKeys.privateKey,
-			signatureAlgorithm,
-			signingCert: saml.Utility.normalizeCerString(fixtureKeys.certificate),
-			isBase64Output: false,
-			isMessageSigned: !assertion,
-			signatureConfig: {
-				prefix: "ds",
-				location: {
-					reference: `${node}/*[local-name(.)='Issuer']`,
-					action: "after",
-				},
-			},
-		});
-	}
-	if (signature === "assertion" || signature === "both") xml = sign(true);
-	if (signature === "response" || signature === "both") xml = sign(false);
+
+	if (signature === "assertion" || signature === "both")
+		xml = signSamlFixture(xml, true);
+	if (signature === "response" || signature === "both")
+		xml = signSamlFixture(xml, false);
 	return { assertionId, encoded: Buffer.from(xml).toString("base64") };
+}
+
+function signSamlFixture(xml: string, assertion: boolean) {
+	const node = assertion
+		? "/*[local-name(.)='Response']/*[local-name(.)='Assertion']"
+		: "/*[local-name(.)='Response']";
+	return saml.SamlLib.constructSAMLSignature({
+		rawSamlMessage: xml,
+		referenceTagXPath: assertion ? node : undefined,
+		privateKey: fixtureKeys.privateKey,
+		signatureAlgorithm,
+		signingCert: saml.Utility.normalizeCerString(fixtureKeys.certificate),
+		isBase64Output: false,
+		isMessageSigned: !assertion,
+		signatureConfig: {
+			prefix: "ds",
+			location: {
+				reference: `${node}/*[local-name(.)='Issuer']`,
+				action: "after",
+			},
+		},
+	});
+}
+type SAMLSigning = "assertion" | "response" | "both";
+
+function encryptedConfiguration(wantAssertionsSigned = true) {
+	const configured = configuration();
+	const passphrase = "synthetic-realm-saml-key-passphrase";
+	const key = createPrivateKey(fixtureEncryptionKeys.privateKey)
+		.export({
+			type: "pkcs8",
+			format: "pem",
+			cipher: "aes-256-cbc",
+			passphrase,
+		})
+		.toString();
+	return {
+		...configured,
+		wantAssertionsSigned,
+		idpMetadata: { ...configured.idpMetadata, isAssertionEncrypted: true },
+		spMetadata: {
+			isAssertionEncrypted: true,
+			encPrivateKey: key,
+			encPrivateKeyPass: passphrase,
+		},
+	};
+}
+
+async function encryptedFixtureResponse(
+	requestId: string,
+	signing: SAMLSigning,
+	options: {
+		certificate?: string;
+		dataAlgorithm?: string;
+		keyAlgorithm?: string;
+	} = {},
+) {
+	const fixture = signedResponse(requestId, {
+		signature: signing === "response" ? "none" : "assertion",
+	});
+	const receiver = saml.ServiceProvider({
+		entityID: sp,
+		assertionConsumerService: [
+			{
+				Binding: "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST",
+				Location: acs,
+			},
+		],
+		encryptCert: options.certificate ?? fixtureEncryptionKeys.certificate,
+	});
+	// Samlify consumes these entity settings at runtime and omits them from its declarations.
+	const senderSettings: Parameters<typeof saml.IdentityProvider>[0] & {
+		dataEncryptionAlgorithm: string;
+		keyEncryptionAlgorithm: string;
+	} = {
+		entityID: issuer,
+		isAssertionEncrypted: true,
+		singleSignOnService: [
+			{
+				Binding: "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect",
+				Location: `${idpOrigin}/redirect`,
+			},
+		],
+		dataEncryptionAlgorithm:
+			options.dataAlgorithm ?? "http://www.w3.org/2009/xmlenc11#aes256-gcm",
+		keyEncryptionAlgorithm:
+			options.keyAlgorithm ?? "http://www.w3.org/2001/04/xmlenc#rsa-oaep-mgf1p",
+	};
+	const sender = saml.IdentityProvider(senderSettings);
+	const encrypted = await saml.SamlLib.encryptAssertion(
+		sender,
+		receiver,
+		Buffer.from(fixture.encoded, "base64").toString("utf8"),
+	);
+	if (signing === "assertion") return encrypted;
+	return Buffer.from(
+		signSamlFixture(Buffer.from(encrypted, "base64").toString("utf8"), false),
+	).toString("base64");
 }
 
 describe.skipIf(!existsSync(fixturePath))(
@@ -276,7 +363,10 @@ describe.skipIf(!existsSync(fixturePath))(
 		let created = false;
 
 		beforeAll(async () => {
-			fixtureKeys = await generateSamlKeys();
+			[fixtureKeys, fixtureEncryptionKeys] = await Promise.all([
+				generateSamlKeys(),
+				generateSamlKeys(),
+			]);
 			const fixture: { container: string; DATABASE_URL: string } = JSON.parse(
 				readFileSync(fixturePath, "utf8"),
 			);
@@ -381,7 +471,7 @@ describe.skipIf(!existsSync(fixturePath))(
 			}
 		});
 
-		function owned() {
+		function owned(saml: true | "encrypted-fixture" = true) {
 			const store = createProjectEngineStore(database, schema);
 			return createOwnedProjectSso({
 				database,
@@ -392,7 +482,7 @@ describe.skipIf(!existsSync(fixturePath))(
 				signingSecret: secret,
 				defaultErrorURL: `${origin}/auth-error`,
 				signUpEnabled: true,
-				saml: true,
+				saml,
 				async complete(client, input) {
 					expect(input).toMatchObject({
 						user: { id: managed },
@@ -508,11 +598,205 @@ describe.skipIf(!existsSync(fixturePath))(
 			return pending(await owned().start(startRequest(), body));
 		}
 
+		async function storeSamlConfiguration(value: object) {
+			await database.query(
+				`UPDATE "${schema}"."ssoProvider" SET "samlConfig"=$1 WHERE "providerId"=$2`,
+				[JSON.stringify(value), providerId],
+			);
+		}
+
+		it.each([
+			{
+				order: "sign-then-encrypt",
+				signing: "assertion" as const,
+				requireAssertion: true,
+				bits: 128,
+			},
+			{
+				order: "encrypt-then-sign",
+				signing: "response" as const,
+				requireAssertion: false,
+				bits: 256,
+			},
+			{
+				order: "both signatures",
+				signing: "both" as const,
+				requireAssertion: true,
+				bits: 256,
+			},
+		])("round-trips encrypted $order through native and owned sessions", async ({
+			signing,
+			requireAssertion,
+			bits,
+		}) => {
+			const encryptedConfig = encryptedConfiguration(requireAssertion);
+			await storeSamlConfiguration({
+				...encryptedConfig,
+				spMetadata: {
+					...encryptedConfig.spMetadata,
+					isAssertionEncrypted: signing !== "response",
+				},
+			});
+			const engine = owned("encrypted-fixture");
+			const encryption = {
+				dataAlgorithm: `http://www.w3.org/2009/xmlenc11#aes${bits}-gcm`,
+			};
+			try {
+				const issuedByNative = await pending(
+					await native.handler(startRequest()),
+				);
+				await assertSession(
+					await engine.samlCallback(
+						callback(
+							await encryptedFixtureResponse(
+								issuedByNative.requestId,
+								signing,
+								encryption,
+							),
+							issuedByNative.relay,
+						),
+						providerId,
+					),
+				);
+				const issuedByOwned = await pending(
+					await engine.start(startRequest(), body),
+				);
+				await assertSession(
+					await native.handler(
+						callback(
+							await encryptedFixtureResponse(
+								issuedByOwned.requestId,
+								signing,
+								encryption,
+							),
+							issuedByOwned.relay,
+						),
+					),
+				);
+			} finally {
+				await storeSamlConfiguration(configuration());
+			}
+		});
+
+		it("requires the selected realm's decryption key and configured signed assertion policy", async () => {
+			const configured = encryptedConfiguration();
+			await storeSamlConfiguration(configured);
+			const engine = owned("encrypted-fixture");
+			try {
+				const disabled = await owned().start(startRequest(), body);
+				expect(disabled.status).toBe(400);
+				await storeSamlConfiguration({
+					...configured,
+					spMetadata: {
+						...configured.spMetadata,
+						encPrivateKeyPass: "different-synthetic-passphrase",
+					},
+				});
+				expect((await engine.start(startRequest(), body)).status).toBe(400);
+				await storeSamlConfiguration(configured);
+				const initial = await database.query<{ count: number }>(
+					`SELECT count(*)::int AS count FROM "${schema}"."session" WHERE "userId"=$1`,
+					[managed],
+				);
+				const state = await pending(await engine.start(startRequest(), body));
+				for (const assertion of [
+					signedResponse(state.requestId).encoded,
+					await encryptedFixtureResponse(state.requestId, "assertion", {
+						certificate: fixtureKeys.certificate,
+					}),
+					await encryptedFixtureResponse(state.requestId, "response"),
+					await encryptedFixtureResponse(state.requestId, "assertion", {
+						dataAlgorithm: "http://www.w3.org/2001/04/xmlenc#aes256-cbc",
+					}),
+				]) {
+					const rejected = await engine.samlCallback(
+						callback(assertion, state.relay),
+						providerId,
+					);
+					expect(rejected.status, await rejected.clone().text()).toBe(400);
+					expect(await rejected.json()).toEqual({
+						code: "INVALID_SAML_RESPONSE",
+						message: "Invalid SAML response.",
+					});
+					expect(cookies(rejected)).toBe("");
+				}
+				const after = await database.query<{ count: number }>(
+					`SELECT count(*)::int AS count FROM "${schema}"."session" WHERE "userId"=$1`,
+					[managed],
+				);
+				expect(after.rows).toEqual(initial.rows);
+				await assertSession(
+					await engine.samlCallback(
+						callback(
+							await encryptedFixtureResponse(state.requestId, "assertion"),
+							state.relay,
+						),
+						providerId,
+					),
+				);
+			} finally {
+				await storeSamlConfiguration(configuration());
+			}
+		});
+
+		it("keeps legacy CBC and XML Encryption 1.1 key transport outside the supported overlap", async () => {
+			await storeSamlConfiguration(encryptedConfiguration());
+			try {
+				const legacy = await pending(await native.handler(startRequest()));
+				const cbc = await encryptedFixtureResponse(
+					legacy.requestId,
+					"assertion",
+					{
+						dataAlgorithm: "http://www.w3.org/2001/04/xmlenc#aes256-cbc",
+					},
+				);
+				await assertSession(await native.handler(callback(cbc, legacy.relay)));
+
+				const candidate = owned("encrypted-fixture");
+				const issued = await pending(
+					await candidate.start(startRequest(), body),
+				);
+				const xml11 = await encryptedFixtureResponse(
+					issued.requestId,
+					"assertion",
+					{
+						keyAlgorithm: "http://www.w3.org/2009/xmlenc11#rsa-oaep",
+					},
+				);
+				const result = await candidate.samlCallback(
+					callback(xml11, issued.relay),
+					providerId,
+				);
+				expect(result.status).toBe(400);
+				expect(cookies(result)).toBe("");
+				const libraryError = vi
+					.spyOn(console, "error")
+					.mockImplementation(() => {});
+				try {
+					const rollback = await native.handler(callback(xml11, issued.relay));
+					expect(rollback.status).toBe(302);
+					const error = new URL(rollback.headers.get("location")!);
+					expect(error.searchParams.get("error")).toBe("saml_error");
+					expect(cookies(rollback)).toBe("");
+					expect(libraryError).toHaveBeenCalledWith(
+						expect.objectContaining({
+							message:
+								"key encryption algorithm http://www.w3.org/2009/xmlenc11#rsa-oaep not supported",
+						}),
+					);
+				} finally {
+					libraryError.mockRestore();
+				}
+			} finally {
+				await storeSamlConfiguration(configuration());
+			}
+		});
+
 		it("finishes a native request using a verified assertion and the exact managed subject", async () => {
 			const state = await pending(await native.handler(startRequest()));
 			const signed = signedResponse(state.requestId);
 			const protocol = configureOwnedSaml(configuration(), acs);
-			expect(verifyOwnedSaml(signed.encoded, protocol).requestId).toBe(
+			expect((await verifyOwnedSaml(signed.encoded, protocol)).requestId).toBe(
 				state.requestId,
 			);
 			await assertSession(

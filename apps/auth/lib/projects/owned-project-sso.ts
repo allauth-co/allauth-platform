@@ -75,7 +75,7 @@ export interface OwnedProjectSsoOptions {
 	defaultErrorURL: string;
 	signUpEnabled: boolean;
 	/** The generated SP subset uses the selected transport's ACS for every request. */
-	saml?: boolean | "generated-sp";
+	saml?: boolean | "generated-sp" | "encrypted-fixture";
 	/** Session/MFA admission runs on the same client as the exact account and directory binding. */
 	complete(
 		client: PoolClient,
@@ -163,6 +163,7 @@ export function createOwnedProjectSso(options: OwnedProjectSsoOptions) {
 			signingSecret: options.signingSecret,
 			signUpEnabled: options.signUpEnabled,
 			generatedSPOnly: options.saml === "generated-sp",
+			allowEncrypted: options.saml === "encrypted-fixture",
 			defaultError,
 			store,
 			allowedReturn: (value) => allowedReturn(value, origin, origins),

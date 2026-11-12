@@ -1,4 +1,8 @@
-import type { Element as XmlElement } from "@xmldom/xmldom";
+import { createPrivateKey } from "node:crypto";
+import type {
+	Document as XmlDocument,
+	Element as XmlElement,
+} from "@xmldom/xmldom";
 import { DOMParser } from "@xmldom/xmldom";
 import samlifyDefault, * as samlifyNamespace from "samlify";
 import * as z from "zod";
@@ -14,6 +18,8 @@ const assertionNS = "urn:oasis:names:tc:SAML:2.0:assertion";
 const protocolNS = "urn:oasis:names:tc:SAML:2.0:protocol";
 const metadataNS = "urn:oasis:names:tc:SAML:2.0:metadata";
 const signatureNS = "http://www.w3.org/2000/09/xmldsig#";
+const encryptionNS = "http://www.w3.org/2001/04/xmlenc#";
+const encryption11NS = "http://www.w3.org/2009/xmlenc11#";
 const post = "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST";
 const redirect = "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect";
 const bearer = "urn:oasis:names:tc:SAML:2.0:cm:bearer";
@@ -54,7 +60,8 @@ const metadata = z.object({
 	privateKey: z.string().max(16384).optional(),
 	privateKeyPass: z.string().max(4096).optional(),
 	isAssertionEncrypted: z.boolean().optional(),
-	encPrivateKey: z.string().optional(),
+	encPrivateKey: z.string().min(1).max(16384).optional(),
+	encPrivateKeyPass: z.string().max(4096).optional(),
 });
 const config = z.object({
 	issuer: identifier,
@@ -136,22 +143,49 @@ function pem(value: string | undefined) {
 		.trim();
 }
 
-/** The configured plaintext SP/IdP pair, built with the same library as legacy SSO. */
+function decryptionKey(
+	idp: z.infer<typeof metadata>,
+	sp: z.infer<typeof metadata> | undefined,
+	allowEncrypted: boolean | undefined,
+) {
+	if (
+		!sp?.isAssertionEncrypted &&
+		!idp.isAssertionEncrypted &&
+		!sp?.encPrivateKey &&
+		!idp.encPrivateKey &&
+		!sp?.encPrivateKeyPass &&
+		!idp.encPrivateKeyPass
+	)
+		return undefined;
+	// The native receive path uses the IdP flag to require encryption and the SP key to decrypt.
+	if (!allowEncrypted || !idp.isAssertionEncrypted || !sp?.encPrivateKey)
+		invalid();
+	const privateKey = createPrivateKey({
+		key: pem(sp.encPrivateKey)!,
+		passphrase: sp.encPrivateKeyPass,
+	});
+	if (
+		privateKey.asymmetricKeyType !== "rsa" ||
+		(privateKey.asymmetricKeyDetails?.modulusLength ?? 0) < 2048
+	)
+		invalid();
+	return privateKey.export({ type: "pkcs8", format: "pem" });
+}
+
+/** The configured SP/IdP pair, built with the same library as legacy SSO. */
 export function configureOwnedSaml(
 	value: unknown,
 	acs: string,
-	options: { relayState?: string; generatedSPOnly?: boolean } = {},
+	options: {
+		relayState?: string;
+		generatedSPOnly?: boolean;
+		allowEncrypted?: boolean;
+	} = {},
 ) {
 	const saved = config.parse(value);
 	const sp = saved.spMetadata;
 	const idp = saved.idpMetadata;
-	if (
-		sp?.isAssertionEncrypted ||
-		idp.isAssertionEncrypted ||
-		sp?.encPrivateKey ||
-		idp.encPrivateKey
-	)
-		invalid();
+	const encPrivateKey = decryptionKey(idp, sp, options.allowEncrypted);
 	const spMetadata = sp?.metadata;
 	if (options.generatedSPOnly && spMetadata !== undefined) invalid();
 	const spDescriptor =
@@ -204,6 +238,7 @@ export function configureOwnedSaml(
 				.getMetadata(),
 		privateKey: requestPrivateKey,
 		privateKeyPass: sp?.privateKeyPass,
+		...(encPrivateKey ? { isAssertionEncrypted: true, encPrivateKey } : {}),
 		allowCreate: true,
 		relayState: options.relayState,
 	});
@@ -215,11 +250,12 @@ export function configureOwnedSaml(
 	if (!idp.metadata && (!idp.entityID || !certs?.length)) invalid();
 	const idpEntity = saml.IdentityProvider(
 		idp.metadata
-			? { metadata: idp.metadata }
+			? { metadata: idp.metadata, isAssertionEncrypted: Boolean(encPrivateKey) }
 			: {
 					entityID: idp.entityID,
 					signingCert: certs?.map((cert) => pem(cert)!),
 					wantAuthnRequestsSigned: saved.authnRequestsSigned === true,
+					isAssertionEncrypted: Boolean(encPrivateKey),
 					singleSignOnService: idp.singleSignOnService ?? [
 						{ Binding: redirect, Location: saved.entryPoint ?? "" },
 					],
@@ -235,6 +271,7 @@ export function configureOwnedSaml(
 		idp: idpEntity,
 		wantAssertion,
 		requestsSigned,
+		encrypted: Boolean(encPrivateKey),
 		postLocations,
 		recipients: new Set([...postLocations, acs]),
 		saved,
@@ -344,14 +381,7 @@ function attributes(assertion: XmlElement) {
 	return values;
 }
 
-/** Verify XML signatures with Samlify and read identity only from its authenticated assertion. */
-export function verifyOwnedSaml(encoded: string, configured: ConfiguredSaml) {
-	if (encoded.length > 256 * 1024) invalid();
-	const wire = encoded.replace(/[\t\n\r ]/g, "");
-	if (!/^[A-Za-z0-9+/]+={0,2}$/.test(wire)) invalid();
-	const xml = new TextDecoder("utf-8", { fatal: true }).decode(
-		Uint8Array.from(atob(wire), (item) => item.charCodeAt(0)),
-	);
+function parseSamlEnvelope(xml: string) {
 	const document = parseXML(xml);
 	const response = document.documentElement;
 	if (
@@ -361,58 +391,178 @@ export function verifyOwnedSaml(encoded: string, configured: ConfiguredSaml) {
 		response.getAttribute("Version") !== "2.0"
 	)
 		invalid();
-	const plain = child(response, assertionNS, "Assertion");
-	const all = Array.from(response.getElementsByTagName("*"));
-	if (
-		all.filter((item) => item.localName === "Assertion").length !== 1 ||
-		all.some((item) => item.localName === "EncryptedAssertion")
-	)
-		invalid();
 	const responseId = response.getAttribute("ID") ?? "";
-	const id = plain.getAttribute("ID") ?? "";
-	const ids = [response, ...all].flatMap((item) =>
+	const elements = Array.from(response.getElementsByTagName("*"));
+	const ids = [response, ...elements].flatMap((item) =>
 		Array.from(item.attributes)
 			.filter((attr) => attr.localName?.toLowerCase() === "id")
 			.map((attr) => attr.value),
 	);
+	if (!signedId.test(responseId) || new Set(ids).size !== ids.length) invalid();
+	return { document, response, responseId, elements };
+}
+
+function authenticatedEnvelope(
+	xml: string,
+	envelope: ReturnType<typeof parseSamlEnvelope>,
+	configured: ConfiguredSaml,
+) {
+	const outer = children(envelope.response, signatureNS, "Signature");
+	if (outer.length > 1) invalid();
+	if (!outer[0]) return;
+	checkSignature(outer[0], envelope.responseId);
+	const [verified, content] = saml.SamlLib.verifySignature(xml, {
+		metadata: configured.idp.entityMeta,
+		allowedSignatureAlgorithms: [...algorithms],
+		requireMessageSignature: true,
+	});
+	if (!verified || !content) invalid();
+	return { node: outer[0], content };
+}
+
+function plaintextAssertion(envelope: ReturnType<typeof parseSamlEnvelope>) {
 	if (
-		!signedId.test(responseId) ||
-		!signedId.test(id) ||
-		new Set(ids).size !== ids.length
+		envelope.elements.filter((item) => item.localName === "Assertion")
+			.length !== 1 ||
+		envelope.elements.some((item) => item.localName === "EncryptedAssertion")
 	)
 		invalid();
-	const outer = children(response, signatureNS, "Signature");
-	const inner = children(plain, signatureNS, "Signature");
+	return child(envelope.response, assertionNS, "Assertion");
+}
+
+function verifyAssertionSignature(
+	document: XmlDocument,
+	plain: XmlElement,
+	signature: XmlElement,
+	configured: ConfiguredSaml,
+) {
+	checkSignature(signature, plain.getAttribute("ID") ?? "");
+	const [verified, content] = saml.SamlLib.verifySignature(
+		document.toString(),
+		{
+			metadata: configured.idp.entityMeta,
+			allowedSignatureAlgorithms: [...algorithms],
+		},
+	);
+	if (!verified || !content) invalid();
+	return parseXML(content).documentElement;
+}
+
+function checkCiphertext(parent: XmlElement) {
+	const value = child(
+		child(parent, encryptionNS, "CipherData"),
+		encryptionNS,
+		"CipherValue",
+	);
+	if (!/^[A-Za-z0-9+/]+={0,2}$/.test(text(value).replace(/[\t\n\r ]/g, "")))
+		invalid();
+}
+
+function checkEncryptedAssertion(
+	envelope: ReturnType<typeof parseSamlEnvelope>,
+) {
 	if (
-		outer.length > 1 ||
+		envelope.elements.filter((item) => item.localName === "EncryptedAssertion")
+			.length !== 1 ||
+		envelope.elements.some((item) => item.localName === "Assertion") ||
+		envelope.elements.filter((item) => item.localName === "EncryptedData")
+			.length !== 1 ||
+		envelope.elements.filter((item) => item.localName === "EncryptedKey")
+			.length !== 1 ||
+		envelope.elements.filter((item) => item.localName === "EncryptionMethod")
+			.length !== 2 ||
+		envelope.elements.filter((item) => item.localName === "CipherData")
+			.length !== 2 ||
+		envelope.elements.filter((item) => item.localName === "CipherValue")
+			.length !== 2 ||
+		envelope.elements.some(
+			(item) =>
+				item.localName === "CipherReference" ||
+				item.localName === "RetrievalMethod",
+		)
+	)
+		invalid();
+	const encrypted = child(envelope.response, assertionNS, "EncryptedAssertion");
+	const data = child(encrypted, encryptionNS, "EncryptedData");
+	const key = child(
+		child(data, signatureNS, "KeyInfo"),
+		encryptionNS,
+		"EncryptedKey",
+	);
+	const dataMethod = child(data, encryptionNS, "EncryptionMethod");
+	const keyMethod = child(key, encryptionNS, "EncryptionMethod");
+	const keyParameters = Array.from(keyMethod.childNodes).filter(
+		(node) => node.nodeType === 1,
+	);
+	if (
+		![`${encryption11NS}aes128-gcm`, `${encryption11NS}aes256-gcm`].includes(
+			dataMethod.getAttribute("Algorithm") ?? "",
+		) ||
+		keyMethod.getAttribute("Algorithm") !== `${encryptionNS}rsa-oaep-mgf1p` ||
+		keyParameters.length > 1 ||
+		keyParameters.some((node) => {
+			const element = node as XmlElement;
+			return (
+				element.namespaceURI !== signatureNS ||
+				element.localName !== "DigestMethod" ||
+				element.getAttribute("Algorithm") !== `${signatureNS}sha1`
+			);
+		})
+	)
+		invalid();
+	checkCiphertext(data);
+	checkCiphertext(key);
+}
+
+async function authenticatedAssertion(
+	xml: string,
+	envelope: ReturnType<typeof parseSamlEnvelope>,
+	configured: ConfiguredSaml,
+) {
+	const initialAssertion = configured.encrypted
+		? undefined
+		: plaintextAssertion(envelope);
+	if (configured.encrypted) {
+		checkEncryptedAssertion(envelope);
+		if (
+			envelope.elements.filter((item) => item.localName === "Signature")
+				.length !== children(envelope.response, signatureNS, "Signature").length
+		)
+			invalid();
+	}
+	const outer = authenticatedEnvelope(xml, envelope, configured);
+	// A response signature authenticates the ciphertext. Decrypt that authenticated
+	// serialization when available, then validate the separately signed assertion.
+	const decrypted = configured.encrypted
+		? parseSamlEnvelope(
+				(
+					await saml.SamlLib.decryptAssertion(
+						configured.service,
+						outer?.content ?? xml,
+					)
+				)[0],
+			)
+		: envelope;
+	const plain = initialAssertion ?? plaintextAssertion(decrypted);
+	const id = plain.getAttribute("ID") ?? "";
+	const inner = children(plain, signatureNS, "Signature");
+	const outerNodes = children(decrypted.response, signatureNS, "Signature");
+	if (
+		!signedId.test(id) ||
 		inner.length > 1 ||
-		all.filter((item) => item.localName === "Signature").length !==
-			outer.length + inner.length ||
-		(!outer.length && !inner.length) ||
+		decrypted.elements.filter((item) => item.localName === "Signature")
+			.length !==
+			outerNodes.length + inner.length ||
+		(!outer && !inner.length) ||
 		(configured.wantAssertion && !inner.length)
 	)
 		invalid();
-	if (outer[0]) checkSignature(outer[0], responseId);
-	if (inner[0]) checkSignature(inner[0], id);
-	// Isolate the assertion signature when present. When it is absent, the sole
-	// signature is the envelope signature referencing the unique response ID.
-	const verification = {
-		metadata: configured.idp.entityMeta,
-		allowedSignatureAlgorithms: [...algorithms],
-	};
-	const outerResult =
-		outer[0] &&
-		saml.SamlLib.verifySignature(xml, {
-			...verification,
-			requireMessageSignature: true,
-		});
-	if (outerResult && !outerResult[0]) invalid();
-	if (inner.length && outer[0]) response.removeChild(outer[0]);
-	const [verified, authenticated] = inner.length
-		? saml.SamlLib.verifySignature(document.toString(), verification)
-		: outerResult || [false, null];
-	if (!verified || !authenticated) invalid();
-	const assertion = parseXML(authenticated).documentElement;
+	for (const signature of outerNodes) decrypted.response.removeChild(signature);
+	const assertion = inner[0]
+		? verifyAssertionSignature(decrypted.document, plain, inner[0], configured)
+		: configured.encrypted
+			? plain
+			: parseXML(outer!.content).documentElement;
 	if (
 		!assertion ||
 		assertion.localName !== "Assertion" ||
@@ -421,6 +571,27 @@ export function verifyOwnedSaml(encoded: string, configured: ConfiguredSaml) {
 		assertion.getAttribute("Version") !== "2.0"
 	)
 		invalid();
+	return { assertion, id };
+}
+
+/** Verify the assertion with Samlify before its identity or timing claims are used. */
+export async function verifyOwnedSaml(
+	encoded: string,
+	configured: ConfiguredSaml,
+) {
+	if (encoded.length > 256 * 1024) invalid();
+	const wire = encoded.replace(/[\t\n\r ]/g, "");
+	if (!/^[A-Za-z0-9+/]+={0,2}$/.test(wire)) invalid();
+	const xml = new TextDecoder("utf-8", { fatal: true }).decode(
+		Uint8Array.from(atob(wire), (item) => item.charCodeAt(0)),
+	);
+	const envelope = parseSamlEnvelope(xml);
+	const { response } = envelope;
+	const { assertion, id } = await authenticatedAssertion(
+		xml,
+		envelope,
+		configured,
+	);
 	const issuer = configured.idp.entityMeta.getEntityID();
 	if (
 		text(child(assertion, assertionNS, "Issuer")) !== issuer ||

@@ -123,6 +123,7 @@ export function createOwnedProjectSaml(options: {
 	signingSecret: string;
 	signUpEnabled: boolean;
 	generatedSPOnly?: boolean;
+	allowEncrypted?: boolean;
 	defaultError: URL;
 	store: SsoStore;
 	allowedReturn(value: string): URL | null;
@@ -161,7 +162,11 @@ export function createOwnedProjectSaml(options: {
 			const configured = configureOwnedSaml(
 				provider.samlConfig,
 				acs(provider.providerId),
-				{ relayState: relay, generatedSPOnly: options.generatedSPOnly },
+				{
+					relayState: relay,
+					generatedSPOnly: options.generatedSPOnly,
+					allowEncrypted: options.allowEncrypted,
+				},
 			);
 			const login = configured.service.createLoginRequest(
 				configured.idp,
@@ -240,7 +245,7 @@ export function createOwnedProjectSaml(options: {
 
 	async function consume(
 		provider: SsoProvider,
-		proof: ReturnType<typeof verifyOwnedSaml>,
+		proof: Awaited<ReturnType<typeof verifyOwnedSaml>>,
 		relay: string | undefined,
 	) {
 		const providerId = provider.providerId;
@@ -320,12 +325,13 @@ export function createOwnedProjectSaml(options: {
 		const provider = await store.getProvider(providerId);
 		if (!provider?.samlConfig) return failure("invalid_provider");
 		let configured: ReturnType<typeof configureOwnedSaml>;
-		let proof: ReturnType<typeof verifyOwnedSaml>;
+		let proof: Awaited<ReturnType<typeof verifyOwnedSaml>>;
 		try {
 			configured = configureOwnedSaml(provider.samlConfig, acs(providerId), {
 				generatedSPOnly: options.generatedSPOnly,
+				allowEncrypted: options.allowEncrypted,
 			});
-			proof = verifyOwnedSaml(form.response, configured);
+			proof = await verifyOwnedSaml(form.response, configured);
 		} catch {
 			return json(
 				{ code: "INVALID_SAML_RESPONSE", message: "Invalid SAML response." },
