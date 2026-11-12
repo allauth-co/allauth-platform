@@ -1,6 +1,8 @@
-import { createHash, createHmac } from "node:crypto";
+import { createHash, createHmac, randomBytes } from "node:crypto";
+import { isIP } from "node:net";
 import type { Pool, PoolClient } from "pg";
 import * as z from "zod";
+import { supportCallbackSchema } from "../auth-policy/policy";
 import type { ControlPrincipal } from "../control/types";
 import { readLegacySessionCookie } from "./legacy-session-cookie";
 import { createProjectEngineStore } from "./owned-project-engine-store";
@@ -32,11 +34,15 @@ export interface OwnedProjectSupportOptions {
 	platformOrigin: string;
 	signingSecret: string;
 	configuration(): Promise<OwnedSupportRegistration | null>;
+	/** Resolve and authorize the current platform session for the selected project's workspace. */
+	authorizePlatformRequest?(request: Request): Promise<ControlPrincipal | null>;
 	/** Resolve the stored platform actor's current project authority and active session. */
 	authorizeStoredActor(principal: ControlPrincipal): Promise<boolean>;
 	/** Verify the signed transport and return its current registry key version. */
 	verifyProxy(request: Request): Promise<VerifiedProxy | null>;
 	readBody(request: Request): Promise<unknown>;
+	/** Return only an address established by the platform's trusted ingress. */
+	trustedIP?(request: Request): string | null;
 	revokeSession?(
 		client: PoolClient,
 		current: SupportSession,
@@ -63,13 +69,14 @@ const principalSchema = z.object({
 			.transform((value) => value ?? undefined),
 	}),
 });
+const applicationContext = z
+	.object({ kind: z.enum(["user", "company", "practice"]), id: identifier })
+	.strict();
 const application = z.object({
 	actorKind: z.literal("application"),
 	actorSessionId: identifier,
 	applicationAuditId: identifier,
-	context: z
-		.object({ kind: z.enum(["user", "company", "practice"]), id: identifier })
-		.strict(),
+	context: applicationContext,
 	applicationReturnURL: z.url(),
 	applicationAuthorizeURL: z.url(),
 });
@@ -87,11 +94,36 @@ const revokeInput = z
 	.object({ sessionId: identifier, applicationAuditId: identifier })
 	.strict();
 const stopInput = z.object({}).strict();
+const impersonateInput = z.object({ userId: identifier }).strict();
 const opaque = z.string().regex(/^[A-Za-z0-9_-]{43}$/);
 const grantSchema = bindingSchema.extend({
 	stateHash: opaque,
 	codeChallenge: opaque,
 });
+const applicationLaunchInput = z
+	.object({
+		actorSessionId: identifier,
+		targetUserId: identifier,
+		reason: z.string().trim().min(3).max(2000),
+		applicationAuditId: identifier,
+		context: applicationContext,
+	})
+	.strict();
+const applicationLaunchSchema = applicationLaunchInput
+	.omit({ actorSessionId: true })
+	.extend({
+		kind: z.literal("application-launch"),
+		projectId: identifier,
+		actor: principalSchema,
+		callbackUrl: z.url(),
+		proxyVersion: identifier,
+		authorizeUrl: z.url(),
+		returnUrl: z.url(),
+	});
+const authorizeInput = z
+	.object({ launch: opaque, state: opaque, codeChallenge: opaque })
+	.strict();
+
 const exchangeInput = z
 	.object({
 		code: opaque,
@@ -102,8 +134,15 @@ const exchangeInput = z
 	.strict();
 const digest = (value: string) =>
 	createHash("sha256").update(value).digest("base64url");
+const launchKey = (value: string) => `support-launch:${digest(value)}`;
+const grantKey = (value: string) => `support-code:${digest(value)}`;
+const randomCode = () => randomBytes(32).toString("base64url");
+const auditValue = (value: string) =>
+	value.slice(0, 256).replace(/[\u0000-\u001f]/g, "");
 
 type Binding = z.infer<typeof bindingSchema>;
+type ApplicationLaunch = z.infer<typeof applicationLaunchSchema>;
+type AuthorizeInput = z.infer<typeof authorizeInput>;
 type RealmSupport = ReturnType<typeof projectSupportStore>;
 
 function json(value: unknown, status = 200, headers = new Headers()) {
@@ -161,7 +200,9 @@ function ordinaryActor(value: SupportSession | null): value is SupportSession {
 	);
 }
 
-function eligibleTarget(value: SupportSession) {
+function eligibleTarget(
+	value: Pick<SupportSession, "banned" | "directoryDisabled" | "role">,
+) {
 	return (
 		!value.banned &&
 		!value.directoryDisabled &&
@@ -209,7 +250,61 @@ function browserOrigin(request: Request, origin: string) {
 	);
 }
 
-/** Read and end existing connected support sessions without refreshing or elevating a session. */
+function applicationProof(
+	config: OwnedSupportRegistration | null,
+	request: Request,
+	verified: VerifiedProxy,
+) {
+	const app = config?.applicationInitiated;
+	if (
+		!config ||
+		!app?.enabled ||
+		!supportCallbackSchema.safeParse(config.callbackUrl).success ||
+		verified.origin !== app.primaryOrigin ||
+		verified.proxyVersion !== config.proxyVersion ||
+		!browserOrigin(request, verified.origin) ||
+		!exactOrigin(app.authorizeUrl, app.primaryOrigin) ||
+		!exactOrigin(app.returnUrl, app.primaryOrigin) ||
+		new URL(config.callbackUrl).hostname === new URL(app.primaryOrigin).hostname
+	)
+		return null;
+	return { config, app };
+}
+
+function boundedExpiry(maximum: number, remaining: Date) {
+	return new Date(Math.min(Date.now() + maximum, remaining.getTime()));
+}
+
+function redirect(value: string, query: Record<string, string>) {
+	const url = new URL(value);
+	for (const [name, item] of Object.entries(query))
+		url.searchParams.set(name, item);
+	return new Response(null, {
+		status: 302,
+		headers: {
+			Location: url.href,
+			"Cache-Control": "no-store",
+			Pragma: "no-cache",
+			"Referrer-Policy": "no-referrer",
+		},
+	});
+}
+
+function realmActor(value: SupportSession): ControlPrincipal {
+	return {
+		user: {
+			id: value.userId,
+			name: value.name,
+			email: value.email,
+			emailVerified: value.emailVerified,
+			role: value.role ?? undefined,
+			banned: value.banned ?? undefined,
+		},
+		session: { id: value.id, userId: value.userId },
+	};
+}
+
+/** Handle support handoffs and bound project sessions through their separate platform and proxy authorities. */
 export function createOwnedProjectSupportHttp(
 	options: OwnedProjectSupportOptions,
 ) {
@@ -251,6 +346,23 @@ export function createOwnedProjectSupportHttp(
 				"Set-Cookie",
 				`${name}=; Path=/; HttpOnly; SameSite=Lax${secure ? "; Secure" : ""}; Max-Age=0`,
 			);
+		return headers;
+	}
+
+	function issueSessionCookies(token: string) {
+		const headers = new Headers();
+		for (const [name, value] of [
+			["session_token", token],
+			["dont_remember", "true"],
+		] as const) {
+			const signature = createHmac("sha256", options.signingSecret)
+				.update(value)
+				.digest("base64");
+			headers.append(
+				"Set-Cookie",
+				`${cookiePrefix}${name}=${encodeURIComponent(`${value}.${signature}`)}; Path=/; HttpOnly; SameSite=Lax${secure ? "; Secure" : ""}`,
+			);
+		}
 		return headers;
 	}
 
@@ -313,6 +425,437 @@ export function createOwnedProjectSupportHttp(
 		};
 	}
 
+	async function platformActor(request: Request, write: boolean) {
+		if (
+			(write && !browserOrigin(request, platform)) ||
+			request.headers.has("allauth-proxy-signature")
+		)
+			return null;
+		const actor = principalSchema.safeParse(
+			await options.authorizePlatformRequest?.(request),
+		);
+		if (!actor.success) return null;
+		const value = actor.data;
+		return value.user.id === value.session.userId &&
+			value.user.emailVerified &&
+			!value.user.banned &&
+			!value.session.impersonatedBy
+			? value
+			: null;
+	}
+
+	function bindingFor(
+		actor: ControlPrincipal,
+		target: SupportSession,
+		config: OwnedSupportRegistration,
+	): Binding {
+		return {
+			projectId: project.id,
+			actor: principalSchema.parse(actor),
+			sessionId: target.id,
+			userId: target.userId,
+			sessionExpiresAt: target.expiresAt.toISOString(),
+			callbackUrl: config.callbackUrl,
+			proxyVersion: config.proxyVersion,
+		};
+	}
+
+	async function launchTicket(
+		realm: RealmSupport,
+		value: Binding | ApplicationLaunch,
+		expiresAt: Date,
+	) {
+		if (expiresAt.getTime() <= Date.now()) return invalid();
+		const launch = randomCode();
+		await realm.createVerification(
+			launchKey(launch),
+			JSON.stringify(value),
+			expiresAt,
+		);
+		const url = new URL(value.callbackUrl.replace(/\/callback$/, "/start"));
+		url.searchParams.set("launch", launch);
+		return json({ url: url.href, expiresAt: expiresAt.toISOString() });
+	}
+
+	async function issueGrant(
+		realm: RealmSupport,
+		binding: Binding,
+		input: AuthorizeInput,
+	) {
+		const code = randomCode();
+		const expiresAt = boundedExpiry(60_000, new Date(binding.sessionExpiresAt));
+		if (expiresAt.getTime() <= Date.now()) throw invalid();
+		await realm.createVerification(
+			grantKey(code),
+			JSON.stringify({
+				...binding,
+				stateHash: digest(input.state),
+				codeChallenge: input.codeChallenge,
+			}),
+			expiresAt,
+		);
+		return { code, state: input.state };
+	}
+
+	async function impersonateConsoleUser(
+		realm: RealmSupport,
+		request: Request,
+		token: string | null,
+		userId: string,
+	) {
+		if (!browserOrigin(request, platform))
+			return json(
+				{ message: "Project changes require a same-origin request." },
+				403,
+			);
+		const actor = await platformActor(request, true);
+		if (!actor)
+			return json(
+				{ message: "A verified workspace administrator is required." },
+				403,
+			);
+		const browserSession = token
+			? await realm.session(token, "token", { lock: "read" })
+			: null;
+		if (browserSession?.impersonatedBy)
+			return json(
+				{
+					message: "End the existing support session before starting another.",
+				},
+				403,
+			);
+		const user = await realm.target(userId);
+		if (!user)
+			return json(
+				{ message: "This user does not exist in the selected project." },
+				404,
+			);
+		if (
+			user.banned ||
+			user.role?.split(",").some((role) => role.trim() === "admin")
+		)
+			return json(
+				{
+					message: "Administrator and banned accounts cannot be impersonated.",
+				},
+				403,
+			);
+		if (user.directoryDisabled)
+			return json(
+				{ message: "This user cannot receive an impersonation session." },
+				403,
+			);
+		const ip = options.trustedIP?.(request) ?? "";
+		const userAgent = request.headers.get("user-agent") ?? "";
+		const target = await realm.createSession(
+			user,
+			actor.user.id,
+			new Date(Date.now() + 15 * 60_000),
+			isIP(ip) ? ip : "",
+			userAgent,
+		);
+		await realm.recordEvent(
+			target,
+			userAgent,
+			"session.impersonation-started",
+			{
+				path: "/project-admin/impersonate-user",
+				signal: "platform-project-management",
+			},
+			target.userId,
+		);
+		return json(
+			{
+				session: {
+					id: target.id,
+					userId: target.userId,
+					expiresAt: target.expiresAt.toISOString(),
+					impersonatedBy: actor.user.id,
+				},
+				user: {
+					id: user.userId,
+					email: user.email,
+					name: user.name,
+					emailVerified: user.emailVerified,
+					role: user.role,
+					banned: user.banned,
+					banReason: user.banReason,
+					banExpires: user.banExpires,
+					image: user.image,
+					createdAt: user.createdAt,
+					updatedAt: user.updatedAt,
+					publicMetadata: user.publicMetadata,
+				},
+			},
+			200,
+			issueSessionCookies(target.token),
+		);
+	}
+
+	async function stopConsoleImpersonation(
+		realm: RealmSupport,
+		request: Request,
+		token: string | null,
+	) {
+		if (
+			!browserOrigin(request, platform) ||
+			request.headers.has("allauth-proxy-signature")
+		)
+			return json(
+				{ message: "Project changes require a same-origin request." },
+				403,
+			);
+		const current = token
+			? await realm.session(token, "token", { lock: "write" })
+			: null;
+		if (!current) return json({ message: "Unauthorized" }, 401);
+		if (!current.impersonatedBy)
+			return json(
+				{ message: "This session is not impersonating a project user." },
+				400,
+			);
+		if (!(await realm.revokeSession(current)))
+			return json({ message: "Unauthorized" }, 401);
+		await realm.recordEvent(
+			current,
+			request.headers.get("user-agent"),
+			"session.impersonation-stopped",
+			{ signal: "platform-project-management" },
+		);
+		return json({ success: true }, 200, clearSession(request));
+	}
+
+	async function consoleStatus(
+		realm: RealmSupport,
+		request: Request,
+		token: string | null,
+	) {
+		const actor = await platformActor(request, false);
+		if (!actor) return forbidden();
+		const config = await options.configuration();
+		const target = token ? await realm.session(token, "token") : null;
+		return json({
+			enabled: Boolean(config),
+			...(config ? { callbackUrl: config.callbackUrl } : {}),
+			launchAvailable: Boolean(
+				config &&
+					target?.impersonatedBy === actor.user.id &&
+					eligibleTarget(target),
+			),
+		});
+	}
+
+	async function consoleLaunch(
+		realm: RealmSupport,
+		request: Request,
+		token: string | null,
+	) {
+		const actor = await platformActor(request, true);
+		if (!actor) return forbidden();
+		const config = await options.configuration();
+		if (!config || !supportCallbackSchema.safeParse(config.callbackUrl).success)
+			return forbidden();
+		const target = token
+			? await realm.session(token, "token", { lock: "read" })
+			: null;
+		if (
+			!target ||
+			target.impersonatedBy !== actor.user.id ||
+			!eligibleTarget(target)
+		)
+			return forbidden();
+		return launchTicket(
+			realm,
+			bindingFor(actor, target, config),
+			boundedExpiry(120_000, target.expiresAt),
+		);
+	}
+
+	async function consoleAuthorize(
+		realm: RealmSupport,
+		request: Request,
+		token: string | null,
+		input: AuthorizeInput,
+	) {
+		const config = await options.configuration();
+		if (!config || !supportCallbackSchema.safeParse(config.callbackUrl).success)
+			return forbidden();
+		const identifier = launchKey(input.launch);
+		const stored = await realm.verification(identifier);
+		const launch = decodeStored(applicationLaunchSchema, stored);
+		if (launch) {
+			const app = config.applicationInitiated;
+			if (
+				!app?.enabled ||
+				launch.projectId !== project.id ||
+				launch.callbackUrl !== config.callbackUrl ||
+				launch.proxyVersion !== config.proxyVersion ||
+				launch.authorizeUrl !== app.authorizeUrl ||
+				launch.returnUrl !== app.returnUrl ||
+				!exactOrigin(app.authorizeUrl, app.primaryOrigin)
+			)
+				return forbidden();
+			return redirect(app.authorizeUrl, input);
+		}
+		const actor = await platformActor(request, false);
+		if (!actor) return forbidden();
+		const binding = decodeBinding(stored);
+		if (!stored || !binding) return invalid();
+		if (
+			binding.application ||
+			binding.callbackUrl !== config.callbackUrl ||
+			binding.proxyVersion !== config.proxyVersion ||
+			binding.actor.user.id !== actor.user.id ||
+			binding.actor.session.id !== actor.session.id
+		)
+			return forbidden();
+		const target = await boundTarget(realm, binding, config, true);
+		if (!target || target.token !== token) return forbidden();
+		if (!(await realm.consumeVerification(identifier, stored.id)))
+			return invalid();
+		return redirect(
+			binding.callbackUrl,
+			await issueGrant(realm, binding, input),
+		);
+	}
+
+	async function applicationLaunch(
+		realm: RealmSupport,
+		request: Request,
+		verified: VerifiedProxy,
+		token: string | null,
+		input: z.infer<typeof applicationLaunchInput>,
+	) {
+		const proof = applicationProof(
+			await options.configuration(),
+			request,
+			verified,
+		);
+		if (!proof || !token) return forbidden();
+		const actor = await realm.session(token, "token", { lock: "read" });
+		if (
+			!ordinaryActor(actor) ||
+			input.actorSessionId !== actor.id ||
+			input.targetUserId === actor.userId
+		)
+			return forbidden();
+		const target = await realm.target(input.targetUserId);
+		if (!target || !eligibleTarget(target)) return forbidden();
+		const { config, app } = proof;
+		const launch: ApplicationLaunch = {
+			kind: "application-launch",
+			projectId: project.id,
+			actor: principalSchema.parse(realmActor(actor)),
+			targetUserId: target.userId,
+			reason: input.reason,
+			applicationAuditId: input.applicationAuditId,
+			context: input.context,
+			callbackUrl: config.callbackUrl,
+			proxyVersion: config.proxyVersion,
+			authorizeUrl: app.authorizeUrl,
+			returnUrl: app.returnUrl,
+		};
+		return launchTicket(realm, launch, boundedExpiry(120_000, actor.expiresAt));
+	}
+
+	async function applicationAuthorize(
+		realm: RealmSupport,
+		request: Request,
+		verified: VerifiedProxy,
+		token: string | null,
+		input: AuthorizeInput,
+	) {
+		const proof = applicationProof(
+			await options.configuration(),
+			request,
+			verified,
+		);
+		if (!proof || !token) return forbidden();
+		const actor = await realm.session(token, "token", { lock: "read" });
+		if (!ordinaryActor(actor)) return forbidden();
+		const { config, app } = proof;
+		const identifier = launchKey(input.launch);
+		const stored = await realm.verification(identifier);
+		const launch = decodeStored(applicationLaunchSchema, stored);
+		if (!stored || !launch) return invalid();
+		if (
+			launch.projectId !== project.id ||
+			launch.actor.user.id !== actor.userId ||
+			launch.actor.session.userId !== actor.userId ||
+			launch.actor.session.id !== actor.id ||
+			launch.actor.session.impersonatedBy ||
+			launch.targetUserId === actor.userId ||
+			launch.callbackUrl !== config.callbackUrl ||
+			launch.proxyVersion !== config.proxyVersion ||
+			launch.authorizeUrl !== app.authorizeUrl ||
+			launch.returnUrl !== app.returnUrl
+		)
+			return forbidden();
+		const user = await realm.target(launch.targetUserId);
+		if (!user || !eligibleTarget(user)) return invalid();
+		if (user.directoryManaged)
+			return json(
+				{
+					message:
+						"This account must sign in through its enterprise identity provider.",
+				},
+				403,
+			);
+		const expiresAt = boundedExpiry(15 * 60_000, actor.expiresAt);
+		if (
+			expiresAt.getTime() <= Date.now() ||
+			!(await realm.consumeVerification(identifier, stored.id))
+		)
+			return invalid();
+		const proxyIP = request.headers.get("allauth-proxy-ip") ?? "";
+		const userAgent = request.headers.get("user-agent") ?? "";
+		const target = await realm.createSession(
+			user,
+			actor.userId,
+			expiresAt,
+			isIP(proxyIP) ? proxyIP : "",
+			userAgent,
+		);
+		const binding = {
+			...bindingFor(realmActor(actor), target, config),
+			application: {
+				actorKind: "application" as const,
+				actorSessionId: actor.id,
+				applicationAuditId: launch.applicationAuditId,
+				context: launch.context,
+				applicationReturnURL: app.returnUrl,
+				applicationAuthorizeURL: app.authorizeUrl,
+			},
+		};
+		await realm.createVerification(
+			supportSessionKey(target.id),
+			JSON.stringify(binding),
+			expiresAt,
+		);
+		const query = await issueGrant(realm, binding, input);
+		await realm.recordEvent(
+			target,
+			userAgent,
+			"session.impersonation-started",
+			{
+				signal: "application-support",
+				actorKind: "application",
+				reason: auditValue(launch.reason),
+				applicationAuditId: auditValue(launch.applicationAuditId),
+				contextKind: launch.context.kind,
+				contextId: auditValue(launch.context.id),
+			},
+		);
+		const url = new URL(config.callbackUrl);
+		url.searchParams.set("code", query.code);
+		url.searchParams.set("state", query.state);
+		return json({
+			url: url.href,
+			expiresAt: expiresAt.toISOString(),
+			sessionId: target.id,
+		});
+	}
+
 	async function readSupport(
 		realm: RealmSupport,
 		request: Request,
@@ -355,7 +898,7 @@ export function createOwnedProjectSupportHttp(
 			!exactOrigin(config.callbackUrl, verified.origin)
 		)
 			return forbidden();
-		const identifier = `support-code:${digest(input.code)}`;
+		const identifier = grantKey(input.code);
 		const stored = await realm.verification(identifier);
 		const grant = decodeStored(grantSchema, stored);
 		if (
@@ -400,20 +943,11 @@ export function createOwnedProjectSupportHttp(
 			"session.support-connected",
 			{ signal: "connected-app-support" },
 		);
-		const headers = new Headers();
-		for (const [name, value] of [
-			["session_token", target.token],
-			["dont_remember", "true"],
-		] as const) {
-			const signature = createHmac("sha256", options.signingSecret)
-				.update(value)
-				.digest("base64");
-			headers.append(
-				"Set-Cookie",
-				`${cookiePrefix}${name}=${encodeURIComponent(`${value}.${signature}`)}; Path=/; HttpOnly; SameSite=Lax${secure ? "; Secure" : ""}`,
-			);
-		}
-		return json(supportIdentity(binding, target), 200, headers);
+		return json(
+			supportIdentity(binding, target),
+			200,
+			issueSessionCookies(target.token),
+		);
 	}
 
 	async function stopSupport(
@@ -472,19 +1006,7 @@ export function createOwnedProjectSupportHttp(
 			(await realm.verification(supportEndedKey(input.sessionId))) ??
 			(await realm.verification(supportSessionKey(input.sessionId)));
 		if (!stored || stored.expiresAt.getTime() <= Date.now()) {
-			const config = await options.configuration();
-			const app = config?.applicationInitiated;
-			if (
-				!config ||
-				!app?.enabled ||
-				verified.origin !== app.primaryOrigin ||
-				verified.proxyVersion !== config.proxyVersion ||
-				!browserOrigin(request, verified.origin) ||
-				!exactOrigin(app.authorizeUrl, app.primaryOrigin) ||
-				!exactOrigin(app.returnUrl, app.primaryOrigin) ||
-				new URL(config.callbackUrl).hostname ===
-					new URL(app.primaryOrigin).hostname
-			)
+			if (!applicationProof(await options.configuration(), request, verified))
 				return forbidden();
 			if (await realm.session(input.sessionId, "id", { allowExpired: true }))
 				return invalid();
@@ -527,38 +1049,96 @@ export function createOwnedProjectSupportHttp(
 		path: string,
 		request: Request,
 	): Promise<Response | undefined> => {
-		const read = path === "/sdk/support/session" && request.method === "GET";
-		const stop = path === "/sdk/support/stop" && request.method === "POST";
-		const revoke =
-			path === "/sdk/support/application/revoke" && request.method === "POST";
-		const exchange =
-			path === "/sdk/support/exchange" && request.method === "POST";
-		if (!read && !stop && !revoke && !exchange) return;
+		const get = request.method === "GET";
+		const post = request.method === "POST";
+		const read = get && path === "/sdk/support/session";
+		const stop = post && path === "/sdk/support/stop";
+		const revoke = post && path === "/sdk/support/application/revoke";
+		const exchange = post && path === "/sdk/support/exchange";
+		const appLaunch = post && path === "/sdk/support/application/launch";
+		const appAuthorize = post && path === "/sdk/support/application/authorize";
+		const impersonate = post && path === "/project-admin/impersonate-user";
+		const consoleStop = post && path === "/project-admin/stop-impersonating";
+		const status = get && path === "/project-admin/support/status";
+		const launch = post && path === "/project-admin/support/launch";
+		const authorize = get && path === "/project-admin/support/authorize";
+		const signedProxy =
+			read || stop || revoke || exchange || appLaunch || appAuthorize;
+		if (
+			!signedProxy &&
+			!status &&
+			!launch &&
+			!authorize &&
+			!impersonate &&
+			!consoleStop
+		)
+			return;
 		if (
 			request.headers.has("authorization") ||
-			!request.headers.has("allauth-proxy-signature")
+			(signedProxy && !request.headers.has("allauth-proxy-signature"))
 		)
 			return forbidden();
-		const verified = await options.verifyProxy(request.clone() as Request);
-		if (!verified) return forbidden();
+		const verified = signedProxy
+			? await options.verifyProxy(request.clone() as Request)
+			: null;
+		if (signedProxy && !verified) return forbidden();
 		const token = readLegacySessionCookie(
 			request.headers,
 			`${cookiePrefix}session_token`,
 			options.signingSecret,
 		);
-		const input = read ? undefined : await options.readBody(request);
-		if (stop && !stopInput.safeParse(input).success) return invalid();
+		const input =
+			post && !consoleStop ? await options.readBody(request) : undefined;
+		const impersonationBody = impersonate
+			? impersonateInput.safeParse(input)
+			: undefined;
+		if ((stop || launch) && !stopInput.safeParse(input).success)
+			return invalid();
 		const revokeBody = revoke ? revokeInput.safeParse(input) : undefined;
-		if (revokeBody && !revokeBody.success) return invalid();
 		const exchangeBody = exchange ? exchangeInput.safeParse(input) : undefined;
-		if (exchangeBody && !exchangeBody.success) return invalid();
+		const appLaunchBody = appLaunch
+			? applicationLaunchInput.safeParse(input)
+			: undefined;
+		const appAuthorizeBody = appAuthorize
+			? authorizeInput.safeParse(input)
+			: undefined;
+		const query = authorize ? new URL(request.url).searchParams : undefined;
+		const authorization =
+			query?.size === 3
+				? authorizeInput.safeParse(Object.fromEntries(query))
+				: undefined;
+		if (
+			[
+				revokeBody,
+				exchangeBody,
+				appLaunchBody,
+				appAuthorizeBody,
+				impersonationBody,
+			].some((result) => result && !result.success) ||
+			(authorize && !authorization?.success)
+		)
+			return invalid();
 		try {
 			return await store.transaction(async (client) => {
-				const revoke = options.revokeSession;
+				const revokeSession = options.revokeSession;
 				const realm = projectSupportStore(
 					client,
-					revoke && ((current) => revoke(client, current, request)),
+					revokeSession &&
+						((current) => revokeSession(client, current, request)),
 				);
+				if (impersonationBody?.success)
+					return impersonateConsoleUser(
+						realm,
+						request,
+						token,
+						impersonationBody.data.userId,
+					);
+				if (consoleStop) return stopConsoleImpersonation(realm, request, token);
+				if (status) return consoleStatus(realm, request, token);
+				if (launch) return consoleLaunch(realm, request, token);
+				if (authorization?.success)
+					return consoleAuthorize(realm, request, token, authorization.data);
+				if (!verified) return forbidden();
 				if (read) return readSupport(realm, request, verified, token);
 				if (stop) return stopSupport(realm, request, verified, token);
 				if (exchangeBody?.success)
@@ -571,10 +1151,40 @@ export function createOwnedProjectSupportHttp(
 						token,
 						revokeBody.data,
 					);
+				if (appLaunchBody?.success)
+					return applicationLaunch(
+						realm,
+						request,
+						verified,
+						token,
+						appLaunchBody.data,
+					);
+				if (appAuthorizeBody?.success)
+					return applicationAuthorize(
+						realm,
+						request,
+						verified,
+						token,
+						appAuthorizeBody.data,
+					);
 				return invalid();
 			});
 		} catch (error) {
 			if (error instanceof Response) return error;
+			if (
+				error &&
+				typeof error === "object" &&
+				"code" in error &&
+				error.code === "PAA02"
+			)
+				return json(
+					{
+						code: "IMPERSONATION_LIMIT_REACHED",
+						message:
+							"This workspace has used its five free impersonations this month. Upgrade to Pro for unlimited impersonations.",
+					},
+					403,
+				);
 			throw error;
 		}
 	};

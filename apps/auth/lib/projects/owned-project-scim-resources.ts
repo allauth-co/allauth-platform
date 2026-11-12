@@ -35,7 +35,7 @@ interface ResourceRow {
 	updatedAt: Date;
 }
 
-interface UserRow extends ResourceRow {
+export interface OwnedSCIMUserRow extends ResourceRow {
 	userName: string;
 	active: boolean;
 	serializedAttributes: string | null;
@@ -46,7 +46,7 @@ interface UserRow extends ResourceRow {
 }
 
 type ResourceRows =
-	| { kind: "User"; rows: UserRow[] }
+	| { kind: "User"; rows: OwnedSCIMUserRow[] }
 	| { kind: "Group"; rows: ResourceRow[] };
 
 interface GroupMembership {
@@ -84,8 +84,8 @@ function resourceMeta(
 	};
 }
 
-function userResource(
-	row: UserRow,
+export function ownedSCIMUserResource(
+	row: OwnedSCIMUserRow,
 	location: Location,
 	projection: AttributeProjection,
 ) {
@@ -260,7 +260,7 @@ export function createOwnedProjectSCIMResources(
 							? {
 									kind,
 									rows: (
-										await client.query<UserRow>(
+										await client.query<OwnedSCIMUserRow>(
 											`SELECT ${userColumns} FROM ${table} ${clause}`,
 											parameters,
 										)
@@ -281,7 +281,7 @@ export function createOwnedProjectSCIMResources(
 					) =>
 						result.kind === "User"
 							? result.rows.map((row) =>
-									userResource(row, location, projection),
+									ownedSCIMUserResource(row, location, projection),
 								)
 							: groupResources(
 									client,

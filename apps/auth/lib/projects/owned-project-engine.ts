@@ -6,8 +6,10 @@ import type { AuthEngine } from "../auth-engine";
 import { defaultPasswordPolicy } from "../auth-policy/password";
 import type { AuthPolicy } from "../auth-policy/policy";
 import { authPolicySchema } from "../auth-policy/policy";
+import type { ApplicationBranding } from "../branding/types";
 import { clerkCompatiblePasswords } from "../clerk-password";
 import { applicationMfaCallback } from "../mfa-continuation";
+import type { NativePasskeyCapability } from "../project-native-passkeys";
 import { readLegacySessionCookie } from "./legacy-session-cookie";
 import type { LegacyMfaKeys } from "./legacy-mfa-record";
 import { createOwnedProjectMfa } from "./owned-mfa";
@@ -33,19 +35,29 @@ import {
 	createOwnedProjectOAuth,
 	ownedProjectOAuthStartInput,
 	ownedProjectOAuthUnlinkInput,
+	projectOAuthProvider,
 	type OwnedProjectOAuthOptions,
 } from "./owned-project-oauth";
 import {
 	createOwnedProjectOrganizationHttp,
 	type OwnedProjectOrganizationOptions,
 } from "./owned-project-organization";
-import { createOwnedProjectSCIMDiscovery } from "./owned-project-scim-discovery";
+import {
+	createOwnedProjectPasswordChange,
+	type OwnedProjectPasswordChangeOptions,
+} from "./owned-project-password-change";
+import {
+	createOwnedProjectSCIMDiscovery,
+	ownedSCIMError,
+} from "./owned-project-scim-discovery";
+import { createOwnedProjectSCIMUserWrites } from "./owned-project-scim-user-writes";
 import { createOwnedProjectSCIMResources } from "./owned-project-scim-resources";
 import {
 	createOwnedProjectSso,
 	ownedProjectSsoInput,
 	type OwnedProjectSsoOptions,
 } from "./owned-project-sso";
+import { createOwnedProjectServiceDirectory } from "./owned-project-service-directory";
 import {
 	createOwnedProjectSupportHttp,
 	type OwnedProjectSupportOptions,
@@ -93,6 +105,18 @@ interface OwnedProjectEngineOptions {
 	signingSecret: string;
 	policy: AuthPolicy;
 	mfaKeys?: LegacyMfaKeys;
+	passwordChange?: Pick<
+		OwnedProjectPasswordChangeOptions,
+		"checkPasswordSafety"
+	>;
+	serviceDirectory?: Pick<
+		Parameters<typeof createOwnedProjectServiceDirectory>[0],
+		"projectId" | "environment" | "authorize"
+	>;
+	sdk?: {
+		nativePasskeys?: NativePasskeyCapability;
+		getBranding?(): Promise<ApplicationBranding>;
+	};
 	appName?: string;
 	signUp?: Omit<
 		Parameters<typeof createOwnedSignUpHttp>[0],
@@ -146,6 +170,7 @@ interface OwnedProjectEngineOptions {
 		| "signingSecret"
 		| "readBody"
 		| "revokeSession"
+		| "trustedIP"
 	> & { projectId: string; workspaceId: string };
 	organization?: Pick<
 		OwnedProjectOrganizationOptions,
@@ -580,11 +605,14 @@ export function createOwnedProjectEngine(
 		rememberMe: boolean,
 		path: string,
 		callback?: string,
-		enterprise?: { managed: boolean },
+		providerProof?: { managed?: boolean; allowUnverifiedEmail: boolean },
 	): Promise<Response> {
-		if (!activeUser(user) || (user.directoryManaged && !enterprise?.managed))
+		if (!activeUser(user) || (user.directoryManaged && !providerProof?.managed))
 			return forbidden();
-		if (!verifiedUser(user) && (!enterprise || policy.mfaMode === "required"))
+		if (
+			!verifiedUser(user) &&
+			(!providerProof?.allowUnverifiedEmail || policy.mfaMode === "required")
+		)
 			return failure(403, "EMAIL_NOT_VERIFIED", "Email not verified");
 		if (policy.supportAccess?.enabled) return unsupported();
 		if (await security.denySession(client, request, user.email))
@@ -1373,10 +1401,81 @@ export function createOwnedProjectEngine(
 					true,
 					`/callback/${provider}`,
 					destination,
+					{
+						allowUnverifiedEmail:
+							provider === "microsoft" || provider === "apple",
+					},
 				);
 				return result.status === 200
 					? redirect(new Headers(result.headers), destination)
 					: result;
+			},
+		});
+	const directory =
+		options.serviceDirectory &&
+		createOwnedProjectServiceDirectory({
+			...options.serviceDirectory,
+			database: options.database,
+			schemaName: options.project.schemaName,
+			project: options.project.slug,
+		});
+	const passwordSafety =
+		options.passwordChange?.checkPasswordSafety ??
+		options.recovery?.checkPasswordSafety ??
+		options.signUp?.checkPasswordSafety;
+	const passwordChange =
+		passwordSafety &&
+		createOwnedProjectPasswordChange({
+			database: options.database,
+			project: options.project,
+			policy,
+			checkPasswordSafety: passwordSafety,
+			readAuthority(request) {
+				return currentSession(request.headers);
+			},
+			async lockAuthority(client, request) {
+				const current = await currentSession(request.headers, client);
+				if (
+					!current ||
+					!(await store.lockUser(client, current.user.id)) ||
+					!(await store.lockSession(
+						client,
+						current.token,
+						current.user.id,
+						false,
+					))
+				)
+					return null;
+				return currentSession(request.headers, client);
+			},
+			async rotateSession(client, request, { user, session }) {
+				const path = "/change-password";
+				const { rows } = await client.query<{ token: string }>(
+					'SELECT token FROM "session" WHERE "userId" = $1 ORDER BY id',
+					[user.id],
+				);
+				const tokens = rows.map(({ token }) => token);
+				const removed = await store.revoke(
+					{ tokens },
+					path,
+					Boolean(backchannel),
+					client,
+				);
+				if (!removed) throw unavailableLogout;
+				deliverLogoutAfterCommit(client, request, removed.targets);
+				const replacement = await createSession(
+					client,
+					user,
+					request,
+					!tokenFrom(request.headers, rememberCookie),
+					path,
+					session,
+				);
+				for (const cookie of multiSessionTokens(request.headers)) {
+					if (tokens.includes(cookie.token))
+						writeCookie(replacement.headers, cookie.name, "", 0);
+				}
+				return replacement;
 			},
 		});
 	const sso =
@@ -1401,7 +1500,7 @@ export function createOwnedProjectEngine(
 					true,
 					`/sso/callback/${providerId}`,
 					destination,
-					{ managed },
+					{ managed, allowUnverifiedEmail: true },
 				);
 				return result.status === 200
 					? redirect(new Headers(result.headers), destination)
@@ -1419,6 +1518,25 @@ export function createOwnedProjectEngine(
 			baseURL: `${origin}${options.basePath}`,
 			credentialHashSecret: options.scim.credentialHashSecret,
 		});
+	const scimUserWrites =
+		options.scim &&
+		createOwnedProjectSCIMUserWrites({
+			database: options.database,
+			schemaName: options.project.schemaName,
+			baseURL: `${origin}${options.basePath}`,
+			credentialHashSecret: options.scim.credentialHashSecret,
+			async admitProfile({ client, request, email }) {
+				return (await security.admit(client, request, {
+					email,
+					signup: true,
+				}))
+					? ownedSCIMError(
+							429,
+							"This authentication request is temporarily unavailable. Try again later.",
+						)
+					: null;
+			},
+		});
 	const support =
 		options.support &&
 		createOwnedProjectSupportHttp({
@@ -1432,6 +1550,7 @@ export function createOwnedProjectEngine(
 			baseURL: origin,
 			signingSecret: options.signingSecret,
 			readBody: requestBody,
+			trustedIP: security.trustedIP,
 			async revokeSession(client, current, request) {
 				const path = new URL(request.url).pathname.slice(
 					options.basePath.length,
@@ -1469,6 +1588,41 @@ export function createOwnedProjectEngine(
 		},
 	});
 
+	async function publicSDKConfiguration() {
+		const providerOptions = options.oauth;
+		const googleProvider = providerOptions?.google
+			? "google"
+			: providerOptions?.broker.hintGoogle
+				? "allauth"
+				: null;
+		const apple = Boolean(providerOptions?.apple);
+		const microsoft = Boolean(providerOptions?.microsoft);
+		return json({
+			nativePasskeys: (options.passkeys && options.sdk?.nativePasskeys) || {
+				enabled: false,
+				ios: false,
+				android: false,
+			},
+			emailPassword: policy.emailAndPasswordEnabled,
+			signUpEnabled: policy.signUpEnabled,
+			emailVerificationRequired: policy.requireEmailVerification,
+			passwordPolicy: policy.passwordPolicy,
+			google: googleProvider !== null,
+			googleProvider,
+			apple,
+			appleProvider: apple ? "apple" : null,
+			microsoft,
+			microsoftProvider: microsoft ? "microsoft" : null,
+			organizations: true,
+			twoFactor: true,
+			profileImageUpload: false,
+			profileImageOwnershipAndDeletion: false,
+			...(options.sdk?.getBranding
+				? { branding: await options.sdk.getBranding() }
+				: {}),
+		});
+	}
+
 	async function route(request: Request) {
 		const url = new URL(request.url);
 		if (
@@ -1477,9 +1631,17 @@ export function createOwnedProjectEngine(
 		)
 			return forbidden();
 		const path = url.pathname.slice(options.basePath.length);
+		const directoryResponse = await directory?.dispatch(path, request);
+		if (directoryResponse) return directoryResponse;
+		if (path === "/sdk/config" && request.method === "GET") {
+			if (!trustedRequest(request.headers, false)) return forbidden();
+			return publicSDKConfiguration();
+		}
 		if (path.startsWith("/scim/v2/")) {
 			const response =
-				scimDiscovery?.(request) ?? (await scimResources?.(request));
+				scimDiscovery?.(request) ??
+				(await scimResources?.(request)) ??
+				(await scimUserWrites?.(request));
 			if (response) return response;
 		}
 		const supportResponse = await support?.(path, request);
@@ -1551,19 +1713,21 @@ export function createOwnedProjectEngine(
 			if (denied) return securityBlocked();
 			return oauth.start(request, body.data);
 		}
-		if (
-			oauth &&
-			(path === "/callback/allauth" || path === "/callback/google") &&
-			request.method === "GET"
-		) {
-			const denied = await store.transaction((client) =>
-				security.admit(client, request),
+		if (oauth && path.startsWith("/callback/")) {
+			const provider = projectOAuthProvider.safeParse(
+				path.slice("/callback/".length),
 			);
-			if (denied) return securityBlocked();
-			return oauth.callback(
-				request,
-				path === "/callback/allauth" ? "allauth" : "google",
-			);
+			if (
+				provider.success &&
+				(request.method === "GET" ||
+					(provider.data === "apple" && request.method === "POST"))
+			) {
+				const denied = await store.transaction((client) =>
+					security.admit(client, request),
+				);
+				if (denied) return securityBlocked();
+				return oauth.callback(request, provider.data);
+			}
 		}
 		if (passkeyHttp && path.startsWith("/passkey/")) {
 			if (!trustedRequest(request.headers, request.method !== "GET"))
@@ -1597,12 +1761,28 @@ export function createOwnedProjectEngine(
 			return completeMfa(request, "totp");
 		if (request.method === "POST" && path === "/two-factor/verify-backup-code")
 			return completeMfa(request, "backup");
+		if (
+			passwordChange &&
+			request.method === "POST" &&
+			path === "/change-password"
+		) {
+			if (!trustedRequest(request.headers, true)) return forbidden();
+			const denied = await factorAdmission(request, "change-password");
+			if (denied) return denied;
+			return passwordChange.change(request, await requestBody(request));
+		}
 		if (request.method === "POST" && path === "/sign-in/email")
 			return signIn(request);
 		if (request.method === "POST" && path === "/sign-in/username")
 			return signIn(request, "username");
 		if (request.method === "GET" && path === "/get-session")
 			return readSession(request);
+		if (request.method === "POST" && path === "/get-session")
+			return failure(
+				405,
+				"METHOD_NOT_ALLOWED_DEFER_SESSION_REQUIRED",
+				"POST method requires deferSessionRefresh to be enabled in session config",
+			);
 		if (request.method === "POST" && path === "/sign-out")
 			return signOut(request);
 		if (
@@ -1646,7 +1826,8 @@ export function createOwnedProjectEngine(
 		readSession,
 		listAccountSessions,
 		revokeAccountSession,
-		readDirectory: async () => unsupported(),
+		readDirectory: async (operation, headers, query) =>
+			directory ? directory.read(operation, headers, query) : unsupported(),
 		async readPrincipal(headers) {
 			if (!trustedRequest(headers, false)) return null;
 			const current = await currentSession(headers);

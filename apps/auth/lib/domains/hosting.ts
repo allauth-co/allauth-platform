@@ -84,13 +84,40 @@ export async function withPortalAuthEngine<T>(
 		env,
 	);
 }
-/** Server-rendered pages receive only proxy-minted proofs and re-resolve the active mapping on each read. */
-export async function withPortalHeaders<T>(headers:Headers,callback:(instance:AuthInstance,headers:Headers,binding:HostedBinding|null)=>Promise<T>):Promise<T> {
-	const proof=headers.get(portalHeader);
-	if(!proof) { if(edgeHeaders.some(name=>headers.has(name))) throw new APIError("FORBIDDEN"); return withAuth((instance)=>callback(instance,headers,null)); }
-	const env=await getAuthEnvironment();const hostname=await verifyPortalBinding(proof,setting(env,"ALLAUTH_EDGE_SECRET"));
-	const binding=hostname ? await resolveHostedBinding(hostname,env) : null;
-	if(!binding) throw new APIError("FORBIDDEN");
-	return withHostedProjectAuth(binding.project,binding.hostname,(instance)=>callback(instance,hostedHeaders(headers,binding),binding),env);
+/** Server-rendered pages reverify the gateway proof and the active mapping on each read. */
+async function bindPortalHeaders(headers: Headers) {
+	const proof = headers.get(portalHeader);
+	if (!proof) {
+		if (edgeHeaders.some((name) => headers.has(name))) throw new APIError("FORBIDDEN");
+		return null;
+	}
+	const env = await getAuthEnvironment();
+	const hostname = await verifyPortalBinding(proof, setting(env, "ALLAUTH_EDGE_SECRET"));
+	const binding = hostname ? await resolveHostedBinding(hostname, env) : null;
+	if (!binding) throw new APIError("FORBIDDEN");
+	return { binding, env, headers: hostedHeaders(headers, binding) };
 }
+
+export async function withPortalHeaders<T>(
+	headers: Headers,
+	callback: (instance: AuthInstance, headers: Headers, binding: HostedBinding | null) => Promise<T>,
+): Promise<T> {
+	const bound = await bindPortalHeaders(headers);
+	if (!bound) return withAuth((instance) => callback(instance, headers, null));
+	const { binding, env } = bound;
+	return withHostedProjectAuth(binding.project, binding.hostname,
+		(instance) => callback(instance, bound.headers, binding), env);
+}
+
+export async function withPortalHeadersEngine<T>(
+	headers: Headers,
+	callback: (engine: AuthEngine, headers: Headers, binding: HostedBinding | null) => Promise<T>,
+): Promise<T> {
+	const bound = await bindPortalHeaders(headers);
+	if (!bound) return withAuthEngine((engine) => callback(engine, headers, null));
+	const { binding, env } = bound;
+	return withHostedProjectAuthEngine(binding.project, binding.hostname,
+		(engine) => callback(engine, bound.headers, binding), env);
+}
+
 export function portalSession(headers:Headers) {return withPortalHeaders(headers,(instance,bound)=>instance.api.getSession({headers:bound,query:{disableCookieCache:true}}));}

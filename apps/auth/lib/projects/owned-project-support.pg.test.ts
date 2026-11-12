@@ -12,11 +12,13 @@ import { allauthControl } from "../control";
 import type { ControlPrincipal } from "../control/types";
 import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
 import { readLegacySessionCookie } from "./legacy-session-cookie";
+import { projectManagement } from "./management-plugin";
 import { createOwnedProjectEngine } from "./owned-project-engine";
 import type { OwnedSupportRegistration } from "./owned-project-support";
 import { createOwnedProjectSupportHttp } from "./owned-project-support";
 import { projectProxySecret, verifiedProjectRequest } from "./proxy";
 import type { Project } from "./registry";
+import type { ProjectSupportOptions } from "./support-plugin";
 import { projectSupport } from "./support-plugin";
 
 const fixturePath = new URL(
@@ -136,6 +138,27 @@ describe.skipIf(!existsSync(fixturePath))(
 			return { session: { id: sessionId, userId: user.id }, user };
 		}
 
+		async function authorizePlatformRequest(request: Request) {
+			const token = readLegacySessionCookie(
+				request.headers,
+				platformCookie,
+				signingSecret,
+			);
+			return token ? rootActor("token", token) : null;
+		}
+
+		const requirePlatformAdmin: ProjectSupportOptions["requirePlatformAdmin"] =
+			async (ctx) => {
+				const token = readLegacySessionCookie(
+					ctx.headers ?? new Headers(),
+					platformCookie,
+					signingSecret,
+				);
+				const actor = token ? await rootActor("token", token) : null;
+				if (!actor) throw new APIError("FORBIDDEN");
+				return actor;
+			};
+
 		async function authorizeStoredActor(principal: ControlPrincipal) {
 			return (
 				(await rootActor("id", principal.session.id))?.user.id ===
@@ -174,6 +197,7 @@ describe.skipIf(!existsSync(fixturePath))(
 						"001-initial-auth.sql",
 						"002-control-plane.sql",
 						"005-free-plugins.sql",
+						"016-invitation-import-provenance.sql",
 					])
 						await client.query(
 							readFileSync(
@@ -207,27 +231,30 @@ describe.skipIf(!existsSync(fixturePath))(
 					user: {
 						additionalFields: {
 							directoryDisabled: { type: "boolean", required: false },
+							publicMetadata: { type: "json", required: false },
+							privateMetadata: {
+								type: "json",
+								required: false,
+								returned: false,
+							},
 						},
 					},
 					plugins: [
 						admin(),
 						allauthControl(),
+						projectManagement({
+							projectId: project.id,
+							projectSlug: project.slug,
+							baseURL: origin,
+							requirePlatformAdmin,
+						}),
 						projectSupport({
 							projectId: project.id,
 							projectSlug: project.slug,
 							workspaceId: project.workspaceId,
 							platformOrigin: origin,
 							configuration: async () => registration,
-							async requirePlatformAdmin(ctx) {
-								const token = readLegacySessionCookie(
-									ctx.headers ?? new Headers(),
-									platformCookie,
-									signingSecret,
-								);
-								const actor = token ? await rootActor("token", token) : null;
-								if (!actor) throw new APIError("FORBIDDEN");
-								return actor;
-							},
+							requirePlatformAdmin,
 							async authorizeStoredActor(principal) {
 								if (!(await authorizeStoredActor(principal)))
 									throw new APIError("FORBIDDEN");
@@ -263,11 +290,13 @@ describe.skipIf(!existsSync(fixturePath))(
 				cookie = "",
 				body,
 				signed = true,
+				ip = "",
 			}: {
 				caller?: string;
 				cookie?: string;
 				body?: object;
 				signed?: boolean;
+				ip?: string;
 			} = {},
 		) {
 			const url = new URL(`${basePath}${path}`, origin);
@@ -292,7 +321,7 @@ describe.skipIf(!existsSync(fixturePath))(
 							method,
 							`${url.pathname}${url.search}`,
 							caller,
-							"",
+							ip,
 							digest,
 						].join("\n"),
 					)
@@ -300,6 +329,7 @@ describe.skipIf(!existsSync(fixturePath))(
 				headers.set("allauth-proxy-signature", signature);
 				headers.set("allauth-proxy-origin", caller);
 				headers.set("allauth-proxy-timestamp", timestamp);
+				if (ip) headers.set("allauth-proxy-ip", ip);
 			}
 			return new Request(url, {
 				method,
@@ -316,6 +346,7 @@ describe.skipIf(!existsSync(fixturePath))(
 				platformOrigin: origin,
 				signingSecret,
 				configuration: async () => registration,
+				authorizePlatformRequest,
 				authorizeStoredActor,
 				verifyProxy,
 				readBody: (value) => value.json().catch(() => null),
@@ -350,6 +381,7 @@ describe.skipIf(!existsSync(fixturePath))(
 					workspaceId: project.workspaceId,
 					platformOrigin: origin,
 					configuration: async () => registration,
+					authorizePlatformRequest,
 					authorizeStoredActor,
 					verifyProxy,
 				},
@@ -412,13 +444,16 @@ describe.skipIf(!existsSync(fixturePath))(
 			return { cookie: cookieOf(response), data: await response.json() };
 		}
 
-		async function nativeConsoleGrant() {
+		async function nativeConsoleGrant(
+			launchHandle = native,
+			authorizeHandle = native,
+		) {
 			const actor = await account("admin", "public");
 			const root = await session(actor, "public");
 			const target = await account();
 			const current = await session(target, schema, actor.id);
 			const cookies = `${root.cookie}; ${current.cookie}`;
-			const launched = await native(
+			const launched = await launchHandle(
 				request("/project-admin/support/launch", {
 					cookie: cookies,
 					caller: origin,
@@ -436,7 +471,7 @@ describe.skipIf(!existsSync(fixturePath))(
 				state,
 				codeChallenge: sha(verifier),
 			});
-			const authorized = await native(
+			const authorized = await authorizeHandle(
 				request(`/project-admin/support/authorize?${query}`, {
 					cookie: cookies,
 					caller: origin,
@@ -463,13 +498,24 @@ describe.skipIf(!existsSync(fixturePath))(
 			};
 		}
 
-		async function nativeApplicationSupport(handle = native) {
+		async function applicationTicket(
+			launchHandle = native,
+			actorLifetimeMs?: number,
+		) {
 			const actor = await account();
 			const original = await session(actor);
+			const actorExpiresAt = actorLifetimeMs
+				? new Date(Date.now() + actorLifetimeMs)
+				: undefined;
+			if (actorExpiresAt)
+				await database.query(
+					`UPDATE "${schema}".session SET "expiresAt" = $2 WHERE id = $1`,
+					[original.id, actorExpiresAt],
+				);
 			const target = await account();
 			const applicationAuditId = randomUUID();
 			const context = { kind: "company", id: "fixture-company" };
-			const launched = await native(
+			const launched = await launchHandle(
 				request("/sdk/support/application/launch", {
 					caller: applicationOrigin,
 					cookie: original.cookie,
@@ -483,15 +529,37 @@ describe.skipIf(!existsSync(fixturePath))(
 				}),
 			);
 			expect(launched.status).toBe(200);
-			const { url } = (await launched.json()) as { url: string };
-			const launch = new URL(url).searchParams.get("launch")!;
+			const { url, expiresAt } = (await launched.json()) as {
+				url: string;
+				expiresAt: string;
+			};
+			const location = new URL(url);
+			expect(location.origin).toBe(supportOrigin);
+			expect(location.pathname).toBe("/api/allauth/support/start");
+			const launch = location.searchParams.get("launch")!;
 			const state = opaque();
 			const verifier = opaque();
+			return {
+				actor,
+				original,
+				target,
+				applicationAuditId,
+				context,
+				actorExpiresAt,
+				launchExpiresAt: expiresAt,
+				state,
+				verifier,
+				query: { launch, state, codeChallenge: sha(verifier) },
+			};
+		}
+
+		async function nativeApplicationSupport(handle = native) {
+			const fixture = await applicationTicket();
 			const authorization = await native(
 				request("/sdk/support/application/authorize", {
 					caller: applicationOrigin,
-					cookie: original.cookie,
-					body: { launch, state, codeChallenge: sha(verifier) },
+					cookie: fixture.original.cookie,
+					body: fixture.query,
 				}),
 			);
 			expect(authorization.status).toBe(200);
@@ -500,13 +568,14 @@ describe.skipIf(!existsSync(fixturePath))(
 				sessionId: string;
 			};
 			return {
-				actor,
-				original,
-				target,
-				applicationAuditId,
-				context,
+				...fixture,
 				sessionId: authorized.sessionId,
-				...(await exchange(new URL(authorized.url), state, verifier, handle)),
+				...(await exchange(
+					new URL(authorized.url),
+					fixture.state,
+					fixture.verifier,
+					handle,
+				)),
 			};
 		}
 
@@ -847,6 +916,473 @@ describe.skipIf(!existsSync(fixturePath))(
 				}),
 			);
 			expect(idempotent.status).toBe(200);
+		});
+
+		it("passes console launch tickets and grants in both directions while requiring the exact platform session", async () => {
+			const handler = ownedEngine();
+			const status = "/project-admin/support/status";
+			for (const [launch, authorize] of [
+				[handler, native],
+				[native, handler],
+			] as const) {
+				const fixture = await nativeConsoleGrant(launch, authorize);
+				const connected = await exchange(
+					fixture.url,
+					fixture.state,
+					fixture.verifier,
+				);
+				expect(connected.data).toMatchObject({
+					session: { id: fixture.current.id },
+					actor: { id: fixture.actor.id },
+				});
+				const both = `${fixture.root.cookie}; ${connected.cookie}`;
+				const loaded = await handler(
+					request(status, { caller: origin, cookie: both, signed: false }),
+				);
+				expect(await loaded.json()).toEqual({
+					enabled: true,
+					callbackUrl,
+					launchAvailable: true,
+				});
+				const wrong = await handler(
+					request("/project-admin/support/launch", {
+						caller: otherOrigin,
+						cookie: both,
+						signed: false,
+						body: {},
+					}),
+				);
+				expect(wrong.status).toBe(403);
+				const signedProxy = await handler(
+					request(status, { caller: applicationOrigin, cookie: both }),
+				);
+				expect(signedProxy.status).toBe(403);
+			}
+			const actor = await account("admin", "public");
+			const platformSession = await session(actor, "public");
+			const alternateSession = await session(actor, "public");
+			const target = await session(await account(), schema, actor.id);
+			const current = `${platformSession.cookie}; ${target.cookie}`;
+			const issued = await handler(
+				request("/project-admin/support/launch", {
+					caller: origin,
+					cookie: current,
+					signed: false,
+					body: {},
+				}),
+			);
+			const { url } = (await issued.json()) as { url: string };
+			const query = new URLSearchParams({
+				launch: new URL(url).searchParams.get("launch")!,
+				state: opaque(),
+				codeChallenge: sha(opaque()),
+			});
+			const authorizePath = `/project-admin/support/authorize?${query}`;
+			expect(
+				(
+					await handler(
+						request(authorizePath, {
+							caller: origin,
+							cookie: `${alternateSession.cookie}; ${target.cookie}`,
+							signed: false,
+						}),
+					)
+				).status,
+			).toBe(403);
+			expect(
+				(
+					await handler(
+						request(authorizePath, {
+							caller: origin,
+							cookie: current,
+							signed: false,
+						}),
+					)
+				).status,
+			).toBe(302);
+			expect(
+				(
+					await native(
+						request(authorizePath, {
+							caller: origin,
+							cookie: current,
+							signed: false,
+						}),
+					)
+				).status,
+			).toBe(400);
+		});
+
+		it("relays native application tickets and issues audited owned sessions that the native engine can exchange", async () => {
+			const handler = ownedEngine();
+			const fixture = await applicationTicket(native, 3 * 60_000);
+			const relay = await handler(
+				request(
+					`/project-admin/support/authorize?${new URLSearchParams(fixture.query)}`,
+					{ caller: supportOrigin, signed: false },
+				),
+			);
+			expect(relay.status).toBe(302);
+			const destination = new URL(relay.headers.get("location")!);
+			expect(destination.href.split("?", 1)[0]).toBe(
+				config.applicationInitiated!.authorizeUrl,
+			);
+			expect(Object.fromEntries(destination.searchParams)).toEqual(
+				fixture.query,
+			);
+			const path = "/sdk/support/application/authorize";
+			const differentSession = await session(fixture.actor);
+			expect(
+				(
+					await handler(
+						request(path, {
+							caller: applicationOrigin,
+							cookie: differentSession.cookie,
+							body: fixture.query,
+						}),
+					)
+				).status,
+			).toBe(403);
+			expect(
+				(
+					await handler(
+						request(path, {
+							caller: supportOrigin,
+							cookie: fixture.original.cookie,
+							body: fixture.query,
+						}),
+					)
+				).status,
+			).toBe(403);
+			const issued = await handler(
+				request(path, {
+					caller: applicationOrigin,
+					cookie: fixture.original.cookie,
+					body: fixture.query,
+					ip: "203.0.113.25",
+				}),
+			);
+			expect(issued.status).toBe(200);
+			expect(issued.headers.getSetCookie()).toEqual([]);
+			const { url, sessionId, expiresAt } = (await issued.json()) as {
+				url: string;
+				sessionId: string;
+				expiresAt: string;
+			};
+			expect(expiresAt).toBe(fixture.actorExpiresAt!.toISOString());
+			const connected = await exchange(
+				new URL(url),
+				fixture.state,
+				fixture.verifier,
+			);
+			expect(connected.data).toMatchObject({
+				session: { id: sessionId, expiresAt },
+				actor: { id: fixture.actor.id },
+				applicationAuditId: fixture.applicationAuditId,
+				context: fixture.context,
+			});
+			const event = await database.query(
+				`SELECT s."ipAddress", s."impersonatedBy", e.metadata FROM "${schema}".session s JOIN "${schema}"."allauthEvent" e ON e."targetId" = s.id WHERE s.id = $1 AND e.type = 'session.impersonation-started'`,
+				[sessionId],
+			);
+			expect(event.rows).toEqual([
+				{
+					ipAddress: "203.0.113.25",
+					impersonatedBy: fixture.actor.id,
+					metadata: {
+						signal: "application-support",
+						actorKind: "application",
+						reason: "Fixture support investigation",
+						applicationAuditId: fixture.applicationAuditId,
+						contextKind: "company",
+						contextId: "fixture-company",
+					},
+				},
+			]);
+		});
+
+		it("writes native-readable application launches and rolls back support issuance at the commercial limit", async () => {
+			const handler = ownedEngine();
+			const fixture = await applicationTicket(handler);
+			const requestAuthorize = (value: typeof fixture) =>
+				request("/sdk/support/application/authorize", {
+					caller: applicationOrigin,
+					cookie: value.original.cookie,
+					body: value.query,
+				});
+			const legacy = await native(requestAuthorize(fixture));
+			expect(legacy.status).toBe(200);
+			const { url } = (await legacy.json()) as { url: string };
+			expect(
+				(await exchange(new URL(url), fixture.state, fixture.verifier, handler))
+					.data,
+			).toMatchObject({ applicationAuditId: fixture.applicationAuditId });
+			const blocked = await applicationTicket(handler);
+			await database.query(`CREATE FUNCTION "${schema}".fixture_support_guard() RETURNS trigger LANGUAGE plpgsql AS $$
+				BEGIN IF NEW."impersonatedBy" = '${blocked.actor.id}' THEN RAISE EXCEPTION 'fixture quota' USING ERRCODE = 'PAA02'; END IF; RETURN NEW; END $$;
+				CREATE TRIGGER fixture_support_guard AFTER INSERT ON "${schema}".session FOR EACH ROW EXECUTE FUNCTION "${schema}".fixture_support_guard()`);
+			const denied = await handler(requestAuthorize(blocked));
+			expect(denied.status).toBe(403);
+			expect(await denied.json()).toMatchObject({
+				code: "IMPERSONATION_LIMIT_REACHED",
+			});
+			const pending = await database.query(
+				`SELECT id FROM "${schema}".verification WHERE identifier = $1`,
+				[`support-launch:${sha(blocked.query.launch)}`],
+			);
+			expect(pending.rowCount).toBe(1);
+			const sessions = await database.query(
+				`SELECT id FROM "${schema}".session WHERE "impersonatedBy" = $1`,
+				[blocked.actor.id],
+			);
+			expect(sessions.rows).toEqual([]);
+		});
+
+		it("issues a legacy-readable console impersonation with an absolute expiry and an unchanged platform session", async () => {
+			const handler = ownedEngine();
+			const actor = await account("admin", "public");
+			const platformSession = await session(actor, "public");
+			const target = await account();
+			const original = await session(target);
+			await database.query(
+				`UPDATE "${schema}"."user" SET "publicMetadata" = '{"fixture":"public"}'::jsonb WHERE id = $1`,
+				[target.id],
+			);
+			const input = {
+				caller: origin,
+				cookie: `${platformSession.cookie}; ${original.cookie}`,
+				signed: false,
+				body: { userId: target.id },
+			};
+			registration = null;
+			const issued = await handler(
+				request("/project-admin/impersonate-user", input),
+			);
+			expect(issued.status).toBe(200);
+			const data = (await issued.json()) as {
+				session: {
+					id: string;
+					userId: string;
+					impersonatedBy: string;
+					expiresAt: string;
+				};
+				user: Record<string, unknown>;
+			};
+			expect(data.session).toMatchObject({
+				userId: target.id,
+				impersonatedBy: actor.id,
+			});
+			expect(data.session).not.toHaveProperty("token");
+			expect(data.user).toMatchObject({
+				id: target.id,
+				email: target.email,
+				publicMetadata: { fixture: "public" },
+			});
+			expect(data.user).not.toHaveProperty("privateMetadata");
+			const remaining = Date.parse(data.session.expiresAt) - Date.now();
+			expect(remaining).toBeGreaterThan(14 * 60_000);
+			expect(remaining).toBeLessThanOrEqual(15 * 60_000);
+			const cookies = issued.headers.getSetCookie();
+			expect(cookies).toHaveLength(2);
+			expect(
+				cookies.every(
+					(value) =>
+						value.startsWith(`__Secure-allauth_project_${slug}.`) &&
+						!/max-age/i.test(value),
+				),
+			).toBe(true);
+			const cookie = cookieOf(issued);
+			const legacyRead = await native(
+				request("/get-session?disableCookieCache=true&disableRefresh=true", {
+					caller: origin,
+					cookie,
+					signed: false,
+				}),
+			);
+			expect(await legacyRead.json()).toMatchObject({
+				session: data.session,
+				user: { id: target.id },
+			});
+			registration = config;
+			const status = await native(
+				request("/project-admin/support/status", {
+					caller: origin,
+					cookie: `${platformSession.cookie}; ${cookie}`,
+					signed: false,
+				}),
+			);
+			expect(await status.json()).toMatchObject({ launchAvailable: true });
+			const databaseSession = await database.query(
+				`SELECT "ipAddress", "expiresAt" FROM "${schema}".session WHERE id = $1`,
+				[data.session.id],
+			);
+			expect(databaseSession.rows).toEqual([
+				{
+					ipAddress: "203.0.113.20",
+					expiresAt: new Date(data.session.expiresAt),
+				},
+			]);
+			const event = await database.query(
+				`SELECT "actorId", "userId", "targetId", metadata FROM "${schema}"."allauthEvent" WHERE type = 'session.impersonation-started' AND "actorId" = $1`,
+				[actor.id],
+			);
+			expect(event.rows).toEqual([
+				{
+					actorId: actor.id,
+					userId: target.id,
+					targetId: target.id,
+					metadata: {
+						path: "/project-admin/impersonate-user",
+						signal: "platform-project-management",
+					},
+				},
+			]);
+			const ended = await native(
+				request("/project-admin/stop-impersonating", {
+					caller: origin,
+					cookie,
+					signed: false,
+					body: {},
+				}),
+			);
+			expect(ended.status).toBe(200);
+			expect(await rootActor("id", platformSession.id)).toMatchObject({
+				user: { id: actor.id },
+			});
+			const sessions = await database.query(
+				`SELECT id FROM "${schema}".session WHERE id IN ($1,$2)`,
+				[original.id, data.session.id],
+			);
+			expect(sessions.rows).toEqual([{ id: original.id }]);
+		});
+
+		it("ends only the supplied native realm support cookie and denies nested, administrator and cross-origin impersonation", async () => {
+			const handler = ownedEngine();
+			const actor = await account("admin", "public");
+			const platformSession = await session(actor, "public");
+			const target = await account();
+			const ordinary = await session(target);
+			const adminTarget = await account("user, admin");
+			const bannedTarget = await account();
+			const disabledTarget = await account();
+			await database.query(
+				`UPDATE "${schema}"."user" SET banned = true WHERE id = $1`,
+				[bannedTarget.id],
+			);
+			await database.query(
+				`UPDATE "${schema}"."user" SET "directoryDisabled" = true WHERE id = $1`,
+				[disabledTarget.id],
+			);
+			const start = "/project-admin/impersonate-user";
+			const end = "/project-admin/stop-impersonating";
+			const base = {
+				caller: origin,
+				cookie: platformSession.cookie,
+				signed: false,
+				body: { userId: target.id },
+			};
+			for (const restricted of [adminTarget, bannedTarget, disabledTarget]) {
+				expect(
+					(
+						await handler(
+							request(start, { ...base, body: { userId: restricted.id } }),
+						)
+					).status,
+				).toBe(403);
+			}
+			expect(
+				(await handler(request(start, { ...base, caller: otherOrigin })))
+					.status,
+			).toBe(403);
+			expect(
+				(await handler(request(start, { ...base, cookie: ordinary.cookie })))
+					.status,
+			).toBe(403);
+			const issued = await native(request(start, base));
+			expect(issued.status).toBe(200);
+			const { session: current } = (await issued.json()) as {
+				session: { id: string };
+			};
+			const cookie = cookieOf(issued);
+			expect(
+				(
+					await handler(
+						request(start, {
+							...base,
+							cookie: `${platformSession.cookie}; ${cookie}`,
+						}),
+					)
+				).status,
+			).toBe(403);
+			const options = {
+				caller: origin,
+				cookie,
+				signed: false,
+				body: { userId: ordinary.id },
+			};
+			expect(
+				(await handler(request(end, { ...options, cookie: ordinary.cookie })))
+					.status,
+			).toBe(400);
+			expect(
+				(await handler(request(end, { ...options, caller: otherOrigin })))
+					.status,
+			).toBe(403);
+			expect((await owned(alternateSchema)(request(end, options))).status).toBe(
+				401,
+			);
+			const expired = await native(request(start, base));
+			expect(expired.status).toBe(200);
+			const { session: expiredSession } = (await expired.json()) as {
+				session: { id: string };
+			};
+			await database.query(
+				`UPDATE "${schema}".session SET "expiresAt" = statement_timestamp() - interval '1 second' WHERE id = $1`,
+				[expiredSession.id],
+			);
+			expect(
+				(await handler(request(end, { ...options, cookie: cookieOf(expired) })))
+					.status,
+			).toBe(401);
+			await database.query(`DELETE FROM public.session WHERE id = $1`, [
+				platformSession.id,
+			]);
+			const concurrent = await Promise.all([
+				handler(request(end, options)),
+				handler(request(end, options)),
+			]);
+			expect(concurrent.map((response) => response.status).sort()).toEqual([
+				200, 401,
+			]);
+			const ended = concurrent.find((response) => response.ok)!;
+			expect(await ended.json()).toEqual({ success: true });
+			expect(
+				ended.headers
+					.getSetCookie()
+					.every(
+						(value) =>
+							value.startsWith(`__Secure-allauth_project_${slug}.`) &&
+							value.includes("Max-Age=0"),
+					),
+			).toBe(true);
+			expect((await native(request(end, options))).status).toBe(401);
+			const remaining = await database.query(
+				`SELECT id FROM "${schema}".session WHERE id IN ($1,$2)`,
+				[ordinary.id, current.id],
+			);
+			expect(remaining.rows).toEqual([{ id: ordinary.id }]);
+			const event = await database.query(
+				`SELECT "actorId", "userId", "targetId", metadata FROM "${schema}"."allauthEvent" WHERE type = 'session.impersonation-stopped' AND "targetId" = $1`,
+				[current.id],
+			);
+			expect(event.rows).toEqual([
+				{
+					actorId: actor.id,
+					userId: target.id,
+					targetId: current.id,
+					metadata: { signal: "platform-project-management" },
+				},
+			]);
 		});
 	},
 );

@@ -4,7 +4,7 @@ import { scim } from "@better-auth/scim";
 import { sso } from "@better-auth/sso";
 import { symmetricDecrypt } from "better-auth/crypto";
 import { getTestInstance } from "better-auth/test";
-import { exportJWK, generateKeyPair, SignJWT } from "jose";
+import { exportJWK, generateKeyPair, jwtVerify, SignJWT } from "jose";
 import { Kysely, PostgresDialect } from "kysely";
 import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
@@ -13,8 +13,8 @@ import { resolveEnterpriseUser } from "../enterprise";
 import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
 import { createOwnedProjectEngine } from "./owned-project-engine";
 import { createProjectEngineStore } from "./owned-project-engine-store";
-import { createOwnedProjectSso } from "./owned-project-sso";
 import type { OwnedProjectSsoOptions } from "./owned-project-sso";
+import { createOwnedProjectSso } from "./owned-project-sso";
 
 const fixturePath = new URL(
 	"../../../../.secrets/local-postgres.json",
@@ -56,7 +56,10 @@ const scopedKey = (parts: string[]) =>
 
 type LegacyDatabase = Kysely<Record<string, Record<string, unknown>>>;
 
-async function nativeSso(db: LegacyDatabase) {
+async function nativeSso(
+	db: LegacyDatabase,
+	resolvePrivateKey: NonNullable<OwnedProjectSsoOptions["resolvePrivateKey"]>,
+) {
 	return (
 		await getTestInstance(
 			{
@@ -96,6 +99,8 @@ async function nativeSso(db: LegacyDatabase) {
 					sso({
 						domainVerification: { enabled: true },
 						resolveUser: resolveEnterpriseUser,
+						resolvePrivateKey: async (input) =>
+							(await resolvePrivateKey(input)) ?? {},
 					}),
 				],
 			},
@@ -134,6 +139,33 @@ describe.skipIf(!existsSync(fixturePath))(
 		const sourceId = randomUUID();
 		const domain = `organization:${organization}`;
 		const privateKey = generateKeyPair("RS256");
+		const clientSigningKey = generateKeyPair("RS256", { extractable: true });
+		const privateKeyId = "synthetic-enterprise-client-key";
+		const usedAssertions = new Set<string>();
+		const discoveryEndpoint = issuer + "/config/openid-configuration";
+		const discovery = {
+			issuer,
+			authorization_endpoint: config.authorizationEndpoint,
+			token_endpoint: config.tokenEndpoint,
+			jwks_uri: config.jwksEndpoint,
+			userinfo_endpoint: config.userInfoEndpoint,
+			token_endpoint_auth_methods_supported: ["client_secret_post"],
+		};
+		let discoveryDocument = discovery;
+		let discoveryRequests: string[] = [];
+		let networkRequestCount = 0;
+		let tokenRequests = 0;
+		let expectsPrivateKey = false;
+		const resolvePrivateKey: NonNullable<
+			OwnedProjectSsoOptions["resolvePrivateKey"]
+		> = async (input) => {
+			expect(input).toEqual({ providerId, issuer, keyId: privateKeyId });
+			return {
+				privateKeyJwk: await exportJWK((await clientSigningKey).privateKey),
+				kid: privateKeyId,
+				algorithm: "RS256",
+			};
+		};
 		const authorizationCodes = new Map<string, URL>();
 		const profiles = new Map<string, { email: string; subject: string }>();
 		let database: Pool;
@@ -148,6 +180,12 @@ describe.skipIf(!existsSync(fixturePath))(
 			init,
 		) => {
 			const request = new Request(input, init);
+			networkRequestCount++;
+			if ([config.discoveryEndpoint, discoveryEndpoint].includes(request.url)) {
+				expect(request.method).toBe("GET");
+				discoveryRequests.push(request.url);
+				return Response.json(discoveryDocument);
+			}
 			const keys = await privateKey;
 			if (request.url === config.jwksEndpoint)
 				return Response.json({
@@ -172,6 +210,7 @@ describe.skipIf(!existsSync(fixturePath))(
 			}
 			if (request.url !== config.tokenEndpoint)
 				throw new Error("Unexpected enterprise fixture endpoint.");
+			tokenRequests++;
 			const params = new URLSearchParams(await request.text());
 			const code = params.get("code")!;
 			const authorization = authorizationCodes.get(code);
@@ -179,7 +218,35 @@ describe.skipIf(!existsSync(fixturePath))(
 				return Response.json({ error: "invalid_grant" }, { status: 400 });
 			authorizationCodes.delete(code);
 			expect(params.get("client_id")).toBe(config.clientId);
-			expect(params.get("client_secret")).toBe(config.clientSecret);
+			if (expectsPrivateKey) {
+				expect(params.get("client_secret")).toBeNull();
+				expect(request.headers.get("authorization")).toBeNull();
+				expect(params.get("client_assertion_type")).toBe(
+					"urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+				);
+				const { payload, protectedHeader } = await jwtVerify(
+					params.get("client_assertion")!,
+					(await clientSigningKey).publicKey,
+					{
+						algorithms: ["RS256"],
+						issuer: config.clientId,
+						subject: config.clientId,
+						audience: config.tokenEndpoint,
+						maxTokenAge: 120,
+						requiredClaims: ["jti", "exp", "iat"],
+					},
+				);
+				expect(protectedHeader).toMatchObject({
+					kid: privateKeyId,
+					typ: "JWT",
+				});
+				expect(payload.exp! - payload.iat!).toBe(120);
+				expect(payload.nbf).toBeUndefined();
+				expect(usedAssertions.has(payload.jti!)).toBe(false);
+				usedAssertions.add(payload.jti!);
+			} else {
+				expect(params.get("client_secret")).toBe(config.clientSecret);
+			}
 			expect(params.get("redirect_uri")).toBe(
 				authorization.searchParams.get("redirect_uri"),
 			);
@@ -328,7 +395,7 @@ describe.skipIf(!existsSync(fixturePath))(
 				}),
 			});
 			vi.stubGlobal("fetch", network);
-			native = await nativeSso(nativeDatabase);
+			native = await nativeSso(nativeDatabase, resolvePrivateKey);
 		});
 
 		afterAll(async () => {
@@ -343,7 +410,10 @@ describe.skipIf(!existsSync(fixturePath))(
 			}
 		});
 
-		function owned(namespace = schema) {
+		function owned(
+			namespace = schema,
+			keyResolver?: OwnedProjectSsoOptions["resolvePrivateKey"],
+		) {
 			const store = createProjectEngineStore(database, namespace);
 			return createOwnedProjectSso({
 				database,
@@ -355,6 +425,7 @@ describe.skipIf(!existsSync(fixturePath))(
 				defaultErrorURL: `${origin}/auth-error`,
 				signUpEnabled: true,
 				fetch: network,
+				resolvePrivateKey: keyResolver,
 				async complete(
 					client,
 					{ user, managed: isManaged, destination: target },
@@ -387,6 +458,7 @@ describe.skipIf(!existsSync(fixturePath))(
 			started: Response,
 			expectedCallback = callbackURL,
 			profile?: { email: string; subject: string },
+			expectedAuthorization = config.authorizationEndpoint,
 		) {
 			expect(started.status, await started.clone().text()).toBe(200);
 			const { url, redirect } = (await started.json()) as {
@@ -395,7 +467,9 @@ describe.skipIf(!existsSync(fixturePath))(
 			};
 			expect(redirect).toBe(true);
 			const authorization = new URL(url);
-			expect(authorization.origin).toBe(issuer);
+			expect(`${authorization.origin}${authorization.pathname}`).toBe(
+				expectedAuthorization,
+			);
 			expect(authorization.searchParams.get("redirect_uri")).toBe(
 				expectedCallback,
 			);
@@ -574,6 +648,152 @@ describe.skipIf(!existsSync(fixturePath))(
 					[organization, session?.user.id],
 				);
 				expect(membership.rows).toEqual(invited ? [] : [{ role: "member" }]);
+			}
+		});
+
+		async function configure(value: Record<string, unknown>) {
+			await database.query(
+				`UPDATE "${schema}"."ssoProvider" SET "oidcConfig"=$1 WHERE id=$2`,
+				[JSON.stringify(value), recordId],
+			);
+		}
+
+		it("hydrates legacy discovery-only providers across an engine switch and rollback", async () => {
+			const storedAuthorization = issuer + "/explicit-authorization";
+			const discoverable = {
+				...config,
+				discoveryEndpoint,
+				authorizationEndpoint: storedAuthorization,
+				tokenEndpoint: undefined,
+				jwksEndpoint: undefined,
+				userInfoEndpoint: undefined,
+				tokenEndpointAuthentication: undefined,
+			};
+			discoveryRequests = [];
+			await configure(discoverable);
+			try {
+				const callbacks = [
+					await authorize(
+						await native.handler(startRequest()),
+						callbackURL,
+						undefined,
+						storedAuthorization,
+					),
+					await authorize(
+						await owned().start(startRequest(), body),
+						callbackURL,
+						undefined,
+						storedAuthorization,
+					),
+				];
+				for (const [index, callback] of callbacks.entries()) {
+					const response =
+						index === 0
+							? await owned().callback(callback, providerId)
+							: await native.handler(callback);
+					expect(response.headers.get("location")).toBe(destination);
+					expect(
+						await native.api.getSession({
+							headers: new Headers({ cookie: cookies(response) }),
+							query: { disableRefresh: true },
+						}),
+					).toMatchObject({ user: { id: managed } });
+				}
+				expect(discoveryRequests).toEqual(
+					Array<string>(4).fill(discoveryEndpoint),
+				);
+			} finally {
+				await configure(config);
+			}
+		});
+
+		it("validates discovery issuer and endpoint trust before starting or exchanging", async () => {
+			await configure({
+				...config,
+				tokenEndpoint: undefined,
+				discoveryEndpoint: undefined,
+			});
+			try {
+				const callback = await authorize(
+					await owned().start(startRequest(), body),
+				);
+				expect(discoveryRequests.at(-1)).toBe(config.discoveryEndpoint);
+				const before = tokenRequests;
+				discoveryDocument = {
+					...discovery,
+					issuer: "https://other.fixture.example",
+				};
+				const denied = await owned().callback(callback, providerId);
+				expect(
+					new URL(denied.headers.get("location")!).searchParams.get("error"),
+				).toBe("invalid_provider");
+				expect(cookies(denied)).toBe("");
+				discoveryDocument = {
+					...discovery,
+					token_endpoint: "https://untrusted.fixture.example/token",
+				};
+				expect(await owned().start(startRequest(), body)).toMatchObject({
+					status: 400,
+				});
+				await configure({
+					...config,
+					tokenEndpoint: undefined,
+					discoveryEndpoint: "https://untrusted.fixture.example/discovery",
+				});
+				const networkBefore = networkRequestCount;
+				expect(await owned().start(startRequest(), body)).toMatchObject({
+					status: 400,
+				});
+				expect(networkRequestCount).toBe(networkBefore);
+				expect(tokenRequests).toBe(before);
+			} finally {
+				discoveryDocument = discovery;
+				await configure(config);
+			}
+		});
+
+		it("authenticates with a private key and preserves the native assertion audience in both callback engines", async () => {
+			expectsPrivateKey = true;
+			const privateConfig = {
+				...config,
+				clientSecret: undefined,
+				tokenEndpointAuthentication: "private_key_jwt",
+				privateKeyId,
+				privateKeyAlgorithm: "RS256",
+			};
+			await configure(privateConfig);
+			try {
+				const ownedEngine = owned(schema, resolvePrivateKey);
+				const nativePending = await authorize(
+					await native.handler(startRequest()),
+				);
+				const first = await ownedEngine.callback(nativePending, providerId);
+				expect(first.headers.get("location")).toBe(destination);
+				const ownedPending = await authorize(
+					await ownedEngine.start(startRequest(), body),
+				);
+				const second = await native.handler(ownedPending);
+				expect(second.headers.get("location")).toBe(destination);
+				expect(usedAssertions.size).toBe(2);
+				for (const result of [first, second])
+					expect(
+						await native.api.getSession({
+							headers: new Headers({ cookie: cookies(result) }),
+							query: { disableRefresh: true },
+						}),
+					).toMatchObject({ user: { id: managed } });
+				const missing = await authorize(
+					await ownedEngine.start(startRequest(), body),
+				);
+				const before = tokenRequests;
+				const denied = await owned().callback(missing, providerId);
+				expect(
+					new URL(denied.headers.get("location")!).searchParams.get("error"),
+				).toBe("invalid_provider");
+				expect(tokenRequests).toBe(before);
+			} finally {
+				expectsPrivateKey = false;
+				await configure(config);
 			}
 		});
 

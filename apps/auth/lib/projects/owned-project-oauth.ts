@@ -25,7 +25,18 @@ import type {
 import {
 	createProjectOAuthStore,
 	oauthStateAge,
+	projectOAuthProvider,
 } from "./owned-project-oauth-store";
+import {
+	appleCallbackForm,
+	appleDisplayName,
+	appleMetadata,
+	appleNonce,
+	microsoftEmailVerified,
+	microsoftIssuer,
+	microsoftMetadata,
+} from "./owned-project-provider-tokens";
+export { projectOAuthProvider } from "./owned-project-oauth-store";
 import type { Project } from "./registry";
 import { projectOrigin, projectSlug } from "./validation";
 
@@ -47,7 +58,7 @@ const googleMetadata: oauth.AuthorizationServer = {
 };
 
 export const ownedProjectOAuthStartInput = z.strictObject({
-	provider: z.enum(["allauth", "google"]),
+	provider: projectOAuthProvider,
 	callbackURL: z.string().max(2048).optional(),
 	newUserCallbackURL: z.string().max(2048).optional(),
 	errorCallbackURL: z.string().max(2048).optional(),
@@ -81,6 +92,10 @@ type Credentials = {
 	clientSecret: string;
 	redirectURI: string;
 };
+type AppleCredentials = Omit<Credentials, "clientSecret"> & {
+	clientSecret(): Promise<string>;
+};
+
 export interface OwnedProjectOAuthOptions {
 	database: Pool;
 	project: Pick<Project, "schemaName" | "slug">;
@@ -98,6 +113,8 @@ export interface OwnedProjectOAuthOptions {
 		hintGoogle?: boolean;
 	};
 	google?: Credentials;
+	microsoft?: Credentials & { tenantId: string };
+	apple?: AppleCredentials;
 	/** Inject a scoped session/MFA operation. Its response is released only after the account transaction commits. */
 	complete(
 		client: PoolClient,
@@ -196,7 +213,7 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 	const secure = origin.startsWith("https:");
 	const stateCookie = `${secure ? "__Secure-" : ""}allauth_project_${slug}.state`;
 	const sessionCookie = `${secure ? "__Secure-" : ""}allauth_project_${slug}.session_token`;
-	const attributes = `Path=/; HttpOnly; SameSite=Lax${secure ? "; Secure" : ""}`;
+	const attributes = `Path=/; HttpOnly; SameSite=${options.apple ? "None" : "Lax"}${secure ? "; Secure" : ""}`;
 	const expireState = `${stateCookie}=; Max-Age=0; ${attributes}`;
 	const network: ProjectOAuthFetch = (input, init) =>
 		(options.fetch ?? globalThis.fetch)(input, init);
@@ -217,7 +234,7 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 
 	function checkCredentials(
 		provider: ProjectOAuthProvider,
-		config: Credentials,
+		config: Credentials | AppleCredentials,
 	) {
 		const url = safeURL(config.redirectURI, origin, origins);
 		const path = url?.pathname;
@@ -225,6 +242,7 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 			!config.clientId ||
 			!config.clientSecret ||
 			!url ||
+			(provider === "apple" && (!secure || url.protocol !== "https:")) ||
 			url.search ||
 			url.hash ||
 			![
@@ -236,6 +254,10 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 	}
 	checkCredentials("allauth", options.broker);
 	if (options.google) checkCredentials("google", options.google);
+	if (options.apple) checkCredentials("apple", options.apple);
+	if (options.microsoft) checkCredentials("microsoft", options.microsoft);
+	const microsoftServer =
+		options.microsoft && microsoftMetadata(options.microsoft.tenantId);
 
 	let brokerDiscovery:
 		| { expires: number; pending: Promise<oauth.AuthorizationServer> }
@@ -270,6 +292,12 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 
 	function metadata(provider: ProjectOAuthProvider) {
 		if (provider === "google") return Promise.resolve(googleMetadata);
+		if (provider === "apple") return Promise.resolve(appleMetadata);
+		if (provider === "microsoft") {
+			if (!microsoftServer)
+				throw new Error("Microsoft is unavailable in this project.");
+			return Promise.resolve(microsoftServer);
+		}
 		if (!brokerDiscovery || brokerDiscovery.expires <= Date.now()) {
 			const pending = discoverBroker();
 			brokerDiscovery = { expires: Date.now() + 300_000, pending };
@@ -281,7 +309,7 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 	}
 
 	function credentials(provider: ProjectOAuthProvider) {
-		return provider === "allauth" ? options.broker : options.google;
+		return provider === "allauth" ? options.broker : options[provider];
 	}
 
 	function route(request: Request, path: string) {
@@ -396,12 +424,16 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 			authorization = new URL(provider.authorization_endpoint!);
 			authorization.searchParams.set("client_id", client.clientId);
 			authorization.searchParams.set("redirect_uri", client.redirectURI);
-			authorization.searchParams.set("response_type", "code");
+			const apple = body.provider === "apple";
+			authorization.searchParams.set(
+				"response_type",
+				apple ? "code id_token" : "code",
+			);
+			if (apple) authorization.searchParams.set("response_mode", "form_post");
+			const scopes = apple ? ["email", "name"] : ["openid", "profile", "email"];
 			authorization.searchParams.set(
 				"scope",
-				[
-					...new Set(["openid", "profile", "email", ...(body.scopes ?? [])]),
-				].join(" "),
+				[...new Set([...scopes, ...(body.scopes ?? [])])].join(" "),
 			);
 			authorization.searchParams.set("state", state);
 			authorization.searchParams.set(
@@ -410,7 +442,7 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 			);
 			authorization.searchParams.set("code_challenge_method", "S256");
 			authorization.searchParams.set("nonce", nonce);
-			if (body.loginHint)
+			if (body.loginHint && !apple)
 				authorization.searchParams.set("login_hint", body.loginHint);
 			if (body.provider === "google")
 				authorization.searchParams.set("include_granted_scopes", "true");
@@ -521,7 +553,7 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 
 	async function getIdentity(
 		provider: ProjectOAuthProvider,
-		config: Credentials,
+		config: Credentials | AppleCredentials,
 		url: URL,
 		state: string,
 		flow: ProjectOAuthState,
@@ -529,12 +561,16 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 		const as = await metadata(provider);
 		const client: oauth.Client = { client_id: config.clientId };
 		const query = oauth.validateAuthResponse(as, client, url, state);
-		if (provider === "allauth" && !flow.idTokenNonce)
-			throw new Error("Project broker nonce missing.");
+		if (provider !== "google" && !flow.idTokenNonce)
+			throw new Error("Project provider nonce is missing.");
+		const secret =
+			typeof config.clientSecret === "string"
+				? config.clientSecret
+				: await config.clientSecret();
 		const auth =
 			provider === "allauth"
-				? oauth.ClientSecretBasic(config.clientSecret)
-				: oauth.ClientSecretPost(config.clientSecret);
+				? oauth.ClientSecretBasic(secret)
+				: oauth.ClientSecretPost(secret);
 		const response = await oauth.authorizationCodeGrantRequest(
 			as,
 			client,
@@ -547,38 +583,73 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 				signal: AbortSignal.timeout(7000),
 			},
 		);
-		// Google documents both issuer spellings for its ID tokens. Endpoints and keys stay pinned.
 		let tokenServer = as;
-		if (provider === "google" && response.ok) {
+		let expectedNonce = flow.idTokenNonce;
+		if (provider !== "allauth" && response.ok) {
 			const body: unknown = await response.clone().json();
 			if (
 				body &&
 				typeof body === "object" &&
 				"id_token" in body &&
 				typeof body.id_token === "string" &&
-				decodeJwt(body.id_token).iss === "accounts.google.com"
-			)
-				tokenServer = { ...as, issuer: "accounts.google.com" };
+				body.id_token.length <= 32768
+			) {
+				const claims = decodeJwt(body.id_token);
+				// Google publishes two issuer spellings. The network endpoints and keys remain pinned.
+				if (provider === "google" && claims.iss === "accounts.google.com")
+					tokenServer = { ...as, issuer: "accounts.google.com" };
+				if (provider === "microsoft")
+					tokenServer = {
+						...as,
+						issuer: microsoftIssuer(options.microsoft!.tenantId, claims),
+					};
+				if (provider === "apple" && expectedNonce)
+					expectedNonce = appleNonce(expectedNonce, claims.nonce);
+			}
 		}
 		const tokens = await oauth.processAuthorizationCodeResponse(
 			tokenServer,
 			client,
 			response,
 			{
-				expectedNonce: flow.idTokenNonce ?? oauth.expectNoNonce,
+				expectedNonce: expectedNonce ?? oauth.expectNoNonce,
 				requireIdToken: true,
 			},
 		);
 		if (!tokens.id_token || tokens.token_type !== "bearer")
 			throw new Error("Invalid provider token response.");
 		const jwks = as.jwks_uri!;
-		let resolver = resolvers.get(jwks);
+		const resolverKey = provider === "microsoft" ? tokenServer.issuer : jwks;
+		let resolver = resolvers.get(resolverKey);
 		if (!resolver) {
+			if (resolvers.size >= 32) resolvers.clear();
 			resolver = createRemoteJWKSet(new URL(jwks), {
-				[joseFetch]: network,
+				[joseFetch]:
+					provider === "microsoft"
+						? async (input, init) => {
+								const keys = await network(input, init);
+								if (!keys.ok) return keys;
+								const data = z
+									.object({
+										keys: z
+											.array(z.looseObject({ issuer: z.string().optional() }))
+											.max(64),
+									})
+									.parse(await keys.json());
+								return Response.json({
+									keys: data.keys.filter(
+										({ issuer }) =>
+											issuer === undefined ||
+											issuer === tokenServer.issuer ||
+											issuer ===
+												"https://login.microsoftonline.com/{tenantid}/v2.0",
+									),
+								});
+							}
+						: network,
 				timeoutDuration: 7000,
 			});
-			resolvers.set(jwks, resolver);
+			resolvers.set(resolverKey, resolver);
 		}
 		const algorithms =
 			as.id_token_signing_alg_values_supported?.filter((value) =>
@@ -589,30 +660,46 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 			audience: config.clientId,
 			algorithms,
 			requiredClaims: ["sub", "iat", "exp"],
-			...(provider === "google" ? { maxTokenAge: 3600 } : {}),
+			...(provider !== "allauth" ? { maxTokenAge: 3600 } : {}),
 		});
-		const subject = payload.sub;
-		if (!subject || subject.length > 512)
+		const subject = provider === "microsoft" ? payload.oid : payload.sub;
+		if (
+			typeof subject !== "string" ||
+			!subject ||
+			subject.length > 512 ||
+			originControls.test(subject)
+		)
 			throw new Error("Provider identity is incomplete.");
+		if (provider === "microsoft")
+			microsoftIssuer(options.microsoft!.tenantId, payload);
 		const profile =
 			!payload.email && as.userinfo_endpoint
 				? await oauth.processUserInfoResponse(
 						as,
 						client,
-						subject,
+						payload.sub!,
 						await oauth.userInfoRequest(as, client, tokens.access_token, {
 							[oauth.customFetch]: network,
 							signal: AbortSignal.timeout(7000),
 						}),
 					)
 				: payload;
-		if (
-			typeof profile.email !== "string" ||
-			profile.email.length > 320 ||
-			!profile.email.includes("@") ||
-			originControls.test(profile.email)
-		)
-			throw new Error("Provider identity is incomplete.");
+		const missingAppleEmail =
+			provider === "apple" &&
+			(profile.email === undefined || profile.email === "");
+		const email = missingAppleEmail
+			? undefined
+			: z.email().max(320).parse(profile.email).toLowerCase();
+		const emailVerified =
+			provider === "microsoft"
+				? microsoftEmailVerified(profile)
+				: profile.email_verified === true ||
+					(provider === "apple" && profile.email_verified === "true");
+		const displayName =
+			(provider === "apple"
+				? appleDisplayName(url.searchParams.get("user"))
+				: undefined) ??
+			(typeof profile.name === "string" ? profile.name.slice(0, 256) : "");
 		let image: string | undefined;
 		if (typeof profile.picture === "string" && profile.picture.length <= 2048) {
 			try {
@@ -631,9 +718,9 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 		return {
 			provider,
 			subject,
-			email: profile.email.toLowerCase(),
-			emailVerified: profile.email_verified === true,
-			name: typeof profile.name === "string" ? profile.name.slice(0, 256) : "",
+			email,
+			emailVerified,
+			name: displayName,
 			image,
 			accessToken: tokens.access_token,
 			refreshToken: tokens.refresh_token,
@@ -647,12 +734,20 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 	async function callback(request: Request, provider: ProjectOAuthProvider) {
 		const url = route(request, `callback/${provider}`);
 		const config = credentials(provider);
-		if (
-			request.method !== "GET" ||
-			!url ||
-			!config ||
-			request.headers.has("authorization")
-		)
+		if (!url || !config || request.headers.has("authorization"))
+			return errorRedirect("invalid_callback_request");
+		if (request.method === "POST" && provider === "apple") {
+			const caller = request.headers.get("origin");
+			if (!caller || (caller !== appleMetadata.issuer && !origins.has(caller)))
+				return errorRedirect("invalid_callback_request");
+			const continuation = await appleCallbackForm(request, url);
+			if (!continuation) return errorRedirect("invalid_callback_request");
+			const response = publicRedirect(continuation.href);
+			response.headers.set("cache-control", "no-store");
+			response.headers.set("referrer-policy", "no-referrer");
+			return response;
+		}
+		if (request.method !== "GET")
 			return errorRedirect("invalid_callback_request");
 		const states = url.searchParams.getAll("state");
 		const state = states.length === 1 ? states[0] : undefined;
@@ -690,7 +785,18 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 					? { ...flow.link, sessionToken: linkSession }
 					: undefined;
 			const response = await store.transaction(async (client) => {
-				const account = await store.bind(client, identity, options, link);
+				const account = await store.bind(
+					client,
+					identity,
+					{
+						signUpEnabled: options.signUpEnabled,
+						requireEmailVerification:
+							options.requireEmailVerification &&
+							provider !== "microsoft" &&
+							provider !== "apple",
+					},
+					link,
+				);
 				if (!account) throw rejected;
 				if (link) {
 					if (

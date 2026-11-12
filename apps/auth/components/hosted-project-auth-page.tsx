@@ -6,7 +6,7 @@ import {
 	projectEmailEnvironment,
 } from "@/lib/configuration";
 import { portalHeader } from "@/lib/domains/edge";
-import { withPortalHeaders } from "@/lib/domains/hosting";
+import { withPortalHeadersEngine } from "@/lib/domains/hosting";
 import {
 	hostedSdkBasePath,
 	hostedSdkProjectEnabled,
@@ -49,16 +49,25 @@ export async function HostedProjectAuthPage({
 	const request = hostedSdkViewRequest(view, await searchParams);
 	if (!request) return standardForm;
 
-	const project = await withPortalHeaders(
+	const project = await withPortalHeadersEngine(
 		requestHeaders,
-		async (instance, _bound, binding) => {
+		async (engine, _bound, binding) => {
 			if (
 				!binding ||
 				binding.kind !== "accounts" ||
 				!hostedSdkProjectEnabled(configured, binding.project)
 			)
 				return null;
-			const showPassword = instance.options.emailAndPassword?.enabled === true;
+			const config = await engine.dispatch(
+				new Request(`https://${binding.hostname}/api/auth/sdk/config`, {
+					headers: { accept: "application/json" },
+				}),
+			);
+			if (!config.ok) return null;
+			const data: unknown = await config.json().catch(() => null);
+			if (!data || typeof data !== "object") return null;
+			const showPassword =
+				"emailPassword" in data && data.emailPassword === true;
 			const showEmail = emailConfigured(
 				projectEmailEnvironment(env, binding.project.slug),
 			);
@@ -80,7 +89,9 @@ export async function HostedProjectAuthPage({
 				showPassword,
 				showEmail,
 				showSso,
-				showBroker: !instance.options.socialProviders?.google,
+				showBroker: !(
+					"googleProvider" in data && data.googleProvider === "google"
+				),
 			};
 		},
 	);

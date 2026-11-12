@@ -267,7 +267,14 @@ export function ownedSCIMResponse(body: object, status = 200): Response {
 export function ownedSCIMError(
 	status: number,
 	detail: string,
-	scimType?: "invalidFilter" | "invalidValue",
+	scimType?:
+		| "invalidFilter"
+		| "invalidValue"
+		| "invalidPath"
+		| "invalidSyntax"
+		| "mutability"
+		| "noTarget"
+		| "uniqueness",
 ): Response {
 	return ownedSCIMResponse(
 		{

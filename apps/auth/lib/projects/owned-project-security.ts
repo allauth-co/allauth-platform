@@ -9,6 +9,8 @@ import {
 	type SecurityPolicy,
 } from "../control/security-policy";
 
+type SecurityDatabase = Pick<PoolClient, "query">;
+
 export const projectSecurityBlockedCode = "ALLAUTH_SECURITY_BLOCKED";
 
 interface RequestIdentity {
@@ -26,7 +28,7 @@ export function createOwnedProjectSecurity(options: SecurityOptions) {
 	const trustedIP = (request: Request) =>
 		canonicalIP(options.trustedIP(request));
 
-	async function readPolicy(client: PoolClient) {
+	async function readPolicy(client: SecurityDatabase) {
 		const { rows } = await client.query<{ policy: unknown }>(
 			`SELECT policy FROM "allauthSecurityPolicy" WHERE id = 'default'`,
 		);
@@ -36,7 +38,7 @@ export function createOwnedProjectSecurity(options: SecurityOptions) {
 	}
 
 	async function record(
-		client: PoolClient,
+		client: SecurityDatabase,
 		request: Request,
 		type: string,
 		outcome: "success" | "failure" | "blocked",
@@ -59,7 +61,7 @@ export function createOwnedProjectSecurity(options: SecurityOptions) {
 	}
 
 	async function blocked(
-		client: PoolClient,
+		client: SecurityDatabase,
 		request: Request,
 		policy: SecurityPolicy,
 		signal: string,
@@ -81,7 +83,7 @@ export function createOwnedProjectSecurity(options: SecurityOptions) {
 	}
 
 	async function checkRules(
-		client: PoolClient,
+		client: SecurityDatabase,
 		request: Request,
 		policy: SecurityPolicy,
 		email?: string,
@@ -105,7 +107,7 @@ export function createOwnedProjectSecurity(options: SecurityOptions) {
 	}
 
 	async function increment(
-		client: PoolClient,
+		client: SecurityDatabase,
 		scope: string,
 		subject: string,
 		windowSeconds: number,
@@ -148,7 +150,7 @@ export function createOwnedProjectSecurity(options: SecurityOptions) {
 			: ([["fail-ip", ip]] as const);
 	}
 
-	async function pruneExpiredState(client: PoolClient) {
+	async function pruneExpiredState(client: SecurityDatabase) {
 		await client.query(
 			`DELETE FROM "allauthSecurityCounter" WHERE key IN (
 				SELECT key FROM "allauthSecurityCounter"
@@ -167,7 +169,7 @@ export function createOwnedProjectSecurity(options: SecurityOptions) {
 	}
 
 	async function admit(
-		client: PoolClient,
+		client: SecurityDatabase,
 		request: Request,
 		input?: RequestIdentity & { message?: boolean; signup?: boolean },
 	) {
@@ -238,7 +240,7 @@ export function createOwnedProjectSecurity(options: SecurityOptions) {
 	}
 
 	async function failed(
-		client: PoolClient,
+		client: SecurityDatabase,
 		request: Request,
 		path: string,
 		identity?: RequestIdentity,
@@ -264,7 +266,7 @@ export function createOwnedProjectSecurity(options: SecurityOptions) {
 	}
 
 	async function registerDevice(
-		client: PoolClient,
+		client: SecurityDatabase,
 		request: Request,
 		userId: string,
 		cookie: string | null,
@@ -315,11 +317,15 @@ export function createOwnedProjectSecurity(options: SecurityOptions) {
 		failed,
 		registerDevice,
 		trustedIP,
-		async denySession(client: PoolClient, request: Request, email: string) {
+		async denySession(
+			client: SecurityDatabase,
+			request: Request,
+			email: string,
+		) {
 			return checkRules(client, request, await readPolicy(client), email);
 		},
 		async notificationFailed(
-			client: PoolClient,
+			client: SecurityDatabase,
 			request: Request,
 			userId: string,
 		) {

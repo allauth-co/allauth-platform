@@ -5,8 +5,12 @@ import { mkdtemp, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { APIError } from "better-auth";
 import { symmetricDecrypt, symmetricEncrypt } from "better-auth/crypto";
-import { jwt, multiSession } from "better-auth/plugins";
+import { admin, jwt, multiSession, organization } from "better-auth/plugins";
+import { createAccessControl } from "better-auth/plugins/access";
+import type { Statements } from "better-auth/plugins/access";
+import { defaultRoles, defaultStatements } from "better-auth/plugins/organization/access";
 import { getTestInstance } from "better-auth/test";
 import { hash } from "bcryptjs";
 import { createLocalJWKSet, type JSONWebKeySet, jwtVerify } from "jose";
@@ -28,6 +32,7 @@ import { createOwnedProjectEngine } from "./owned-project-engine";
 import { afterOwnedProjectCommit, createProjectEngineStore } from "./owned-project-engine-store";
 import { projectProxySecret, verifiedProjectRequest } from "./proxy";
 import type { Project } from "./registry";
+import { serviceDirectory } from "./service-directory";
 import { readProjectSessionPrincipal } from "./session-principal";
 
 const fixturePath = new URL("../../../../.secrets/local-postgres.json", import.meta.url);
@@ -37,6 +42,13 @@ const basePath = `/api/projects/${slug}/auth`;
 const cookieName = `__Secure-allauth_project_${slug}.session_token`;
 const signingSecret = "isolated-owned-project-fixture-secret-with-32-bytes";
 const password = "owned-project-fixture-password";
+
+const directoryProjectId = "2bc006ea-48ef-43ae-a735-62df31c80fc5";
+const directoryKey = `aabk_${directoryProjectId}_${"b".repeat(43)}`;
+const authorizeDirectory = async (headers: Headers) => {
+	if (headers.get("allauth-backend-key") !== directoryKey || headers.has("authorization"))
+		throw new APIError("UNAUTHORIZED", { message: "The backend credential is invalid or expired." });
+};
 
 function request(path: string, body?: unknown, headers: HeadersInit = {}) {
 	return new Request(`${origin}${basePath}${path}`, {
@@ -109,11 +121,15 @@ describe.skipIf(!existsSync(fixturePath))("isolated PostgreSQL owned project eng
 			secret: signingSecret,
 			session: { cookieCache: { enabled: false } },
 			advanced: { cookiePrefix: `allauth_project_${slug}` },
+			user: { additionalFields: { directoryDisabled: { type: "boolean", input: false, required: false } } },
 			plugins: [
+				admin(),
+				organization({ ac: createAccessControl<Statements>(defaultStatements), roles: defaultRoles, dynamicAccessControl: { enabled: true } }),
 				productionTwoFactor(origin),
 				{ id: "fixture-control-security", hooks: nativeSecurity.hooks },
 				jwt({ jwt: { issuer: `${origin}${basePath}` }, jwks: { keyPairConfig: { alg: "RS256" } } }),
 				multiSession({ maximumSessions: 5 }),
+				serviceDirectory({ project: slug, projectId: directoryProjectId, environment: "development", authorize: authorizeDirectory }),
 			],
 			emailAndPassword: { enabled: true, password: clerkCompatiblePasswords },
 			logger: { disabled: true },
@@ -653,6 +669,78 @@ describe.skipIf(!existsSync(fixturePath))("isolated PostgreSQL owned project eng
 		expect(remaining).toHaveLength(2);
 		expect(remaining.find(({ user }) => user.id === users[0])!.session.token).not.toBe(original);
 		expect(await nativeGetSession(new Headers({ cookie: `${cookieName}=${oldOriginalCookie!.split("=").slice(1).join("=")}` }))).toBeNull();
+	});
+
+	it("changes a password through the project route and rotates legacy sessions atomically", async () => {
+		const email = "password-change-dispatch@fixture.example";
+		const id = await seed(email);
+		const active = await legacySession(id, 1200);
+		const sibling = await legacySession(id, 1200);
+		const owner = createOwnedProjectEngine({
+			database, project: { slug, schemaName: schema }, baseURL: origin, basePath, trustedOrigins: [],
+			signingSecret, policy: defaultAuthPolicy, trustedIP: () => "203.0.113.202",
+			passwordChange: { checkPasswordSafety: async () => "allowed" },
+		});
+		const newPassword = "candidate-replacement-password";
+		const changed = await owner.dispatch(request("/change-password", {
+			currentPassword: password, newPassword, revokeOtherSessions: true,
+		}, { cookie: active.cookie }));
+		expect(changed.status).toBe(200);
+		expect(await changed.json()).toMatchObject({ token: expect.any(String), user: { id } });
+		expect(await nativeGetSession(new Headers({ cookie: active.cookie }))).toBeNull();
+		expect(await nativeGetSession(new Headers({ cookie: sibling.cookie }))).toBeNull();
+		expect(await nativeGetSession(new Headers({ cookie: cookies(changed) }))).toMatchObject({ user: { id } });
+		expect((await nativeRequest(request("/sign-in/email", { email, password }))).status).toBe(401);
+		expect((await nativeRequest(request("/sign-in/email", { email, password: newPassword }))).status).toBe(200);
+	});
+
+	it("preserves the scoped service directory for connected applications", async () => {
+		const id = await seed("directory-project-owner@fixture.example");
+		const org = randomUUID();
+		const role = randomUUID();
+		await database.query(
+			`INSERT INTO "${schema}"."organization"(id,name,slug,"createdAt") VALUES ($1,'Fixture Org','fixture-org',statement_timestamp())`,
+			[org],
+		);
+		await database.query(
+			`INSERT INTO "${schema}"."member"(id,"organizationId","userId",role,"createdAt") VALUES ($1,$2,$3,'member',statement_timestamp())`,
+			[randomUUID(), org, id],
+		);
+		await database.query(
+			`INSERT INTO "${schema}"."organizationRole"(id,"organizationId",role,permission) VALUES ($1,$2,'fixture-role',$3)`,
+			[role, org, JSON.stringify({ ac: ["read"] })],
+		);
+		const owner = createOwnedProjectEngine({
+			database, project: { slug, schemaName: schema }, baseURL: origin, basePath, trustedOrigins: [],
+			signingSecret, policy: defaultAuthPolicy, trustedIP: () => "203.0.113.201",
+			serviceDirectory: { projectId: directoryProjectId, environment: "development", authorize: authorizeDirectory },
+		});
+		const headers = { "allauth-backend-key": directoryKey };
+		for (const path of [
+			`users?userId=${id}`,
+			`organizations?organizationId=${org}`,
+			`members?organizationId=${org}&userId=${id}`,
+			`roles?organizationId=${org}&limit=2&offset=2`,
+		]) {
+			const native = await nativeRequest(request(`/service-directory/${path}`, undefined, headers));
+			const candidate = await owner.dispatch(request(`/service-directory/${path}`, undefined, headers));
+			expect(native.status).toBe(200);
+			expect(candidate.status).toBe(200);
+			expect(await candidate.json()).toEqual(await native.json());
+		}
+		const authorized = await owner.readDirectory("serviceDirectoryUsers", new Headers(headers), { userId: id });
+		const profile = await authorized.json();
+		expect(profile).toMatchObject({ total: 1, users: [{ id }] });
+		expect(JSON.stringify(profile)).not.toMatch(/password|privateMetadata|neverReturn|token/);
+		const unapproved = await owner.readDirectory("serviceDirectoryUsers", new Headers({ authorization: "Bearer not-a-directory-key" }), {});
+		expect(unapproved.status).toBe(401);
+		const foreign = createOwnedProjectEngine({
+			database, project: { slug, schemaName: otherSchema }, baseURL: origin, basePath, trustedOrigins: [],
+			signingSecret, policy: defaultAuthPolicy, trustedIP: () => "203.0.113.201",
+			serviceDirectory: { projectId: randomUUID(), environment: "development", authorize: authorizeDirectory },
+		});
+		const scoped = await foreign.readDirectory("serviceDirectoryUsers", new Headers(headers), { userId: id });
+		expect(await scoped.json()).toMatchObject({ total: 0, users: [] });
 	});
 
 	it("keeps failure counters readable when switching in either direction", async () => {

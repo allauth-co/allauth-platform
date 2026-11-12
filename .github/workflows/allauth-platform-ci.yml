@@ -72,14 +72,17 @@ jobs:
           lib/domains/hosted-sdk.test.ts lib/hosted-sdk-page.test.ts lib/hosted-sdk-ui-render.test.ts
           lib/projects/legacy-mfa-record.test.ts lib/projects/session-shadow.test.ts
           lib/projects/owned-project-engine.pg.test.ts lib/projects/owned-password-reset.pg.test.ts
+          lib/projects/owned-project-password-change.pg.test.ts lib/auth-policy/password.test.ts
           lib/projects/owned-mfa.pg.test.ts lib/projects/owned-mfa-enrollment.pg.test.ts
           lib/projects/owned-recovery-http.pg.test.ts lib/projects/owned-sign-up.pg.test.ts
           lib/projects/owned-project-email-sign-in.pg.test.ts lib/projects/owned-project-oauth.pg.test.ts
           lib/projects/owned-project-organization.pg.test.ts lib/control/security.test.ts
           lib/projects/owned-project-enterprise-catalog.pg.test.ts
           lib/projects/owned-project-scim.pg.test.ts lib/projects/owned-project-scim-resources.pg.test.ts
+          lib/projects/owned-project-scim-user-writes.pg.test.ts
           lib/projects/owned-project-sso.pg.test.ts lib/projects/owned-project-https.test.ts
           lib/projects/owned-project-support.pg.test.ts lib/projects/support-plugin.test.ts
+          lib/projects/management-plugin.test.ts lib/projects/service-directory.test.ts
           lib/projects/passkey-store.pg.test.ts
       - name: Test billing, platform administration, self-hosting and public pages
         run: >-

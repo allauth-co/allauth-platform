@@ -8,8 +8,12 @@ import { exportJWK, generateKeyPair, SignJWT } from "jose";
 import { Kysely, PostgresDialect } from "kysely";
 import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { defaultAuthPolicy } from "../auth-policy/policy";
+import { appleIntegrity } from "../project-providers/apple";
+import { microsoftIntegrity } from "../project-providers/microsoft";
 import { discoveryDocument } from "../discovery";
 import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
+import { createOwnedProjectEngine } from "./owned-project-engine";
 import { createProjectEngineStore } from "./owned-project-engine-store";
 import { createOwnedProjectOAuth } from "./owned-project-oauth";
 import type { OwnedProjectOAuthOptions } from "./owned-project-oauth";
@@ -35,6 +39,20 @@ const google = {
 	clientSecret: "synthetic-owned-google-client-secret",
 	redirectURI: `${origin}/api/auth/callback/google`,
 };
+const microsoft = {
+	clientId: "90000000-2222-4333-8444-555555555555",
+	clientSecret: "synthetic-microsoft-fixture-secret",
+	redirectURI: `${origin}/api/auth/callback/microsoft`,
+	tenantId: "organizations",
+};
+const microsoftTenant = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+const microsoftAuthority = "https://login.microsoftonline.com";
+const apple = {
+	clientId: "com.allauth.fixture",
+	clientSecret: "synthetic-apple-fixture-secret",
+	redirectURI: `${origin}/api/auth/callback/apple`,
+};
+const appleIssuer = "https://appleid.apple.com";
 const cookiePrefix = `allauth_project_${slug}`;
 const sessionCookie = `__Secure-${cookiePrefix}.session_token`;
 
@@ -90,16 +108,32 @@ async function legacyProject(
 				secret: key,
 				logger: { disabled: true },
 				database: { db, type: "postgres" },
-				socialProviders: { google },
+				socialProviders: {
+					google,
+					microsoft: {
+						...microsoft,
+						disableProfilePhoto: true,
+						disableDefaultScope: true,
+						scope: ["openid", "profile", "email"],
+					},
+					apple,
+				},
+				trustedOrigins: [appleIssuer],
 				account: {
 					encryptOAuthTokens: true,
 					accountLinking: { enabled: true, trustedProviders: [] },
 				},
 				advanced: {
 					cookiePrefix,
-					cookies: { state: { attributes: { maxAge: 600 } } },
+					cookies: {
+						state: {
+							attributes: { maxAge: 600, sameSite: "none", secure: true },
+						},
+					},
 				},
 				plugins: [
+					microsoftIntegrity(),
+					appleIntegrity(),
 					genericOAuth({
 						config: [
 							{
@@ -139,7 +173,7 @@ describe.skipIf(!existsSync(fixturePath))(
 		let brokerUserId: string;
 		let config: OwnedProjectOAuthOptions["broker"];
 		let created = false;
-		let googleNetwork: typeof network | undefined;
+		let externalNetwork: typeof network | undefined;
 		const network: NonNullable<OwnedProjectOAuthOptions["fetch"]> = async (
 			input,
 			init,
@@ -147,7 +181,7 @@ describe.skipIf(!existsSync(fixturePath))(
 			const request = new Request(input, init);
 			const url = new URL(request.url);
 			if (url.origin !== platform) {
-				if (googleNetwork) return googleNetwork(request);
+				if (externalNetwork) return externalNetwork(request);
 				throw new Error("Unexpected external request in OAuth fixture.");
 			}
 			if (url.href === discoveryURL)
@@ -434,7 +468,7 @@ describe.skipIf(!existsSync(fixturePath))(
 				alg: "RS256",
 				use: "sig",
 			};
-			googleNetwork = async (input, init) => {
+			externalNetwork = async (input, init) => {
 				const request = new Request(input, init);
 				if (request.url === "https://www.googleapis.com/oauth2/v3/certs")
 					return Response.json({ keys: [jwk] });
@@ -479,6 +513,348 @@ describe.skipIf(!existsSync(fixturePath))(
 			callback.searchParams.set("code", "fixture-google-code");
 			return new Request(callback, { headers: { cookie: cookiePairs(start) } });
 		}
+
+		function ownedProviderEngine() {
+			return createOwnedProjectEngine({
+				database,
+				project: { schemaName: schema, slug },
+				baseURL: origin,
+				basePath: "/api/auth",
+				signingSecret: key,
+				trustedOrigins: [],
+				trustedIP: () => "203.0.113.16",
+				policy: defaultAuthPolicy,
+				oauth: {
+					broker: config,
+					google,
+					microsoft,
+					apple: { ...apple, clientSecret: async () => apple.clientSecret },
+					defaultErrorURL: `${origin}/auth-error`,
+					fetch: network,
+				},
+			});
+		}
+
+		const providerFixtureKeys = generateKeyPair("RS256");
+
+		async function providerAuthorization(
+			started: Response,
+			provider: "microsoft" | "apple",
+			claims: Record<string, unknown>,
+			overrides: {
+				tenant?: string;
+				nonce?: "hashed" | "wrong";
+				jwkIssuer?: string;
+			} = {},
+		) {
+			expect(started.status, await started.clone().text()).toBe(200);
+			const body = (await started.json()) as { url: string };
+			const authorization = new URL(body.url);
+			const parameters = authorization.searchParams;
+			const configuration = provider === "apple" ? apple : microsoft;
+			const callback = new URL(configuration.redirectURI);
+			const tokenEndpoint =
+				provider === "apple"
+					? `${appleIssuer}/auth/token`
+					: `${microsoftAuthority}/${microsoft.tenantId}/oauth2/v2.0/token`;
+			const jwksEndpoint =
+				provider === "apple"
+					? `${appleIssuer}/auth/keys`
+					: `${microsoftAuthority}/${microsoft.tenantId}/discovery/v2.0/keys`;
+			const tenant = overrides.tenant ?? microsoftTenant;
+			const actualIssuer =
+				provider === "apple"
+					? appleIssuer
+					: `${microsoftAuthority}/${tenant}/v2.0`;
+			const keys = await providerFixtureKeys;
+			const code = randomUUID();
+			const nonce = parameters.get("nonce")!;
+			expect(nonce).toBeTruthy();
+			const claimNonce =
+				overrides.nonce === "hashed"
+					? createHash("sha256").update(nonce).digest("hex")
+					: overrides.nonce === "wrong"
+						? "incorrect-nonce"
+						: nonce;
+			externalNetwork = async (input, init) => {
+				const request = new Request(input, init);
+				if (request.url === jwksEndpoint)
+					return Response.json({
+						keys: [
+							{
+								...(await exportJWK(keys.publicKey)),
+								alg: "RS256",
+								kid: "fixture-provider-key",
+								...(overrides.jwkIssuer ? { issuer: overrides.jwkIssuer } : {}),
+							},
+						],
+					});
+				expect(request.url).toBe(tokenEndpoint);
+				const form = new URLSearchParams(await request.text());
+				expect(form.get("code")).toBe(code);
+				expect(form.get("client_id")).toBe(configuration.clientId);
+				expect(form.get("client_secret")).toBe(configuration.clientSecret);
+				expect(form.get("redirect_uri")).toBe(configuration.redirectURI);
+				expect(
+					createHash("sha256")
+						.update(form.get("code_verifier")!)
+						.digest("base64url"),
+				).toBe(parameters.get("code_challenge"));
+				const idToken = await new SignJWT({
+					...claims,
+					nonce: claimNonce,
+					...(provider === "microsoft" ? { tid: tenant } : {}),
+				})
+					.setIssuer(actualIssuer)
+					.setAudience(configuration.clientId)
+					.setProtectedHeader({ alg: "RS256", kid: "fixture-provider-key" })
+					.setIssuedAt()
+					.setExpirationTime("5m")
+					.sign(keys.privateKey);
+				return Response.json({
+					id_token: idToken,
+					token_type: "Bearer",
+					access_token: "fixture-external-access",
+					refresh_token: "fixture-external-refresh",
+					expires_in: 300,
+					scope: "openid email",
+				});
+			};
+			const fields = new URLSearchParams({
+				code,
+				state: parameters.get("state")!,
+			});
+			if (provider === "apple") {
+				expect(parameters.get("response_mode")).toBe("form_post");
+				expect(parameters.get("response_type")).toBe("code id_token");
+				fields.set("id_token", "fixture-front-channel-value");
+				fields.set(
+					"user",
+					JSON.stringify({
+						name: { firstName: "Private", lastName: "Fixture" },
+						email: "unverified-form@fixture.example",
+					}),
+				);
+				return new Request(callback, {
+					method: "POST",
+					headers: { origin: appleIssuer, cookie: cookiePairs(started) },
+					body: fields,
+				});
+			}
+			callback.search = fields.toString();
+			return new Request(callback, {
+				headers: { cookie: cookiePairs(started) },
+			});
+		}
+
+		it("advertises only public hosted configuration for the selected project engine", async () => {
+			const candidate = ownedProviderEngine();
+			const response = await candidate.dispatch(
+				new Request(`${origin}/api/auth/sdk/config`),
+			);
+			expect(response.status).toBe(200);
+			const configuration = await response.json();
+			expect(configuration).toMatchObject({
+				emailPassword: defaultAuthPolicy.emailAndPasswordEnabled,
+				signUpEnabled: defaultAuthPolicy.signUpEnabled,
+				emailVerificationRequired: defaultAuthPolicy.requireEmailVerification,
+				passwordPolicy: defaultAuthPolicy.passwordPolicy,
+				google: true,
+				googleProvider: "google",
+				microsoft: true,
+				microsoftProvider: "microsoft",
+				apple: true,
+				appleProvider: "apple",
+				organizations: true,
+				twoFactor: true,
+			});
+			expect(JSON.stringify(configuration)).not.toMatch(
+				/clientSecret|signingSecret|tenantId|fixture-secret/,
+			);
+		});
+
+		it("switches Microsoft callbacks both ways without changing the existing object-ID binding", async () => {
+			const provider = "microsoft";
+			const input = { ...startBody, provider, newUserCallbackURL: undefined };
+			const oid = "cccccccc-aaaa-4bbb-8ddd-eeeeeeeeeeee";
+			const email = "enterprise-owner@fixture.example";
+			const candidate = ownedProviderEngine();
+			const legacyStart = await native.handler(
+				post(origin, "/sign-in/social", input),
+			);
+			try {
+				const first = await candidate.dispatch(
+					await providerAuthorization(legacyStart, provider, {
+						oid,
+						sub: "first-pairwise-fixture-subject",
+						email,
+						name: "Enterprise owner",
+					}),
+				);
+				expect(first.headers.get("location")).toBe(destination);
+				const session = await native.api.getSession({
+					headers: new Headers({ cookie: cookiePairs(first) }),
+					query: { disableRefresh: true },
+				});
+				expect(session?.user).toMatchObject({ email, emailVerified: false });
+				const ownedStart = await candidate.dispatch(
+					post(origin, "/sign-in/social", input),
+				);
+				const rolledBack = await native.handler(
+					await providerAuthorization(ownedStart, provider, {
+						oid,
+						sub: "another-pairwise-fixture-subject",
+						email,
+					}),
+				);
+				expect(rolledBack.headers.get("location")).toBe(destination);
+				expect(
+					await native.api.getSession({
+						headers: new Headers({ cookie: cookiePairs(rolledBack) }),
+						query: { disableRefresh: true },
+					}),
+				).toMatchObject({ user: { id: session?.user.id } });
+				const account = await database.query(
+					`SELECT "accountId", "userId" FROM "${schema}"."account" WHERE "providerId" = 'microsoft'`,
+				);
+				expect(account.rows).toEqual([
+					{ accountId: oid, userId: session?.user.id },
+				]);
+			} finally {
+				externalNetwork = undefined;
+			}
+		});
+
+		it("refuses Microsoft callbacks from a disallowed tenant, a different nonce, or a key assigned to another issuer", async () => {
+			const input = { ...startBody, provider: "microsoft" as const };
+			try {
+				for (const overrides of [
+					{ tenant: "9188040d-6c67-4c5b-b112-36a304b66dad" },
+					{ nonce: "wrong" as const },
+					{
+						jwkIssuer: `${microsoftAuthority}/11111111-2222-4333-8444-555555555555/v2.0`,
+					},
+				]) {
+					const candidate = ownedProviderEngine();
+					const started = await candidate.dispatch(
+						post(origin, "/sign-in/social", input),
+					);
+					const response = await candidate.dispatch(
+						await providerAuthorization(
+							started,
+							"microsoft",
+							{
+								oid: randomUUID(),
+								sub: "test-mismatch",
+								email: "denied-provider@fixture.example",
+							},
+							overrides,
+						),
+					);
+					expect(
+						new URL(response.headers.get("location")!).searchParams.get(
+							"error",
+						),
+					).toBe("invalid_code");
+					expect(cookiePairs(response)).not.toContain(".session_token=");
+				}
+				const user = await database.query(
+					`SELECT id FROM "${schema}"."user" WHERE email = 'denied-provider@fixture.example'`,
+				);
+				expect(user.rowCount).toBe(0);
+			} finally {
+				externalNetwork = undefined;
+			}
+		});
+
+		it("switches Apple form callbacks both ways and reuses the exact relay account when email is omitted", async () => {
+			const provider = "apple";
+			const email = "stable-relay@privaterelay.appleid.com";
+			const subject = "stable-apple-fixture-subject";
+			const input = { ...startBody, provider, newUserCallbackURL: undefined };
+			const candidate = ownedProviderEngine();
+			try {
+				const legacyStart = await native.handler(
+					post(origin, "/sign-in/social", input),
+				);
+				const firstForm = await providerAuthorization(
+					legacyStart,
+					provider,
+					{ sub: subject, email, email_verified: "true" },
+					{ nonce: "hashed" },
+				);
+				const formCookies = firstForm.headers.get("cookie")!;
+				const forwarded = await candidate.dispatch(firstForm);
+				const location = forwarded.headers.get("location")!;
+				expect(new URL(location).pathname).toBe("/api/auth/callback/apple");
+				expect(location).not.toContain("fixture-front-channel-value");
+				const signedIn = await candidate.dispatch(
+					new Request(location, { headers: { cookie: formCookies } }),
+				);
+				expect(signedIn.headers.get("location")).toBe(destination);
+				const before = await native.api.getSession({
+					headers: new Headers({ cookie: cookiePairs(signedIn) }),
+					query: { disableRefresh: true },
+				});
+				expect(before?.user).toMatchObject({
+					email,
+					emailVerified: true,
+					name: "Private Fixture",
+				});
+
+				const ownedStart = await candidate.dispatch(
+					post(origin, "/sign-in/social", input),
+				);
+				expect(
+					ownedStart.headers
+						.getSetCookie()
+						.some(
+							(value) =>
+								value.includes("SameSite=None") && value.includes("Secure"),
+						),
+				).toBe(true);
+				const legacyForm = await providerAuthorization(ownedStart, provider, {
+					sub: subject,
+				});
+				const nativeCookies = legacyForm.headers.get("cookie")!;
+				const continuation = await native.handler(legacyForm);
+				const rolledBack = await native.handler(
+					new Request(continuation.headers.get("location")!, {
+						headers: { cookie: nativeCookies },
+					}),
+				);
+				expect(rolledBack.headers.get("location")).toBe(destination);
+				expect(
+					await native.api.getSession({
+						headers: new Headers({ cookie: cookiePairs(rolledBack) }),
+						query: { disableRefresh: true },
+					}),
+				).toMatchObject({ user: { id: before?.user.id, email } });
+
+				const again = await candidate.dispatch(
+					post(origin, "/sign-in/social", input),
+				);
+				const lastForm = await providerAuthorization(again, provider, {
+					sub: subject,
+				});
+				const lastCookies = lastForm.headers.get("cookie")!;
+				const prepared = await candidate.dispatch(lastForm);
+				const continued = await candidate.dispatch(
+					new Request(prepared.headers.get("location")!, {
+						headers: { cookie: lastCookies },
+					}),
+				);
+				expect(continued.headers.get("location")).toBe(destination);
+				const binding = await database.query(
+					`SELECT "accountId", "userId" FROM "${schema}"."account" WHERE "providerId" = 'apple'`,
+				);
+				expect(binding.rows).toEqual([
+					{ accountId: subject, userId: before?.user.id },
+				]);
+			} finally {
+				externalNetwork = undefined;
+			}
+		});
 
 		it("consumes a native pending state, verifies the actual broker token and establishes a legacy-readable project session", async () => {
 			const started = await native.handler(
@@ -585,7 +961,7 @@ describe.skipIf(!existsSync(fixturePath))(
 				]);
 				expect(new Set(bindings.rows.map((row) => row.userId)).size).toBe(1);
 			} finally {
-				googleNetwork = undefined;
+				externalNetwork = undefined;
 			}
 		});
 
@@ -744,7 +1120,7 @@ describe.skipIf(!existsSync(fixturePath))(
 				);
 				expect(sessionCount.rows).toEqual([{ id: owner.id }]);
 			} finally {
-				googleNetwork = undefined;
+				externalNetwork = undefined;
 			}
 		});
 

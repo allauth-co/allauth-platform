@@ -7,12 +7,12 @@ import { portalHeader } from "./domains/edge";
 const runtime = vi.hoisted(() => ({
 	headers: vi.fn(),
 	getAuthEnvironment: vi.fn(),
-	withPortalHeaders: vi.fn(),
+	withPortalHeadersEngine: vi.fn(),
 }));
 vi.mock("next/headers", () => ({ headers: runtime.headers }));
 vi.mock("./auth", () => ({ getAuthEnvironment: runtime.getAuthEnvironment }));
 vi.mock("./domains/hosting", () => ({
-	withPortalHeaders: runtime.withPortalHeaders,
+	withPortalHeadersEngine: runtime.withPortalHeadersEngine,
 }));
 vi.mock("@/components/hosted-project-auth", () => ({
 	HostedProjectAuth: () => null,
@@ -21,6 +21,13 @@ vi.mock("@/components/better-auth-ui/allauth-auth", () => ({
 	AllAuthAuth: () => null,
 }));
 
+function engineConfiguration(configuration: Record<string, unknown>) {
+	return {
+		dispatch: vi.fn(async (_request: Request) => Response.json(configuration)),
+	};
+}
+
+const accountsHostname = "accounts.fixture.example";
 const project = {
 	id: "018dad31-1be5-4f84-9196-68949a8db228",
 	slug: "fixture-project",
@@ -34,7 +41,7 @@ beforeEach(() => {
 	runtime.getAuthEnvironment
 		.mockReset()
 		.mockResolvedValue({ ALLAUTH_PROJECT_HOSTED_UI_PROJECT_IDS: project.id });
-	runtime.withPortalHeaders.mockReset();
+	runtime.withPortalHeadersEngine.mockReset();
 });
 
 it("uses the standard page for an unverified account hostname without looking up project configuration", async () => {
@@ -44,7 +51,7 @@ it("uses the standard page for an unverified account hostname without looking up
 	});
 	expect(result.type).toBe(AllAuthAuth);
 	expect(runtime.getAuthEnvironment).not.toHaveBeenCalled();
-	expect(runtime.withPortalHeaders).not.toHaveBeenCalled();
+	expect(runtime.withPortalHeadersEngine).not.toHaveBeenCalled();
 });
 
 it("keeps hosted OAuth continuation in the standard page even when preview is configured", async () => {
@@ -56,28 +63,35 @@ it("keeps hosted OAuth continuation in the standard page even when preview is co
 		searchParams: Promise.resolve({ client_id: "fixture" }),
 	});
 	expect(result.type).toBe(AllAuthAuth);
-	expect(runtime.withPortalHeaders).not.toHaveBeenCalled();
+	expect(runtime.withPortalHeadersEngine).not.toHaveBeenCalled();
 });
 
 it("uses the first-party page for an allowlisted development accounts realm with an exact callback", async () => {
 	const requestHeaders = new Headers({ [portalHeader]: "fixture-proof" });
 	runtime.headers.mockResolvedValue(requestHeaders);
-	runtime.withPortalHeaders.mockImplementation(async (_headers, select) =>
-		select(
-			{ options: { emailAndPassword: { enabled: true }, socialProviders: {} } },
-			new Headers(),
-			{ kind: "accounts", project },
-		),
+	const engine = engineConfiguration({
+		emailPassword: true,
+		googleProvider: null,
+	});
+	runtime.withPortalHeadersEngine.mockImplementation(async (_headers, select) =>
+		select(engine, new Headers(), {
+			kind: "accounts",
+			project,
+			hostname: accountsHostname,
+		}),
 	);
 	const result = await HostedProjectAuthPage({
 		view: "signIn",
 		searchParams: Promise.resolve({ callbackUrl: "/account/security" }),
 	});
-	expect(runtime.withPortalHeaders).toHaveBeenCalledWith(
+	expect(runtime.withPortalHeadersEngine).toHaveBeenCalledWith(
 		requestHeaders,
 		expect.any(Function),
 	);
 	expect(result.type).toBe(HostedProjectAuth);
+	expect(engine.dispatch.mock.calls[0]?.[0]?.url).toBe(
+		`https://${accountsHostname}/api/auth/sdk/config`,
+	);
 	expect(result.props).toMatchObject({
 		destination: "/account/security",
 		basePath: "/api/auth/hosted-ui",
@@ -89,10 +103,11 @@ it("keeps production on the standard page even when the immutable ID appears in 
 	runtime.headers.mockResolvedValue(
 		new Headers({ [portalHeader]: "fixture-proof" }),
 	);
-	runtime.withPortalHeaders.mockImplementation(async (_headers, select) =>
-		select({ options: {} }, new Headers(), {
+	runtime.withPortalHeadersEngine.mockImplementation(async (_headers, select) =>
+		select(engineConfiguration({}), new Headers(), {
 			kind: "accounts",
 			project: { ...project, environment: "production" },
+			hostname: accountsHostname,
 		}),
 	);
 	const result = await HostedProjectAuthPage({
@@ -106,12 +121,12 @@ it("only selects alternate sign-in methods when the verified project can offer t
 	runtime.headers.mockResolvedValue(
 		new Headers({ [portalHeader]: "fixture-proof" }),
 	);
-	runtime.withPortalHeaders.mockImplementation(async (_headers, select) =>
-		select(
-			{ options: { emailAndPassword: { enabled: false } } },
-			new Headers(),
-			{ kind: "accounts", project },
-		),
+	runtime.withPortalHeadersEngine.mockImplementation(async (_headers, select) =>
+		select(engineConfiguration({ emailPassword: false }), new Headers(), {
+			kind: "accounts",
+			project,
+			hostname: accountsHostname,
+		}),
 	);
 	const username = await HostedProjectAuthPage({
 		view: "signIn",
@@ -144,8 +159,12 @@ it("selects project MFA for a local callback and keeps signed broker MFA on the 
 	runtime.headers.mockResolvedValue(
 		new Headers({ [portalHeader]: "fixture-proof" }),
 	);
-	runtime.withPortalHeaders.mockImplementation(async (_headers, select) =>
-		select({ options: {} }, new Headers(), { kind: "accounts", project }),
+	runtime.withPortalHeadersEngine.mockImplementation(async (_headers, select) =>
+		select(engineConfiguration({}), new Headers(), {
+			kind: "accounts",
+			project,
+			hostname: accountsHostname,
+		}),
 	);
 	const local = await HostedProjectAuthPage({
 		view: "twoFactor",

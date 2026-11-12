@@ -56,12 +56,13 @@ function readScopes(value: string): readonly string[] | undefined {
 	}
 }
 
-/** Runs a SCIM read with an established managed bearer binding in one read-only snapshot. */
-export function createOwnedProjectSCIMReadAuthority(options: {
+interface AuthorityOptions {
 	database: Pool;
 	schemaName: string;
 	credentialHashSecret: string;
-}) {
+}
+
+function createAuthority(options: AuthorityOptions, write: boolean) {
 	const schema = checkedProjectSchema(options.schemaName);
 	const { database, credentialHashSecret } = options;
 	if (credentialHashSecret.length < 32)
@@ -82,7 +83,7 @@ export function createOwnedProjectSCIMReadAuthority(options: {
 			 FROM "${schema}"."scimManagedCredential" k
 			 JOIN "${schema}"."scimManagedConnection" c ON c.id = k."connectionRecordId"
 			 WHERE k."credentialId" = $1 AND k."hashVersion" = 'v1' AND k.status = 'active'
-			   AND k."expiresAt" > $2 AND c.status = 'active'`,
+			   AND k."expiresAt" > $2 AND c.status = 'active'${write ? " FOR SHARE OF k" : ""}`,
 				[credentialId, new Date()],
 			)
 		).rows[0];
@@ -102,8 +103,7 @@ export function createOwnedProjectSCIMReadAuthority(options: {
 		const permissions = readScopes(credential.serializedScopes);
 		if (!permissions)
 			return deny(500, "Managed SCIM credential scope policy is invalid");
-		const required =
-			resource === "Users" ? "scim.users.read" : "scim.groups.read";
+		const required = `scim.${resource.toLowerCase()}.${write ? "write" : "read"}`;
 		if (!permissions.includes(required))
 			return deny(
 				403,
@@ -137,7 +137,7 @@ export function createOwnedProjectSCIMReadAuthority(options: {
 		return { ok: true, connection: { connectionId, provisioningDomainId } };
 	}
 
-	return async function read<T>(
+	async function transaction<T>(
 		headers: Headers,
 		resource: "Users" | "Groups",
 		select: (
@@ -155,7 +155,9 @@ export function createOwnedProjectSCIMReadAuthority(options: {
 		const client = await database.connect();
 		let discard = false;
 		try {
-			await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+			await client.query(
+				write ? "BEGIN" : "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY",
+			);
 			await client.query(`SET LOCAL search_path TO "${schema}"`);
 			const authorization = await authorize(
 				client,
@@ -169,6 +171,25 @@ export function createOwnedProjectSCIMReadAuthority(options: {
 						value: await select(client, authorization.connection),
 					}
 				: authorization;
+			if (authorization.ok && write) {
+				const { connectionId, provisioningDomainId } = authorization.connection;
+				const fenced = await client.query(
+					`UPDATE "${schema}"."scimConnectionBinding" SET "decommissionRevision" = "decommissionRevision" + 1
+					 WHERE "connectionKey" = $1 AND "connectionId" = $2 AND "provisioningDomainId" = $3 AND "decommissionStatus" = 'active'`,
+					[
+						ownedSCIMScopedKey(["scim-connection", connectionId]),
+						connectionId,
+						provisioningDomainId,
+					],
+				);
+				if (!fenced.rowCount) {
+					await client.query("ROLLBACK");
+					return deny(
+						409,
+						"SCIM connection lifecycle changed concurrently; retry the request",
+					);
+				}
+			}
 			await client.query("COMMIT");
 			return result;
 		} catch (error) {
@@ -181,5 +202,18 @@ export function createOwnedProjectSCIMReadAuthority(options: {
 		} finally {
 			client.release(discard);
 		}
-	};
+	}
+	return transaction;
+}
+
+/** Runs a SCIM read with an established managed bearer binding in one read-only snapshot. */
+export function createOwnedProjectSCIMReadAuthority(options: AuthorityOptions) {
+	return createAuthority(options, false);
+}
+
+/** Holds the managed credential and fences the active connection before committing database-only writes. */
+export function createOwnedProjectSCIMWriteAuthority(
+	options: AuthorityOptions,
+) {
+	return createAuthority(options, true);
 }

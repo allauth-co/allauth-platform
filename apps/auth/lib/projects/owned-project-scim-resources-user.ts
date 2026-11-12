@@ -98,7 +98,7 @@ const emails = z
 	)
 	.refine(uniqueTypes);
 
-const attributes = z
+export const ownedSCIMStoredUserAttributes = z
 	.object({
 		schemas: z
 			.array(z.enum([scimUserSchema, scimEnterpriseUserSchema]))
@@ -164,7 +164,7 @@ export function readOwnedSCIMUserAttributes(row: {
 					},
 					emails: JSON.parse(row.serializedEmails),
 				};
-		const parsed = attributes.safeParse(input);
+		const parsed = ownedSCIMStoredUserAttributes.safeParse(input);
 		if (parsed.success) {
 			const { enterprise: extension, ...core } = parsed.data;
 			return {

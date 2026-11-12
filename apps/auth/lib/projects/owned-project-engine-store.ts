@@ -269,7 +269,7 @@ export function createProjectEngineStore(database: Pool, schemaName: string) {
 			if (!ids.length) return { ids, targets: [] };
 			if (path === "/sign-out") {
 				const upstream = await client.query(
-					`SELECT 1 FROM "account" WHERE "providerId" NOT IN ('credential', 'allauth', 'google')
+					`SELECT 1 FROM "account" WHERE "providerId" NOT IN ('credential', 'allauth', 'google', 'microsoft', 'apple')
 					 AND "userId" = ANY($1::text[]) LIMIT 1`,
 					[selected.rows.map((row) => row.userId)],
 				);

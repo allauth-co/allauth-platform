@@ -12,6 +12,12 @@ import {
 	fetchPublicSsoEndpoint,
 	ssoHttpsUrl,
 } from "./owned-project-sso-network";
+import type { ProjectSsoKeyResolver } from "./owned-project-sso-oidc";
+import {
+	projectOidcClientAuth,
+	resolveProjectOidc,
+	ssoScope,
+} from "./owned-project-sso-oidc";
 import type {
 	SsoIdentity,
 	SsoProvider,
@@ -28,11 +34,6 @@ import { projectOrigin, projectSlug } from "./validation";
 
 const unsafeURL = /[\\\u0000-\u0020\u007f]/;
 const defaultScopes = ["openid", "email", "profile", "offline_access"];
-const scope = z
-	.string()
-	.min(1)
-	.max(256)
-	.regex(/^[\x21\x23-\x5b\x5d-\x7e]+$/);
 const algorithms = [
 	"RS256",
 	"RS384",
@@ -57,33 +58,10 @@ export const ownedProjectSsoInput = z.strictObject({
 	newUserCallbackURL: z.string().max(2048).optional(),
 	errorCallbackURL: z.string().max(2048).optional(),
 	loginHint: z.string().max(320).optional(),
-	scopes: z.array(scope).max(24).optional(),
+	scopes: z.array(ssoScope).max(24).optional(),
 	requestSignUp: z.boolean().optional(),
 });
 export type OwnedProjectSsoInput = z.infer<typeof ownedProjectSsoInput>;
-
-const configSchema = z.object({
-	issuer: z.string().max(2048).optional(),
-	clientId: z.string().min(1).max(512),
-	clientSecret: z.string().min(1).max(4096),
-	authorizationEndpoint: z.string(),
-	tokenEndpoint: z.string(),
-	jwksEndpoint: z.string(),
-	userInfoEndpoint: z.string().optional(),
-	tokenEndpointAuthentication: z
-		.enum(["client_secret_post", "client_secret_basic"])
-		.optional(),
-	pkce: z.boolean().optional(),
-	scopes: z.array(scope).max(24).optional(),
-	overrideUserInfo: z.boolean().optional(),
-	mapping: z
-		.object({
-			email: z.string().min(1).max(128).optional(),
-			name: z.string().min(1).max(128).optional(),
-			image: z.string().min(1).max(128).optional(),
-		})
-		.optional(),
-});
 
 export interface OwnedProjectSsoOptions {
 	database: Pool;
@@ -109,27 +87,7 @@ export interface OwnedProjectSsoOptions {
 	): Promise<Response>;
 	/** Deployment-owned transport for approved IdPs, or an isolated fixture network. */
 	fetch?: SsoFetch;
-}
-
-function configuration(provider: SsoProvider) {
-	const config = configSchema.parse(provider.oidcConfig);
-	const issuer = ssoHttpsUrl(provider.issuer);
-	if (
-		issuer.search ||
-		(config.issuer && config.issuer !== provider.issuer) ||
-		config.overrideUserInfo
-	)
-		throw new Error("Unsupported enterprise identity configuration.");
-	const metadata: oauth.AuthorizationServer = {
-		issuer: provider.issuer,
-		authorization_endpoint: ssoHttpsUrl(config.authorizationEndpoint).href,
-		token_endpoint: ssoHttpsUrl(config.tokenEndpoint).href,
-		jwks_uri: ssoHttpsUrl(config.jwksEndpoint).href,
-		...(config.userInfoEndpoint
-			? { userinfo_endpoint: ssoHttpsUrl(config.userInfoEndpoint).href }
-			: {}),
-	};
-	return { config, metadata };
+	resolvePrivateKey?: ProjectSsoKeyResolver;
 }
 
 function tokenExpiry(value: unknown) {
@@ -300,11 +258,15 @@ export function createOwnedProjectSso(options: OwnedProjectSsoOptions) {
 				404,
 			);
 		try {
-			const { config, metadata } = configuration(provider);
+			const { config, metadata } = await resolveProjectOidc(
+				provider,
+				network,
+				origins,
+			);
 			const state = oauth.generateRandomState();
 			const verifier = oauth.generateRandomCodeVerifier();
 			const nonce = oauth.generateRandomNonce();
-			const authorization = new URL(metadata.authorization_endpoint!);
+			const authorization = new URL(metadata.authorization_endpoint);
 			const scopes = body.scopes ?? config.scopes ?? defaultScopes;
 			if (!scopes.includes("openid")) throw new Error("OpenID scope required.");
 			for (const [name, value] of Object.entries({
@@ -361,13 +323,15 @@ export function createOwnedProjectSso(options: OwnedProjectSsoOptions) {
 		flow: SsoState,
 		provider: SsoProvider,
 	): Promise<SsoIdentity> {
-		const { config, metadata } = configuration(provider);
+		const resolved = await resolveProjectOidc(provider, network, origins);
+		const { config, metadata } = resolved;
 		const client: oauth.Client = { client_id: config.clientId };
 		const query = oauth.validateAuthResponse(metadata, client, url, state);
-		const auth =
-			config.tokenEndpointAuthentication === "client_secret_post"
-				? oauth.ClientSecretPost(config.clientSecret)
-				: oauth.ClientSecretBasic(config.clientSecret);
+		const auth = await projectOidcClientAuth(
+			resolved,
+			provider.providerId,
+			options.resolvePrivateKey,
+		);
 		const requestOptions = {
 			[oauth.customFetch]: network,
 			signal: AbortSignal.timeout(8000),
@@ -392,7 +356,7 @@ export function createOwnedProjectSso(options: OwnedProjectSsoOptions) {
 		);
 		if (!tokens.id_token || tokens.token_type !== "bearer")
 			throw new Error("Enterprise identity token is missing.");
-		const jwksURI = metadata.jwks_uri!;
+		const jwksURI = metadata.jwks_uri;
 		let jwks = resolvers.get(jwksURI);
 		if (!jwks) {
 			if (resolvers.size >= 16) resolvers.clear();

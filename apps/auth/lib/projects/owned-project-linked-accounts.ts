@@ -4,7 +4,7 @@ import type { ProjectUser } from "./owned-project-engine-store";
 import { createProjectEngineStore } from "./owned-project-engine-store";
 import { checkedProjectSchema } from "./validation";
 
-const supportedProvider = z.enum(["allauth", "google"]);
+const supportedProvider = z.enum(["allauth", "google", "microsoft", "apple"]);
 const oneDay = 86_400_000;
 
 export const ownedProjectOAuthUnlinkInput = z
@@ -149,7 +149,7 @@ export function createOwnedProjectLinkedAccounts(
 			const userId = authority.user.id;
 			const matches = await client.query<{ id: string }>(
 				`SELECT id FROM "${schema}"."account" WHERE "userId" = $1
-				AND "providerId" IN ('allauth', 'google') AND (
+				AND "providerId" IN ('allauth', 'google', 'microsoft', 'apple') AND (
 					($2::text IS NULL AND id = $3) OR
 					("providerId" = $2 AND ($3::text IS NULL OR id = $3 OR "accountId" = $3))
 				) ORDER BY id LIMIT 2 FOR UPDATE`,

@@ -7,8 +7,13 @@ import { createProjectEngineStore } from "./owned-project-engine-store";
 import { checkedProjectSchema } from "./validation";
 
 export const oauthStateAge = 600;
-const providerId = z.enum(["allauth", "google"]);
-export type ProjectOAuthProvider = z.infer<typeof providerId>;
+export const projectOAuthProvider = z.enum([
+	"allauth",
+	"google",
+	"microsoft",
+	"apple",
+]);
+export type ProjectOAuthProvider = z.infer<typeof projectOAuthProvider>;
 const stateData = z.object({
 	callbackURL: z.string().max(2048),
 	newUserURL: z.string().max(2048).optional(),
@@ -26,7 +31,7 @@ const stateData = z.object({
 		.optional(),
 	serverContext: z
 		.object({
-			ownedProjectProvider: providerId.optional(),
+			ownedProjectProvider: projectOAuthProvider.optional(),
 			linkedSessionId: z.string().min(1).max(512).optional(),
 		})
 		.optional(),
@@ -39,7 +44,7 @@ type LinkAuthority = NonNullable<ProjectOAuthState["link"]> & {
 export type ProjectOAuthIdentity = {
 	provider: ProjectOAuthProvider;
 	subject: string;
-	email: string;
+	email: string | undefined;
 	emailVerified: boolean;
 	name: string;
 	image?: string;
@@ -153,10 +158,20 @@ export function createProjectOAuthStore(
 		);
 		if (binding.rows.length > 1) return null;
 		const account = binding.rows[0];
+		// Apple can omit email after consent. Use only the persisted owner of this exact verified subject.
+		const persistedOwner =
+			!identity.email && identity.provider === "apple" && account
+				? await realm.lockUser(client, account.userId)
+				: null;
+		const email = (identity.email ?? persistedOwner?.email)?.toLowerCase();
+		if (!email) return null;
+		const emailVerified = identity.email
+			? identity.emailVerified
+			: persistedOwner?.emailVerified === true;
 		if (
 			link &&
-			(!identity.emailVerified ||
-				link.email.toLowerCase() !== identity.email ||
+			(!emailVerified ||
+				link.email.toLowerCase() !== email ||
 				(account && account.userId !== link.userId))
 		)
 			return null;
@@ -165,14 +180,14 @@ export function createProjectOAuthStore(
 		if (!userId) {
 			const existing = await client.query<{ id: string }>(
 				`SELECT id FROM "${schema}"."user" WHERE email = $1`,
-				[identity.email],
+				[email],
 			);
 			userId = existing.rows[0]?.id;
 		}
 		if (!userId) {
 			if (
 				!policy.signUpEnabled ||
-				(policy.requireEmailVerification && !identity.emailVerified)
+				(policy.requireEmailVerification && !emailVerified)
 			)
 				return null;
 			const created = await client.query<{ id: string }>(
@@ -180,10 +195,10 @@ export function createProjectOAuthStore(
 				VALUES ($1,$2,$3,$4,$5,FALSE,FALSE) ON CONFLICT (email) DO NOTHING RETURNING id`,
 				[
 					randomUUID(),
-					identity.email,
+					email,
 					identity.name,
 					identity.image ?? null,
-					identity.emailVerified,
+					emailVerified,
 				],
 			);
 			userId = created.rows[0]?.id;
@@ -191,7 +206,7 @@ export function createProjectOAuthStore(
 			if (!userId) {
 				const match = await client.query<{ id: string }>(
 					`SELECT id FROM "${schema}"."user" WHERE email = $1`,
-					[identity.email],
+					[email],
 				);
 				userId = match.rows[0]?.id;
 			}
@@ -208,7 +223,7 @@ export function createProjectOAuthStore(
 			return null;
 		if (
 			link &&
-			(user.email.toLowerCase() !== identity.email ||
+			(user.email.toLowerCase() !== email ||
 				!(await realm.lockSession(client, link.sessionToken, user.id, false)))
 		)
 			return null;
@@ -221,8 +236,8 @@ export function createProjectOAuthStore(
 			if (
 				!link &&
 				!user.emailVerified &&
-				identity.emailVerified &&
-				user.email === identity.email
+				emailVerified &&
+				user.email === email
 			) {
 				await client.query(
 					`UPDATE "${schema}"."user" SET "emailVerified" = TRUE, "updatedAt" = statement_timestamp() WHERE id = $1`,
@@ -242,9 +257,7 @@ export function createProjectOAuthStore(
 		} else if (
 			!link &&
 			!registered &&
-			(user.email !== identity.email ||
-				!user.emailVerified ||
-				!identity.emailVerified)
+			(user.email !== email || !user.emailVerified || !emailVerified)
 		) {
 			// Project account linking has no trusted-provider bypass. Both addresses must be verified.
 			return null;
