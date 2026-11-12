@@ -1039,17 +1039,25 @@ describe.skipIf(!existsSync(fixturePath))(
 					)
 				).status,
 			).toBe(403);
-			const finish = () =>
+			const finish = (applicationAuditId = body.applicationAuditId) =>
 				handler(
 					request(path, {
 						caller: applicationOrigin,
 						cookie: fixture.original.cookie,
-						body,
+						body: { ...body, applicationAuditId },
 					}),
 				);
-			const ended = await Promise.all([finish(), finish()]);
-			for (const response of ended)
+			const [first, second, unrelated] = await Promise.all([
+				finish(),
+				finish(),
+				finish(randomUUID()),
+			]);
+			for (const response of [first, second]) {
+				expect(response.status).toBe(200);
 				expect(await response.json()).toEqual({ success: true, ...body });
+			}
+			expect(unrelated.status).toBe(403);
+			expect(await (await finish()).json()).toEqual({ success: true, ...body });
 			const events = await database.query(
 				`SELECT metadata FROM "${schema}"."allauthEvent" WHERE type = 'session.impersonation-stopped' AND "targetId" = $1`,
 				[fixture.sessionId],

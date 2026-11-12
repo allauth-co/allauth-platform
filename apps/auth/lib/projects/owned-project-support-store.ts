@@ -81,15 +81,16 @@ export function projectSupportStore(
 		return { ...target, id, token, expiresAt, impersonatedBy: actorId };
 	}
 
-	async function verification(identifier: string) {
+	async function verification(...identifiers: string[]) {
 		const result = await client.query<{
 			id: string;
 			value: string;
 			expiresAt: Date;
 		}>(
 			`SELECT id, value, "expiresAt" FROM "verification"
-			 WHERE identifier = $1 ORDER BY "createdAt" DESC, id LIMIT 1`,
-			[identifier],
+			 WHERE identifier = ANY($1::text[])
+			 ORDER BY array_position($1::text[], identifier), "createdAt" DESC, id LIMIT 1`,
+			[identifiers],
 		);
 		return result.rows[0] ?? null;
 	}

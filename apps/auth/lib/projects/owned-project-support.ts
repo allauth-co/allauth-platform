@@ -1109,9 +1109,12 @@ export function createOwnedProjectSupportHttp(
 			? await realm.session(token, "token", { lock: "read" })
 			: null;
 		if (!ordinaryActor(actor)) return forbidden();
-		const stored =
-			(await realm.verification(supportEndedKey(input.sessionId))) ??
-			(await realm.verification(supportSessionKey(input.sessionId)));
+		// A concurrent revoke replaces the active binding with the ended marker.
+		// Read both together so the request sees one authorization snapshot.
+		const stored = await realm.verification(
+			supportEndedKey(input.sessionId),
+			supportSessionKey(input.sessionId),
+		);
 		if (!stored || stored.expiresAt.getTime() <= Date.now()) {
 			if (!applicationProof(await options.configuration(), request, verified))
 				return forbidden();
