@@ -264,9 +264,18 @@ export function ownedSCIMResponse(body: object, status = 200): Response {
 	});
 }
 
-export function ownedSCIMError(status: number, detail: string): Response {
+export function ownedSCIMError(
+	status: number,
+	detail: string,
+	scimType?: "invalidFilter" | "invalidValue",
+): Response {
 	return ownedSCIMResponse(
-		{ schemas: [`${messagePrefix}Error`], status: String(status), detail },
+		{
+			schemas: [`${messagePrefix}Error`],
+			status: String(status),
+			detail,
+			...(scimType ? { scimType } : {}),
+		},
 		status,
 	);
 }
@@ -293,8 +302,8 @@ function decodedIdentifier(value: string) {
 	}
 }
 
-/** Serves the public SCIM discovery contract for a server-selected project auth URL. */
-export function createOwnedProjectSCIMDiscovery(baseURL: string) {
+/** Builds SCIM route and metadata URLs from the server-selected auth URL. */
+export function ownedSCIMURLs(baseURL: string) {
 	const url = new URL(baseURL);
 	if (
 		!/^https?:$/.test(url.protocol) ||
@@ -308,6 +317,12 @@ export function createOwnedProjectSCIMDiscovery(baseURL: string) {
 	const prefix = `${basePath}${discoveryPath}`;
 	const location = (path: string) =>
 		new URL(path.replace(/^\/+/, ""), `${url.origin}${basePath}/`).toString();
+	return { prefix, location };
+}
+
+/** Serves the public SCIM discovery contract for a server-selected project auth URL. */
+export function createOwnedProjectSCIMDiscovery(baseURL: string) {
+	const { prefix, location } = ownedSCIMURLs(baseURL);
 	const describe = <T extends { meta: { location: string } }>(resource: T) => ({
 		...resource,
 		meta: { ...resource.meta, location: location(resource.meta.location) },

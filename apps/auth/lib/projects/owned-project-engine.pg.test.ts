@@ -6,8 +6,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { symmetricDecrypt, symmetricEncrypt } from "better-auth/crypto";
+import { jwt, multiSession } from "better-auth/plugins";
 import { getTestInstance } from "better-auth/test";
 import { hash } from "bcryptjs";
+import { createLocalJWKSet, type JSONWebKeySet, jwtVerify } from "jose";
 import { Kysely, PostgresDialect } from "kysely";
 import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
@@ -20,8 +22,10 @@ import { defaultSecurityPolicy, securitySubject } from "../control/security-poli
 import { readLegacySessionCookie } from "./legacy-session-cookie";
 import { productionTwoFactor } from "../mfa";
 import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
+import { createOwnedProjectBackchannelLogout } from "./owned-project-backchannel-logout";
 import { createOwnedEmailVerification } from "./owned-email-verification";
 import { createOwnedProjectEngine } from "./owned-project-engine";
+import { afterOwnedProjectCommit, createProjectEngineStore } from "./owned-project-engine-store";
 import { projectProxySecret, verifiedProjectRequest } from "./proxy";
 import type { Project } from "./registry";
 import { readProjectSessionPrincipal } from "./session-principal";
@@ -59,6 +63,7 @@ describe.skipIf(!existsSync(fixturePath))("isolated PostgreSQL owned project eng
 	let nativeGetSession: (headers: Headers) => Promise<{ user: { id: string } } | null>;
 	let nativeRequest: (request: Request) => Promise<Response>;
 	let nativeTotp: (secret: string) => Promise<string>;
+	let nativeJwks: () => Promise<JSONWebKeySet>;
 	let fixtureCreated = false;
 
 	beforeAll(async () => {
@@ -104,13 +109,19 @@ describe.skipIf(!existsSync(fixturePath))("isolated PostgreSQL owned project eng
 			secret: signingSecret,
 			session: { cookieCache: { enabled: false } },
 			advanced: { cookiePrefix: `allauth_project_${slug}` },
-			plugins: [productionTwoFactor(origin), { id: "fixture-control-security", hooks: nativeSecurity.hooks }],
+			plugins: [
+				productionTwoFactor(origin),
+				{ id: "fixture-control-security", hooks: nativeSecurity.hooks },
+				jwt({ jwt: { issuer: `${origin}${basePath}` }, jwks: { keyPairConfig: { alg: "RS256" } } }),
+				multiSession({ maximumSessions: 5 }),
+			],
 			emailAndPassword: { enabled: true, password: clerkCompatiblePasswords },
 			logger: { disabled: true },
 		}, { disableTestUser: true });
 		nativeGetSession = (headers) => auth.api.getSession({ headers, query: { disableRefresh: true } });
 		nativeRequest = auth.handler;
 		nativeTotp = async (secret) => (await auth.api.generateTOTP({ body: { secret } })).code;
+		nativeJwks = async () => auth.api.getJwks();
 	});
 
 	afterAll(async () => {
@@ -416,6 +427,132 @@ describe.skipIf(!existsSync(fixturePath))("isolated PostgreSQL owned project eng
 		expect((await owner.dispatch(request("/sso/sign-in", { email: "person@example.test" }))).status).toBe(501);
 	});
 
+	it("sends one logout token per affected app using the existing project signing key after commit", async () => {
+		const id = await seed("backchannel-logout-owner@fixture.example");
+		const live = await legacySession(id, 1200);
+		const clientId = "fixture-connected-app";
+		const endpoint = "https://client.fixture.example/backchannel";
+		const other = await seed("backchannel-other-owner@fixture.example");
+		const unrelated = await legacySession(other, 1200);
+		const clients = [
+			{ id: clientId, url: endpoint, disabled: false, session: live, user: id },
+			{ id: "fixture-disabled-app", url: endpoint, disabled: true, session: live, user: id },
+			{ id: "fixture-non-public-app", url: "https://127.0.0.1/backchannel", disabled: false, session: live, user: id },
+			{ id: "fixture-unrelated-app", url: endpoint, disabled: false, session: unrelated, user: other },
+		];
+		for (const app of clients) {
+			await database.query(
+				`INSERT INTO "${schema}"."oauthClient"(id,"clientId","redirectUris","backchannelLogoutUri",disabled)
+				 VALUES ($1,$2,'[]',$3,$4)`, [randomUUID(), app.id, app.url, app.disabled],
+			);
+			await database.query(
+				`INSERT INTO "${schema}"."oauthRefreshToken"(id,token,"clientId","userId","sessionId","expiresAt","createdAt",scopes)
+				 VALUES ($1,$2,$3,$4,$5,statement_timestamp() + interval '1 hour',statement_timestamp(),'["openid"]')`,
+				[randomUUID(), randomUUID(), app.id, app.user, app.session.id],
+			);
+			await database.query(
+				`INSERT INTO "${schema}"."oauthAccessToken"(id,token,"clientId","userId","sessionId","expiresAt","createdAt",scopes)
+				 VALUES ($1,$2,$3,$4,$5,statement_timestamp() + interval '5 minutes',statement_timestamp(),'["openid"]')`,
+				[randomUUID(), randomUUID(), app.id, app.user, app.session.id],
+			);
+		}
+		const published = await nativeJwks();
+		const deferred: (() => Promise<void>)[] = [];
+		const deliveries: { url: string; jwt: string }[] = [];
+		const outcomes: { clientId: string; outcome: string }[] = [];
+		const owner = createOwnedProjectEngine({
+			database, project: { slug, schemaName: schema }, baseURL: origin, basePath, trustedOrigins: [],
+			signingSecret, policy: defaultAuthPolicy, trustedIP: () => "203.0.113.199",
+			backchannelLogout: {
+				defer: (work) => { deferred.push(work); },
+				observe: (result) => { outcomes.push(result); },
+				async post(url, body) {
+					expect(await nativeGetSession(new Headers({ cookie: live.cookie }))).toBeNull();
+					deliveries.push({ url: url.href, jwt: body.get("logout_token") ?? "" });
+					return 204;
+				},
+			},
+		});
+		const response = await owner.dispatch(request("/sign-out", {}, { cookie: live.cookie }));
+		expect(await response.json()).toEqual({ success: true });
+		expect(deliveries).toHaveLength(0);
+		expect(deferred).toHaveLength(1);
+		await deferred[0]();
+		expect(deliveries).toHaveLength(1);
+		expect(deliveries[0].url).toBe(endpoint);
+		const { payload, protectedHeader } = await jwtVerify(deliveries[0].jwt, createLocalJWKSet(published), {
+			issuer: `${origin}${basePath}`, audience: clientId, typ: "logout+jwt",
+		});
+		expect(published.keys.some(({ kid }) => kid === protectedHeader.kid)).toBe(true);
+		expect(payload).toMatchObject({
+			sub: id, sid: live.id, jti: expect.any(String),
+			events: { "http://schemas.openid.net/event/backchannel-logout": {} },
+		});
+		expect(payload.exp! - payload.iat!).toBe(120);
+		expect(payload).not.toHaveProperty("nonce");
+		expect(outcomes).toEqual(expect.arrayContaining([
+			{ clientId, outcome: "delivered" },
+			{ clientId: "fixture-non-public-app", outcome: "failed" },
+		]));
+		expect(outcomes).toHaveLength(2);
+		expect(await nativeGetSession(new Headers({ cookie: unrelated.cookie }))).toMatchObject({ user: { id: other } });
+		const repeated = await owner.dispatch(request("/sign-out", {}, { cookie: live.cookie }));
+		expect(repeated.status).toBe(200);
+		expect(deferred).toHaveLength(1);
+	});
+
+	it("creates one legacy-readable project signing key when concurrent logout notices need a new key", async () => {
+		const audience = "fixture-new-key-client";
+		const issuer = `${origin}/api/auth`;
+		const published: string[] = [];
+		const deliver = createOwnedProjectBackchannelLogout({
+			database, schemaName: otherSchema, issuer, keys: { secret: signingSecret },
+			async post(_url, body) {
+				published.push(body.get("logout_token") ?? "");
+				return 200;
+			},
+		});
+		const targets = [randomUUID(), randomUUID()].map((sessionId) => ({
+			clientId: audience, sessionId, userId: "fixture-user", url: "https://client.fixture.example/logout",
+		}));
+		await Promise.all(targets.map((target) => deliver([target])));
+		expect(published).toHaveLength(2);
+		const keys = await database.query<{ id: string; publicKey: string; privateKey: string; alg: string }>(
+			`SELECT id, "publicKey", "privateKey", alg FROM "${otherSchema}"."jwks"`,
+		);
+		expect(keys.rows).toHaveLength(1);
+		const key = keys.rows[0];
+		const oldPrivate = JSON.parse(await symmetricDecrypt({ key: signingSecret, data: JSON.parse(key.privateKey) }));
+		const publicKey = { ...JSON.parse(key.publicKey), alg: key.alg, kid: key.id };
+		expect(oldPrivate).toMatchObject({ kty: "RSA", n: publicKey.n, d: expect.any(String) });
+		const verified = await Promise.all(published.map((token) =>
+			jwtVerify(token, createLocalJWKSet({ keys: [publicKey] }), { issuer, audience, typ: "logout+jwt" }),
+		));
+		expect(verified.map(({ payload }) => payload.sid)).toEqual(expect.arrayContaining(targets.map((target) => target.sessionId)));
+		expect(new Set(verified.map(({ payload }) => payload.jti)).size).toBe(2);
+	});
+
+	it("keeps the old session and suppresses logout effects if its replacement rolls back", async () => {
+		const id = await seed("rollback-browser-session@fixture.example");
+		const active = await legacySession(id, 1200);
+		const store = createProjectEngineStore(database, schema);
+		const effect = vi.fn();
+		const aborted = new Error("Isolated replacement failure");
+		await expect(store.transaction(async (client) => {
+			expect((await store.revoke({ tokens: [active.token] }, "/sign-in/email", true, client))?.ids).toEqual([active.id]);
+			afterOwnedProjectCommit(client, effect);
+			throw aborted;
+		})).rejects.toBe(aborted);
+		expect(effect).not.toHaveBeenCalled();
+		expect(await nativeGetSession(new Headers({ cookie: active.cookie }))).toMatchObject({ user: { id } });
+		await store.transaction(async (client) => {
+			expect((await store.revoke({ tokens: [active.token] }, "/sign-out", true, client))?.ids).toEqual([active.id]);
+			afterOwnedProjectCommit(client, effect);
+		});
+		expect(effect).toHaveBeenCalledOnce();
+		expect(await nativeGetSession(new Headers({ cookie: active.cookie }))).toBeNull();
+	});
+
 	it("revokes the browser grants on sign-out and retains offline refresh authority", async () => {
 		const userId = await seed("offline-grant-owner@fixture.example");
 		const active = await legacySession(userId, 1200);
@@ -460,6 +597,62 @@ describe.skipIf(!existsSync(fixturePath))("isolated PostgreSQL owned project eng
 		]));
 		const accessToken = await database.query(`SELECT revoked, "sessionId" FROM "${schema}"."oauthAccessToken" WHERE id = $1`, [access]);
 		expect(accessToken.rows).toEqual([{ revoked: expect.any(Date), sessionId: null }]);
+	});
+
+	it("switches, replaces and revokes browser-owned accounts across engines", async () => {
+		const emails = ["switch-legacy-one@fixture.example", "switch-legacy-two@fixture.example", "switch-owned@fixture.example"];
+		const users = await Promise.all(emails.map((email) => seed(email)));
+		const jar = new Map<string, string>();
+		const headers = () => ({ cookie: [...jar.values()].join("; ") });
+		function storeCookies(response: Response) {
+			for (const value of response.headers.getSetCookie()) {
+				const pair = value.split(";", 1)[0];
+				const name = pair.split("=", 1)[0];
+				if (/;\s*Max-Age=0(?:;|$)/i.test(value)) jar.delete(name);
+				else jar.set(name, pair);
+			}
+		}
+		for (const email of emails.slice(0, 2)) {
+			const signedIn = await nativeRequest(request("/sign-in/email", { email, password }, headers()));
+			expect(signedIn.status).toBe(200);
+			storeCookies(signedIn);
+		}
+		const owner = engine(schema, "203.0.113.200");
+		const readList = async () => {
+			const response = await owner.dispatch(request("/multi-session/list-device-sessions", undefined, headers()));
+			expect(response.status).toBe(200);
+			return response.json() as Promise<{ user: { id: string }; session: { token: string } }[]>;
+		};
+		const first = await readList();
+		expect(first.map(({ user }) => user.id)).toEqual(expect.arrayContaining(users.slice(0, 2)));
+		const original = first.find(({ user }) => user.id === users[0])!.session.token;
+		const selected = await owner.dispatch(request("/multi-session/set-active", { sessionToken: original }, headers()));
+		expect(selected.status).toBe(200);
+		storeCookies(selected);
+		expect(await nativeGetSession(new Headers(headers()))).toMatchObject({ user: { id: users[0] } });
+		const added = await owner.dispatch(request("/sign-in/email", { email: emails[2], password }, headers()));
+		expect(added.status).toBe(200);
+		storeCookies(added);
+		const list = await readList();
+		expect(list.map(({ user }) => user.id)).toEqual(expect.arrayContaining(users));
+		const candidateToken = list.find(({ user }) => user.id === users[2])!.session.token;
+		const rollbackSwitch = await nativeRequest(request("/multi-session/set-active", { sessionToken: candidateToken }, headers()));
+		expect(rollbackSwitch.status).toBe(200);
+		storeCookies(rollbackSwitch);
+		const revoke = await owner.dispatch(request("/multi-session/revoke", { sessionToken: candidateToken }, headers()));
+		expect(await revoke.json()).toEqual({ status: true });
+		storeCookies(revoke);
+		expect((await readList()).map(({ user }) => user.id)).toEqual(expect.arrayContaining(users.slice(0, 2)));
+		expect((await readList()).some(({ user }) => user.id === users[2])).toBe(false);
+		const oldOriginalCookie = jar.get(`${cookieName}_multi-${original.toLowerCase()}`);
+		expect(oldOriginalCookie).toBeDefined();
+		const replaced = await owner.dispatch(request("/sign-in/email", { email: emails[0], password }, headers()));
+		expect(replaced.status).toBe(200);
+		storeCookies(replaced);
+		const remaining = await readList();
+		expect(remaining).toHaveLength(2);
+		expect(remaining.find(({ user }) => user.id === users[0])!.session.token).not.toBe(original);
+		expect(await nativeGetSession(new Headers({ cookie: `${cookieName}=${oldOriginalCookie!.split("=").slice(1).join("=")}` }))).toBeNull();
 	});
 
 	it("keeps failure counters readable when switching in either direction", async () => {

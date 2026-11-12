@@ -77,7 +77,9 @@ jobs:
           lib/projects/owned-project-email-sign-in.pg.test.ts lib/projects/owned-project-oauth.pg.test.ts
           lib/projects/owned-project-organization.pg.test.ts lib/control/security.test.ts
           lib/projects/owned-project-enterprise-catalog.pg.test.ts
-          lib/projects/owned-project-scim.pg.test.ts
+          lib/projects/owned-project-scim.pg.test.ts lib/projects/owned-project-scim-resources.pg.test.ts
+          lib/projects/owned-project-sso.pg.test.ts lib/projects/owned-project-https.test.ts
+          lib/projects/owned-project-support.pg.test.ts lib/projects/support-plugin.test.ts
           lib/projects/passkey-store.pg.test.ts
       - name: Test billing, platform administration, self-hosting and public pages
         run: >-

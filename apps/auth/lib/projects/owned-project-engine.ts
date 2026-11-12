@@ -15,8 +15,13 @@ import { createOwnedMfaEnrollment } from "./owned-mfa-enrollment";
 import { createOwnedProjectPasskeyHttp } from "./owned-passkey-http";
 import { createOwnedRecoveryHttp } from "./owned-recovery-http";
 import { createOwnedSignUpHttp } from "./owned-sign-up";
+import {
+	createOwnedProjectBackchannelLogout,
+	type ProjectBackchannelTarget,
+} from "./owned-project-backchannel-logout";
 import type { ProjectSession, ProjectUser } from "./owned-project-engine-store";
 import {
+	afterOwnedProjectCommit,
 	createProjectEngineStore,
 	projectUserResponse,
 } from "./owned-project-engine-store";
@@ -34,6 +39,17 @@ import {
 	createOwnedProjectOrganizationHttp,
 	type OwnedProjectOrganizationOptions,
 } from "./owned-project-organization";
+import { createOwnedProjectSCIMDiscovery } from "./owned-project-scim-discovery";
+import { createOwnedProjectSCIMResources } from "./owned-project-scim-resources";
+import {
+	createOwnedProjectSso,
+	ownedProjectSsoInput,
+	type OwnedProjectSsoOptions,
+} from "./owned-project-sso";
+import {
+	createOwnedProjectSupportHttp,
+	type OwnedProjectSupportOptions,
+} from "./owned-project-support";
 import {
 	createOwnedProjectSecurity,
 	projectSecurityBlockedCode,
@@ -61,6 +77,9 @@ const usernameInput = z
 	})
 	.strict();
 const sessionIdInput = z.object({ id: z.string().min(1).max(160) }).strict();
+const deviceSessionInput = z.object({
+	sessionToken: z.string().regex(/^[a-z0-9_-]{1,64}$/i),
+});
 const emptyInput = z.object({}).strict();
 const maximumBodyBytes = 8192;
 const passwordLimit = { max: 20, window: 900, burst: 5 };
@@ -107,9 +126,34 @@ interface OwnedProjectEngineOptions {
 		| "authorizeLinkedAccounts"
 		| "complete"
 	>;
+	sso?: Omit<
+		OwnedProjectSsoOptions,
+		| "database"
+		| "project"
+		| "baseURL"
+		| "basePath"
+		| "trustedOrigins"
+		| "signingSecret"
+		| "signUpEnabled"
+		| "complete"
+	>;
+	scim?: { credentialHashSecret: string };
+	support?: Omit<
+		OwnedProjectSupportOptions,
+		| "database"
+		| "project"
+		| "baseURL"
+		| "signingSecret"
+		| "readBody"
+		| "revokeSession"
+	> & { projectId: string; workspaceId: string };
 	organization?: Pick<
 		OwnedProjectOrganizationOptions,
 		"membershipLimit" | "invitationEmail"
+	>;
+	backchannelLogout?: Pick<
+		Parameters<typeof createOwnedProjectBackchannelLogout>[0],
+		"post" | "defer" | "observe"
 	>;
 	security?: {
 		requireTrustedIP?: boolean;
@@ -233,6 +277,16 @@ export function createOwnedProjectEngine(
 		options.database,
 		options.project.schemaName,
 	);
+	const backchannel =
+		options.backchannelLogout &&
+		createOwnedProjectBackchannelLogout({
+			...options.backchannelLogout,
+			database: options.database,
+			schemaName: options.project.schemaName,
+			issuer: `${origin}${options.basePath}`,
+			keys: options.oauth?.tokenKeys ??
+				options.mfaKeys ?? { secret: options.signingSecret },
+		});
 	const prefix = `${secure ? "__Secure-" : ""}allauth_project_${slug}.`;
 	const sessionCookie = `${prefix}session_token`;
 	const rememberCookie = `${prefix}dont_remember`;
@@ -258,6 +312,13 @@ export function createOwnedProjectEngine(
 	});
 	const newDevice = options.security?.newDevice;
 	const notifications = new WeakMap<Request, () => Promise<void>>();
+	const committedLogoutTargets = new WeakMap<
+		Request,
+		ProjectBackchannelTarget[]
+	>();
+	const unavailableLogout = Symbol(
+		"Existing session requires a configured logout handler",
+	);
 	const deniedMfa = Symbol("MFA sign-in denied by project security");
 	const changedMfaOwner = Symbol("MFA account no longer eligible");
 
@@ -312,8 +373,20 @@ export function createOwnedProjectEngine(
 		);
 	}
 
-	async function currentSession(headers: Headers, client?: PoolClient) {
-		const token = tokenFrom(headers);
+	function multiSessionTokens(headers: Headers) {
+		return multiCookies(headers).flatMap((name) => {
+			const token = tokenFrom(headers, name);
+			return token && name === `${multiCookiePrefix}${token.toLowerCase()}`
+				? [{ name, token }]
+				: [];
+		});
+	}
+
+	function currentSession(headers: Headers, client?: PoolClient) {
+		return eligibleSession(tokenFrom(headers), client);
+	}
+
+	async function eligibleSession(token: string | null, client?: PoolClient) {
 		const current = token
 			? await store.session(token, refreshWindow, client)
 			: null;
@@ -374,6 +447,18 @@ export function createOwnedProjectEngine(
 		);
 	}
 
+	function deliverLogoutAfterCommit(
+		client: PoolClient,
+		request: Request,
+		targets: ProjectBackchannelTarget[],
+	) {
+		if (!targets.length) return;
+		afterOwnedProjectCommit(client, () => {
+			const pending = committedLogoutTargets.get(request) ?? [];
+			committedLogoutTargets.set(request, [...pending, ...targets]);
+		});
+	}
+
 	async function createSession(
 		client: PoolClient,
 		user: ProjectUser,
@@ -382,6 +467,26 @@ export function createOwnedProjectEngine(
 		path: string,
 		prior?: ProjectSession,
 	) {
+		const headers = new Headers();
+		const existing = multiSessionTokens(request.headers);
+		const owned = [];
+		if (!prior) {
+			for (const item of existing) {
+				const previous = await store.session(item.token, refreshWindow, client);
+				if (previous?.user.id === user.id) owned.push(item);
+			}
+		}
+		if (owned.length) {
+			const removed = await store.revoke(
+				{ tokens: owned.map((item) => item.token) },
+				path,
+				Boolean(backchannel),
+				client,
+			);
+			if (!removed) throw unavailableLogout;
+			deliverLogoutAfterCommit(client, request, removed.targets);
+			for (const item of owned) writeCookie(headers, item.name, "", 0);
+		}
 		const id = randomUUID();
 		const token = btoa(
 			String.fromCharCode(...crypto.getRandomValues(new Uint8Array(24))),
@@ -401,15 +506,16 @@ export function createOwnedProjectEngine(
 		await store.record(client, "session.created", "success", path, user.id, id);
 		if (!prior)
 			await store.record(client, "auth.sign-in", "success", path, user.id, id);
-		const headers = new Headers();
 		const maxAge = rememberMe ? policy.sessionExpiresInSeconds : undefined;
 		writeCookie(headers, sessionCookie, token, maxAge);
-		writeCookie(
-			headers,
-			`${multiCookiePrefix}${token.toLowerCase()}`,
-			token,
-			maxAge,
-		);
+		if (existing.length - owned.length < 5 || prior) {
+			writeCookie(
+				headers,
+				`${multiCookiePrefix}${token.toLowerCase()}`,
+				token,
+				maxAge,
+			);
+		}
 		rememberPreference(headers, rememberMe);
 		if (!prior && user.emailVerified) {
 			const name = `${prefix}control_device`;
@@ -422,21 +528,23 @@ export function createOwnedProjectEngine(
 			writeCookie(headers, name, known.token, 180 * 86400);
 			if (known.notify && newDevice) {
 				const { id, name, email } = user;
-				notifications.set(request, async () => {
-					try {
-						await newDevice.notify(
-							{ id, name, email },
-							{
-								ipAddress: security.trustedIP(request) ?? undefined,
-								userAgent: request.headers.get("user-agent")?.slice(0, 512),
-							},
-						);
-					} catch {
-						await store.transaction((client) =>
-							security.notificationFailed(client, request, id),
-						);
-					}
-				});
+				afterOwnedProjectCommit(client, () =>
+					notifications.set(request, async () => {
+						try {
+							await newDevice.notify(
+								{ id, name, email },
+								{
+									ipAddress: security.trustedIP(request) ?? undefined,
+									userAgent: request.headers.get("user-agent")?.slice(0, 512),
+								},
+							);
+						} catch {
+							await store.transaction((client) =>
+								security.notificationFailed(client, request, id),
+							);
+						}
+					}),
+				);
 			}
 		}
 		return { headers, session, token, user: projectUserResponse(user) };
@@ -472,9 +580,11 @@ export function createOwnedProjectEngine(
 		rememberMe: boolean,
 		path: string,
 		callback?: string,
+		enterprise?: { managed: boolean },
 	): Promise<Response> {
-		if (!activeUser(user) || user.directoryManaged) return forbidden();
-		if (!verifiedUser(user))
+		if (!activeUser(user) || (user.directoryManaged && !enterprise?.managed))
+			return forbidden();
+		if (!verifiedUser(user) && (!enterprise || policy.mfaMode === "required"))
 			return failure(403, "EMAIL_NOT_VERIFIED", "Email not verified");
 		if (policy.supportAccess?.enabled) return unsupported();
 		if (await security.denySession(client, request, user.email))
@@ -701,8 +811,7 @@ export function createOwnedProjectEngine(
 					const user = await store.lockUser(client, pending.userId);
 					if (
 						!activeUser(user) ||
-						!verifiedUser(user) ||
-						user.directoryManaged ||
+						(policy.mfaMode === "required" && !user.emailVerified) ||
 						!user.twoFactorEnabled ||
 						policy.supportAccess?.enabled
 					)
@@ -772,8 +881,6 @@ export function createOwnedProjectEngine(
 			);
 		const callback = callbackURL(body.data.callbackURL, request);
 		if (callback === null) return forbidden();
-		if (multiCookies(request.headers).length > 0 || tokenFrom(request.headers))
-			return unsupported();
 
 		const login = (
 			"email" in body.data ? body.data.email : body.data.username
@@ -895,26 +1002,109 @@ export function createOwnedProjectEngine(
 		if (!emptyInput.safeParse(await requestBody(request)).success)
 			return unsupported();
 		const token = tokenFrom(request.headers);
-		const multi = multiCookies(request.headers);
-		if (multi.length > 5) return unsupported();
-		const valid = multi.flatMap((name) => {
-			const value = tokenFrom(request.headers, name);
-			return value && name === `${multiCookiePrefix}${value.toLowerCase()}`
-				? [{ name, token: value }]
-				: [];
-		});
+		const valid = multiSessionTokens(request.headers);
 		const tokens = [
 			...new Set([
 				...(token ? [token] : []),
 				...valid.map((entry) => entry.token),
 			]),
 		];
-		if (tokens.length && (await store.revoke({ tokens }, "/sign-out")) === null)
-			return unsupported();
+		if (tokens.length) {
+			const removed = await store.revoke(
+				{ tokens },
+				"/sign-out",
+				Boolean(backchannel),
+			);
+			if (!removed) return unsupported();
+			await backchannel?.(removed.targets);
+		}
 		const headers = new Headers();
 		clearSessionCookies(headers);
 		for (const { name } of valid) writeCookie(headers, name, "", 0);
 		return json({ success: true }, 200, headers);
+	}
+
+	function publicDeviceSession(
+		current: NonNullable<Awaited<ReturnType<typeof eligibleSession>>>,
+	) {
+		return {
+			session: { ...current.session, token: current.token },
+			user: projectUserResponse(current.user),
+		};
+	}
+
+	async function listDeviceSessions(request: Request) {
+		if (!trustedRequest(request.headers, false)) return forbidden();
+		const sessions = [];
+		const users = new Set<string>();
+		for (const { token } of multiSessionTokens(request.headers)) {
+			const current = await eligibleSession(token);
+			if (!current || users.has(current.user.id)) continue;
+			users.add(current.user.id);
+			sessions.push(publicDeviceSession(current));
+		}
+		return json(sessions);
+	}
+
+	function setActiveDeviceCookie(
+		headers: Headers,
+		request: Request,
+		token: string,
+	) {
+		const maxAge = tokenFrom(request.headers, rememberCookie)
+			? undefined
+			: policy.sessionExpiresInSeconds;
+		writeCookie(headers, `${prefix}session_data`, "", 0);
+		writeCookie(headers, sessionCookie, token, maxAge);
+	}
+
+	async function deviceSessionAction(request: Request, revoke: boolean) {
+		if (!trustedRequest(request.headers, true)) return forbidden();
+		const body = deviceSessionInput.safeParse(await requestBody(request));
+		if (!body.success)
+			return failure(400, "INVALID_BODY", "Supply a session token.");
+		const token = body.data.sessionToken;
+		const name = `${multiCookiePrefix}${token.toLowerCase()}`;
+		const headers = new Headers();
+		const invalid = () =>
+			failure(401, "INVALID_SESSION_TOKEN", "Invalid session token", headers);
+		if (tokenFrom(request.headers, name) !== token) return invalid();
+		if (!revoke) {
+			const current = await eligibleSession(token);
+			if (!current) {
+				writeCookie(headers, name, "", 0);
+				return invalid();
+			}
+			setActiveDeviceCookie(headers, request, token);
+			return json(publicDeviceSession(current), 200, headers);
+		}
+
+		const current = await currentSession(request.headers);
+		if (!current)
+			return failure(401, "UNAUTHORIZED", "Authentication required.");
+		const removed = await store.revoke(
+			{ tokens: [token] },
+			"/multi-session/revoke",
+			Boolean(backchannel),
+		);
+		if (!removed) return unsupported();
+		await backchannel?.(removed.targets);
+		writeCookie(headers, name, "", 0);
+		if (current.token === token) {
+			let replacement: string | undefined;
+			for (const candidate of multiSessionTokens(request.headers)) {
+				if (
+					candidate.token !== token &&
+					(await eligibleSession(candidate.token))
+				) {
+					replacement = candidate.token;
+					break;
+				}
+			}
+			if (replacement) setActiveDeviceCookie(headers, request, replacement);
+			else clearSessionCookies(headers);
+		}
+		return json({ status: true }, 200, headers);
 	}
 
 	async function listAccountSessions(headers: Headers) {
@@ -945,10 +1135,12 @@ export function createOwnedProjectEngine(
 				currentToken: current.token,
 			},
 			"/account/sessions/revoke",
+			Boolean(backchannel),
 		);
 		if (!removed) return unsupported();
-		if (removed.length === 0)
+		if (!removed.ids.length)
 			return failure(404, "NOT_FOUND", "This session no longer exists.");
+		await backchannel?.(removed.targets);
 		const responseHeaders = new Headers();
 		if (body.data.id === current.session.id)
 			clearSessionCookies(responseHeaders);
@@ -1187,6 +1379,74 @@ export function createOwnedProjectEngine(
 					: result;
 			},
 		});
+	const sso =
+		options.sso &&
+		createOwnedProjectSso({
+			...options.sso,
+			database: options.database,
+			project: options.project,
+			baseURL: origin,
+			basePath: options.basePath,
+			trustedOrigins: options.trustedOrigins,
+			signingSecret: options.signingSecret,
+			signUpEnabled: policy.signUpEnabled,
+			async complete(
+				client,
+				{ user, request, providerId, destination, managed },
+			) {
+				const result = await primaryResult(
+					client,
+					await store.lockUser(client, user.id),
+					request,
+					true,
+					`/sso/callback/${providerId}`,
+					destination,
+					{ managed },
+				);
+				return result.status === 200
+					? redirect(new Headers(result.headers), destination)
+					: result;
+			},
+		});
+	const scimDiscovery =
+		options.scim &&
+		createOwnedProjectSCIMDiscovery(`${origin}${options.basePath}`);
+	const scimResources =
+		options.scim &&
+		createOwnedProjectSCIMResources({
+			database: options.database,
+			schemaName: options.project.schemaName,
+			baseURL: `${origin}${options.basePath}`,
+			credentialHashSecret: options.scim.credentialHashSecret,
+		});
+	const support =
+		options.support &&
+		createOwnedProjectSupportHttp({
+			...options.support,
+			database: options.database,
+			project: {
+				...options.project,
+				id: options.support.projectId,
+				workspaceId: options.support.workspaceId,
+			},
+			baseURL: origin,
+			signingSecret: options.signingSecret,
+			readBody: requestBody,
+			async revokeSession(client, current, request) {
+				const path = new URL(request.url).pathname.slice(
+					options.basePath.length,
+				);
+				const removed = await store.revoke(
+					{ tokens: [current.token] },
+					path,
+					Boolean(backchannel),
+					client,
+				);
+				if (!removed) throw unavailableLogout;
+				deliverLogoutAfterCommit(client, request, removed.targets);
+				return removed.ids.length > 0;
+			},
+		});
 	const organization = createOwnedProjectOrganizationHttp({
 		database: options.database,
 		project: options.project,
@@ -1217,6 +1477,39 @@ export function createOwnedProjectEngine(
 		)
 			return forbidden();
 		const path = url.pathname.slice(options.basePath.length);
+		if (path.startsWith("/scim/v2/")) {
+			const response =
+				scimDiscovery?.(request) ?? (await scimResources?.(request));
+			if (response) return response;
+		}
+		const supportResponse = await support?.(path, request);
+		if (supportResponse) return supportResponse;
+		if (sso && request.method === "POST" && path === "/sign-in/sso") {
+			if (!trustedRequest(request.headers, true)) return forbidden();
+			const body = ownedProjectSsoInput.safeParse(await requestBody(request));
+			if (!body.success)
+				return failure(
+					400,
+					"INVALID_BODY",
+					"Invalid enterprise sign-in request.",
+				);
+			const denied = await store.transaction((client) =>
+				security.admit(client, request, {
+					email: body.data.email?.toLowerCase(),
+				}),
+			);
+			if (denied) return securityBlocked();
+			return sso.start(request, body.data);
+		}
+		if (sso && request.method === "GET" && path.startsWith("/sso/callback/")) {
+			const provider = path.slice("/sso/callback/".length);
+			if (!provider || provider.includes("/")) return forbidden();
+			const denied = await store.transaction((client) =>
+				security.admit(client, request),
+			);
+			if (denied) return securityBlocked();
+			return sso.callback(request, provider);
+		}
 		const recovery = await recoveryHttp?.(request);
 		if (recovery) return recovery;
 		const registration = await signUpHttp?.(request);
@@ -1312,6 +1605,15 @@ export function createOwnedProjectEngine(
 			return readSession(request);
 		if (request.method === "POST" && path === "/sign-out")
 			return signOut(request);
+		if (
+			request.method === "GET" &&
+			path === "/multi-session/list-device-sessions"
+		)
+			return listDeviceSessions(request);
+		if (request.method === "POST" && path === "/multi-session/set-active")
+			return deviceSessionAction(request, false);
+		if (request.method === "POST" && path === "/multi-session/revoke")
+			return deviceSessionAction(request, true);
 		if (request.method === "GET" && path === "/account/sessions")
 			return listAccountSessions(request.headers);
 		if (request.method === "POST" && path === "/account/sessions/revoke") {
@@ -1331,8 +1633,14 @@ export function createOwnedProjectEngine(
 				if (response.status < 400 && notify && newDevice)
 					newDevice.defer(notify);
 				return response;
+			} catch (error) {
+				if (error === unavailableLogout) return unsupported();
+				throw error;
 			} finally {
 				notifications.delete(request);
+				const targets = committedLogoutTargets.get(request);
+				committedLogoutTargets.delete(request);
+				if (targets) await backchannel?.(targets);
 			}
 		},
 		readSession,

@@ -1,0 +1,604 @@
+import { createHash, createHmac, randomUUID } from "node:crypto";
+import { existsSync, readFileSync } from "node:fs";
+import { scim } from "@better-auth/scim";
+import { sso } from "@better-auth/sso";
+import { symmetricDecrypt } from "better-auth/crypto";
+import { getTestInstance } from "better-auth/test";
+import { exportJWK, generateKeyPair, SignJWT } from "jose";
+import { Kysely, PostgresDialect } from "kysely";
+import { Pool } from "pg";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { defaultAuthPolicy } from "../auth-policy/policy";
+import { resolveEnterpriseUser } from "../enterprise";
+import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
+import { createOwnedProjectEngine } from "./owned-project-engine";
+import { createProjectEngineStore } from "./owned-project-engine-store";
+import { createOwnedProjectSso } from "./owned-project-sso";
+import type { OwnedProjectSsoOptions } from "./owned-project-sso";
+
+const fixturePath = new URL(
+	"../../../../.secrets/local-postgres.json",
+	import.meta.url,
+);
+const origin = "https://owned-enterprise.fixture.example";
+const issuer = "https://fixture-sso-idp.example";
+const slug = "owned-enterprise-fixture";
+const providerId = "isolated-enterprise";
+const secret = "synthetic-project-enterprise-sso-signing-secret";
+const cookiePrefix = `allauth_project_${slug}`;
+const destination = `${origin}/account?from=enterprise`;
+const callbackPath = `/api/auth/sso/callback/${providerId}`;
+const callbackURL = origin + callbackPath;
+const subject = "fixture-managed-opaque-idp-subject";
+const managedEmail = "directory-profile@corp.example";
+const providerEmail = "matching-email-decoy@corp.example";
+const config = {
+	issuer,
+	clientId: "enterprise-client",
+	clientSecret: "synthetic-enterprise-idp-secret",
+	authorizationEndpoint: issuer + "/authorize",
+	tokenEndpoint: issuer + "/token",
+	jwksEndpoint: issuer + "/jwks",
+	userInfoEndpoint: issuer + "/userinfo",
+	discoveryEndpoint: issuer + "/.well-known/openid-configuration",
+	tokenEndpointAuthentication: "client_secret_post",
+	pkce: true,
+	scopes: ["openid", "profile", "email"],
+	mapping: { email: "enterprise_email", name: "enterprise_name" },
+};
+const body = {
+	providerId,
+	callbackURL: destination,
+	providerType: "oidc" as const,
+};
+const scopedKey = (parts: string[]) =>
+	createHash("sha256").update(JSON.stringify(parts)).digest("base64url");
+
+type LegacyDatabase = Kysely<Record<string, Record<string, unknown>>>;
+
+async function nativeSso(db: LegacyDatabase) {
+	return (
+		await getTestInstance(
+			{
+				baseURL: origin,
+				secret,
+				trustedOrigins: [issuer],
+				logger: { disabled: true },
+				database: { db, type: "postgres", transaction: true },
+				advanced: {
+					cookiePrefix,
+					cookies: { state: { attributes: { maxAge: 600 } } },
+				},
+				account: {
+					encryptOAuthTokens: true,
+					accountLinking: { enabled: true, trustedProviders: [] },
+				},
+				plugins: [
+					{
+						id: "fixture-allauth-directory",
+						schema: {
+							allauthDirectory: {
+								fields: {
+									providerId: { type: "string", required: true },
+									organizationId: { type: "string", required: true },
+									connectionId: { type: "string", required: true },
+									createdAt: { type: "date", required: true },
+								},
+							},
+						},
+					},
+					scim({
+						connections: [],
+						managedConnections: {
+							credentialHashSecret: "synthetic-scim-credential-hash-secret-32",
+						},
+					}),
+					sso({
+						domainVerification: { enabled: true },
+						resolveUser: resolveEnterpriseUser,
+					}),
+				],
+			},
+			{ disableTestUser: true },
+		)
+	).auth;
+}
+
+function startRequest(input: unknown = body) {
+	return new Request(`${origin}/api/auth/sign-in/sso`, {
+		method: "POST",
+		headers: { origin, "content-type": "application/json" },
+		body: JSON.stringify(input),
+	});
+}
+
+function cookies(response: Response) {
+	return response.headers
+		.getSetCookie()
+		.filter((value) => !/;\s*Max-Age=0(?:;|$)/i.test(value))
+		.map((value) => value.split(";", 1)[0])
+		.join("; ");
+}
+
+describe.skipIf(!existsSync(fixturePath))(
+	"isolated PostgreSQL enterprise OIDC compatibility",
+	() => {
+		const databaseName = `allauth_hosted_${randomUUID().replaceAll("-", "")}`;
+		const schema = `allauth_project_${randomUUID().replaceAll("-", "")}`;
+		const otherSchema = `allauth_project_${randomUUID().replaceAll("-", "")}`;
+		const managed = randomUUID();
+		const decoy = randomUUID();
+		const organization = randomUUID();
+		const connection = randomUUID();
+		const recordId = randomUUID();
+		const sourceId = randomUUID();
+		const domain = `organization:${organization}`;
+		const privateKey = generateKeyPair("RS256");
+		const authorizationCodes = new Map<string, URL>();
+		const profiles = new Map<string, { email: string; subject: string }>();
+		let database: Pool;
+		let administrator: Pool | undefined;
+		let nativeDatabase: LegacyDatabase | undefined;
+		let native: Awaited<ReturnType<typeof nativeSso>>;
+		let created = false;
+		let afterExchange: (() => Promise<void>) | undefined;
+
+		const network: NonNullable<OwnedProjectSsoOptions["fetch"]> = async (
+			input,
+			init,
+		) => {
+			const request = new Request(input, init);
+			const keys = await privateKey;
+			if (request.url === config.jwksEndpoint)
+				return Response.json({
+					keys: [
+						{
+							...(await exportJWK(keys.publicKey)),
+							kid: "synthetic-enterprise-key",
+							alg: "RS256",
+							use: "sig",
+						},
+					],
+				});
+			if (request.url === config.userInfoEndpoint) {
+				expect(request.headers.get("authorization")).toBe(
+					"Bearer synthetic-enterprise-access",
+				);
+				return Response.json({
+					sub: subject,
+					enterprise_email: providerEmail,
+					enterprise_name: "Remote profile",
+				});
+			}
+			if (request.url !== config.tokenEndpoint)
+				throw new Error("Unexpected enterprise fixture endpoint.");
+			const params = new URLSearchParams(await request.text());
+			const code = params.get("code")!;
+			const authorization = authorizationCodes.get(code);
+			if (!authorization)
+				return Response.json({ error: "invalid_grant" }, { status: 400 });
+			authorizationCodes.delete(code);
+			expect(params.get("client_id")).toBe(config.clientId);
+			expect(params.get("client_secret")).toBe(config.clientSecret);
+			expect(params.get("redirect_uri")).toBe(
+				authorization.searchParams.get("redirect_uri"),
+			);
+			expect(
+				createHash("sha256")
+					.update(params.get("code_verifier")!)
+					.digest("base64url"),
+			).toBe(authorization.searchParams.get("code_challenge"));
+			const nonce = authorization.searchParams.get("nonce");
+			const profile = profiles.get(code);
+			profiles.delete(code);
+			const token = await new SignJWT({
+				...(nonce ? { nonce } : {}),
+				...(profile
+					? {
+							enterprise_email: profile.email,
+							enterprise_name: "New fixture user",
+						}
+					: {}),
+			})
+				.setProtectedHeader({ alg: "RS256", kid: "synthetic-enterprise-key" })
+				.setIssuer(issuer)
+				.setSubject(profile?.subject ?? subject)
+				.setAudience(config.clientId)
+				.setIssuedAt()
+				.setExpirationTime("5m")
+				.sign(keys.privateKey);
+			await afterExchange?.();
+			return Response.json({
+				access_token: "synthetic-enterprise-access",
+				refresh_token: "synthetic-enterprise-refresh",
+				token_type: "Bearer",
+				expires_in: 300,
+				id_token: token,
+				scope: "openid profile email",
+			});
+		};
+
+		beforeAll(async () => {
+			const fixture: { container: string; DATABASE_URL: string } = JSON.parse(
+				readFileSync(fixturePath, "utf8"),
+			);
+			const url = new URL(fixture.DATABASE_URL);
+			if (
+				fixture.container !== "allauth-production-test-20261007" ||
+				url.hostname !== "127.0.0.1" ||
+				url.port !== "55445"
+			)
+				throw new Error(
+					"Owned SSO tests require the isolated PostgreSQL fixture.",
+				);
+			administrator = new Pool({
+				connectionString: fixture.DATABASE_URL,
+				max: 1,
+			});
+			await administrator.query(`CREATE DATABASE "${databaseName}"`);
+			created = true;
+			url.pathname = `/${databaseName}`;
+			database = new Pool({ connectionString: url.toString(), max: 4 });
+			const client = await database.connect();
+			try {
+				for (const name of [schema, otherSchema]) {
+					await client.query(`CREATE SCHEMA "${name}"`);
+					await client.query(`SET search_path TO "${name}"`);
+					for (const migration of [
+						"001-initial-auth.sql",
+						"002-control-plane.sql",
+						"005-free-plugins.sql",
+					]) {
+						await client.query(
+							readFileSync(
+								new URL(`../../migrations/${migration}`, import.meta.url),
+								"utf8",
+							),
+						);
+					}
+				}
+				await client.query("RESET search_path");
+			} finally {
+				client.release();
+			}
+			await database.query(
+				`INSERT INTO "${schema}"."user" (id,email,name,"emailVerified","directoryManaged","directoryDisabled")
+			VALUES ($1,$2,'Directory profile',TRUE,TRUE,FALSE),($3,$4,'Unmanaged matching email',TRUE,FALSE,FALSE)`,
+				[managed, managedEmail, decoy, providerEmail],
+			);
+			await database.query(
+				`INSERT INTO "${schema}"."organization" (id,name,slug,"createdAt") VALUES ($1,'Fixture Organization','fixture-company',statement_timestamp())`,
+				[organization],
+			);
+			await database.query(
+				`INSERT INTO "${schema}"."ssoProvider" (id,"providerId",issuer,"oidcConfig","userId","organizationId",domain,"domainVerified")
+			VALUES ($1,$2,$3,$4,$5,$6,'corp.example',TRUE)`,
+				[
+					recordId,
+					providerId,
+					issuer,
+					JSON.stringify(config),
+					decoy,
+					organization,
+				],
+			);
+			await database.query(
+				`INSERT INTO "${schema}"."allauthDirectory" (id,"providerId","organizationId","connectionId","createdAt") VALUES ($1,$2,$3,$4,statement_timestamp())`,
+				[randomUUID(), providerId, organization, connection],
+			);
+			await database.query(
+				`INSERT INTO "${schema}"."scimManagedConnection" (id,"creationRequestId","connectionId","provisioningDomainId",status,revision,"createdAt","createdBy")
+			VALUES ($1,$2,$3,$4,'active',0,statement_timestamp(),$5)`,
+				[randomUUID(), randomUUID(), connection, domain, decoy],
+			);
+			await database.query(
+				`INSERT INTO "${schema}"."scimConnectionBinding" (id,"connectionId","connectionKey","provisioningDomainId","createdAt","decommissionStatus","decommissionReconciledUserCount","decommissionBatchCount","decommissionRevision")
+			VALUES ($1,$2,$3,$4,statement_timestamp(),'active',0,0,0)`,
+				[
+					randomUUID(),
+					connection,
+					scopedKey(["scim-connection", connection]),
+					domain,
+				],
+			);
+			await database.query(
+				`INSERT INTO "${schema}"."scimSubject" (id,"userId","profileSourceId",revision,"createdAt","updatedAt") VALUES ($1,$2,$3,0,statement_timestamp(),statement_timestamp())`,
+				[randomUUID(), managed, sourceId],
+			);
+			await database.query(
+				`INSERT INTO "${schema}"."scimUser" (id,"connectionId","provisioningDomainId","userId","connectionUserKey","userName","userNameKey","primaryEmail","workEmailValueIndex","emailValueIndex","displayName","formattedName","serializedEmails","serializedAttributes","externalId","externalIdKey",active,"orderKey","createdAt","updatedAt")
+			VALUES ($1,$2,$3,$4,$1,$5,$1,$5,'','', 'Directory profile','Directory profile','[]','{}',$6,$7,TRUE,$1,statement_timestamp(),statement_timestamp())`,
+				[
+					sourceId,
+					connection,
+					domain,
+					managed,
+					managedEmail,
+					subject,
+					scopedKey(["scim-user-external-id", connection, subject]),
+				],
+			);
+			nativeDatabase = new Kysely({
+				dialect: new PostgresDialect({
+					pool: new Pool({
+						connectionString: url.toString(),
+						max: 1,
+						options: `-c search_path=${schema}`,
+					}),
+				}),
+			});
+			vi.stubGlobal("fetch", network);
+			native = await nativeSso(nativeDatabase);
+		});
+
+		afterAll(async () => {
+			vi.unstubAllGlobals();
+			await Promise.all([database?.end(), nativeDatabase?.destroy()]);
+			if (!administrator) return;
+			try {
+				if (created)
+					await dropClosedFixtureDatabase(administrator, databaseName);
+			} finally {
+				await administrator.end();
+			}
+		});
+
+		function owned(namespace = schema) {
+			const store = createProjectEngineStore(database, namespace);
+			return createOwnedProjectSso({
+				database,
+				project: { slug, schemaName: namespace },
+				baseURL: origin,
+				basePath: "/api/auth",
+				trustedOrigins: [],
+				signingSecret: secret,
+				defaultErrorURL: `${origin}/auth-error`,
+				signUpEnabled: true,
+				fetch: network,
+				async complete(
+					client,
+					{ user, managed: isManaged, destination: target },
+				) {
+					expect(isManaged).toBe(true);
+					const token = randomUUID();
+					await store.createSession(client, {
+						id: randomUUID(),
+						token,
+						userId: user.id,
+						expiresIn: 604800,
+						ip: "192.0.2.15",
+						userAgent: "SSO fixture",
+					});
+					const signature = createHmac("sha256", secret)
+						.update(token)
+						.digest("base64");
+					return new Response(null, {
+						status: 302,
+						headers: {
+							location: target,
+							"set-cookie": `__Secure-${cookiePrefix}.session_token=${encodeURIComponent(`${token}.${signature}`)}; Path=/; HttpOnly; Secure; SameSite=Lax`,
+						},
+					});
+				},
+			});
+		}
+
+		async function authorize(
+			started: Response,
+			expectedCallback = callbackURL,
+			profile?: { email: string; subject: string },
+		) {
+			expect(started.status, await started.clone().text()).toBe(200);
+			const { url, redirect } = (await started.json()) as {
+				url: string;
+				redirect: boolean;
+			};
+			expect(redirect).toBe(true);
+			const authorization = new URL(url);
+			expect(authorization.origin).toBe(issuer);
+			expect(authorization.searchParams.get("redirect_uri")).toBe(
+				expectedCallback,
+			);
+			expect(authorization.searchParams.get("code_challenge_method")).toBe(
+				"S256",
+			);
+			const code = randomUUID();
+			authorizationCodes.set(code, authorization);
+			if (profile) profiles.set(code, profile);
+			const callback = new URL(expectedCallback);
+			callback.searchParams.set("code", code);
+			callback.searchParams.set(
+				"state",
+				authorization.searchParams.get("state")!,
+			);
+			return new Request(callback, {
+				headers: {
+					cookie: cookies(started),
+					"sec-fetch-mode": "navigate",
+					"sec-fetch-site": "cross-site",
+				},
+			});
+		}
+
+		async function account() {
+			return (
+				await database.query<{
+					id: string;
+					userId: string;
+					accessToken: string;
+					refreshToken: string;
+				}>(
+					`SELECT id,"userId","accessToken","refreshToken" FROM "${schema}"."account" WHERE "providerId"=$1 AND "accountId"=$2`,
+					[providerId, subject],
+				)
+			).rows[0];
+		}
+
+		it("finishes a native pending SSO callback with the exact active directory identity", async () => {
+			const callback = await authorize(await native.handler(startRequest()));
+			const foreign = await owned(otherSchema).callback(callback, providerId);
+			expect(
+				new URL(foreign.headers.get("location")!).searchParams.get("error"),
+			).toBe("invalid_state");
+			const result = await owned().callback(callback, providerId);
+			expect(result.headers.get("location")).toBe(destination);
+			const session = await native.api.getSession({
+				headers: new Headers({ cookie: cookies(result) }),
+				query: { disableRefresh: true },
+			});
+			expect(session?.user).toMatchObject({
+				id: managed,
+				email: managedEmail,
+				name: "Directory profile",
+			});
+			const linked = await account();
+			expect(linked?.userId).toBe(managed);
+			await expect(
+				symmetricDecrypt({ key: secret, data: linked!.accessToken }),
+			).resolves.toBe("synthetic-enterprise-access");
+			await expect(
+				symmetricDecrypt({ key: secret, data: linked!.refreshToken }),
+			).resolves.toBe("synthetic-enterprise-refresh");
+		});
+
+		it("issues a legacy-readable provider snapshot and state that survives rollback", async () => {
+			const linked = await account();
+			const byOrganization = {
+				callbackURL: destination,
+				organizationSlug: "fixture-company",
+			};
+			const callback = await authorize(
+				await owned().start(startRequest(byOrganization), byOrganization),
+			);
+			const result = await native.handler(callback);
+			expect(result.headers.get("location")).toBe(destination);
+			const session = await native.api.getSession({
+				headers: new Headers({ cookie: cookies(result) }),
+				query: { disableRefresh: true },
+			});
+			expect(session?.user.id).toBe(managed);
+			expect(await account()).toMatchObject({
+				id: linked?.id,
+				userId: managed,
+			});
+		});
+
+		it("rejects an inactive directory subject even when its older binding and a matching local email remain", async () => {
+			const callback = await authorize(
+				await owned().start(startRequest(), body),
+			);
+			const prior = await account();
+			await database.query(
+				`UPDATE "${schema}"."scimUser" SET active=FALSE WHERE id=$1`,
+				[sourceId],
+			);
+			try {
+				const denied = await owned().callback(callback, providerId);
+				expect(
+					new URL(denied.headers.get("location")!).searchParams.get("error"),
+				).toBe("directory_identity_inactive");
+				expect(cookies(denied)).toBe("");
+				expect(await account()).toEqual(prior);
+			} finally {
+				await database.query(
+					`UPDATE "${schema}"."scimUser" SET active=TRUE WHERE id=$1`,
+					[sourceId],
+				);
+			}
+		});
+
+		it("completes configured SSO through the owned dispatch with the native email and organization policy", async () => {
+			const unmanaged = "unmanaged-fixture";
+			const unmanagedCallback = `${origin}/api/auth/sso/callback/${unmanaged}`;
+			const owned = createOwnedProjectEngine({
+				database,
+				project: { slug, schemaName: schema },
+				baseURL: origin,
+				basePath: "/api/auth",
+				trustedOrigins: [],
+				signingSecret: secret,
+				policy: defaultAuthPolicy,
+				trustedIP: () => "203.0.113.43",
+				sso: { defaultErrorURL: `${origin}/auth-error`, fetch: network },
+			});
+			const managedPending = await authorize(
+				await native.handler(startRequest()),
+			);
+			const verified = await owned.dispatch(managedPending);
+			expect(verified.headers.get("location")).toBe(destination);
+			expect(
+				await native.api.getSession({
+					headers: new Headers({ cookie: cookies(verified) }),
+					query: { disableRefresh: true },
+				}),
+			).toMatchObject({ user: { id: managed, email: managedEmail } });
+
+			await database.query(
+				`INSERT INTO "${schema}"."ssoProvider"(id,"providerId",issuer,"oidcConfig","userId","organizationId",domain,"domainVerified")
+				 VALUES ($1,$2,$3,$4,$5,$6,'corp.example',TRUE)`,
+				[
+					randomUUID(),
+					unmanaged,
+					issuer,
+					JSON.stringify({ ...config, userInfoEndpoint: undefined }),
+					decoy,
+					organization,
+				],
+			);
+			for (const invited of [false, true]) {
+				const email = invited
+					? "owned-sso-invited@corp.example"
+					: "owned-sso-register@corp.example";
+				if (invited)
+					await database.query(
+						`INSERT INTO "${schema}"."invitation"(id,"organizationId",email,role,status,"inviterId","expiresAt")
+						 VALUES ($1,$2,$3,'admin','pending',$4,statement_timestamp() + interval '1 day')`,
+						[randomUUID(), organization, email, decoy],
+					);
+				const callback = await authorize(
+					await owned.dispatch(
+						startRequest({ callbackURL: destination, providerId: unmanaged }),
+					),
+					unmanagedCallback,
+					{ email, subject: randomUUID() },
+				);
+				const response = await owned.dispatch(callback);
+				expect(response.headers.get("location")).toBe(destination);
+				const session = await native.api.getSession({
+					headers: new Headers({ cookie: cookies(response) }),
+					query: { disableRefresh: true },
+				});
+				expect(session?.user).toMatchObject({ email, emailVerified: false });
+				const membership = await database.query(
+					`SELECT role FROM "${schema}"."member" WHERE "organizationId" = $1 AND "userId" = $2`,
+					[organization, session?.user.id],
+				);
+				expect(membership.rows).toEqual(invited ? [] : [{ role: "member" }]);
+			}
+		});
+
+		it("rechecks the same provider authentication configuration inside the session transaction", async () => {
+			const callback = await authorize(await native.handler(startRequest()));
+			const prior = await account();
+			afterExchange = async () => {
+				await database.query(
+					`UPDATE "${schema}"."ssoProvider" SET "oidcConfig"=$1 WHERE id=$2`,
+					[JSON.stringify({ ...config, clientId: "changed-client" }), recordId],
+				);
+			};
+			try {
+				const denied = await owned().callback(callback, providerId);
+				expect(
+					new URL(denied.headers.get("location")!).searchParams.get("error"),
+				).toBe("invalid_state");
+				expect(await account()).toEqual(prior);
+			} finally {
+				afterExchange = undefined;
+				await database.query(
+					`UPDATE "${schema}"."ssoProvider" SET "oidcConfig"=$1 WHERE id=$2`,
+					[JSON.stringify(config), recordId],
+				);
+			}
+		});
+	},
+);

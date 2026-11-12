@@ -29,6 +29,11 @@ interface ConnectionBinding extends OwnedProjectSCIMConnection {
 	decommissionStatus: string;
 }
 
+/** Derives the persisted lookup key for a scoped SCIM tuple. */
+export function ownedSCIMScopedKey(parts: readonly string[]) {
+	return createHash("sha256").update(JSON.stringify(parts)).digest("base64url");
+}
+
 function deny(
 	status: OwnedProjectSCIMDenial["status"],
 	detail: string,
@@ -106,9 +111,7 @@ export function createOwnedProjectSCIMReadAuthority(options: {
 			);
 
 		const { connectionId, provisioningDomainId } = credential;
-		const connectionKey = createHash("sha256")
-			.update(JSON.stringify(["scim-connection", connectionId]))
-			.digest("base64url");
+		const connectionKey = ownedSCIMScopedKey(["scim-connection", connectionId]);
 		const binding = (
 			await client.query<ConnectionBinding>(
 				`SELECT "connectionId", "provisioningDomainId", "decommissionStatus"
