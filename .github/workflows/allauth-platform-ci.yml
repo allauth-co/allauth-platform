@@ -83,7 +83,7 @@ jobs:
           lib/projects/legacy-mfa-record.test.ts lib/projects/session-shadow.test.ts
           lib/projects/legacy-project-keyring.test.ts
           lib/projects/owned-project-engine.pg.test.ts lib/projects/owned-project-rollback.pg.test.ts
-          lib/projects/owned-project-runtime.pg.test.ts lib/projects/owned-project-openapi.test.ts
+          lib/projects/owned-project-openapi.test.ts
           lib/projects/owned-project-password-safety.test.ts
           lib/projects/owned-project-bulk-session.pg.test.ts lib/projects/owned-project-email-callback.test.ts
           lib/projects/owned-project-personal-keys.pg.test.ts
@@ -112,6 +112,10 @@ jobs:
           lib/projects/owned-project-support.pg.test.ts lib/projects/support-plugin.test.ts
           lib/projects/management-plugin.test.ts lib/projects/service-directory.test.ts
           lib/projects/passkey-store.pg.test.ts
+      - name: Rehearse project writer restarts and rollback
+        run: >-
+          pnpm exec vitest run --root apps/auth --config vitest.config.ts
+          lib/projects/owned-project-runtime.pg.test.ts
       - name: Test billing, platform administration, self-hosting and public pages
         run: >-
           pnpm exec vitest run --root apps/auth --config vitest.config.ts

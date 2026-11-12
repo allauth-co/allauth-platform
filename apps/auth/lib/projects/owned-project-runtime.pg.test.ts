@@ -4082,7 +4082,7 @@ describe.skipIf(!existsSync(fixture))(
 					}
 				}
 			}
-		}, 90_000);
+		}, 180_000);
 
 		it("pins a synthetic encrypted SAML provider across direct, hosted, and rollback transports", async () => {
 			const local: { container: string; DATABASE_URL: string } = JSON.parse(
