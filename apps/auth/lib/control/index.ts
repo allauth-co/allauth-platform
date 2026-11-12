@@ -1,6 +1,6 @@
 import type { BetterAuthPlugin, GenericEndpointContext, HookEndpointContext } from "@better-auth/core";
 import { APIError } from "better-auth";
-import { createAuthEndpoint, createAuthMiddleware, getAuthoritativeSessionFromCtx } from "better-auth/api";
+import { createAuthEndpoint, createAuthMiddleware, getAuthoritativeSessionFromCtx, isAPIError } from "better-auth/api";
 import * as z from "zod";
 import { isPlatformAdmin, rolesInclude } from "../configuration";
 import { controlResponseFailure, isPrimaryAuthenticationPath, mutationEventType, recordControlEvent, writeControlEvent } from "./events";
@@ -149,6 +149,20 @@ export function allauthControl(options: AllauthControlOptions = {}) {
 			if (ctx.method === "GET" && path !== "/verify-email") return;
 			const type = mutationEventType(path);
 			if (!type) return;
+			if (type.startsWith("mfa.")) {
+				const returned = ctx.context.returned;
+				// Body validation errors are emitted by the endpoint library's base APIError.
+				const malformed = isAPIError(returned) && returned.statusCode === 400 && returned.body?.code === "VALIDATION_ERROR";
+				const errorCode = malformed ? "VALIDATION_ERROR" : result.failed ? result.code : undefined;
+				// MFA mutations act only on the current account. Ignore raw body identity fields.
+				await recordControlEvent(ctx, {
+					type, outcome: malformed || result.failed ? "failure" : "success",
+					actorId: actor?.session.impersonatedBy || actor?.user.id,
+					userId: actor?.user.id || authenticated?.user.id,
+					metadata: { path, ...(errorCode ? { errorCode } : {}) },
+				}, options.ipHeader);
+				return;
+			}
 			const targetId = field(body, "userId") || field(body, "memberId") || field(body, "teamId") || field(body, "invitationId") || field(body, "providerId") || field(body, "client_id") || field(body, "id");
 			let organizationId = field(body, "organizationId") || field(response, "organizationId") || field(object(response?.organization), "id") || field(object(response?.team), "organizationId");
 			if (path.startsWith("/organization/") && !organizationId && targetId) {

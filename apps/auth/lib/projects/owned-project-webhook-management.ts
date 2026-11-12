@@ -70,7 +70,8 @@ export function createOwnedProjectWebhookManagement(options: {
 	origin: string;
 	basePath: string;
 	platformOrigin: string;
-	signingSecret: string;
+	/** The derived project key used by the existing delivery worker. */
+	encryptionSecret: string;
 	readWorkspacePrincipal(headers: Headers): Promise<ControlPrincipal | null>;
 	readBody(request: Request): Promise<unknown>;
 	trustedIP(request: Request): string | null;
@@ -79,7 +80,7 @@ export function createOwnedProjectWebhookManagement(options: {
 	const { store, project } = options;
 	const direct = `/api/projects/${project.slug}/auth`;
 	const encrypt = (value: string) =>
-		sealLegacyMfaRecord(value, { secret: options.signingSecret });
+		sealLegacyMfaRecord(value, { secret: options.encryptionSecret });
 
 	return async (request: Request, path: string) => {
 		const method = webhookRoutes.get(path);

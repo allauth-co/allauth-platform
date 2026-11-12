@@ -148,7 +148,7 @@ export function createOwnedMfaEnrollment<
 	function recordMfaEvent(
 		client: PoolClient,
 		request: Request,
-		userId: string,
+		userId: string | undefined,
 		type: string,
 		path: string,
 		errorCode?: string,
@@ -172,17 +172,36 @@ export function createOwnedMfaEnrollment<
 			const auth = await options.lockAuthority(client, request, {
 				fresh: false,
 			});
-			if (!auth) return reject("unauthorized");
-			const result = await work(client, auth);
+			const result = auth ? await work(client, auth) : reject("unauthorized");
 			await recordMfaEvent(
 				client,
 				request,
-				auth.user.id,
+				auth?.user.id,
 				mutationEvents[path],
 				path,
 				result.status === "rejected" ? result.code : undefined,
 			);
 			return result;
+		});
+	}
+
+	async function recordMalformedMutation(
+		request: Request,
+		path: keyof typeof mutationEvents,
+	) {
+		if (path === "/two-factor/disable" && options.mfaRequired) return;
+		await store.transaction(async (client) => {
+			const auth = await options.lockAuthority(client, request, {
+				fresh: false,
+			});
+			await recordMfaEvent(
+				client,
+				request,
+				auth?.user.id,
+				mutationEvents[path],
+				path,
+				"VALIDATION_ERROR",
+			);
 		});
 	}
 
@@ -464,5 +483,12 @@ export function createOwnedMfaEnrollment<
 		);
 	}
 
-	return { enable, verify, disable, readTotp, rotateBackupCodes };
+	return {
+		enable,
+		verify,
+		disable,
+		readTotp,
+		rotateBackupCodes,
+		recordMalformedMutation,
+	};
 }

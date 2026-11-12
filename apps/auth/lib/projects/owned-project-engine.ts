@@ -150,6 +150,11 @@ const deviceSessionInput = z.object({
 	sessionToken: z.string().regex(/^[a-z0-9_-]{1,64}$/i),
 });
 const emptyInput = z.object({}).strict();
+const mfaPasswordInput = z.object({ password: z.string().optional() });
+const mfaEnableInput = mfaPasswordInput.extend({
+	issuer: z.string().optional(),
+	method: z.enum(["totp", "otp"]).optional(),
+});
 const maximumBodyBytes = 8192;
 const passwordLimit = { max: 20, window: 900, burst: 5 };
 
@@ -283,7 +288,7 @@ interface OwnedProjectEngineOptions {
 	analytics?: boolean;
 	webhookManagement?: Pick<
 		Parameters<typeof createOwnedProjectWebhookManagement>[0],
-		"resolver"
+		"resolver" | "encryptionSecret"
 	>;
 	recovery?: Omit<
 		Parameters<typeof createOwnedRecoveryHttp>[0],
@@ -1041,17 +1046,35 @@ export function createOwnedProjectEngine(
 		operation: "enable" | "disable" | "get-totp-uri" | "generate-backup-codes",
 	) {
 		if (!trustedRequest(request.headers, true)) return forbidden();
-		const refused = await factorAdmission(request, operation);
+		const ip = options.trustedIP(request);
+		if (!ip || !isIP(ip)) return forbidden();
+		const refused = await store.transaction((client) =>
+			admitOwnedProjectNativeRoute(client, ip, `/two-factor/${operation}`, {
+				max: 3,
+				windowMs: 10_000,
+			}),
+		);
 		if (refused) return refused;
-		const input = z
-			.object({
-				password: z.string().max(128).optional(),
-				issuer: z.string().max(128).optional(),
-				method: z.enum(["totp", "otp"]).optional(),
-			})
-			.safeParse(await requestBody(request));
-		if (!input.success)
+		const token = tokenFrom(request.headers);
+		const session = token ? await store.session(token, refreshWindow) : null;
+		if (session?.session.impersonatedBy)
+			return failure(
+				403,
+				"FORBIDDEN",
+				"Authentication changes and account deletion are unavailable during impersonation.",
+			);
+		const body = await requestBody(request);
+		const input = (
+			operation === "enable" ? mfaEnableInput : mfaPasswordInput
+		).safeParse(body);
+		if (!input.success) {
+			if (body !== undefined && operation !== "get-totp-uri")
+				await mfaEnrollment.recordMalformedMutation(
+					request,
+					`/two-factor/${operation}`,
+				);
 			return failure(400, "INVALID_BODY", "Invalid two-factor request.");
+		}
 		const result = await {
 			enable: mfaEnrollment.enable,
 			disable: mfaEnrollment.disable,
@@ -2210,7 +2233,6 @@ export function createOwnedProjectEngine(
 			store,
 			origin,
 			basePath: options.basePath,
-			signingSecret: options.signingSecret,
 			trustedIP: options.trustedIP,
 			readBody: requestBody,
 		});

@@ -1,19 +1,24 @@
 import { createHmac, randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { symmetricDecrypt, symmetricEncrypt } from "better-auth/crypto";
+import { admin } from "better-auth/plugins";
 import { getTestInstance } from "better-auth/test";
 import { Kysely, PostgresDialect } from "kysely";
 import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { authPolicyPlugin } from "../auth-policy/plugin";
+import { defaultAuthPolicy } from "../auth-policy/policy";
 import { clerkCompatiblePasswords } from "../clerk-password";
 import { allauthControl } from "../control";
 import { newWebhookSigningSecret } from "../control/webhook-contract";
 import type { ControlWebhookEnvelope } from "../control/webhooks";
 import { deliverPendingWebhooks, webhookSignature } from "../control/webhooks";
+import { featureBoundaries } from "../features/server";
 import { productionTwoFactor } from "../mfa";
 import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
 import { readLegacySessionCookie } from "./legacy-session-cookie";
 import { createOwnedMfaEnrollment } from "./owned-mfa-enrollment";
+import { createOwnedProjectEngine } from "./owned-project-engine";
 import { createProjectEngineStore } from "./owned-project-engine-store";
 
 const fixturePath = new URL(
@@ -35,7 +40,12 @@ const auditContext = {
 
 type LegacyDatabase = Kysely<Record<string, Record<string, unknown>>>;
 
-async function nativeInstance(database: LegacyDatabase, audit = false) {
+async function nativeInstance(
+	database: LegacyDatabase,
+	audit = false,
+	mfaRequired = false,
+	persistedAdmission = false,
+) {
 	return (
 		await getTestInstance(
 			{
@@ -45,8 +55,22 @@ async function nativeInstance(database: LegacyDatabase, audit = false) {
 				session: { expiresIn: 86400, cookieCache: { enabled: false } },
 				secret,
 				emailAndPassword: { enabled: true, password: clerkCompatiblePasswords },
-				advanced: { cookiePrefix: `allauth_project_${slug}` },
+				advanced: {
+					cookiePrefix: `allauth_project_${slug}`,
+					ipAddress: { ipAddressHeaders: ["x-real-ip"] },
+				},
+				...(persistedAdmission
+					? {
+							rateLimit: {
+								enabled: true,
+								storage: "database",
+								max: 100,
+								window: 60,
+							},
+						}
+					: {}),
 				plugins: [
+					...(audit ? [admin()] : []),
 					productionTwoFactor(origin, "/two-factor", issuer),
 					...(audit
 						? [
@@ -59,6 +83,13 @@ async function nativeInstance(database: LegacyDatabase, audit = false) {
 								}),
 							]
 						: []),
+					...(audit ? [featureBoundaries()] : []),
+					authPolicyPlugin({
+						...defaultAuthPolicy,
+						...(mfaRequired
+							? { mfaMode: "required", signUpEnabled: false }
+							: {}),
+					}),
 				],
 			},
 			{ disableTestUser: true },
@@ -574,6 +605,115 @@ describe.skipIf(!existsSync(fixturePath))(
 			}
 
 			const oldUser = await signedIn();
+			const required = await nativeInstance(webhookDatabase, true, true);
+			const claimedUser = "synthetic-claimed-user";
+			const exerciseRejectedRequests = async (
+				send: (input: Request) => Promise<Response>,
+			) => {
+				for (const path of ["enable", "disable", "generate-backup-codes"]) {
+					expect(
+						(
+							await send(
+								request(
+									`/two-factor/${path}`,
+									{ password, userId: claimedUser },
+									"",
+								),
+							)
+						).status,
+					).toBe(401);
+					expect(
+						(
+							await send(
+								request(
+									`/two-factor/${path}`,
+									{ password: 123, userId: claimedUser },
+									oldUser.cookie,
+								),
+							)
+						).status,
+					).toBe(400);
+				}
+				const longPassword = password.repeat(8);
+				expect(
+					(
+						await send(
+							request(
+								"/two-factor/enable",
+								{ password: longPassword },
+								oldUser.cookie,
+							),
+						)
+					).status,
+				).toBe(400);
+				return signedEvents(oldUser.id, [
+					claimedUser,
+					oldUser.cookie,
+					longPassword,
+				]);
+			};
+			const legacyRejected = await exerciseRejectedRequests((input) =>
+				legacy.handler(input),
+			);
+			expect(legacyRejected).toHaveLength(7);
+			expect(legacyRejected).toContainEqual({
+				...auditContext,
+				type: "mfa.enrollment-started",
+				outcome: "failure",
+				actorId: "owner",
+				userId: "owner",
+				metadata: { path: "/two-factor/enable", errorCode: "VALIDATION_ERROR" },
+			});
+			expect(legacyRejected).toContainEqual({
+				...auditContext,
+				type: "mfa.enrollment-started",
+				outcome: "failure",
+				actorId: "owner",
+				userId: "owner",
+				metadata: {
+					path: "/two-factor/enable",
+					errorCode: "PASSWORD_TOO_LONG",
+				},
+			});
+			const ownedRuntime = createOwnedProjectEngine({
+				database,
+				project: { schemaName: schema, slug },
+				baseURL: origin,
+				basePath: "/api/auth",
+				trustedOrigins: [],
+				signingSecret: secret,
+				policy: { ...defaultAuthPolicy, requireEmailVerification: false },
+				trustedIP: (input) => input.headers.get("x-real-ip"),
+			});
+			expect(
+				await exerciseRejectedRequests((input) => ownedRuntime.dispatch(input)),
+			).toEqual(legacyRejected);
+			expect(
+				(
+					await required.handler(
+						request("/two-factor/disable", { password }, oldUser.cookie),
+					)
+				).status,
+			).toBe(403);
+			const impersonated = await signedIn();
+			await database.query(
+				`UPDATE "${schema}"."session" SET "impersonatedBy"=$1 WHERE id=$2`,
+				[oldUser.id, impersonated.sessionId],
+			);
+			function impersonatedRequest() {
+				const input = request(
+					"/two-factor/enable",
+					{ password },
+					impersonated.cookie,
+				);
+				input.headers.set("x-real-ip", "192.0.2.20");
+				return input;
+			}
+			expect((await legacy.handler(impersonatedRequest())).status).toBe(403);
+			expect((await ownedRuntime.dispatch(impersonatedRequest())).status).toBe(
+				403,
+			);
+			expect(await signedEvents(oldUser.id, [])).toEqual([]);
 			const nativeSend = (
 				path: string,
 				body: unknown,
@@ -699,6 +839,42 @@ describe.skipIf(!existsSync(fixturePath))(
 			expect(
 				await signedEvents(user.id, [code, cookie, ...setup.backupCodes]),
 			).toEqual(expected);
+
+			const rateLimitedNative = await nativeInstance(
+				webhookDatabase,
+				true,
+				false,
+				true,
+			);
+			const rateIP = "192.0.2.19";
+			function repeatAttempt() {
+				const input = request("/two-factor/disable", { password }, "");
+				input.headers.set("x-real-ip", rateIP);
+				return input;
+			}
+			for (let attempt = 0; attempt < 2; attempt++)
+				expect((await rateLimitedNative.handler(repeatAttempt())).status).toBe(
+					401,
+				);
+			expect((await ownedRuntime.dispatch(repeatAttempt())).status).toBe(401);
+			const candidateLimit = await ownedRuntime.dispatch(repeatAttempt());
+			const legacyLimit = await rateLimitedNative.handler(repeatAttempt());
+			expect(candidateLimit.status).toBe(429);
+			expect(legacyLimit.status).toBe(429);
+			expect(await candidateLimit.json()).toEqual(await legacyLimit.json());
+			for (const response of [candidateLimit, legacyLimit])
+				expect(Number(response.headers.get("X-Retry-After"))).toBeGreaterThan(
+					0,
+				);
+			expect(await signedEvents(user.id, [])).toEqual(
+				Array.from({ length: 3 }, () => ({
+					type: "mfa.disabled",
+					outcome: "failure",
+					metadata: { path: "/two-factor/disable", errorCode: "UNAUTHORIZED" },
+					ipAddress: rateIP,
+					userAgent: auditContext.userAgent,
+				})),
+			);
 		});
 
 		it("rolls back failed rotation and revokes only the selected realm on disable", async () => {

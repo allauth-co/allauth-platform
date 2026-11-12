@@ -187,6 +187,7 @@ describe.skipIf(!existsSync(fixture))(
 		let legacy: Awaited<ReturnType<typeof native>>;
 		let owned: ReturnType<typeof createOwnedProjectEngine>;
 		let other: ReturnType<typeof createOwnedProjectEngine>;
+		let rotatedAuthSigningKey: ReturnType<typeof createOwnedProjectEngine>;
 		let rootCookie: string;
 		let created = false;
 
@@ -327,13 +328,13 @@ describe.skipIf(!existsSync(fixture))(
 			expect(
 				await readRoot(new Headers({ cookie: rootCookie })),
 			).not.toBeNull();
-			const engine = (project: typeof alpha) =>
+			const engine = (project: typeof alpha, signingSecret = project.secret) =>
 				createOwnedProjectEngine({
 					database,
 					project,
 					baseURL: origin,
 					basePath: project.path,
-					signingSecret: project.secret,
+					signingSecret,
 					policy: defaultAuthPolicy,
 					trustedOrigins: [],
 					trustedIP: () => "192.0.2.46",
@@ -343,13 +344,17 @@ describe.skipIf(!existsSync(fixture))(
 						platformOrigin: origin,
 						readWorkspacePrincipal: readRoot,
 					},
-					webhookManagement: { resolver },
+					webhookManagement: { resolver, encryptionSecret: project.secret },
 					passwordChange: {
 						checkPasswordSafety: createOwnedProjectPasswordSafety(),
 					},
 				});
 			owned = engine(alpha);
 			other = engine(beta);
+			rotatedAuthSigningKey = engine(
+				alpha,
+				"synthetic-rotated-project-auth-signing-key",
+			);
 		});
 
 		afterAll(async () => {
@@ -775,9 +780,13 @@ describe.skipIf(!existsSync(fixture))(
 			expect(
 				(await deliveries("legacy", old.endpoint.id)).deliveries[0],
 			).toMatchObject({ id, status: "pending", attempts: 1 });
-			const rotated = await send("owned", `${base}/rotate`, {
-				id: old.endpoint.id,
-			});
+			const rotated = await rotatedAuthSigningKey.dispatch(
+				request(
+					`${alpha.path}${base}/rotate`,
+					{ id: old.endpoint.id },
+					rootCookie,
+				),
+			);
 			expect(rotated.status).toBe(200);
 			const { secret: next } = (await rotated.json()) as { secret: string };
 			expect(next).not.toBe(old.secret);
