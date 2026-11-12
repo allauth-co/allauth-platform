@@ -9,7 +9,8 @@ The platform installs `@better-auth/agent-auth` 0.6.2. The endpoint inventory be
 | Host revocation | `POST /host/revoke` | Fresh verified owner cookie or signed self-revocation by an active owned inline Ed25519 host. |
 | Host provisioning and enrollment | `POST /host/create`, `POST /host/enroll` | Fresh verified browser provisioning, inline Ed25519, and one-time enrollment across writers. |
 | Host update | `POST /host/update` | Fresh verified browser owner can edit the host and replace its inline key under the existing ID. |
-| Other host maintenance | `POST /host/rotate-key`, `POST /host/switch-account` | Pending |
+| Signed host key rotation | `POST /host/rotate-key` | Active owned inline host with an exact host-ID issuer and unused JTI. Host-ID changes require a host without linked agents or approvals. |
+| Host account switch | `POST /host/switch-account` | Pending |
 | Delegated registration | `POST /agent/register` | Existing active owned host with a verified inline Ed25519 JWT and one-time JWT ID. The agent starts active with an empty capability budget. |
 | Agent identity transfer | `POST /agent/claim` | Pending. |
 | Agent session | `GET /agent/session` | Verified active inline delegated agent, live grants, and an explicit public user projection. |
@@ -57,7 +58,9 @@ Capability revocation accepts the fresh verified browser owner of the agent or i
 
 Signed host self-revocation verifies the active host’s existing inline key, accepts its exact ID or an unambiguous key ID as the issuer, and applies the same grant cascade as browser revocation. Successful revocation clears the verifying key. A retry using that key receives the native authentication error, including after rollback. The fixture covers direct requests to the selected realm.
 
-Browser host update replaces the inline Ed25519 key under the original host ID and preserves existing agent and approval links. The candidate rejects a key ID already assigned to another host or matching another host ID. The native and owned engines accept each other’s replacement keys and reject the previous key after a successful write. The separate signed rotation endpoints still require compatibility proof.
+Browser host update replaces the inline Ed25519 key under the original host ID and preserves existing agent and approval links. The candidate rejects a key ID already assigned to another host or matching another host ID. The native and owned engines accept each other’s replacement keys and reject the previous key after a successful write.
+
+Signed host rotation uses the replacement JWK thumbprint as the host ID. The installed route’s issuer lookup requires the existing host ID. A client using the key ID as its issuer can rotate through this route when those IDs match. PostgreSQL’s agent and approval foreign keys prevent changing the ID of a referenced host. The fixture reports that conflict before writing and supports same-ID key metadata updates under the same authorization.
 
 Capability catalog reads preserve the native empty list and unknown-capability response. Both require a live signed host or delegated agent in the selected realm. Agent credentials share the same single-use proof records and bounded heartbeat as signed status. Host credentials remain reusable for catalog reads within their existing lifetime.
 

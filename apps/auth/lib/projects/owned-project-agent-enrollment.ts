@@ -4,13 +4,14 @@ import type { PoolClient } from "pg";
 import * as z from "zod";
 import { hasRemoteAgentKeys } from "../features/helpers";
 
-const jwkInput = z.record(
+/** Native inline public JWK body shape for project host operations. */
+export const ownedAgentPublicJwkInput = z.record(
 	z.string(),
 	z.union([z.string(), z.boolean(), z.array(z.string())]).optional(),
 );
 const createInput = z.object({
 	name: z.string().optional(),
-	public_key: jwkInput.optional(),
+	public_key: ownedAgentPublicJwkInput.optional(),
 	default_capabilities: z.array(z.string()).optional(),
 });
 const updateInput = createInput.extend({
@@ -19,7 +20,7 @@ const updateInput = createInput.extend({
 });
 const enrollInput = z.object({
 	token: z.string(),
-	public_key: jwkInput,
+	public_key: ownedAgentPublicJwkInput,
 	name: z.string().optional(),
 });
 const publicFields = new Set([
@@ -97,7 +98,7 @@ function invalidKey() {
 export async function readOwnedAgentPublicKey(
 	value: unknown,
 ): Promise<HostKey | Response> {
-	const parsed = jwkInput.safeParse(value);
+	const parsed = ownedAgentPublicJwkInput.safeParse(value);
 	if (!parsed.success) return invalidKey();
 	const input = parsed.data;
 	if (!input.kty || !input.x) return invalidKey();
@@ -142,20 +143,31 @@ function expiredEnrollment() {
 	);
 }
 
-async function lockKey(client: PoolClient, key: HostKey) {
-	await client.query(
-		`SELECT pg_advisory_xact_lock(hashtextextended(current_schema() || ':agent-host:' || $1, 0))`,
-		[key.kid ? `kid:${key.kid}` : `key:${key.serialized}`],
-	);
+/** Serialize assignment of a realm host key and any new host ID it will claim. */
+export async function lockOwnedAgentHostKey(
+	client: PoolClient,
+	key: HostKey,
+	newHostId?: string,
+) {
+	const keyLock = key.kid ? `kid:${key.kid}` : `key:${key.serialized}`;
+	const locks = newHostId
+		? [...new Set([keyLock, `kid:${newHostId}`])].sort()
+		: [keyLock];
+	for (const lock of locks)
+		await client.query(
+			`SELECT pg_advisory_xact_lock(hashtextextended(current_schema() || ':agent-host:' || $1, 0))`,
+			[lock],
+		);
 }
 
 async function keyOwner(client: PoolClient, key: HostKey, userId: string) {
-	const { rows } = await client.query<Host>(
-		`SELECT ${fields} FROM "agentHost" WHERE kid=NULLIF($1,'') OR "publicKey"=$2 ORDER BY id LIMIT 2 FOR UPDATE`,
+	const { rows } = await client.query<Host & { idAliasOnly: boolean }>(
+		`SELECT ${fields},((id=NULLIF($1,'')) IS TRUE AND (kid=NULLIF($1,'') OR "publicKey"=$2) IS NOT TRUE) AS "idAliasOnly"
+		 FROM "agentHost" WHERE id=NULLIF($1,'') OR kid=NULLIF($1,'') OR "publicKey"=$2 ORDER BY id LIMIT 2 FOR UPDATE`,
 		[key.kid, key.serialized],
 	);
 	const host = rows[0];
-	if (rows.length > 1)
+	if (rows.length > 1 || host?.idAliasOnly)
 		return protocolError(
 			409,
 			"host_already_linked",
@@ -198,7 +210,7 @@ export async function createOwnedAgentHost(
 			"One or more requested capability names don't exist or are blocked",
 		);
 	if (key) {
-		await lockKey(client, key);
+		await lockOwnedAgentHostKey(client, key);
 		const existing = await keyOwner(client, key, userId);
 		if (existing instanceof Response) return existing;
 		const hostId = existing?.id ?? randomUUID();
@@ -277,7 +289,7 @@ export async function updateOwnedAgentHost(
 			"invalid_capabilities",
 			"One or more requested capability names don't exist or are blocked",
 		);
-	if (key) await lockKey(client, key);
+	if (key) await lockOwnedAgentHostKey(client, key);
 	const {
 		rows: [host],
 	} = await client.query<{ status: string; jwksUrl: string | null }>(
@@ -343,7 +355,7 @@ export async function enrollOwnedAgentHost(client: PoolClient, body: unknown) {
 	const { token, public_key, name } = parsed.data;
 	const key = await readOwnedAgentPublicKey(public_key);
 	if (key instanceof Response) return key;
-	await lockKey(client, key);
+	await lockOwnedAgentHostKey(client, key);
 	const { rows: pending } = await client.query<Host & { live: boolean }>(
 		`SELECT ${fields},COALESCE("enrollmentTokenExpiresAt">clock_timestamp(),false) AS live
 		 FROM "agentHost" WHERE "enrollmentTokenHash"=$1 ORDER BY id LIMIT 2 FOR UPDATE`,

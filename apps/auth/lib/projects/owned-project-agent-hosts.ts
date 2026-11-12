@@ -35,6 +35,10 @@ import {
 	revokeOwnSignedAgentGrants,
 } from "./owned-project-agent-grant-revocation";
 import {
+	agentHostRotationPath,
+	rotateOwnedAgentHost,
+} from "./owned-project-agent-host-rotation";
+import {
 	agentIntrospectionPath,
 	introspectOwnedProjectAgent,
 } from "./owned-project-agent-introspection";
@@ -296,6 +300,8 @@ export function createOwnedProjectAgentHosts(options: BrowserHosts) {
 		const agentCleanup = request.method === "POST" && path === "/agent/cleanup";
 		const browserAgentWrite = agentRevoke || agentUpdate || agentCleanup;
 		const hostRevoke = request.method === "POST" && path === revokePath;
+		const hostRotation =
+			request.method === "POST" && path === agentHostRotationPath;
 		const hostUpdate = request.method === "POST" && path === "/host/update";
 		const write =
 			decision ||
@@ -318,6 +324,7 @@ export function createOwnedProjectAgentHosts(options: BrowserHosts) {
 			!register &&
 			!catalog &&
 			!introspect &&
+			!hostRotation &&
 			!agentRead
 		)
 			return;
@@ -342,6 +349,12 @@ export function createOwnedProjectAgentHosts(options: BrowserHosts) {
 			}),
 		);
 		if (limited) return limited;
+		if (hostRotation) {
+			const body = await options.readBody(request);
+			return options.store.transaction((client) =>
+				rotateOwnedAgentHost(client, request, body),
+			);
+		}
 		if (session)
 			return options.store.transaction((client) =>
 				readOwnedAgentSession(client, request),

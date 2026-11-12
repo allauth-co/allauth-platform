@@ -3,7 +3,12 @@ import { existsSync, readFileSync } from "node:fs";
 import { oauthProvider } from "@better-auth/oauth-provider";
 import { admin, jwt } from "better-auth/plugins";
 import { getTestInstance } from "better-auth/test";
-import { exportJWK, generateKeyPair, SignJWT } from "jose";
+import {
+	calculateJwkThumbprint,
+	exportJWK,
+	generateKeyPair,
+	SignJWT,
+} from "jose";
 import { Kysely, PostgresDialect } from "kysely";
 import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -2442,6 +2447,219 @@ describe.skipIf(!existsSync(fixture))(
 				id: host.hostId,
 				name: "Owned replacement",
 			});
+		});
+
+		it("rotates an unreferenced signed host using native thumbprint IDs across writers", async () => {
+			const path = "/host/rotate-key";
+			const initial = await nativeMachineHost(
+				"Signed host rotation",
+				sessionCookie,
+			);
+			const schema = `"${alpha.schemaName}"`;
+			const record = async (id: string) =>
+				(
+					await database.query(
+						`SELECT id,kid,"publicKey",name,"userId","defaultCapabilities",status,"createdAt","activatedAt","expiresAt","lastUsedAt" FROM ${schema}."agentHost" WHERE id=$1`,
+						[id],
+					)
+				).rows[0];
+			const before = await record(initial.hostId);
+			const pair = async (kid: string) => {
+				const hostKey = await generateKeyPair("EdDSA", { extractable: true });
+				const publicKey = { ...(await exportJWK(hostKey.publicKey)), kid };
+				return {
+					hostId: await calculateJwkThumbprint(publicKey),
+					hostKey,
+					kid,
+					publicKey,
+				};
+			};
+			const sign = async (
+				machine: typeof initial,
+				issuer = machine.hostId,
+				audience = agentAudience,
+				jti: string = randomUUID(),
+			) =>
+				`Bearer ${await new SignJWT({})
+					.setProtectedHeader({
+						alg: "EdDSA",
+						typ: "host+jwt",
+						kid: machine.kid,
+					})
+					.setIssuer(issuer)
+					.setAudience(audience)
+					.setIssuedAt()
+					.setExpirationTime("45s")
+					.setJti(jti)
+					.sign(machine.hostKey.privateKey)}`;
+			const legacyKey = await pair("fixture-native-rotated");
+			const candidateKey = await pair("fixture-owned-rotated");
+			const resumedKey = await pair("fixture-resumed-rotated");
+			const legacyBody = { public_key: legacyKey.publicKey };
+			const alias = await legacy.handler(
+				request(alpha, path, "", legacyBody, await sign(initial, initial.kid)),
+			);
+			expect(alias.status).toBe(404);
+			expect(await alias.json()).toMatchObject({ error: "host_not_found" });
+			const first = await legacy.handler(
+				request(alpha, path, "", legacyBody, await sign(initial)),
+			);
+			expect(
+				first.status,
+				first.ok ? undefined : await first.clone().text(),
+			).toBe(200);
+			expect(await first.json()).toEqual({
+				host_id: legacyKey.hostId,
+				status: "active",
+			});
+			expect(await record(initial.hostId)).toBeUndefined();
+			expect(await record(legacyKey.hostId)).toEqual({
+				...before,
+				id: legacyKey.hostId,
+				kid: legacyKey.kid,
+				publicKey: JSON.stringify(legacyKey.publicKey),
+			});
+			const candidateBody = { public_key: candidateKey.publicKey };
+			const collision = await owned.dispatch(
+				request(alpha, "/host/create", sessionCookie, {
+					public_key: { ...candidateKey.publicKey, kid: legacyKey.hostId },
+				}),
+			);
+			expect(collision.status).toBe(409);
+			expect(await collision.json()).toMatchObject({
+				error: "host_already_linked",
+			});
+			await expectSame(path, sessionCookie, 401, candidateBody);
+			await expectSame(
+				path,
+				"",
+				404,
+				candidateBody,
+				await sign(legacyKey, legacyKey.kid),
+			);
+			await expectSame(path, "", 401, candidateBody, await sign(initial));
+			await expectSame(
+				path,
+				"",
+				401,
+				candidateBody,
+				await sign(legacyKey, legacyKey.hostId, agentAudience, ""),
+			);
+			await expectSame(
+				path,
+				"",
+				401,
+				candidateBody,
+				await sign(
+					legacyKey,
+					legacyKey.hostId,
+					"https://elsewhere.fixture.example",
+				),
+			);
+			const candidateProof = await sign(legacyKey);
+			expect(
+				(
+					await outside.dispatch(
+						request(beta, path, "", candidateBody, candidateProof),
+					)
+				).status,
+			).toBe(401);
+			expect(
+				(
+					await disabled.dispatch(
+						request(alpha, path, "", candidateBody, candidateProof),
+					)
+				).status,
+			).toBe(501);
+			const sameKey = {
+				public_key: {
+					...legacyKey.publicKey,
+					kid: "fixture-native-relabelled",
+				},
+			};
+			const registrationKey = await generateKeyPair("EdDSA", {
+				extractable: true,
+			});
+			const sameProof = `Bearer ${await registerProof(legacyKey, registrationKey)}`;
+			const same = await owned.dispatch(
+				request(alpha, path, "", sameKey, sameProof),
+			);
+			expect(same.status).toBe(200);
+			expect(await same.json()).toEqual({
+				host_id: legacyKey.hostId,
+				status: "active",
+			});
+			const replay = await candidate(alpha, true).dispatch(
+				request(alpha, path, "", sameKey, sameProof),
+			);
+			expect(replay.status).toBe(401);
+			expect(await replay.json()).toMatchObject({ error: "jti_replay" });
+			const sharedReplay = await owned.dispatch(
+				request(
+					alpha,
+					"/agent/register",
+					"",
+					{ mode: "delegated", name: "Disposable rotation proof" },
+					sameProof,
+				),
+			);
+			expect(sharedReplay.status).toBe(401);
+			expect(await sharedReplay.json()).toMatchObject({ error: "jti_replay" });
+			const rotate = () =>
+				owned.dispatch(request(alpha, path, "", candidateBody, candidateProof));
+			const second = await Promise.all([rotate(), rotate()]);
+			expect(second.map(({ status }) => status).sort()).toEqual([200, 401]);
+			expect(await second.find(({ ok }) => ok)?.json()).toEqual({
+				host_id: candidateKey.hostId,
+				status: "active",
+			});
+			expect(await record(legacyKey.hostId)).toBeUndefined();
+			expect(await record(candidateKey.hostId)).toEqual({
+				...before,
+				id: candidateKey.hostId,
+				kid: candidateKey.kid,
+				publicKey: JSON.stringify(candidateKey.publicKey),
+			});
+			legacy = await native(nativePool);
+			const retired = await legacy.handler(
+				request(alpha, path, "", candidateBody, await sign(legacyKey)),
+			);
+			expect(retired.status).toBe(401);
+			const resumed = await legacy.handler(
+				request(
+					alpha,
+					path,
+					"",
+					{ public_key: resumedKey.publicKey },
+					await sign(candidateKey),
+				),
+			);
+			expect(resumed.status).toBe(200);
+			expect(await resumed.json()).toEqual({
+				host_id: resumedKey.hostId,
+				status: "active",
+			});
+			expect(await record(candidateKey.hostId)).toBeUndefined();
+			expect(await record(resumedKey.hostId)).toEqual({
+				...before,
+				id: resumedKey.hostId,
+				kid: resumedKey.kid,
+				publicKey: JSON.stringify(resumedKey.publicKey),
+			});
+			const linked = await nativeMachineHost(
+				"Host with linked approval",
+				sessionCookie,
+			);
+			await pendingApproval(linked.hostId, "ciba", sessionOwner);
+			const linkedBefore = await record(linked.hostId);
+			const blocked = await owned.dispatch(
+				request(alpha, path, "", candidateBody, await sign(linked)),
+			);
+			expect(blocked.status).toBe(409);
+			expect(await blocked.json()).toMatchObject({
+				error: "host_rotation_blocked",
+			});
+			expect(await record(linked.hostId)).toEqual(linkedBefore);
 		});
 
 		it("serializes simultaneous browser key-ID replacements across owners in one realm", async () => {
