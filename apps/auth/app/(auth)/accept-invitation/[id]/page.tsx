@@ -17,21 +17,34 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { useInviteAcceptMutation } from "@/data/organization/invitation-accept-mutation";
 import { useInvitationQuery } from "@/data/organization/invitation-query";
 import { useInviteRejectMutation } from "@/data/organization/invitation-reject-mutation";
+import { useHostedOrganizationClient } from "@/components/hosted-organization-client";
+import { HostedProjectInvitation } from "@/components/hosted-project-invitation";
 
 export default function Page() {
-	const params = useParams<{
-		id: string;
-	}>();
+	const { id } = useParams<{ id: string }>();
+	const hosted = useHostedOrganizationClient();
+	return hosted ? (
+		<HostedProjectInvitation key={id} client={hosted} invitationId={id} />
+	) : (
+		<LegacyInvitation invitationId={id} />
+	);
+}
+
+function LegacyInvitation({ invitationId }: { invitationId: string }) {
 	const router = useRouter();
 	const [isRedirecting, setIsRedirecting] = useState(false);
 
-	const { data: invitation, isLoading, error } = useInvitationQuery(params.id);
+	const {
+		data: invitation,
+		isLoading,
+		error,
+	} = useInvitationQuery(invitationId);
 	const acceptMutation = useInviteAcceptMutation();
 	const rejectMutation = useInviteRejectMutation();
 
 	const handleAccept = () => {
 		acceptMutation.mutate(
-			{ invitationId: params.id },
+			{ invitationId },
 			{
 				onSuccess: () => {
 					setIsRedirecting(true);
@@ -43,7 +56,7 @@ export default function Page() {
 
 	const handleReject = () => {
 		rejectMutation.mutate(
-			{ invitationId: params.id },
+			{ invitationId },
 			{
 				onSuccess: () => {
 					setIsRedirecting(true);

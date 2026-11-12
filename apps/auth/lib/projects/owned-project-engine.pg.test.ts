@@ -197,6 +197,50 @@ describe.skipIf(!existsSync(fixturePath))("isolated PostgreSQL owned project eng
 		return { id, token, cookie: `${cookieName}=${encodeURIComponent(`${token}.${signature}`)}` };
 	}
 
+	it("uploads a profile draft for the live project account and keeps the native storage capability contract", async () => {
+		const ownerId = await seed("avatar-owner@fixture.example");
+		const unverifiedId = await seed("avatar-unverified@fixture.example", { verified: false });
+		const owner = await legacySession(ownerId, 3600);
+		const unverified = await legacySession(unverifiedId, 3600);
+		const image = "https://images.fixture.example/uploaded.jpg";
+		let healthy = false;
+		const upload = vi.fn(async () => image);
+		const candidate = engine(schema, "203.0.113.21", {
+			sdk: { avatar: { upload, ownershipAndDeletion: async () => healthy } },
+		});
+		const bytes = Buffer.alloc(10_240);
+		bytes.set([255, 216, 255], 0);
+		bytes.set([255, 217], bytes.length - 2);
+		const avatar = { contentType: "image/jpeg", data: bytes.toString("base64") };
+		const postAvatar = (cookie?: string, headers: HeadersInit = {}, input = avatar) =>
+			candidate.dispatch(request("/sdk/avatar", input, { ...headers, ...(cookie ? { cookie } : {}) }));
+		expect(await (await candidate.dispatch(request("/sdk/config"))).json()).toMatchObject({
+			profileImageUpload: true,
+			profileImageOwnershipAndDeletion: false,
+		});
+		expect((await postAvatar()).status).toBe(401);
+		expect((await postAvatar(unverified.cookie)).status).toBe(403);
+		expect((await postAvatar(owner.cookie, { Origin: "https://foreign.fixture.example" })).status).toBe(403);
+		expect((await postAvatar(owner.cookie)).status).toBe(503);
+		expect(upload).not.toHaveBeenCalled();
+		healthy = true;
+		expect(await (await candidate.dispatch(request("/sdk/config"))).json()).toMatchObject({
+			profileImageUpload: true,
+			profileImageOwnershipAndDeletion: true,
+		});
+		expect((await postAvatar(owner.cookie, {}, { ...avatar, contentType: "image/png" })).status).toBe(400);
+		const response = await postAvatar(owner.cookie);
+		expect(response.status).toBe(200);
+		expect(await response.json()).toEqual({ url: image });
+		expect(upload).toHaveBeenCalledExactlyOnceWith(
+			expect.objectContaining({ contentType: "image/jpeg", extension: "jpg" }),
+			ownerId,
+		);
+		expect((await database.query(
+			`SELECT image FROM "${schema}"."user" WHERE id=$1`, [ownerId],
+		)).rows).toEqual([{ image: null }]);
+	});
+
 	it("keeps signed application sign-in, session and sign-out working in archived SDK v1 and SDK v2", async () => {
 		const directory = await mkdtemp(join(tmpdir(), "allauth-owned-sdk-"));
 		const originalFetch = globalThis.fetch;

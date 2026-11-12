@@ -71,6 +71,7 @@ jobs:
         run: >-
           pnpm exec vitest run --root apps/auth --config vitest.config.ts
           lib/domains/hosted-sdk.test.ts lib/hosted-sdk-page.test.ts lib/hosted-sdk-ui-render.test.ts
+          lib/domains/hosted-organization-preview.test.ts lib/hosted-organization-ui-render.test.ts
           lib/branding/portal.test.ts lib/shared.test.ts lib/oauth-consent-render.test.ts
           lib/domains/portal-session.test.ts lib/app-entry.test.ts lib/console-entry.test.ts
           lib/oauth-picker-portal.test.ts lib/oauth-picker-render.test.ts
@@ -97,6 +98,7 @@ jobs:
           lib/projects/owned-project-scim-console.pg.test.ts
           lib/projects/owned-project-sso.pg.test.ts lib/projects/owned-project-sso-saml.pg.test.ts
           lib/projects/owned-project-https.test.ts lib/avatars/profile.test.ts
+          lib/avatars/lifecycle.pg.test.ts lib/branding/validation.test.ts
           lib/projects/owned-project-support.pg.test.ts lib/projects/support-plugin.test.ts
           lib/projects/management-plugin.test.ts lib/projects/service-directory.test.ts
           lib/projects/passkey-store.pg.test.ts

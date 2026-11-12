@@ -1,8 +1,8 @@
 import { createHmac } from "node:crypto";
 import {
 	createRemoteJWKSet,
-	customFetch as joseFetch,
 	decodeJwt,
+	customFetch as joseFetch,
 	jwtVerify,
 } from "jose";
 import * as oauth from "oauth4webapi";
@@ -16,9 +16,12 @@ import type {
 	OwnedProjectOAuthUnlink,
 } from "./owned-project-linked-accounts";
 import { createOwnedProjectLinkedAccounts } from "./owned-project-linked-accounts";
+
 export { ownedProjectOAuthUnlinkInput } from "./owned-project-linked-accounts";
+
 import type { ProjectUser } from "./owned-project-engine-store";
 import type {
+	ProjectOAuthIdentity,
 	ProjectOAuthProvider,
 	ProjectOAuthState,
 } from "./owned-project-oauth-store";
@@ -29,14 +32,19 @@ import {
 } from "./owned-project-oauth-store";
 import {
 	appleCallbackForm,
+	appleClientProfile,
 	appleDisplayName,
 	appleMetadata,
 	appleNonce,
+	appleProfileName,
+	appleTokenAudience,
 	microsoftEmailVerified,
 	microsoftIssuer,
 	microsoftMetadata,
 } from "./owned-project-provider-tokens";
+
 export { projectOAuthProvider } from "./owned-project-oauth-store";
+
 import type { Project } from "./registry";
 import { projectOrigin, projectSlug } from "./validation";
 
@@ -65,6 +73,16 @@ export const ownedProjectOAuthStartInput = z.strictObject({
 	disableRedirect: z.boolean().optional(),
 	requestSignUp: z.boolean().optional(),
 	loginHint: z.string().max(320).optional(),
+	idToken: z
+		.object({
+			token: z.string().min(1).max(32768),
+			nonce: z.string().max(512).optional(),
+			accessToken: z.string().max(32768).optional(),
+			refreshToken: z.string().max(32768).optional(),
+			expiresAt: z.number().optional(),
+			user: appleClientProfile.optional(),
+		})
+		.optional(),
 	additionalData: z.record(z.string(), z.unknown()).optional(),
 	scopes: z
 		.array(
@@ -93,7 +111,8 @@ type Credentials = {
 	redirectURI: string;
 };
 type AppleCredentials = Omit<Credentials, "clientSecret"> & {
-	clientSecret(): Promise<string>;
+	appBundleIdentifier?: string;
+	clientSecret(clientId: string): Promise<string>;
 };
 
 export interface OwnedProjectOAuthOptions {
@@ -124,6 +143,7 @@ export interface OwnedProjectOAuthOptions {
 			provider: ProjectOAuthProvider;
 			destination: string;
 			registered: boolean;
+			transport: "browser" | "id-token";
 		},
 	): Promise<Response>;
 	authorizeLinkedAccounts?: AuthorizeLinkedAccounts;
@@ -217,6 +237,25 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 	const expireState = `${stateCookie}=; Max-Age=0; ${attributes}`;
 	const network: ProjectOAuthFetch = (input, init) =>
 		(options.fetch ?? globalThis.fetch)(input, init);
+	const appleKeys =
+		options.apple &&
+		createRemoteJWKSet(new URL(appleMetadata.jwks_uri!), {
+			[joseFetch]: network,
+			timeoutDuration: 7000,
+		});
+	const appleBindingFailures = {
+		SOCIAL_ACCOUNT_ALREADY_LINKED: ["Social account already linked", 409],
+		LINKING_NOT_ALLOWED: ["Account not linked - linking not allowed", 401],
+		LINKING_DIFFERENT_EMAILS_NOT_ALLOWED: [
+			"Account not linked - different emails not allowed",
+			401,
+		],
+		USER_EMAIL_NOT_FOUND: ["User email not found", 401],
+		SIGN_UP_DISABLED: [
+			"New account registration is disabled for this application.",
+			403,
+		],
+	} as const;
 	const issuer = new URL(options.broker.issuer);
 	const discoveryURL = new URL(options.broker.discoveryURL);
 	if (
@@ -515,11 +554,229 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 	}
 
 	function start(request: Request, input: OwnedProjectOAuthStart) {
-		return redirectStart(request, input, false);
+		return input.idToken
+			? directApple(request, input, input.idToken, false)
+			: redirectStart(request, input, false);
 	}
 
 	function startLink(request: Request, input: OwnedProjectOAuthStart) {
-		return redirectStart(request, input, true);
+		return input.idToken
+			? directApple(request, input, input.idToken, true)
+			: redirectStart(request, input, true);
+	}
+
+	async function verifyAppleToken(
+		token: string,
+		config: AppleCredentials,
+		nonce?: string,
+	) {
+		if (!appleKeys) throw new Error("Apple sign-in is unavailable.");
+		const { payload } = await jwtVerify(token, appleKeys, {
+			issuer: appleMetadata.issuer,
+			audience: config.appBundleIdentifier
+				? [config.clientId, config.appBundleIdentifier]
+				: config.clientId,
+			algorithms: ["RS256"],
+			requiredClaims: ["sub", "iat", "exp"],
+			maxTokenAge: "1h",
+		});
+		const clientId = appleTokenAudience(payload.aud, config);
+		const subject = payload.sub;
+		if (
+			!clientId ||
+			!subject ||
+			subject.length > 512 ||
+			originControls.test(subject) ||
+			(nonce && payload.nonce !== appleNonce(nonce, payload.nonce))
+		)
+			throw new Error("Apple identity is invalid.");
+		return { clientId, subject, payload };
+	}
+
+	async function verifiedAppleRefresh(
+		config: AppleCredentials,
+		subject: string,
+		clientId: string,
+		refreshToken: string,
+	) {
+		const client = { client_id: clientId };
+		const response = await oauth.refreshTokenGrantRequest(
+			appleMetadata,
+			client,
+			oauth.ClientSecretPost(await config.clientSecret(clientId)),
+			refreshToken,
+			{ [oauth.customFetch]: network, signal: AbortSignal.timeout(7000) },
+		);
+		const tokens = await oauth.processRefreshTokenResponse(
+			appleMetadata,
+			client,
+			response,
+		);
+		if (!tokens.id_token)
+			throw new Error("Apple did not return a grant identity.");
+		const proof = await verifyAppleToken(tokens.id_token, config);
+		if (proof.subject !== subject || proof.clientId !== clientId)
+			throw new Error("Apple grant does not match the verified identity.");
+		return {
+			accessToken: tokens.access_token,
+			idToken: tokens.id_token,
+			refreshToken,
+			accessTokenExpiresAt: boundedExpiry(tokens.expires_in),
+		};
+	}
+
+	async function directApple(
+		request: Request,
+		input: OwnedProjectOAuthStart,
+		token: NonNullable<OwnedProjectOAuthStart["idToken"]>,
+		linking: boolean,
+	) {
+		const operation = linking ? "link-social" : "sign-in/social";
+		if (!browserRequest(request, operation, "POST"))
+			return publicFailure(
+				"FORBIDDEN",
+				"This authentication request is not permitted.",
+				403,
+			);
+		if (!credentials(input.provider))
+			return publicFailure("PROVIDER_NOT_FOUND", "Provider not found", 404);
+		const config = options.apple;
+		if (input.provider !== "apple" || !config)
+			return publicFailure(
+				"ID_TOKEN_NOT_SUPPORTED",
+				"id_token not supported",
+				404,
+			);
+		const requestOrigin = request.headers.get("origin")!;
+		if (
+			[
+				input.callbackURL,
+				input.newUserCallbackURL,
+				input.errorCallbackURL,
+			].some(
+				(value) =>
+					value !== undefined && !safeURL(value, requestOrigin, origins),
+			)
+		)
+			return publicFailure(
+				"FORBIDDEN",
+				"This authentication destination is not permitted.",
+				403,
+			);
+
+		const sessionToken = linking ? browserToken(request) : null;
+		if (linking && !sessionToken)
+			return publicFailure("UNAUTHORIZED", "Unauthorized", 401);
+		const authority = sessionToken
+			? await store.transaction((client) =>
+					linked.lockAuthority(client, request, sessionToken, "link"),
+				)
+			: null;
+		if (authority?.status === "rejected") return rejectedResponse(authority);
+
+		let identity: ProjectOAuthIdentity;
+		try {
+			const { clientId, subject, payload } = await verifyAppleToken(
+				token.token,
+				config,
+				token.nonce,
+			);
+			const email =
+				payload.email === undefined || payload.email === ""
+					? undefined
+					: z.email().max(320).parse(payload.email).toLowerCase();
+			identity = {
+				provider: "apple",
+				subject,
+				email,
+				idToken: token.token,
+				emailVerified:
+					payload.email_verified === true || payload.email_verified === "true",
+				name:
+					appleProfileName(token.user) ??
+					(typeof payload.name === "string" ? payload.name.slice(0, 256) : ""),
+				accessToken: token.accessToken,
+			};
+			if (linking && token.refreshToken)
+				Object.assign(
+					identity,
+					await verifiedAppleRefresh(
+						config,
+						subject,
+						clientId,
+						token.refreshToken,
+					),
+				);
+		} catch {
+			return publicFailure("INVALID_TOKEN", "Invalid token", 401);
+		}
+
+		const link =
+			sessionToken && authority?.status === "authorized"
+				? {
+						userId: authority.user.id,
+						email: authority.user.email,
+						sessionToken,
+					}
+				: undefined;
+		try {
+			return await store.transaction(async (client) => {
+				const account = await store.bind(
+					client,
+					identity,
+					{
+						signUpEnabled: options.signUpEnabled,
+						requireEmailVerification: false,
+					},
+					link,
+					`/${operation}`,
+				);
+				if (!account)
+					return publicFailure("OAUTH_LINK_ERROR", "Account not linked", 401);
+				if ("error" in account) {
+					const [message, status] = appleBindingFailures[account.error];
+					return publicFailure(
+						account.error === "SIGN_UP_DISABLED" ? "FORBIDDEN" : account.error,
+						message,
+						status,
+					);
+				}
+				if (link) {
+					if (
+						options.authorizeLinkedAccounts &&
+						!(await options.authorizeLinkedAccounts(client, {
+							request,
+							user: account.user,
+							operation: "link-callback",
+						}))
+					)
+						throw publicFailure(
+							"FORBIDDEN",
+							"This authentication request is not permitted.",
+							403,
+						);
+					return publicJSON({ url: "", status: true, redirect: false }, 200);
+				}
+				const response = await options.complete(client, {
+					request,
+					user: account.user,
+					provider: "apple",
+					destination: origin,
+					registered: account.registered,
+					transport: "id-token",
+				});
+				if (response.status >= 400) throw response;
+				return response;
+			});
+		} catch (error) {
+			return error instanceof Response
+				? error
+				: publicFailure(
+						"PROVIDER_UNAVAILABLE",
+						"Provider sign-in is temporarily unavailable.",
+						503,
+					);
+		}
 	}
 
 	async function listAccounts(request: Request) {
@@ -566,7 +823,7 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 		const secret =
 			typeof config.clientSecret === "string"
 				? config.clientSecret
-				: await config.clientSecret();
+				: await config.clientSecret(config.clientId);
 		const auth =
 			provider === "allauth"
 				? oauth.ClientSecretBasic(secret)
@@ -797,7 +1054,7 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 					},
 					link,
 				);
-				if (!account) throw rejected;
+				if (!account || "error" in account) throw rejected;
 				if (link) {
 					if (
 						options.authorizeLinkedAccounts &&
@@ -816,6 +1073,7 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 					provider,
 					destination: ((account.registered && newUser) || destination).href,
 					registered: account.registered,
+					transport: "browser",
 				});
 				if (response.status >= 400) throw rejected;
 				return response;

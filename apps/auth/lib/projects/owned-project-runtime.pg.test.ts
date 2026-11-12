@@ -18,6 +18,8 @@ import { createWorkspace } from "../workspaces/repository";
 import { signProjectIssuerQuery } from "./owned-project-issuer-authorization-query";
 import type { ProjectRuntimeFixtureBoot } from "./owned-project-runtime-fixture";
 import {
+	runtimeFixtureAssetOrigin,
+	runtimeFixtureAssetSecret,
 	runtimeFixtureGoogle,
 	runtimeFixtureMicrosoft,
 	runtimeProviderFixtureCode,
@@ -65,6 +67,8 @@ function childEnvironment(microsoftProject?: string): NodeJS.ProcessEnv {
 		SCIM_CREDENTIAL_HASH_SECRET:
 			"disposable-project-runtime-fixture-credential-hash-key",
 		ALLAUTH_EDGE_SECRET: edgeSecret,
+		ALLAUTH_ASSET_ORIGIN: runtimeFixtureAssetOrigin,
+		ALLAUTH_ASSET_SECRET: runtimeFixtureAssetSecret,
 		CLOUDFLARE_SAAS_READY: "true",
 		ALLAUTH_HOSTING_BASE_DOMAIN: "allauth.co",
 		...(microsoftProject
@@ -335,6 +339,131 @@ async function issueFixtureTokens(
 	return keys;
 }
 
+type RuntimePersonalKey = {
+	id: string;
+	key?: string;
+	name: string;
+	enabled: boolean;
+	referenceId: string;
+};
+
+type ApiKeyTransport = { prefix: string; host?: string; cookie: string };
+
+async function runtimeApiKeys(
+	service: Awaited<ReturnType<typeof openProcess>>,
+	transport: ApiKeyTransport,
+) {
+	const response = await service.request(
+		`${transport.prefix}/api-key/list?sortBy=name&sortDirection=asc`,
+		transport,
+	);
+	expect(
+		response.status,
+		response.ok ? undefined : await response.clone().text(),
+	).toBe(200);
+	expect(response.headers.get("cache-control")).toBe("no-store");
+	const result = (await response.json()) as {
+		apiKeys: RuntimePersonalKey[];
+		total: number;
+	};
+	expect(result.apiKeys.every((key) => !("key" in key))).toBe(true);
+	return result;
+}
+
+async function runtimeCreateApiKey(
+	service: Awaited<ReturnType<typeof openProcess>>,
+	transport: ApiKeyTransport,
+	name: string,
+) {
+	const response = await service.request(`${transport.prefix}/api-key/create`, {
+		...transport,
+		body: { name },
+	});
+	expect(
+		response.status,
+		response.ok ? undefined : await response.clone().text(),
+	).toBe(200);
+	expect(response.headers.get("cache-control")).toBe("no-store");
+	const key = (await response.json()) as RuntimePersonalKey;
+	expect(key).toMatchObject({
+		id: expect.any(String),
+		name,
+		enabled: true,
+		key: expect.stringMatching(/^allauth_[A-Za-z]{64}$/),
+		referenceId: credentials.project.id,
+	});
+	return key;
+}
+
+async function runtimeGetApiKey(
+	service: Awaited<ReturnType<typeof openProcess>>,
+	transport: ApiKeyTransport,
+	keyId: string,
+	status = 200,
+) {
+	const response = await service.request(
+		`${transport.prefix}/api-key/get?id=${encodeURIComponent(keyId)}`,
+		transport,
+	);
+	expect(
+		response.status,
+		response.ok ? undefined : await response.clone().text(),
+	).toBe(status);
+	const result = (await response.json()) as RuntimePersonalKey;
+	expect(result).not.toHaveProperty("key");
+	return result;
+}
+
+async function exerciseOwnedApiKeys(
+	service: Awaited<ReturnType<typeof openProcess>>,
+	transport: ApiKeyTransport,
+	legacy: RuntimePersonalKey,
+	createdName: string,
+) {
+	expect((await runtimeApiKeys(service, transport)).apiKeys).toEqual(
+		expect.arrayContaining([
+			expect.objectContaining({ id: legacy.id, name: legacy.name }),
+		]),
+	);
+	expect(await runtimeGetApiKey(service, transport, legacy.id)).toMatchObject({
+		id: legacy.id,
+		enabled: true,
+	});
+	const created = await runtimeCreateApiKey(service, transport, createdName);
+	const updatedName = `${createdName} renamed`;
+	const updated = await service.request(`${transport.prefix}/api-key/update`, {
+		...transport,
+		body: {
+			keyId: created.id,
+			name: updatedName,
+			enabled: false,
+			expiresIn: null,
+		},
+	});
+	expect(
+		updated.status,
+		updated.ok ? undefined : await updated.clone().text(),
+	).toBe(200);
+	const changed = (await updated.json()) as RuntimePersonalKey;
+	expect(changed).toMatchObject({
+		id: created.id,
+		name: updatedName,
+		enabled: false,
+		expiresAt: null,
+	});
+	expect(changed).not.toHaveProperty("key");
+	const removed = await service.request(`${transport.prefix}/api-key/delete`, {
+		...transport,
+		body: { keyId: legacy.id },
+	});
+	expect(removed.status).toBe(200);
+	expect(await removed.json()).toEqual({ success: true });
+	expect(
+		await runtimeGetApiKey(service, transport, legacy.id, 404),
+	).toMatchObject({ code: "KEY_NOT_FOUND" });
+	return changed;
+}
+
 async function seed(databaseURL: string) {
 	await promisify(execFile)(
 		process.execPath,
@@ -509,6 +638,33 @@ describe.skipIf(!existsSync(fixture))(
 				});
 				expect(hostedLogin.status).toBe(200);
 				const legacyHostedCookie = cookie(hostedLogin);
+				const avatar = {
+					contentType: "image/jpeg",
+					data: Buffer.from([255, 216, 255, 0, 255, 217]).toString("base64"),
+				};
+				const avatarBase = `${runtimeFixtureAssetOrigin}/branding/${alpha.workspaceId}/${alpha.applicationId}/`;
+				const legacyAvatar = await service.request("/api/auth/sdk/avatar", {
+					host: alphaHost,
+					cookie: legacyHostedCookie,
+					body: avatar,
+				});
+				expect(legacyAvatar.status).toBe(200);
+				expect(
+					((await legacyAvatar.json()) as { url: string }).url.startsWith(
+						avatarBase,
+					),
+				).toBe(true);
+				const nativeDirectKey = await runtimeCreateApiKey(
+					service,
+					{ prefix: alphaPath, cookie: legacyCookie },
+					"Native direct",
+				);
+				const nativeHostedKey = await runtimeCreateApiKey(
+					service,
+					{ prefix: "/api/auth", host: alphaHost, cookie: legacyHostedCookie },
+					"Native hosted",
+				);
+
 				const nativeGoogle = await startFixtureProvider(service, "google", {
 					...hostedProvider,
 					callback: `${hostedIssuer}/callback/google`,
@@ -571,9 +727,41 @@ describe.skipIf(!existsSync(fixture))(
 				expect(
 					await (await service.request(`${alphaPath}/sdk/config`)).json(),
 				).toMatchObject({
+					apiKeys: true,
 					googleProvider: "google",
 					microsoftProvider: "microsoft",
+					profileImageUpload: true,
+					profileImageOwnershipAndDeletion: false,
 				});
+				const directAvatar = await service.request(`${alphaPath}/sdk/avatar`, {
+					cookie: legacyCookie,
+					body: avatar,
+				});
+				expect(directAvatar.status).toBe(200);
+				expect(
+					((await directAvatar.json()) as { url: string }).url.startsWith(
+						avatarBase,
+					),
+				).toBe(true);
+				const hostedAvatar = await service.request("/api/auth/sdk/avatar", {
+					host: alphaHost,
+					cookie: legacyHostedCookie,
+					body: avatar,
+				});
+				expect(hostedAvatar.status).toBe(200);
+				const { url: savedImage } = (await hostedAvatar.json()) as {
+					url: string;
+				};
+				expect(savedImage.startsWith(avatarBase)).toBe(true);
+				expect(
+					(
+						await service.request("/api/auth/update-user", {
+							host: alphaHost,
+							cookie: legacyHostedCookie,
+							body: { image: savedImage },
+						})
+					).status,
+				).toBe(200);
 				const directDiscovery = await service.request(
 					`${alphaPath}/.well-known/openid-configuration`,
 				);
@@ -611,7 +799,9 @@ describe.skipIf(!existsSync(fixture))(
 							cookie: legacyCookie,
 						})
 					).json(),
-				).toMatchObject({ user: { id: credentials.project.id } });
+				).toMatchObject({
+					user: { id: credentials.project.id, image: savedImage },
+				});
 				expect(
 					await (
 						await service.request("/api/auth/get-session", {
@@ -674,7 +864,7 @@ describe.skipIf(!existsSync(fixture))(
 				});
 				expect(ownedConfig.status).toBe(200);
 				expect(await ownedConfig.json()).toMatchObject({
-					apiKeys: false,
+					apiKeys: true,
 					enterpriseSSO: false,
 					scim: false,
 					signUpEnabled: true,
@@ -692,6 +882,49 @@ describe.skipIf(!existsSync(fixture))(
 					google: false,
 					microsoft: false,
 				});
+				const ownedDirectKey = await exerciseOwnedApiKeys(
+					service,
+					{ prefix: alphaPath, cookie: legacyCookie },
+					nativeDirectKey,
+					"Owned direct",
+				);
+				const ownedHostedKey = await exerciseOwnedApiKeys(
+					service,
+					{ prefix: "/api/auth", host: alphaHost, cookie: legacyHostedCookie },
+					nativeHostedKey,
+					"Owned hosted",
+				);
+				expect(
+					(await service.request("/api/auth/api-key/list", { host: alphaHost }))
+						.status,
+				).toBe(401);
+				expect(
+					(
+						await service.request("/api/auth/api-key/verify", {
+							host: alphaHost,
+							body: { key: nativeHostedKey.key },
+						})
+					).status,
+				).toBe(404);
+				const betaLogin = await service.request("/api/auth/sign-in/email", {
+					host: betaHost,
+					body: login,
+				});
+				expect(betaLogin.status).toBe(200);
+				expect(
+					await runtimeApiKeys(service, {
+						prefix: "/api/auth",
+						host: betaHost,
+						cookie: cookie(betaLogin),
+					}),
+				).toEqual({ apiKeys: [], total: 0 });
+				expect(
+					await runtimeApiKeys(service, {
+						prefix: "/api/auth",
+						cookie: rootCookie,
+					}),
+				).toEqual({ apiKeys: [], total: 0 });
+
 				expect(
 					(await service.request("/oauth/login", { host: alphaHost })).status,
 				).toBe(503);
@@ -952,7 +1185,46 @@ describe.skipIf(!existsSync(fixture))(
 							cookie: ownedHostedCookie,
 						})
 					).json(),
-				).toMatchObject({ user: { id: credentials.project.id } });
+				).toMatchObject({
+					user: { id: credentials.project.id, image: savedImage },
+				});
+				const rolledBackDirectKeys = { prefix: alphaPath, cookie: ownedCookie };
+				const rolledBackHostedKeys = {
+					prefix: "/api/auth",
+					host: alphaHost,
+					cookie: ownedHostedCookie,
+				};
+				expect(
+					await runtimeGetApiKey(
+						service,
+						rolledBackDirectKeys,
+						ownedDirectKey.id,
+					),
+				).toEqual(ownedDirectKey);
+				expect(
+					await runtimeGetApiKey(
+						service,
+						rolledBackHostedKeys,
+						ownedHostedKey.id,
+					),
+				).toEqual(ownedHostedKey);
+				expect(
+					await runtimeGetApiKey(
+						service,
+						rolledBackDirectKeys,
+						nativeDirectKey.id,
+						404,
+					),
+				).toMatchObject({ code: "KEY_NOT_FOUND" });
+				expect(
+					await runtimeGetApiKey(
+						service,
+						rolledBackHostedKeys,
+						nativeHostedKey.id,
+						404,
+					),
+				).toMatchObject({ code: "KEY_NOT_FOUND" });
+
 				expect(
 					await (
 						await service.request(`${alphaPath}/get-session`, {
@@ -1010,6 +1282,18 @@ describe.skipIf(!existsSync(fixture))(
 							)
 						).rowCount,
 					).toBe(0);
+					await changed.query(
+						`UPDATE "${alpha.schemaName}"."apikey" SET "rateLimitMax"=101 WHERE id=$1`,
+						[ownedDirectKey.id],
+					);
+					await expect(openProcess(url(restored), alpha, true)).rejects.toThrow(
+						"stored features outside the candidate scope",
+					);
+					await changed.query(
+						`UPDATE "${alpha.schemaName}"."apikey" SET "rateLimitMax"=100 WHERE id=$1`,
+						[ownedDirectKey.id],
+					);
+
 					await changed.query(
 						`UPDATE "${alpha.schemaName}"."oauthClient" SET "grantTypes" = '["client_credentials"]' WHERE "clientId" = $1`,
 						[oauthClientId],

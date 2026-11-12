@@ -10,6 +10,7 @@ import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { defaultAuthPolicy } from "../auth-policy/policy";
 import { discoveryDocument } from "../discovery";
+import { productionTwoFactor } from "../mfa";
 import { appleIntegrity } from "../project-providers/apple";
 import { microsoftIntegrity } from "../project-providers/microsoft";
 import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
@@ -49,10 +50,12 @@ const microsoftTenant = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
 const microsoftAuthority = "https://login.microsoftonline.com";
 const apple = {
 	clientId: "com.allauth.fixture",
+	appBundleIdentifier: "com.allauth.fixture.ios",
 	clientSecret: "synthetic-apple-fixture-secret",
 	redirectURI: `${origin}/api/auth/callback/apple`,
 };
 const appleIssuer = "https://appleid.apple.com";
+const appleBundleSecret = "synthetic-apple-bundle-fixture-secret";
 const cookiePrefix = `allauth_project_${slug}`;
 const sessionCookie = `__Secure-${cookiePrefix}.session_token`;
 
@@ -116,7 +119,11 @@ async function legacyProject(
 						disableDefaultScope: true,
 						scope: ["openid", "profile", "email"],
 					},
-					apple,
+					apple: {
+						...apple,
+						clientId: [apple.clientId, apple.appBundleIdentifier],
+						audience: [apple.clientId, apple.appBundleIdentifier],
+					},
 				},
 				trustedOrigins: [appleIssuer],
 				account: {
@@ -134,6 +141,7 @@ async function legacyProject(
 				plugins: [
 					microsoftIntegrity(),
 					appleIntegrity(),
+					productionTwoFactor(origin),
 					genericOAuth({
 						config: [
 							{
@@ -528,7 +536,13 @@ describe.skipIf(!existsSync(fixturePath))(
 					broker: config,
 					google,
 					microsoft,
-					apple: { ...apple, clientSecret: async () => apple.clientSecret },
+					apple: {
+						...apple,
+						clientSecret: async (clientId) =>
+							clientId === apple.appBundleIdentifier
+								? appleBundleSecret
+								: apple.clientSecret,
+					},
 					defaultErrorURL: `${origin}/auth-error`,
 					fetch: network,
 				},
@@ -536,6 +550,49 @@ describe.skipIf(!existsSync(fixturePath))(
 		}
 
 		const providerFixtureKeys = generateKeyPair("RS256");
+
+		async function appleFixtureToken(
+			subject: string,
+			audience: string,
+			claims: Record<string, unknown> = {},
+		) {
+			return new SignJWT(claims)
+				.setProtectedHeader({ alg: "RS256", kid: "fixture-provider-key" })
+				.setIssuer(appleIssuer)
+				.setAudience(audience)
+				.setSubject(subject)
+				.setIssuedAt()
+				.setExpirationTime("5m")
+				.sign((await providerFixtureKeys).privateKey);
+		}
+
+		function appleDirectFixture(
+			refresh?: (request: Request) => Promise<Response>,
+		) {
+			externalNetwork = async (input, init) => {
+				const request = new Request(input, init);
+				if (
+					request.url === `${appleIssuer}/auth/keys` &&
+					request.method === "GET"
+				)
+					return Response.json({
+						keys: [
+							{
+								...(await exportJWK((await providerFixtureKeys).publicKey)),
+								alg: "RS256",
+								kid: "fixture-provider-key",
+							},
+						],
+					});
+				if (
+					refresh &&
+					request.url === `${appleIssuer}/auth/token` &&
+					request.method === "POST"
+				)
+					return refresh(request);
+				throw new Error("Unexpected request to the offline Apple fixture.");
+			};
+		}
 
 		async function providerAuthorization(
 			started: Response,
@@ -854,6 +911,273 @@ describe.skipIf(!existsSync(fixturePath))(
 				expect(binding.rows).toEqual([
 					{ accountId: subject, userId: before?.user.id },
 				]);
+			} finally {
+				externalNetwork = undefined;
+			}
+		});
+
+		it("preserves the Apple Services ID grant through bundle ID sign-in and completes MFA after rollback", async () => {
+			const subject = "apple-direct-interop-subject";
+			const email = "apple-direct@fixture.example";
+			const nonce = "synthetic-apple-client-nonce";
+			const identity = { email, email_verified: "true" };
+			const request = (idToken: Record<string, unknown>) =>
+				post(origin, "/sign-in/social", { provider: "apple", idToken });
+			const readGrant = async () =>
+				(
+					await database.query<{ idToken: string; refreshToken: string }>(
+						`SELECT "idToken", "refreshToken" FROM "${schema}"."account" WHERE "providerId"='apple' AND "accountId"=$1`,
+						[subject],
+					)
+				).rows[0];
+			try {
+				appleDirectFixture();
+				const servicesToken = await appleFixtureToken(subject, apple.clientId, {
+					...identity,
+					nonce,
+				});
+				const legacy = await native.handler(
+					request({
+						token: servicesToken,
+						nonce,
+						user: {
+							name: { firstName: "Apple", lastName: "Interop" },
+							email: "untrusted@fixture.example",
+						},
+					}),
+				);
+				expect(legacy.status).toBe(200);
+				const original = (await legacy.json()) as { user: { id: string } };
+				expect(original.user).toMatchObject({
+					email,
+					name: "Apple Interop",
+					emailVerified: true,
+				});
+				const browser = await native.handler(
+					post(origin, "/sign-in/social", { ...startBody, provider: "apple" }),
+				);
+				const returned = await providerAuthorization(browser, "apple", {
+					sub: subject,
+					...identity,
+				});
+				const continueBrowser = await native.handler(returned);
+				const browserSession = await native.handler(
+					new Request(continueBrowser.headers.get("location")!, {
+						headers: { cookie: returned.headers.get("cookie")! },
+					}),
+				);
+				expect(browserSession.headers.get("location")).toBe(destination);
+				const savedGrant = await readGrant();
+				expect(savedGrant).toMatchObject({
+					idToken: expect.any(String),
+					refreshToken: expect.any(String),
+				});
+				appleDirectFixture();
+				const candidate = ownedProviderEngine();
+				const bundleToken = await appleFixtureToken(
+					subject,
+					apple.appBundleIdentifier,
+					{
+						nonce: createHash("sha256").update(nonce).digest("hex"),
+					},
+				);
+				const direct = await candidate.dispatch(
+					request({
+						token: bundleToken,
+						nonce,
+						refreshToken: "ignored-caller-refresh",
+					}),
+				);
+				expect(direct.status).toBe(200);
+				expect(await direct.clone().json()).toMatchObject({
+					redirect: false,
+					token: expect.any(String),
+					user: { id: original.user.id, email },
+				});
+				expect(
+					await native.api.getSession({
+						headers: new Headers({ cookie: cookiePairs(direct) }),
+					}),
+				).toMatchObject({ user: { id: original.user.id } });
+				expect(await readGrant()).toEqual(savedGrant);
+				for (const bad of [
+					{ token: bundleToken, nonce: "mismatched-nonce" },
+					{
+						token: await appleFixtureToken(
+							subject,
+							"com.unrelated.fixture",
+							identity,
+						),
+					},
+				]) {
+					const denied = await candidate.dispatch(request(bad));
+					expect(denied.status).toBe(401);
+					expect(await denied.json()).toMatchObject({ code: "INVALID_TOKEN" });
+					expect(denied.headers.getSetCookie()).toEqual([]);
+				}
+				const unknownSubject = await appleFixtureToken(
+					"unknown-relay-subject",
+					apple.appBundleIdentifier,
+				);
+				const missingEmail = await candidate.dispatch(
+					request({ token: unknownSubject }),
+				);
+				expect(missingEmail.status).toBe(401);
+				expect(await missingEmail.json()).toMatchObject({
+					code: "USER_EMAIL_NOT_FOUND",
+				});
+				await database.query(
+					`UPDATE "${schema}"."user" SET "twoFactorEnabled"=TRUE WHERE id=$1`,
+					[original.user.id],
+				);
+				await database.query(
+					`INSERT INTO "${schema}"."twoFactor" (id,"userId",secret,"backupCodes",verified) VALUES ($1,$2,$3,$4,TRUE)`,
+					[
+						randomUUID(),
+						original.user.id,
+						await symmetricEncrypt({
+							key,
+							data: "fixture-apple-direct-factor-secret",
+						}),
+						await symmetricEncrypt({ key, data: '["abcde-fghij"]' }),
+					],
+				);
+				const pending = await candidate.dispatch(
+					request({ token: servicesToken, nonce }),
+				);
+				expect(pending.status).toBe(200);
+				const pendingBody = await pending.json();
+				expect(pendingBody).toMatchObject({ twoFactorRedirect: true });
+				expect(pendingBody).not.toHaveProperty("token");
+				expect(
+					pending.headers
+						.getSetCookie()
+						.some((value) => value.startsWith(`${sessionCookie}=`)),
+				).toBe(false);
+				const factor = await native.handler(
+					accountRequest(
+						"/two-factor/verify-backup-code",
+						cookiePairs(pending),
+						{ code: "abcde-fghij" },
+					),
+				);
+				expect(factor.status).toBe(200);
+				expect(
+					await native.api.getSession({
+						headers: new Headers({ cookie: cookiePairs(factor) }),
+					}),
+				).toMatchObject({ user: { id: original.user.id } });
+				expect(await readGrant()).toEqual(savedGrant);
+			} finally {
+				externalNetwork = undefined;
+			}
+		});
+
+		it("validates an Apple native refresh grant before linking and preserves the exact owner", async () => {
+			const owner = await accountOwner();
+			const other = await accountOwner();
+			const subject = "apple-direct-link-subject";
+			const refreshToken = "synthetic-apple-native-refresh-grant";
+			const email = `${owner.userId}@fixture.example`;
+			const token = await appleFixtureToken(
+				subject,
+				apple.appBundleIdentifier,
+				{ email, email_verified: true },
+			);
+			const candidate = ownedProviderEngine();
+			const link = (cookie: string, proof: Record<string, unknown>) =>
+				accountRequest("/link-social", cookie, {
+					provider: "apple",
+					idToken: { token, ...proof },
+				});
+			const saved = async () =>
+				(
+					await database.query<{
+						userId: string;
+						refreshToken: string;
+						idToken: string;
+					}>(
+						`SELECT "userId", "refreshToken", "idToken" FROM "${schema}"."account" WHERE "providerId"='apple' AND "accountId"=$1`,
+						[subject],
+					)
+				).rows[0];
+			let refreshSubject = "different-apple-direct-link-subject";
+			try {
+				appleDirectFixture(async (request) => {
+					const form = new URLSearchParams(await request.text());
+					expect(form.get("grant_type")).toBe("refresh_token");
+					expect(form.get("client_id")).toBe(apple.appBundleIdentifier);
+					expect(form.get("client_secret")).toBe(appleBundleSecret);
+					expect(form.get("refresh_token")).toBe(refreshToken);
+					return Response.json({
+						access_token: "synthetic-validated-apple-access",
+						token_type: "Bearer",
+						expires_in: 300,
+						id_token: await appleFixtureToken(
+							refreshSubject,
+							apple.appBundleIdentifier,
+						),
+					});
+				});
+				const mismatched = await candidate.dispatch(
+					link(owner.cookie, { refreshToken }),
+				);
+				expect(mismatched.status).toBe(401);
+				expect(await saved()).toBeUndefined();
+				refreshSubject = subject;
+				const linked = await candidate.dispatch(
+					link(owner.cookie, { refreshToken }),
+				);
+				expect(linked.status).toBe(200);
+				expect(await linked.json()).toEqual({
+					url: "",
+					status: true,
+					redirect: false,
+				});
+				expect(linked.headers.getSetCookie()).toEqual([]);
+				const grant = await saved();
+				expect(grant?.userId).toBe(owner.userId);
+				expect(await symmetricDecrypt({ key, data: grant!.refreshToken })).toBe(
+					refreshToken,
+				);
+				const rollback = await native.handler(
+					accountRequest("/list-accounts", owner.cookie),
+				);
+				expect(await rollback.json()).toEqual(
+					expect.arrayContaining([
+						expect.objectContaining({
+							providerId: "apple",
+							accountId: subject,
+						}),
+					]),
+				);
+				const collision = await candidate.dispatch(link(other.cookie, {}));
+				expect(collision.status).toBe(409);
+				expect(await collision.json()).toMatchObject({
+					code: "SOCIAL_ACCOUNT_ALREADY_LINKED",
+				});
+				expect(await saved()).toEqual(grant);
+				const legacySubject = "legacy-apple-direct-link-subject";
+				const legacyToken = await appleFixtureToken(
+					legacySubject,
+					apple.clientId,
+					{ email, email_verified: true },
+				);
+				const legacy = await native.handler(
+					link(owner.cookie, { token: legacyToken }),
+				);
+				expect(legacy.status).toBe(200);
+				const owned = await candidate.dispatch(
+					accountRequest("/list-accounts", owner.cookie),
+				);
+				expect(await owned.json()).toEqual(
+					expect.arrayContaining([
+						expect.objectContaining({
+							providerId: "apple",
+							accountId: legacySubject,
+						}),
+					]),
+				);
 			} finally {
 				externalNetwork = undefined;
 			}

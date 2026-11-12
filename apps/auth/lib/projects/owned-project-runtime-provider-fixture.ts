@@ -1,5 +1,11 @@
 import { createHash } from "node:crypto";
 import { exportJWK, generateKeyPair, SignJWT } from "jose";
+import { verifyAssetRequest } from "../branding/asset-signature";
+
+export const runtimeFixtureAssetOrigin =
+	"https://assets.runtime.fixture.example";
+export const runtimeFixtureAssetSecret =
+	"isolated-runtime-fixture-asset-signing-key";
 
 export const runtimeFixtureGoogle = {
 	clientId: "fixture-runtime-google.apps.googleusercontent.com",
@@ -53,6 +59,12 @@ export function runtimeProviderFixtureFetch() {
 		init?: RequestInit,
 	) {
 		const request = new Request(input, init);
+		if (new URL(request.url).origin === runtimeFixtureAssetOrigin) {
+			const data = await verifyAssetRequest(request, runtimeFixtureAssetSecret);
+			return data && request.headers.get("content-type") === "image/jpeg"
+				? Response.json({ url: request.url }, { status: 201 })
+				: new Response(null, { status: 403 });
+		}
 		const provider = (Object.keys(endpoints) as RuntimeProvider[]).find(
 			(name) =>
 				[endpoints[name].keys, endpoints[name].token].includes(request.url),

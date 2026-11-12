@@ -181,10 +181,17 @@ export function hostedSdkViewRequest(
 const getEndpoints = new Set([
 	"sdk/config",
 	"get-session",
+	"organization/list",
+	"organization/list-user-invitations",
+	"organization/get-invitation",
 	"passkey/generate-authenticate-options",
 ]);
 const postEndpoints = new Set([
 	"get-session",
+	"organization/create",
+	"organization/set-active",
+	"organization/accept-invitation",
+	"organization/reject-invitation",
 	"sign-out",
 	"sign-in/email",
 	"sign-in/username",

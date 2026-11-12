@@ -371,7 +371,7 @@ describe.skipIf(!existsSync(fixturePath))("real PostgreSQL hosted authentication
 		expect((await sessionsGET(await signedRequest(host(alpha), "/api/account/sessions", { headers: { cookie: rootCookie } }))).status).toBe(401);
 	});
 
-	it("compares a selected development project's signed hosted and proxy sessions without changing authority", async () => {
+	it("compares selected development sessions and preserves hosted organization invitation authority", async () => {
 		const workspacePrincipal = await requireWorkspacePrincipal(native.auth as unknown as AuthInstance, new Headers({ cookie: rootCookie }));
 		const project = await provisionProject({
 			name: "Session shadow fixture",
@@ -448,6 +448,53 @@ describe.skipIf(!existsSync(fixturePath))("real PostgreSQL hosted authentication
 			expect(comparisons).toEqual(Array.from({ length: 4 }, () => ({
 				event: "allauth.project_session_shadow", projectId: project.id, outcome: "match",
 			})));
+
+			const organizationUI = async (endpoint: string, cookie: string, body?: Record<string, unknown>) => {
+				const request = await signedRequest(host(project), `/api/auth/hosted-ui/organization/${endpoint}`, {
+					method: body ? "POST" : "GET",
+					headers: { accept: "application/json", cookie },
+					...(body ? { body: JSON.stringify(body) } : {}),
+				});
+				return body ? hostedSdkPOST(request) : hostedSdkGET(request);
+			};
+			const created = await organizationUI("create", cookies(newUI), {
+				name: "Hosted organization fixture", slug: "hosted-organization-fixture",
+			});
+			expect(created.status, await created.clone().text()).toBe(200);
+			const organization = await created.json() as { id: string; name: string };
+			expect(await (await organizationUI("list", cookies(newUI))).json()).toMatchObject([{ id: organization.id }]);
+
+			const recipientEmail = "hosted-invitation-recipient@fixture.example";
+			const recipient = await withHostedProjectAuth(project, host(project), (instance) =>
+				seed(instance, "Invitation recipient", recipientEmail), env,
+			);
+			const recipientLogin = await nativePOST(await signedRequest(host(project), "/api/auth/sign-in/email", {
+				method: "POST", body: JSON.stringify({ email: recipientEmail, password }),
+			}));
+			expect(recipientLogin.status).toBe(200);
+			const recipientCookie = cookies(recipientLogin);
+			const inviteId = randomUUID();
+			await projectRegistryPool(env).query(
+				`INSERT INTO "${project.schemaName}".invitation (id,"organizationId",email,role,status,"expiresAt","inviterId") VALUES ($1,$2,$3,'member','pending',now()+interval '1 hour',$4)`,
+				[inviteId, organization.id, recipientEmail, userId],
+			);
+			expect((await organizationUI("get-invitation?id=" + inviteId, rootCookie)).status).toBe(401);
+			expect((await organizationUI("get-invitation?id=" + inviteId, cookies(newUI))).status).toBe(403);
+			expect(await (await organizationUI("get-invitation?id=" + inviteId, recipientCookie)).json()).toMatchObject({
+				id: inviteId, organizationName: organization.name, email: recipientEmail, role: "member",
+			});
+			expect(await (await organizationUI("list-user-invitations", recipientCookie)).json()).toMatchObject([{ id: inviteId, role: "member" }]);
+			expect((await organizationUI("list-user-invitations?email=" + encodeURIComponent(recipientEmail), cookies(newUI))).status).toBe(400);
+			const accepted = await organizationUI("accept-invitation", recipientCookie, { invitationId: inviteId });
+			expect(accepted.status, await accepted.clone().text()).toBe(200);
+			expect(await accepted.json()).toMatchObject({
+				invitation: { id: inviteId, status: "accepted" },
+				member: { userId: recipient, organizationId: organization.id, role: "member" },
+			});
+			expect(await (await organizationUI("list-user-invitations", recipientCookie)).json()).toEqual([]);
+			expect(await (await organizationUI("list", recipientCookie)).json()).toMatchObject([{ id: organization.id }]);
+			expect(await (await organizationUI("set-active", recipientCookie, { organizationId: null })).json()).toBeNull();
+			expect(await (await organizationUI("set-active", recipientCookie, { organizationId: organization.id })).json()).toMatchObject({ id: organization.id });
 		} finally {
 			info.mockRestore();
 			vi.stubGlobal("fetch", previousFetch);

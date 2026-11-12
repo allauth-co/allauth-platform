@@ -63,23 +63,49 @@ export function appleNonce(expected: string, claim: unknown) {
 	return claim === digest ? digest : expected;
 }
 
+export function appleTokenAudience(
+	claim: JWTPayload["aud"],
+	configured: { clientId: string; appBundleIdentifier?: string },
+) {
+	const audience =
+		Array.isArray(claim) && claim.length === 1 ? claim[0] : claim;
+	return typeof audience === "string" &&
+		(audience === configured.clientId ||
+			audience === configured.appBundleIdentifier)
+		? audience
+		: null;
+}
+
 const appleName = z.object({
-	name: z.object({
-		firstName: z.string().max(256).optional(),
-		lastName: z.string().max(256).optional(),
-	}),
+	firstName: z.string().max(256).optional(),
+	lastName: z.string().max(256).optional(),
 });
+
+export const appleClientProfile = z.object({
+	name: appleName.optional(),
+	email: z.string().max(320).optional(),
+});
+
+export function appleProfileName(
+	profile: z.infer<typeof appleClientProfile> | undefined,
+) {
+	const name = profile?.name;
+	return (
+		(name &&
+			[name.firstName, name.lastName]
+				.filter(Boolean)
+				.join(" ")
+				.trim()
+				.slice(0, 256)) ||
+		undefined
+	);
+}
 
 export function appleDisplayName(user: string | null) {
 	if (!user || user.length > 4096) return undefined;
 	try {
-		const parsed = appleName.safeParse(JSON.parse(user));
-		if (!parsed.success) return undefined;
-		const { firstName, lastName } = parsed.data.name;
-		return (
-			[firstName, lastName].filter(Boolean).join(" ").trim().slice(0, 256) ||
-			undefined
-		);
+		const parsed = appleClientProfile.safeParse(JSON.parse(user));
+		return parsed.success ? appleProfileName(parsed.data) : undefined;
 	} catch {
 		return undefined;
 	}

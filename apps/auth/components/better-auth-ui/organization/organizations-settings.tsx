@@ -4,6 +4,8 @@
 import type { ComponentProps } from "react";
 
 import { cn } from "cn";
+import { useHostedOrganizationClient } from "@/components/hosted-organization-client";
+import { HostedOrganizationSettings } from "@/components/hosted-organizations";
 import { Organizations } from "./organizations";
 import { UserInvitations } from "./user-invitations";
 
@@ -21,13 +23,20 @@ export function OrganizationsSettings({
 	className,
 	...props
 }: OrganizationsSettingsProps & ComponentProps<"div">) {
+	const hosted = useHostedOrganizationClient();
 	return (
 		<div
 			className={cn("flex w-full flex-col gap-4 md:gap-6", className)}
 			{...props}
 		>
-			<Organizations />
-			<UserInvitations />
+			{hosted ? (
+				<HostedOrganizationSettings client={hosted} />
+			) : (
+				<>
+					<Organizations />
+					<UserInvitations />
+				</>
+			)}
 		</div>
 	);
 }

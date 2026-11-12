@@ -81,6 +81,8 @@ import type { OwnedProjectSupportOptions } from "./owned-project-support";
 import { createOwnedProjectSupportHttp } from "./owned-project-support";
 import { createOwnedRecoveryHttp } from "./owned-recovery-http";
 import { createOwnedSignUpHttp } from "./owned-sign-up";
+import type { ProjectAvatarStorage } from "./project-avatar-upload";
+import { uploadProjectAvatar } from "./project-avatar-upload";
 import type { Project } from "./registry";
 import { consumeProxySessionCheck } from "./session-introspection-admission";
 import { projectOrigin, projectSlug } from "./validation";
@@ -136,7 +138,9 @@ interface OwnedProjectEngineOptions {
 		"projectId" | "environment" | "authorize"
 	>;
 	sdk?: {
+		avatar?: ProjectAvatarStorage;
 		nativePasskeys?: NativePasskeyCapability;
+		personalApiKeys?: boolean;
 		getBranding?(): Promise<ApplicationBranding>;
 	};
 	appName?: string;
@@ -764,6 +768,8 @@ export function createOwnedProjectEngine(
 		}
 		if (path === "/sign-in/email-otp")
 			return json({ token, user: value }, 200, headers);
+		if (path === "/sign-in/social")
+			return json({ redirect: false, token, user: value }, 200, headers);
 		if (path === "/magic-link/verify")
 			return json(
 				{ token, user: value, session: { ...session, token } },
@@ -1731,20 +1737,24 @@ export function createOwnedProjectEngine(
 				const active = await currentSession(request.headers, client);
 				return active?.user.id === user.id;
 			},
-			async complete(client, { user, request, provider, destination }) {
+			async complete(
+				client,
+				{ user, request, provider, destination, transport },
+			) {
+				const browser = transport === "browser";
 				const result = await primaryResult(
 					client,
 					await store.lockUser(client, user.id),
 					request,
 					true,
-					`/callback/${provider}`,
-					destination,
+					browser ? `/callback/${provider}` : "/sign-in/social",
+					browser ? destination : undefined,
 					{
 						allowUnverifiedEmail:
 							provider === "microsoft" || provider === "apple",
 					},
 				);
-				return result.status === 200
+				return browser && result.status === 200
 					? redirect(new Headers(result.headers), destination)
 					: result;
 			},
@@ -1992,13 +2002,14 @@ export function createOwnedProjectEngine(
 			appleProvider: apple ? "apple" : null,
 			microsoft,
 			microsoftProvider: microsoft ? "microsoft" : null,
-			apiKeys: false,
+			apiKeys: options.sdk?.personalApiKeys === true,
 			enterpriseSSO: Boolean(sso),
 			scim: Boolean(scimAuthority && options.manageSCIMConsole),
 			organizations: true,
 			twoFactor: true,
-			profileImageUpload: false,
-			profileImageOwnershipAndDeletion: false,
+			profileImageUpload: Boolean(options.sdk?.avatar),
+			profileImageOwnershipAndDeletion:
+				(await options.sdk?.avatar?.ownershipAndDeletion?.()) === true,
 			...(options.sdk?.getBranding
 				? { branding: await options.sdk.getBranding() }
 				: {}),
@@ -2038,6 +2049,22 @@ export function createOwnedProjectEngine(
 		if (path === "/sdk/config" && request.method === "GET") {
 			if (!trustedRequest(request.headers, false)) return forbidden();
 			return publicSDKConfiguration();
+		}
+		if (path === "/sdk/avatar" && request.method === "POST") {
+			if (!trustedRequest(request.headers, true)) return forbidden();
+			const current = await currentSession(request.headers);
+			if (!current) return failure(401, "UNAUTHORIZED", "Unauthorized");
+			if (!current.user.emailVerified)
+				return failure(
+					403,
+					"FORBIDDEN",
+					"A verified, active project account is required.",
+				);
+			return uploadProjectAvatar(
+				options.sdk?.avatar,
+				current.user.id,
+				await requestBody(request, 262_144),
+			);
 		}
 		if (path.startsWith("/scim/v2/")) {
 			const response =

@@ -3,10 +3,13 @@ import { withAuth } from "../auth";
 import type { AuthPolicy } from "../auth-policy/policy";
 import {
 	eraseOwnedAvatarsBeforeDelete,
+	ownedAvatarReady,
 	ownedAvatarSelected,
+	storeOwnedAvatar,
 } from "../avatars/lifecycle";
 import { readWorkspaceEntitlements } from "../billing/entitlements";
 import { readApplicationBranding } from "../branding/repository";
+import { storeBrandingAsset } from "../branding/storage-client";
 import { brandingStorage } from "../branding/validation";
 import type { AuthEnvironment } from "../configuration";
 import {
@@ -46,6 +49,7 @@ import { createProjectEngineStore } from "./owned-project-engine-store";
 import { admitOwnedProjectNativeRoute } from "./owned-project-native-admission";
 import { createOwnedProjectInvitationEmail } from "./owned-project-organization-email";
 import { createOwnedProjectPasswordSafety } from "./owned-project-password-safety";
+import type { ProjectAvatarStorage } from "./project-avatar-upload";
 import { verifiedProjectRequest } from "./proxy";
 import type { Project } from "./registry";
 import {
@@ -92,8 +96,6 @@ async function readSupportedProviders(options: Options) {
 		project.schemaName !==
 			`allauth_project_${project.id.replaceAll("-", "")}` ||
 		policy.supportAccess?.enabled ||
-		ownedAvatarSelected(env, project.id) ||
-		brandingStorage(env).available ||
 		readProjectAppleProvider(env, project.slug)
 	)
 		throw new Error(
@@ -149,19 +151,31 @@ async function readSupportedProviders(options: Options) {
 		 EXISTS (SELECT 1 FROM "${schema}"."scimManagedConnection") OR
 		 EXISTS (SELECT 1 FROM "${schema}"."scimConnectionBinding") OR
 		 EXISTS (SELECT 1 FROM "${schema}"."allauthDirectory") OR
-		 EXISTS (SELECT 1 FROM "${schema}"."apikey") OR
+		 EXISTS (
+		  SELECT 1 FROM "${schema}"."apikey" k WHERE
+		   coalesce(nullif(k."configId",''),'default') <> 'default' OR
+		   NOT EXISTS (SELECT 1 FROM "${schema}"."user" u WHERE u.id=k."referenceId") OR
+		   k.key !~ '^[A-Za-z0-9_-]{43}$' OR
+		   k.permissions IS DISTINCT FROM '{"identity":["read"]}' OR
+		   (k.metadata IS NOT NULL AND k.metadata <> 'null') OR
+		   k."refillInterval" IS NOT NULL OR k."refillAmount" IS NOT NULL OR
+		   k."lastRefillAt" IS NOT NULL OR k.remaining IS NOT NULL OR
+		   k."rateLimitEnabled" IS DISTINCT FROM TRUE OR
+		   k."rateLimitTimeWindow" IS DISTINCT FROM 60000 OR
+		   k."rateLimitMax" IS DISTINCT FROM 100
+		 ) OR
 		 EXISTS (SELECT 1 FROM "${schema}"."walletAddress") OR
 		 EXISTS (SELECT 1 FROM "${schema}"."agentHost") OR
 		 EXISTS (SELECT 1 FROM "${schema}"."user" WHERE "isAnonymous" IS TRUE) OR
 		 EXISTS (SELECT 1 FROM "${schema}"."session" WHERE "impersonatedBy" IS NOT NULL AND "expiresAt" > now()) OR
 		 EXISTS (SELECT 1 FROM "${schema}"."allauthWebhookEndpoint") OR
-		 EXISTS (SELECT 1 FROM "${schema}"."allauthAvatarAsset" WHERE state <> 'deleted') OR
+		 (NOT $2::boolean AND EXISTS (SELECT 1 FROM "${schema}"."allauthAvatarAsset" WHERE state <> 'deleted')) OR
 		 EXISTS (SELECT 1 FROM "${schema}"."account" WHERE "providerId" <> ALL($1::text[])) OR
 		 EXISTS (SELECT 1 FROM "${schema}"."oauthClient" WHERE "grantTypes" IS NOT NULL AND (
 		  jsonb_typeof("grantTypes") <> 'array' OR NOT "grantTypes" <@ '["authorization_code","refresh_token","urn:ietf:params:oauth:grant-type:device_code"]'::jsonb
 		 ))
 		) AS incompatible`,
-		[providers],
+		[providers, ownedAvatarSelected(env, project.id)],
 	);
 	if (!snapshot || snapshot.incompatible)
 		throw new Error(
@@ -266,6 +280,25 @@ export async function createOwnedProjectRuntimeCandidate(options: Options) {
 	);
 	const relyingParty = realmPasskeyOptions(browserOrigin, project.name, native);
 	const credentials = backendCredentialRepository(projectRegistryPool(env));
+	const avatarScope = {
+		projectId: project.id,
+		workspaceId: project.workspaceId,
+		applicationId: project.applicationId,
+		schemaName: project.schemaName,
+	};
+	const avatarStorage: ProjectAvatarStorage | undefined = ownedAvatarSelected(
+		env,
+		project.id,
+	)
+		? {
+				upload: (asset, userId) =>
+					storeOwnedAvatar(asset, userId, avatarScope, database, env),
+				ownershipAndDeletion: () =>
+					ownedAvatarReady(database, avatarScope, env),
+			}
+		: brandingStorage(env).available
+			? { upload: (asset) => storeBrandingAsset(asset, avatarScope, env) }
+			: undefined;
 	const revokeAppleGrants = createOwnedProjectAppleDeletion({
 		database,
 		schemaName: project.schemaName,
@@ -283,6 +316,8 @@ export async function createOwnedProjectRuntimeCandidate(options: Options) {
 		trustedIP,
 		appName: project.name,
 		sdk: {
+			avatar: avatarStorage,
+			personalApiKeys: true,
 			getBranding: readBranding,
 			nativePasskeys: nativePasskeyCapability(native),
 		},
@@ -418,12 +453,7 @@ export async function createOwnedProjectRuntimeCandidate(options: Options) {
 			async beforeDelete({ user }) {
 				await eraseOwnedAvatarsBeforeDelete(
 					user.id,
-					{
-						projectId: project.id,
-						workspaceId: project.workspaceId,
-						applicationId: project.applicationId,
-						schemaName: project.schemaName,
-					},
+					avatarScope,
 					database,
 					env,
 				);

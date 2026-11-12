@@ -23,7 +23,6 @@ import type {
 	ApplicationBranding,
 	ValidatedBrandingAsset,
 } from "../branding/types";
-import { validateBrandingAsset } from "../branding/validation";
 import { recordControlEvent } from "../control/events";
 import type { ControlEventInput, ControlPrincipal } from "../control/types";
 import { clerkImportEndpoint } from "./clerk-import";
@@ -36,6 +35,7 @@ import type { ServiceDirectoryOptions } from "./service-directory";
 import { serviceDirectory } from "./service-directory";
 import type { ProjectSupportOptions } from "./support-plugin";
 import { projectSupport } from "./support-plugin";
+import { projectAvatarAsset, projectAvatarInput } from "./project-avatar-upload";
 
 /** The trusted callback authorizes a fresh platform identity for this workspace; tenant roles grant no console authority. */
 export interface ProjectManagementOptions {
@@ -272,18 +272,7 @@ export function projectManagement(options: ProjectManagementOptions) {
 			{
 				method: "POST",
 				requireHeaders: true,
-				body: z
-					.object({
-						contentType: z.enum(["image/png", "image/jpeg", "image/webp"]),
-						data: z
-							.string()
-							.min(4)
-							.max(174764)
-							.regex(
-								/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/,
-							),
-					})
-					.strict(),
+				body: projectAvatarInput,
 			},
 			async (ctx) => {
 				const current = await requireTenant(ctx, true);
@@ -300,19 +289,7 @@ export function projectManagement(options: ProjectManagementOptions) {
 						message:
 							"Profile photo uploads are not configured for this application.",
 					});
-				const bytes = Uint8Array.from(atob(ctx.body.data), (character) =>
-					character.charCodeAt(0),
-				);
-				if (bytes.byteLength > 131072)
-					throw new APIError("BAD_REQUEST", {
-						message:
-							"Choose a profile photo no larger than 128 KB after resizing.",
-					});
-				const asset = validateBrandingAsset(
-					"logo",
-					bytes,
-					ctx.body.contentType,
-				);
+				const asset = projectAvatarAsset(ctx.body);
 				// Upload prepares a draft. Only the existing native update-user flow saves the photo.
 				return ctx.json({
 					url: await options.uploadAvatar(asset, current.user.id),

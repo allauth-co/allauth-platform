@@ -3,6 +3,7 @@ import type { Pool, PoolClient } from "pg";
 import * as z from "zod";
 import type { LegacyMfaKeys } from "./legacy-mfa-record";
 import { sealLegacyMfaRecord } from "./legacy-mfa-record";
+import type { ProjectUser } from "./owned-project-engine-store";
 import { createProjectEngineStore } from "./owned-project-engine-store";
 import { checkedProjectSchema } from "./validation";
 
@@ -41,6 +42,18 @@ type LinkAuthority = NonNullable<ProjectOAuthState["link"]> & {
 	sessionToken: string;
 };
 
+type Binding =
+	| { user: ProjectUser; registered: boolean }
+	| {
+			error:
+				| "SOCIAL_ACCOUNT_ALREADY_LINKED"
+				| "LINKING_NOT_ALLOWED"
+				| "LINKING_DIFFERENT_EMAILS_NOT_ALLOWED"
+				| "USER_EMAIL_NOT_FOUND"
+				| "SIGN_UP_DISABLED";
+	  }
+	| null;
+
 export type ProjectOAuthIdentity = {
 	provider: ProjectOAuthProvider;
 	subject: string;
@@ -48,7 +61,7 @@ export type ProjectOAuthIdentity = {
 	emailVerified: boolean;
 	name: string;
 	image?: string;
-	accessToken: string;
+	accessToken?: string;
 	refreshToken?: string;
 	idToken: string;
 	accessTokenExpiresAt?: Date;
@@ -142,7 +155,8 @@ export function createProjectOAuthStore(
 		identity: ProjectOAuthIdentity,
 		policy: { signUpEnabled: boolean; requireEmailVerification: boolean },
 		link?: LinkAuthority,
-	) {
+		path = `/callback/${identity.provider}`,
+	): Promise<Binding> {
 		// The legacy schema has no unique provider/subject constraint. Serialize this engine's writes to one identity.
 		await client.query(
 			"SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
@@ -158,23 +172,33 @@ export function createProjectOAuthStore(
 		);
 		if (binding.rows.length > 1) return null;
 		const account = binding.rows[0];
+		const directSignIn = path === "/sign-in/social";
+		const directLink = path === "/link-social";
+		const sameDirectOwner =
+			directLink && link && account?.userId === link.userId;
+		if (link && account && account.userId !== link.userId)
+			return directLink ? { error: "SOCIAL_ACCOUNT_ALREADY_LINKED" } : null;
 		// Apple can omit email after consent. Use only the persisted owner of this exact verified subject.
 		const persistedOwner =
 			!identity.email && identity.provider === "apple" && account
 				? await realm.lockUser(client, account.userId)
 				: null;
 		const email = (identity.email ?? persistedOwner?.email)?.toLowerCase();
-		if (!email) return null;
+		if (!email)
+			return directSignIn || directLink
+				? { error: "USER_EMAIL_NOT_FOUND" }
+				: null;
 		const emailVerified = identity.email
 			? identity.emailVerified
 			: persistedOwner?.emailVerified === true;
-		if (
-			link &&
-			(!emailVerified ||
-				link.email.toLowerCase() !== email ||
-				(account && account.userId !== link.userId))
-		)
-			return null;
+		if (link && !sameDirectOwner) {
+			if (!emailVerified)
+				return directLink ? { error: "LINKING_NOT_ALLOWED" } : null;
+			if (link.email.toLowerCase() !== email)
+				return directLink
+					? { error: "LINKING_DIFFERENT_EMAILS_NOT_ALLOWED" }
+					: null;
+		}
 		let userId = link?.userId ?? account?.userId;
 		let registered = false;
 		if (!userId) {
@@ -185,6 +209,8 @@ export function createProjectOAuthStore(
 			userId = existing.rows[0]?.id;
 		}
 		if (!userId) {
+			if (directSignIn && !policy.signUpEnabled)
+				return { error: "SIGN_UP_DISABLED" };
 			if (
 				!policy.signUpEnabled ||
 				(policy.requireEmailVerification && !emailVerified)
@@ -223,7 +249,7 @@ export function createProjectOAuthStore(
 			return null;
 		if (
 			link &&
-			(user.email.toLowerCase() !== email ||
+			(user.email.toLowerCase() !== link.email.toLowerCase() ||
 				!(await realm.lockSession(client, link.sessionToken, user.id, false)))
 		)
 			return null;
@@ -247,7 +273,7 @@ export function createProjectOAuthStore(
 					client,
 					"user.updated",
 					"success",
-					`/callback/${identity.provider}`,
+					path,
 					user.id,
 					user.id,
 				);
@@ -264,7 +290,9 @@ export function createProjectOAuthStore(
 		}
 		if (!link && policy.requireEmailVerification && !user.emailVerified)
 			return null;
-		const access = sealLegacyMfaRecord(identity.accessToken, keys);
+		const access = identity.accessToken
+			? sealLegacyMfaRecord(identity.accessToken, keys)
+			: null;
 		const refresh = identity.refreshToken
 			? sealLegacyMfaRecord(identity.refreshToken, keys)
 			: null;
@@ -281,8 +309,9 @@ export function createProjectOAuthStore(
 							.join(",")
 					: null;
 			await client.query(
-				`UPDATE "${schema}"."account" SET "accessToken" = $1, "refreshToken" = COALESCE($2, "refreshToken"),
-				"idToken" = $3, "accessTokenExpiresAt" = COALESCE($4, "accessTokenExpiresAt"),
+				`UPDATE "${schema}"."account" SET "accessToken" = COALESCE($1, "accessToken"), "refreshToken" = COALESCE($2, "refreshToken"),
+				"idToken" = CASE WHEN "providerId" = 'apple' AND "refreshToken" IS NOT NULL AND $2::text IS NULL THEN "idToken" ELSE $3 END,
+				"accessTokenExpiresAt" = COALESCE($4, "accessTokenExpiresAt"),
 				"refreshTokenExpiresAt" = COALESCE($5, "refreshTokenExpiresAt"), scope = COALESCE($6, scope),
 				"updatedAt" = statement_timestamp() WHERE id = $7`,
 				[
@@ -318,7 +347,7 @@ export function createProjectOAuthStore(
 					client,
 					"user.created",
 					"success",
-					`/callback/${identity.provider}`,
+					path,
 					user.id,
 					user.id,
 				);
@@ -326,7 +355,7 @@ export function createProjectOAuthStore(
 				client,
 				"account.linked",
 				"success",
-				`/callback/${identity.provider}`,
+				path,
 				user.id,
 				accountId,
 			);

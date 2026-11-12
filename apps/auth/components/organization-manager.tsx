@@ -7,6 +7,7 @@ import { useEffect, useState } from "react";
 import { toast } from "sonner";
 import { authClient } from "@/lib/auth-client";
 import { errorMessage } from "@/lib/shared";
+import { selectHostedOrganization, useHostedOrganizationClient } from "./hosted-organization-client";
 import {
 	Card,
 	CardContent,
@@ -22,6 +23,7 @@ type Result = { error?: { message?: string } | null };
 const MEMBER_PAGE_SIZE = 25;
 export function OrganizationManager() {
 	const { data: session } = authClient.useSession();
+	const hosted = useHostedOrganizationClient();
 	const queryClient = useQueryClient();
 	const [selected, setSelected] = useState("");
 	const [memberOffset, setMemberOffset] = useState(0);
@@ -36,9 +38,9 @@ export function OrganizationManager() {
 	const [roleName, setRoleName] = useState("");
 	const [permissions, setPermissions] = useState<Record<string, string[]>>({});
 	const organizations = useQuery({
-		queryKey: ["organizations"],
+		queryKey: hosted ? ["organizations", "hosted"] : ["organizations"],
 		queryFn: async () => {
-			const { data, error } = await authClient.organization.list();
+			const { data, error } = await (hosted ?? authClient).organization.list();
 			if (error) throw new Error(error.message);
 			return data || [];
 		},
@@ -211,7 +213,7 @@ export function OrganizationManager() {
 							onSubmit={(e) => {
 								e.preventDefault();
 								void run(async () => {
-									const result = await authClient.organization.create({
+									const result = await (hosted ?? authClient).organization.create({
 										name,
 										slug,
 									});
@@ -268,9 +270,11 @@ export function OrganizationManager() {
 								onClick={() =>
 									void run(
 										() =>
-											authClient.organization.setActive({
-												organizationId: selected,
-											}),
+											hosted
+												? selectHostedOrganization(hosted, selected)
+												: authClient.organization.setActive({
+														organizationId: selected,
+													}),
 										"Active organization updated",
 									)
 								}

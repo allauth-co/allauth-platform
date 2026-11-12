@@ -16,8 +16,11 @@ import { AllAuthUserMenu } from "./allauth-user-menu";
 import { OrganizationSwitcher } from "./better-auth-ui/organization/organization-switcher";
 import { useAuth } from "./better-auth-ui/lib/use-auth";
 import { ApplicationLogo } from "./application-brand";
+import { useHostedOrganizationClient } from "./hosted-organization-client";
+import { HostedOrganizationSwitcher } from "./hosted-organizations";
 export default function Header() {
 	const { data: session } = authClient.useSession();
+	const hostedOrganizations = useHostedOrganizationClient();
 	const configuration = useConfiguration();
 	const branding = (configuration.data?.realmName || configuration.data?.broker) ? configuration.data.branding : null;
 	const { Link: AuthenticationLink } = useAuth();
@@ -63,10 +66,14 @@ export default function Header() {
 										<span className="text-xs text-muted-foreground">
 											Organization
 										</span>
-										<OrganizationSwitcher
-											className="account-organization-switcher"
-											hideSettings
-										/>
+										{hostedOrganizations ? (
+											<HostedOrganizationSwitcher client={hostedOrganizations} />
+										) : (
+											<OrganizationSwitcher
+												className="account-organization-switcher"
+												hideSettings
+											/>
+										)}
 									</div>
 								)}
 								<AllAuthUserMenu />
