@@ -72,20 +72,42 @@ export function createOwnedProjectEmailCallbackPolicy(options: {
 			target.username ||
 			target.password ||
 			target.hash ||
-			target.pathname !== "/reset-password" ||
-			[...target.searchParams.keys()].some((name) => name !== "returnTo")
+			target.pathname !== "/reset-password"
 		)
 			return null;
-		const values = target.searchParams.getAll("returnTo");
-		const intent = values[0];
-		if (
-			values.length !== 1 ||
-			!intent?.startsWith("/") ||
-			intent.startsWith("//") ||
-			/[\\\u0000-\u0020\u007f]/.test(intent)
-		)
-			return null;
-		const destination = local(new URL(intent, origin), phase);
+		let continuation: URL;
+		if (target.searchParams.has("client_id")) {
+			continuation = new URL("/oauth2/continue", origin);
+			continuation.search = target.search;
+			const params = continuation.searchParams;
+			const overrides = params.getAll("interface");
+			if (
+				overrides.length &&
+				(overrides.length !== 1 || overrides[0] !== "legacy")
+			)
+				return null;
+			const manifest = params.getAll("ba_param");
+			// The explicit compatibility UI selector can sit outside the issuer's signed query.
+			if (
+				overrides.length &&
+				manifest.length &&
+				!manifest.includes("interface")
+			)
+				params.delete("interface");
+		} else {
+			const values = target.searchParams.getAll("returnTo");
+			const intent = values[0];
+			if (
+				[...target.searchParams.keys()].some((name) => name !== "returnTo") ||
+				values.length !== 1 ||
+				!intent?.startsWith("/") ||
+				intent.startsWith("//") ||
+				/[\\\u0000-\u0020\u007f]/.test(intent)
+			)
+				return null;
+			continuation = new URL(intent, origin);
+		}
+		const destination = local(continuation, phase);
 		if (!destination) return null;
 		if (!destination.expiredContinuation) return { url: target };
 		const reset = new URL("/reset-password", origin);

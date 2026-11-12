@@ -5,7 +5,10 @@ import { act, createElement, StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { afterEach, expect, it, vi } from "vitest";
 import { HostedProjectAuth } from "@/components/hosted-project-auth";
-import type { HostedSdkForm } from "./domains/hosted-sdk-policy";
+import type {
+	HostedPasswordResetStatus,
+	HostedSdkForm,
+} from "./domains/hosted-sdk-policy";
 
 const native = vi.hoisted(() => ({
 	social: vi.fn(),
@@ -204,6 +207,7 @@ async function renderHostedAuth(
 	view: HostedSdkForm,
 	next = destination,
 	strict = false,
+	resetStatus?: HostedPasswordResetStatus,
 ) {
 	const container = document.createElement("div");
 	document.body.appendChild(container);
@@ -225,12 +229,45 @@ async function renderHostedAuth(
 		showPassword: true,
 		showEmail: true,
 		showSso: true,
+		resetStatus,
 	});
 	await act(async () =>
 		root.render(strict ? createElement(StrictMode, null, auth) : auth),
 	);
 	return container;
 }
+
+it.each([
+	["missing", "Open the reset link from your email"],
+	["invalid", "This reset link is invalid or has expired"],
+] as const)("shows a first-party %s reset message without submitting a bearer", async (status, message) => {
+	vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+	const requests = vi.fn(async (_path: string) =>
+		Response.json({ emailPassword: true }),
+	);
+	vi.stubGlobal("fetch", requests);
+	const signed =
+		"/oauth2/continue?client_id=fixture&resource=one&resource=two&sig=signed%2Bfixture";
+	const container = await renderHostedAuth(
+		"resetPassword",
+		signed,
+		false,
+		status,
+	);
+	expect(container.textContent).toContain(message);
+	expect(container.querySelector("form")).toBeNull();
+	const actions = [...container.querySelectorAll("a")].map(
+		(link) => new URL(link.href),
+	);
+	expect(actions.map((action) => action.pathname)).toEqual([
+		"/forgot-password",
+		"/sign-in",
+	]);
+	for (const action of actions)
+		expect(action.searchParams.get("returnTo")).toBe(signed);
+	expect(requests).toHaveBeenCalledOnce();
+	expect(requests.mock.calls[0]?.[0]).toBe(`${basePath}/sdk/config`);
+});
 
 it("renders the project branding and sends the existing AllAuth broker the exact same-origin return", async () => {
 	vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);

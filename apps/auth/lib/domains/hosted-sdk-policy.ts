@@ -25,10 +25,19 @@ const views = {
 } as const;
 export type HostedSdkView = keyof typeof views;
 export type HostedSdkForm = Exclude<HostedSdkView, "authRedirect"> | "username";
+export type HostedPasswordResetStatus = "missing" | "invalid";
 export type HostedSdkSearchParams = Record<
 	string,
 	string | string[] | undefined
 >;
+
+type HostedViewRequest = {
+	destination: string;
+	legacyPath: string;
+	oauthQuery?: string;
+	resetStatus?: HostedPasswordResetStatus;
+	username?: boolean;
+};
 
 /** Enable the hosted SDK UI only for explicitly listed development realms. */
 export function hostedSdkProjectEnabled(
@@ -66,6 +75,7 @@ export function hostedSdkReturnPath(value: string | undefined) {
 function hostedOAuthRequest(
 	view: HostedSdkView,
 	params: HostedSdkSearchParams,
+	resetStatus?: HostedPasswordResetStatus,
 ) {
 	if (
 		params.interface !== undefined ||
@@ -84,8 +94,7 @@ function hostedOAuthRequest(
 	const signed = nested
 		? new URL(nested, localOrigin).searchParams
 		: oauthBrowserQuery(direct);
-	if (!signed || (view === "resetPassword" && typeof params.token !== "string"))
-		return null;
+	if (!signed) return null;
 	const oauthQuery = signed.toString();
 	const fallback = new URL(views[view], localOrigin);
 	fallback.search = oauthQuery;
@@ -94,6 +103,8 @@ function hostedOAuthRequest(
 		fallback.searchParams.set("method", "username");
 	if (view === "resetPassword" && typeof params.token === "string")
 		fallback.searchParams.set("token", params.token);
+	if (resetStatus === "invalid")
+		fallback.searchParams.set("error", "INVALID_TOKEN");
 	return {
 		destination:
 			view === "signOut"
@@ -101,6 +112,7 @@ function hostedOAuthRequest(
 				: `/oauth2/continue?${oauthQuery}`,
 		legacyPath: fallback.pathname + fallback.search,
 		oauthQuery,
+		resetStatus,
 		username: params.method === "username",
 	};
 }
@@ -109,7 +121,7 @@ function hostedOAuthRequest(
 export function hostedSdkViewRequest(
 	view: HostedSdkView,
 	params: HostedSdkSearchParams,
-) {
+): HostedViewRequest | null {
 	if (view === "authCallback" || view === "authRedirect") {
 		if (Object.values(params).some((value) => value !== undefined)) return null;
 		return {
@@ -130,12 +142,22 @@ export function hostedSdkViewRequest(
 	)
 		return null;
 	if (view === "signOut" && params.returnTo !== undefined) return null;
-	const oauth = hostedOAuthRequest(view, params);
+	let resetStatus: HostedPasswordResetStatus | undefined;
+	if (view === "resetPassword") {
+		if (
+			(params.token !== undefined && typeof params.token !== "string") ||
+			(params.error !== undefined &&
+				(params.error !== "INVALID_TOKEN" || params.token))
+		)
+			return null;
+		if (!params.token) resetStatus = params.error ? "invalid" : "missing";
+	}
+	const oauth = hostedOAuthRequest(view, params, resetStatus);
 	if (oauth) return oauth;
 	const allowed = new Set([
 		"returnTo",
 		"callbackUrl",
-		...(view === "resetPassword" ? ["token"] : []),
+		...(view === "resetPassword" ? ["token", "error"] : []),
 		...(view === "signIn" ? ["method"] : []),
 	]);
 	if (
@@ -145,7 +167,6 @@ export function hostedSdkViewRequest(
 		)
 	)
 		return null;
-	if (view === "resetPassword" && !params.token) return null;
 	if (params.method !== undefined && params.method !== "username") return null;
 	const raw = params.returnTo ?? params.callbackUrl;
 	const destination = hostedSdkReturnPath(
@@ -170,9 +191,12 @@ export function hostedSdkViewRequest(
 	fallback.searchParams.set("callbackUrl", destination);
 	if (view === "resetPassword" && typeof params.token === "string")
 		fallback.searchParams.set("token", params.token);
+	if (resetStatus === "invalid")
+		fallback.searchParams.set("error", "INVALID_TOKEN");
 	return {
 		destination,
 		legacyPath: fallback.pathname + fallback.search,
+		resetStatus,
 		...(params.method === "username" ? { username: true } : {}),
 		oauthQuery: undefined,
 	};

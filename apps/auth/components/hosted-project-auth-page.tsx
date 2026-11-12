@@ -132,6 +132,7 @@ export async function HostedProjectAuthPage({
 			basePath={hostedSdkBasePath}
 			destination={request.destination}
 			legacyPath={request.legacyPath}
+			resetStatus={request.resetStatus}
 			{...project}
 		/>
 	);

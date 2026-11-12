@@ -1,7 +1,8 @@
 "use client";
 
 import { useEffect, useRef } from "react";
-import { useAllAuth } from "@/sdk/react";
+import type { HostedPasswordResetStatus } from "@/lib/domains/hosted-sdk-policy";
+import { useAllAuth, withAuthReturnTo } from "@/sdk/react";
 import { HostedProjectCard } from "./hosted-project-forms";
 
 /** Sign out once, then replace this page with the realm's sign-in page. */
@@ -35,6 +36,35 @@ export function HostedProjectAuthCallback() {
 		>
 			<a className="allauth-primary" href="/sign-in">
 				Sign in
+			</a>
+		</HostedProjectCard>
+	);
+}
+
+export function HostedProjectResetStatus({
+	status,
+	destination,
+}: {
+	status: HostedPasswordResetStatus;
+	destination: string;
+}) {
+	return (
+		<HostedProjectCard
+			title="Reset your password"
+			subtitle={
+				status === "invalid"
+					? "This reset link is invalid or has expired."
+					: "Open the reset link from your email to choose a new password."
+			}
+			footer={
+				<a href={withAuthReturnTo("/sign-in", destination)}>Back to sign in</a>
+			}
+		>
+			<a
+				className="allauth-primary"
+				href={withAuthReturnTo("/forgot-password", destination)}
+			>
+				Request a new reset link
 			</a>
 		</HostedProjectCard>
 	);

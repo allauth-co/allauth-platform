@@ -255,6 +255,54 @@ it("uses the first-party page for an allowlisted development accounts realm with
 	});
 });
 
+it("keeps an invalid reset callback on the verified hosted project and honors the explicit legacy form", async () => {
+	runtime.headers.mockResolvedValue(
+		new Headers({ [portalHeader]: "fixture-proof" }),
+	);
+	runtime.getAuthEnvironment.mockResolvedValue({
+		ALLAUTH_PROJECT_HOSTED_UI_PROJECT_IDS: project.id,
+		EMAIL: { send: vi.fn() },
+	});
+	const engine = engineConfiguration({ emailPassword: true });
+	runtime.withPortalHeadersEngine.mockImplementation(async (_headers, select) =>
+		select(engine, new Headers(), {
+			kind: "accounts",
+			project,
+			hostname: accountsHostname,
+		}),
+	);
+	const destination =
+		"/oauth2/continue?client_id=fixture&sig=fixture-signature";
+	engine.readOAuthContext.mockImplementation(async () =>
+		Response.json({ continueURL: destination }),
+	);
+	const page = (params: Awaited<HostedProjectAuthPageProps["searchParams"]>) =>
+		HostedProjectAuthPage({
+			view: "resetPassword",
+			searchParams: Promise.resolve(params),
+		});
+	const status = await page({ error: "INVALID_TOKEN", returnTo: destination });
+	expect(status.type).toBe(HostedProjectAuth);
+	expect(status.props).toMatchObject({
+		view: "resetPassword",
+		resetStatus: "invalid",
+		destination,
+	});
+	const missing = await page({});
+	expect(missing.type).toBe(HostedProjectAuth);
+	expect(missing.props).toMatchObject({ resetStatus: "missing" });
+	const valid = await page({
+		token: "fixture-reset-token",
+		returnTo: destination,
+	});
+	expect(valid.type).toBe(HostedProjectAuth);
+	expect(valid.props.resetStatus).toBeUndefined();
+	const legacy = await page({ interface: "legacy", error: "INVALID_TOKEN" });
+	expect(legacy.type).toBe(AllAuthAuth);
+	runtime.getAuthEnvironment.mockResolvedValue({});
+	expect((await page({ error: "INVALID_TOKEN" })).type).toBe(AllAuthAuth);
+});
+
 it("keeps production on the standard page even when the immutable ID appears in the preview list", async () => {
 	runtime.headers.mockResolvedValue(
 		new Headers({ [portalHeader]: "fixture-proof" }),

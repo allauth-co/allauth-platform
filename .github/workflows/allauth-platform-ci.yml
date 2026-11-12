@@ -85,7 +85,7 @@ jobs:
           lib/domains/hosted-organization-preview.test.ts lib/hosted-organization-ui-render.test.ts
           lib/domains/hosted-header-render.test.ts lib/domains/hosted-account-profile-render.test.ts
           lib/domains/hosted-account-security-render.test.ts
-          lib/domains/hosted-auth-error.test.ts lib/hosted-provider-render.test.ts lib/projects/oauth-return-window.test.ts
+          lib/domains/hosted-auth-error.test.ts lib/hosted-provider-render.test.ts lib/projects/oauth-return-window.test.ts lib/hosted-reset-continuation.test.ts
           lib/projects/owned-project-agent-hosts.pg.test.ts lib/projects/engine-metrics.test.ts
           lib/console/organization-members-route.test.ts lib/projects/project-error-localization.test.ts
           lib/branding/portal.test.ts lib/shared.test.ts lib/oauth-consent-render.test.ts

@@ -1,15 +1,19 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
+import { oauthProvider } from "@better-auth/oauth-provider";
+import { jwt } from "better-auth/plugins";
 import { getTestInstance } from "better-auth/test";
 import { SignJWT } from "jose";
 import { Kysely, PostgresDialect } from "kysely";
 import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { defaultAuthPolicy } from "../auth-policy/policy";
+import { localNavigation } from "../auth-navigation";
 import { clerkCompatiblePasswords } from "../clerk-password";
 import { allauthControl } from "../control";
 import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
 import type { CompleteOwnedEmailVerification } from "./owned-email-verification";
+import { createOwnedProjectEmailCallbackPolicy } from "./owned-project-email-callback";
 import { createOwnedRecoveryHttp } from "./owned-recovery-http";
 
 const fixturePath = new URL(
@@ -29,6 +33,7 @@ const newPassword = "fixture-password-after";
 async function legacyFixture(
 	db: Kysely<Record<string, Record<string, unknown>>>,
 	delivered: string[],
+	resetLinks: string[],
 ) {
 	return getTestInstance(
 		{
@@ -37,13 +42,19 @@ async function legacyFixture(
 			secret: signingSecret,
 			database: { db, type: "postgres" },
 			trustedOrigins: [appOrigin],
-			plugins: [allauthControl({ ipHeader: "x-real-ip" })],
+			plugins: [
+				allauthControl({ ipHeader: "x-real-ip" }),
+				jwt({ disableSettingJwtHeader: true }),
+				oauthProvider({ loginPage: "/sign-in", consentPage: "/oauth/consent" }),
+			],
 			emailAndPassword: {
 				enabled: true,
 				autoSignIn: false,
 				revokeSessionsOnPasswordReset: true,
 				password: clerkCompatiblePasswords,
-				async sendResetPassword() {},
+				async sendResetPassword({ url }) {
+					resetLinks.push(url);
+				},
 			},
 			emailVerification: {
 				autoSignInAfterVerification: false,
@@ -90,6 +101,7 @@ describe.skipIf(!existsSync(fixturePath))(
 			| undefined;
 		let native: Awaited<ReturnType<typeof legacyFixture>>;
 		const legacyTokens: string[] = [];
+		const legacyResetLinks: string[] = [];
 		let created = false;
 
 		beforeAll(async () => {
@@ -131,7 +143,11 @@ describe.skipIf(!existsSync(fixturePath))(
 						"utf8",
 					),
 				);
-			native = await legacyFixture(nativeDatabase, legacyTokens);
+			native = await legacyFixture(
+				nativeDatabase,
+				legacyTokens,
+				legacyResetLinks,
+			);
 		});
 
 		afterAll(async () => {
@@ -148,6 +164,7 @@ describe.skipIf(!existsSync(fixturePath))(
 		function fixture(
 			options: {
 				limited?: boolean;
+				preserveBrowserContinuation?: boolean;
 				completeVerification?: CompleteOwnedEmailVerification;
 			} = {},
 		) {
@@ -164,6 +181,13 @@ describe.skipIf(!existsSync(fixturePath))(
 				trustedOrigins: [appOrigin],
 				resetCallbackURLs: [resetCallback],
 				verificationCallbackURLs: [verifyCallback],
+				callbackPolicy: options.preserveBrowserContinuation
+					? createOwnedProjectEmailCallbackPolicy({
+							browserOrigin: appOrigin,
+							publicLinkBaseURL: `${appOrigin}/api/allauth`,
+							signingSecret,
+						})
+					: undefined,
 				auditContext(request) {
 					return {
 						ipAddress: request.headers.get("x-real-ip") ?? undefined,
@@ -266,9 +290,132 @@ describe.skipIf(!existsSync(fixturePath))(
 					)
 				)?.status,
 			).toBe(400);
+			const consumedLink = await recovery.handler(visit(link));
+			expect(consumedLink?.status).toBe(302);
+			const expired = new URL(consumedLink?.headers.get("location") ?? "");
+			expect(expired.origin + expired.pathname).toBe(resetCallback);
+			expect(expired.searchParams.get("error")).toBe("INVALID_TOKEN");
+			expect(expired.searchParams.has("token")).toBe(false);
 			await expect(
 				native.auth.api.signInEmail({ body: { email, password: newPassword } }),
 			).resolves.toMatchObject({ user: { id: user.id } });
+		});
+
+		it("opens actual legacy signed reset mail and retains the nested replacement across rollback", async () => {
+			const email = "signed-reset@recovery-fixture.example";
+			await seed(email);
+			const session = await native.auth.api.signInEmail({
+				body: { email, password: oldPassword },
+				asResponse: true,
+			});
+			expect(session.status).toBe(200);
+			const headers = new Headers({
+				origin,
+				cookie: session.headers
+					.getSetCookie()
+					.map((value) => value.split(";", 1)[0])
+					.join("; "),
+			});
+			const redirect = `${appOrigin}/oauth-return`;
+			const client = await native.auth.api.adminCreateOAuthClient({
+				headers,
+				body: {
+					redirect_uris: [redirect],
+					token_endpoint_auth_method: "none",
+					grant_types: ["authorization_code"],
+					require_pkce: true,
+					scope: "openid profile",
+				},
+			});
+			const authorization = new URLSearchParams({
+				client_id: client.client_id,
+				redirect_uri: redirect,
+				response_type: "code",
+				scope: "openid profile",
+				state: "fixture+state",
+				code_challenge_method: "S256",
+				code_challenge: createHash("sha256")
+					.update("synthetic-pg-reset-fixture-pkce-verifier-longer-than-43")
+					.digest("base64url"),
+			});
+			const login = await native.auth.handler(
+				new Request(`${origin}${basePath}/oauth2/authorize?${authorization}`),
+			);
+			const signed = new URL(login.headers.get("location")!, origin);
+			expect(signed.pathname).toBe("/sign-in");
+			expect(signed.searchParams.has("sig")).toBe(true);
+			const legacyPath = localNavigation(
+				"/reset-password?interface=legacy",
+				appOrigin,
+				signed.searchParams,
+			)!;
+			const legacyTarget = new URL(legacyPath, appOrigin);
+			const issued = await native.auth.handler(
+				post("/request-password-reset", {
+					email,
+					redirectTo: legacyTarget.href,
+				}),
+			);
+			expect(issued.status).toBe(200);
+			const legacyLink = new URL(legacyResetLinks.at(-1)!);
+			expect(legacyLink.searchParams.get("callbackURL")).toBe(
+				legacyTarget.href,
+			);
+
+			const recovery = fixture({ preserveBrowserContinuation: true });
+			const tamperedTarget = new URL(legacyTarget);
+			tamperedTarget.searchParams.set("state", "changed");
+			const tamperedLink = new URL(legacyLink);
+			tamperedLink.searchParams.set("callbackURL", tamperedTarget.href);
+			const rejected = await recovery.handler(new Request(tamperedLink));
+			expect(rejected?.status).toBe(403);
+			expect(rejected?.headers.has("location")).toBe(false);
+			const opened = await recovery.handler(new Request(legacyLink));
+			expect(opened?.status).toBe(302);
+			const destination = new URL(opened?.headers.get("location") ?? "");
+			const token = destination.searchParams.get("token");
+			expect(token).toBeTruthy();
+			destination.searchParams.delete("token");
+			expect(destination.href).toBe(legacyTarget.href);
+			const changed = await recovery.handler(
+				post("/reset-password", { token, newPassword }),
+			);
+			expect(changed?.status).toBe(200);
+			const consumed = await recovery.handler(new Request(legacyLink));
+			expect(consumed?.status).toBe(302);
+			const failed = new URL(consumed?.headers.get("location") ?? "");
+			expect(failed.searchParams.get("error")).toBe("INVALID_TOKEN");
+			failed.searchParams.delete("error");
+			expect(failed.href).toBe(legacyTarget.href);
+
+			const nested = new URL(resetCallback);
+			nested.searchParams.set(
+				"returnTo",
+				`/oauth2/continue?${signed.searchParams}`,
+			);
+			const next = await recovery.handler(
+				post("/request-password-reset", { email, redirectTo: nested.href }),
+			);
+			expect(next?.status).toBe(200);
+			await recovery.flush();
+			const ownedLink = mailedLink(recovery.deliveries.at(-1)!.html);
+			const rollback = await native.auth.handler(visit(ownedLink));
+			expect(rollback.status).toBe(302);
+			const rolledBack = new URL(rollback.headers.get("location")!);
+			const ownedToken = rolledBack.searchParams.get("token");
+			expect(ownedToken).toBeTruthy();
+			rolledBack.searchParams.delete("token");
+			expect(rolledBack.href).toBe(nested.href);
+			expect(
+				(
+					await native.auth.handler(
+						post("/reset-password", {
+							token: ownedToken,
+							newPassword: oldPassword,
+						}),
+					)
+				).status,
+			).toBe(200);
 		});
 
 		it("records uniform native password request audit outcomes for known and unknown addresses", async () => {

@@ -124,7 +124,7 @@ describe("first-party hosted SDK selection", () => {
 		expect(hostedSdkReturnPath(path)).toBe("/account");
 	});
 
-	it("retains the legacy UI for signed OAuth, broker and error flows or ambiguous queries", () => {
+	it("retains the legacy UI for the explicit override, broker handoff and ambiguous queries", () => {
 		for (const params of [
 			{ client_id: "fixture", callbackUrl: "/account" },
 			{ allauth_mfa: "app-v1" },
@@ -134,7 +134,19 @@ describe("first-party hosted SDK selection", () => {
 			{ callbackUrl: ["/account", "/organizations"] },
 		])
 			expect(hostedSdkViewRequest("signIn", params)).toBeNull();
-		expect(hostedSdkViewRequest("resetPassword", {})).toBeNull();
+		expect(hostedSdkViewRequest("resetPassword", {})).toMatchObject({
+			resetStatus: "missing",
+		});
+		expect(
+			hostedSdkViewRequest("resetPassword", { error: "INVALID_TOKEN" }),
+		).toMatchObject({ resetStatus: "invalid" });
+		for (const params of [
+			{ token: "fixture-token", error: "INVALID_TOKEN" },
+			{ token: ["fixture-first", "fixture-second"] },
+			{ error: "unrecognized" },
+			{ interface: "legacy", error: "INVALID_TOKEN" },
+		])
+			expect(hostedSdkViewRequest("resetPassword", params)).toBeNull();
 		const options = hostedSdkViewRequest("resetPassword", {
 			token: "legacy-token",
 			returnTo: "/account/security",

@@ -85,4 +85,61 @@ describe("project email callback policy", () => {
 		reset.searchParams.append("returnTo", "/console");
 		expect(policy(reset, "password-reset", "issue")).toBeNull();
 	});
+
+	it("accepts the native direct reset continuation only with exact realm authority", () => {
+		vi.useFakeTimers();
+		vi.setSystemTime(new Date("2026-11-12T04:00:00Z"));
+		const signed = signProjectIssuerQuery(
+			new URLSearchParams(
+				"client_id=fixture&resource=one&resource=two&state=encoded%2Bstate",
+			),
+			signingSecret,
+		);
+		const reset = new URL(`/reset-password?${signed}`, origin);
+		for (const marker of [false, true]) {
+			if (marker) reset.searchParams.set("interface", "legacy");
+			expect(policy(reset, "password-reset", "issue")).toEqual({ url: reset });
+			expect(policy(reset, "password-reset", "consume")).toEqual({
+				url: reset,
+			});
+		}
+		for (const [name, value] of [
+			["state", "modified"],
+			["interface", "legacy"],
+			["unrecognized", "query"],
+			["token", "early-bearer"],
+		]) {
+			const modified = new URL(reset);
+			modified.searchParams.append(name, value);
+			expect(policy(modified, "password-reset", "consume")).toBeNull();
+		}
+		expect(
+			policy(
+				new URL(
+					`/reset-password?${signed}`,
+					"https://other.email-callback.example",
+				),
+				"password-reset",
+				"consume",
+			),
+		).toBeNull();
+		const consent = signProjectIssuerQuery(
+			signed,
+			signingSecret,
+			"fixture-session",
+		);
+		expect(
+			policy(
+				new URL(`/reset-password?${consent}`, origin),
+				"password-reset",
+				"consume",
+			),
+		).toBeNull();
+		vi.advanceTimersByTime(61_000);
+		expect(policy(reset, "password-reset", "issue")).toBeNull();
+		expect(policy(reset, "password-reset", "consume")).toEqual({
+			url: new URL("/reset-password?returnTo=%2Faccount", origin),
+			expiredContinuation: true,
+		});
+	});
 });

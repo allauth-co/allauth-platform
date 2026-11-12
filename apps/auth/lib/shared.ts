@@ -1,5 +1,5 @@
 import type { ReadonlyURLSearchParams } from "next/navigation";
-import { submitOAuthBrowserAction } from "./oauth-browser";
+import { oauthBrowserQuery, submitOAuthBrowserAction } from "./oauth-browser";
 import { deviceProject } from "./features/device";
 export function getCallbackURL(
 	params: ReadonlyURLSearchParams | URLSearchParams,
@@ -66,7 +66,9 @@ export async function authenticationCallback(
 ): Promise<string> {
 	if (!params.has("client_id"))
 		return new URL(getCallbackURL(params), window.location.origin).href;
-	const response = await fetch(`/api/oauth/context?${params.toString()}`, {
+	const signed = oauthBrowserQuery(params);
+	if (!signed) throw new Error("The authorization request has expired or is invalid");
+	const response = await fetch(`/api/oauth/context?${signed}`, {
 		cache: "no-store",
 	});
 	const context: { continueURL?: string; error?: string } =

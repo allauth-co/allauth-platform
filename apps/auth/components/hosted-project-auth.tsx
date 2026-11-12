@@ -10,9 +10,13 @@ import {
 	useAllAuth,
 	withAuthReturnTo,
 } from "@/sdk/react";
-import type { HostedSdkForm } from "@/lib/domains/hosted-sdk-policy";
+import type {
+	HostedPasswordResetStatus,
+	HostedSdkForm,
+} from "@/lib/domains/hosted-sdk-policy";
 import {
 	HostedProjectAuthCallback,
+	HostedProjectResetStatus,
 	HostedProjectSignOut,
 } from "./hosted-project-auth-status";
 import { HostedProjectEmailStatus } from "./hosted-project-email-status";
@@ -30,6 +34,7 @@ type HostedProjectAuthProps = {
 	basePath: string;
 	destination: string;
 	legacyPath: string;
+	resetStatus?: HostedPasswordResetStatus;
 	showRecovery: boolean;
 	showBroker: boolean;
 	showPassword: boolean;
@@ -219,6 +224,7 @@ export function HostedProjectAuth({
 	basePath,
 	destination,
 	legacyPath,
+	resetStatus,
 	showRecovery,
 	showBroker,
 	showPassword,
@@ -226,7 +232,9 @@ export function HostedProjectAuth({
 	showSso,
 }: HostedProjectAuthProps) {
 	const mainForm =
-		view === "signIn" || view === "forgotPassword" || view === "resetPassword";
+		view === "signIn" ||
+		view === "forgotPassword" ||
+		(view === "resetPassword" && !resetStatus);
 	const continuation = { destination, legacyPath };
 	return (
 		<div className="mx-auto w-full max-w-lg space-y-4">
@@ -257,9 +265,15 @@ export function HostedProjectAuth({
 						resetPasswordUrl="/reset-password"
 					/>
 				)}
-				{view === "resetPassword" && (
-					<ResetPassword afterSignInUrl={destination} />
-				)}
+				{view === "resetPassword" &&
+					(resetStatus ? (
+						<HostedProjectResetStatus
+							status={resetStatus}
+							destination={destination}
+						/>
+					) : (
+						<ResetPassword afterSignInUrl={destination} />
+					))}
 				{view === "username" && <HostedProjectUsername {...continuation} />}
 				{(view === "magicLink" || view === "emailOtp") && (
 					<HostedProjectEmail method={view} {...continuation} />
