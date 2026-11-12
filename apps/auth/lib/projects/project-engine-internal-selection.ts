@@ -205,10 +205,10 @@ export function selectProjectEngine(
 			),
 			agentReplayApproved: projectAgentReplayApproved(project, env, writer),
 			trustedIP(request) {
-				// Hosted auth and app proxies verify the forwarded client address.
-				if (hosted) return request.headers.get("x-real-ip");
-				if (request.headers.get("allauth-proxy-signature"))
-					return request.headers.get("allauth-proxy-ip");
+				// Verification sets the effective address when a proxy supplies one.
+				// Proxies without an address keep the platform ingress address.
+				if (hosted || request.headers.get("allauth-proxy-signature"))
+					return request.headers.get("x-real-ip");
 				// Direct workspace security calls use the same ingress address as the legacy console.
 				const path = new URL(request.url).pathname;
 				return path === securityConsole || path.startsWith(`${securityConsole}/`)

@@ -277,6 +277,7 @@ interface OwnedProjectEngineOptions {
 	>;
 	brokerTwoFactor?: AuthorizeProjectBrokerMfa;
 	security?: {
+		secret?: string;
 		requireTrustedIP?: boolean;
 		management?: boolean;
 		newDevice?: {
@@ -394,13 +395,15 @@ export function createOwnedProjectEngine(
 	const slug = projectSlug.parse(options.project.slug);
 	const origin = projectOrigin.parse(options.baseURL);
 	const secure = origin.startsWith("https://");
+	const securitySecret = options.security?.secret ?? options.signingSecret;
 	const acceptedOrigins = new Set([
 		origin,
 		...options.trustedOrigins.map((item) => projectOrigin.parse(item)),
 	]);
 	if (
 		!["/api/auth", `/api/projects/${slug}/auth`].includes(options.basePath) ||
-		options.signingSecret.length < 32
+		options.signingSecret.length < 32 ||
+		securitySecret.length < 32
 	)
 		throw new Error("Invalid owned project engine configuration.");
 	const store = createProjectEngineStore(
@@ -511,7 +514,7 @@ export function createOwnedProjectEngine(
 	});
 	const updateProfile = createOwnedProjectProfile(store, origin);
 	const security = createOwnedProjectSecurity({
-		secret: options.signingSecret,
+		secret: securitySecret,
 		trustedIP: options.trustedIP,
 		requireTrustedIP: options.security?.requireTrustedIP,
 	});
@@ -554,9 +557,10 @@ export function createOwnedProjectEngine(
 		name: string,
 		value: string,
 		maxAge?: number,
+		secret = options.signingSecret,
 	) {
 		const signed = value
-			? `${value}.${createHmac("sha256", options.signingSecret).update(value).digest("base64")}`
+			? `${value}.${createHmac("sha256", secret).update(value).digest("base64")}`
 			: "";
 		headers.append(
 			"Set-Cookie",
@@ -833,9 +837,9 @@ export function createOwnedProjectEngine(
 				client,
 				request,
 				user.id,
-				tokenFrom(request.headers, name),
+				readLegacySessionCookie(request.headers, name, securitySecret),
 			);
-			writeCookie(headers, name, known.token, 180 * 86400);
+			writeCookie(headers, name, known.token, 180 * 86400, securitySecret);
 			if (known.notify && newDevice) {
 				const { id, name, email } = user;
 				afterOwnedProjectCommit(client, () =>

@@ -43,7 +43,7 @@ import { defaultAuthPolicy } from "../auth-policy/policy";
 import { lockProjectSettings } from "../auth-policy/serialization";
 import { authPolicyRepository } from "../auth-policy/storage";
 import { clerkCompatiblePasswords } from "../clerk-password";
-import { defaultSecurityPolicy } from "../control/security-policy";
+import { defaultSecurityPolicy, securitySubject } from "../control/security-policy";
 import type { SecurityRule } from "../control/security-management";
 import type { ControlPrincipal } from "../control/types";
 import {
@@ -1819,10 +1819,17 @@ describe.skipIf(!existsSync(fixture))(
 
 				const host = `${alpha.slug}-accounts.allauth.co`;
 				const siblingHost = `${beta.slug}-accounts.allauth.co`;
+				const direct = `/api/projects/${alpha.slug}/auth`;
+				const proxy = { proxy: alpha, origin: alpha.primaryOrigin };
+				const login = {
+					email: credentials.project.email,
+					password: credentials.password,
+				};
 				async function signIn(email: string, accountsHost?: string) {
 					return cookie(
 						await request("/api/auth/sign-in/email", {
 							host: accountsHost,
+							clientIP: accountsHost ? "192.0.2.56" : undefined,
 							body: { email, password: credentials.password },
 						}),
 					);
@@ -1832,7 +1839,49 @@ describe.skipIf(!existsSync(fixture))(
 				const realmAdmin = await signIn(credentials.realmAdmin.email, host);
 				const owner = await signIn(credentials.project.email, host);
 				const sibling = await signIn(credentials.project.email, siblingHost);
-				const direct = `/api/projects/${alpha.slug}/auth`;
+				const legacyProxyCookie = cookie(
+					await request(`${direct}/sign-in/email`, {
+						...proxy,
+						body: login,
+					}),
+				);
+				const deviceName = `__Secure-allauth_project_${alpha.slug}.control_device=`;
+				const deviceCookie = (cookies: string) =>
+					cookies.split("; ").find((pair) => pair.startsWith(deviceName));
+				expect(Boolean(deviceCookie(legacyProxyCookie))).toBe(true);
+				await request(`${direct}/control/security/update`, {
+					cookie: rootCookie,
+					body: { policy: { ...defaultSecurityPolicy, maxFailuresPerIp: 3 } },
+				});
+				const blockedIP = "192.0.2.59";
+				const wrongPassword = "Synthetic-incorrect-credential";
+				for (let index = 0; index < 3; index++) {
+					await request(
+						`${direct}/sign-in/email`,
+						{
+							...proxy,
+							clientIP: blockedIP,
+							body: { ...login, password: wrongPassword },
+						},
+						401,
+					);
+				}
+				const failureKey = await securitySubject(
+					projectSecret(childEnvironment(), alpha.id),
+					"fail-ip",
+					blockedIP,
+				);
+				const realm = `"${alpha.schemaName}"`;
+				const { rows: blocked } = await state.query(
+					`SELECT count, "blockedUntil" > now() AS blocked FROM ${realm}."allauthSecurityCounter" WHERE "key"=$1`,
+					[failureKey],
+				);
+				expect(blocked).toEqual([{ count: 3, blocked: true }]);
+				// Expire only the shorter route bucket so the persisted security block is exercised.
+				await state.query(
+					`UPDATE ${realm}."rateLimit" SET "lastRequest"=$1 WHERE "key"=$2`,
+					[Date.now() - 11_000, `${blockedIP}|/sign-in/email`],
+				);
 				const scim = `/api/organizations/${directoryOrg}/scim`;
 				const directory = await request(
 					`${scim}?project=${alpha.slug}`,
@@ -2082,6 +2131,42 @@ describe.skipIf(!existsSync(fixture))(
 					nativeRule,
 					[originalDirectoryToken, nativeToken],
 				);
+				const blockedByLegacyCounter = await request(
+					`${direct}/sign-in/email`,
+					{
+						...proxy,
+						clientIP: blockedIP,
+						body: login,
+					},
+					429,
+				);
+				expect(await blockedByLegacyCounter.json()).toMatchObject({
+					code: "ALLAUTH_SECURITY_BLOCKED",
+				});
+				expect(
+					await primaryWebhook.drain(1, [credentials.password, wrongPassword]),
+				).toMatchObject([
+					{
+						type: "security.blocked",
+						data: {
+							event: {
+								outcome: "blocked",
+								ipAddress: blockedIP,
+								metadata: { signal: "credential-failure-limit" },
+							},
+						},
+					},
+				]);
+				const ownedProxyCookie = cookie(
+					await request(`${direct}/sign-in/email`, {
+						...proxy,
+						cookie: legacyProxyCookie,
+						body: login,
+					}),
+				);
+				expect(
+					deviceCookie(ownedProxyCookie) === deviceCookie(legacyProxyCookie),
+				).toBe(true);
 
 				const ownedRule = await mutate("Mixed subscription AllAuth");
 				const ownedToken = directoryToken;
@@ -2092,8 +2177,17 @@ describe.skipIf(!existsSync(fixture))(
 				});
 				const ownedPending = await primaryWebhook.rows();
 				expect(
-					ownedPending.filter((row) => row.status === "pending"),
-				).toHaveLength(5);
+					ownedPending
+						.filter((row) => row.status === "pending")
+						.map((row) => row.eventType)
+						.sort(),
+				).toEqual([
+					"admin.update-user",
+					"directory.credential.rotated",
+					"organization.updated",
+					"security.rule.added",
+					"user.updated",
+				]);
 				const siblingPending = await siblingWebhook.rows();
 				expect(siblingPending.map((row) => row.eventType)).toEqual([
 					"user.updated",
@@ -2116,6 +2210,13 @@ describe.skipIf(!existsSync(fixture))(
 				await restart(false);
 				await request("/api/health");
 				await expectSubscription();
+				const restoredSession = await request(`${direct}/get-session`, {
+					...proxy,
+					cookie: ownedProxyCookie,
+				});
+				expect(await restoredSession.json()).toMatchObject({
+					user: { id: credentials.project.id },
+				});
 				expect(await primaryWebhook.rows()).toEqual(ownedPending);
 				expect(
 					await assertDeliveries("Mixed subscription AllAuth", ownedRule, [
@@ -2143,6 +2244,18 @@ describe.skipIf(!existsSync(fixture))(
 						directoryToken,
 					]),
 				).toEqual(baseline);
+				const rolledBackProxyCookie = cookie(
+					await request(`${direct}/sign-in/email`, {
+						...proxy,
+						cookie: ownedProxyCookie,
+						body: login,
+					}),
+				);
+				expect(
+					deviceCookie(rolledBackProxyCookie) ===
+						deviceCookie(ownedProxyCookie),
+				).toBe(true);
+				await primaryWebhook.drain(0, []);
 				await siblingWebhook.drain(0, []);
 			} finally {
 				try {

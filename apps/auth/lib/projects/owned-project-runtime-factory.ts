@@ -725,6 +725,8 @@ export async function createOwnedProjectRuntimeCandidate(options: Options) {
 			};
 		},
 		security: {
+			// Control cookies and counters use the derived realm key across session-key rotations.
+			secret: options.signingSecret,
 			requireTrustedIP: true,
 			management: true,
 			newDevice: {

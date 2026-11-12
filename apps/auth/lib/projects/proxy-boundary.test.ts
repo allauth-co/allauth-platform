@@ -53,6 +53,7 @@ describe("signed project proxy input boundaries", () => {
 	it("preserves the exact signed payload while filtering foreign realm/platform cookies", async () => {
 		const bytes = new TextEncoder().encode('{"id":"fixture-session"}');
 		const headers = proxyHeaders(bytes);
+		headers.set("x-real-ip", "192.0.2.2");
 		headers.set(
 			"cookie",
 			"better-auth.session_token=root-secret; __Secure-allauth_project_other.session_token=other-secret; __Secure-allauth_project_fixture-app.session_token=realm-secret",
