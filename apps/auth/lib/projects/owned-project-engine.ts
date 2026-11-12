@@ -1082,9 +1082,10 @@ export function createOwnedProjectEngine(
 				code: body.data.code,
 			});
 			if (result.status === "rejected") {
-				await store.transaction((client) =>
-					security.failed(client, request, path),
-				);
+				await store.transaction(async (client) => {
+					await security.failed(client, request, path);
+					await recordPrimaryFailure(client, request, path, result.code);
+				});
 				return failure(result.httpStatus, result.code, result.message);
 			}
 			if (result.status === "rotated") {
@@ -1129,9 +1130,10 @@ export function createOwnedProjectEngine(
 				},
 			);
 			if (result.status === "rejected") {
-				await store.transaction((client) =>
-					security.failed(client, request, path),
-				);
+				await store.transaction(async (client) => {
+					await security.failed(client, request, path);
+					await recordPrimaryFailure(client, request, path, result.code);
+				});
 				const headers = new Headers();
 				for (const cookie of result.setCookies)
 					headers.append("Set-Cookie", cookie);
@@ -1153,6 +1155,20 @@ export function createOwnedProjectEngine(
 			ipAddress: security.trustedIP(request) ?? undefined,
 			userAgent: request.headers.get("user-agent") ?? undefined,
 		};
+	}
+
+	function recordPrimaryFailure(
+		client: PoolClient,
+		request: Request,
+		path: string,
+		errorCode: string,
+	) {
+		return store.recordEvent(client, {
+			type: "auth.sign-in",
+			outcome: "failure",
+			...browserEventContext(request),
+			metadata: { path, errorCode },
+		});
 	}
 
 	async function signIn(
@@ -1195,12 +1211,7 @@ export function createOwnedProjectEngine(
 		).toLowerCase();
 		const identity = field === "email" ? { email: login } : { username: login };
 		const recordFailure = (client: PoolClient) =>
-			store.recordEvent(client, {
-				type: "auth.sign-in",
-				outcome: "failure",
-				...browserEventContext(request),
-				metadata: { path, errorCode: invalidCode },
-			});
+			recordPrimaryFailure(client, request, path, invalidCode);
 		if (
 			await store.transaction((client) =>
 				security.admit(client, request, identity),

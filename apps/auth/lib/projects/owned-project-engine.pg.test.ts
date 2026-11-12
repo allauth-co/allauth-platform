@@ -640,16 +640,17 @@ describe.skipIf(!existsSync(fixturePath))("isolated PostgreSQL owned project eng
 		}
 	});
 
-	it("preserves the native pending MFA event without creating a project session", async () => {
+	it("preserves pending and rejected MFA events without creating a project session", async () => {
 		if (!legacyDatabase) throw new Error("The isolated native database was not initialized.");
 		const email = "audit-mfa@fixture.example";
 		const userId = await seed(email, { mfa: true });
+		const secret = "isolated-totp-audit-fixture-secret";
 		await database.query(
 			`INSERT INTO "${schema}"."twoFactor" (id, "userId", secret, "backupCodes", verified)
 			 VALUES ($1,$2,$3,$4,true)`,
 			[
 				randomUUID(), userId,
-				await symmetricEncrypt({ key: signingSecret, data: "isolated-totp-audit-fixture-secret" }),
+				await symmetricEncrypt({ key: signingSecret, data: secret }),
 				await symmetricEncrypt({ key: signingSecret, data: '["abcde-fghij"]' }),
 			],
 		);
@@ -658,7 +659,10 @@ describe.skipIf(!existsSync(fixturePath))("isolated PostgreSQL owned project eng
 			database: { db: legacyDatabase, type: "postgres" },
 			advanced: { cookiePrefix: `allauth_project_${slug}` },
 			emailAndPassword: { enabled: true, autoSignIn: false, password: clerkCompatiblePasswords },
-			plugins: [productionTwoFactor(origin), allauthControl({ ipHeader: "x-real-ip" })],
+			plugins: [
+				productionTwoFactor(origin),
+				allauthControl({ database: legacyDatabase, secret: signingSecret, baseURL: origin, ipHeader: "x-real-ip" }),
+			],
 			logger: { disabled: true },
 		}, { disableTestUser: true });
 		const ip = "203.0.113.146";
@@ -667,7 +671,7 @@ describe.skipIf(!existsSync(fixturePath))("isolated PostgreSQL owned project eng
 		const events = async () => (await database.query(
 			`SELECT type,outcome,"userId","targetId","actorId","ipAddress","userAgent",metadata
 			 FROM "${schema}"."allauthEvent"
-			 WHERE "userAgent"=$1 AND type IN ('auth.mfa-required','auth.sign-in') ORDER BY "createdAt",id`,
+			 WHERE "userAgent"=$1 AND type IN ('auth.mfa-required','auth.sign-in','security.sign-in-failed') ORDER BY "createdAt",id`,
 			[userAgent],
 		)).rows;
 		const legacy = await auth.handler(signIn());
@@ -676,11 +680,28 @@ describe.skipIf(!existsSync(fixturePath))("isolated PostgreSQL owned project eng
 		const expected = await events();
 		expect(expected).toHaveLength(1);
 		expect(expected[0]).toMatchObject({ type: "auth.mfa-required", outcome: "success" });
-		const candidate = await engine(schema, ip).dispatch(signIn());
+		const owned = engine(schema, ip);
+		const candidate = await owned.dispatch(signIn());
 		expect(candidate.status).toBe(200);
 		expect(await candidate.json()).toMatchObject({ twoFactorRedirect: true });
 		expect(cookies(candidate)).not.toContain(".session_token");
 		expect(await events()).toEqual([expected[0], expected[0]]);
+		const validCode = await nativeTotp(secret);
+		const code = `${validCode.slice(0, -1)}${(Number(validCode.at(-1)) + 1) % 10}`;
+		const verify = (challenge: Response) => request("/two-factor/verify-totp", { code }, {
+			cookie: cookies(challenge), "x-real-ip": ip, "user-agent": userAgent,
+		});
+		const legacyFailure = await auth.handler(verify(legacy));
+		expect(legacyFailure.status).toBe(401);
+		const rejectionEvents = (await events()).slice(2).sort((a, b) => a.type.localeCompare(b.type));
+		expect(rejectionEvents).toMatchObject([
+			{ type: "auth.sign-in", outcome: "failure", userId: null, metadata: { errorCode: "INVALID_CODE" } },
+			{ type: "security.sign-in-failed", outcome: "failure", userId: null },
+		]);
+		const ownedFailure = await owned.dispatch(verify(candidate));
+		expect(ownedFailure.status).toBe(legacyFailure.status);
+		expect(await ownedFailure.json()).toEqual(await legacyFailure.json());
+		expect((await events()).slice(4).sort((a, b) => a.type.localeCompare(b.type))).toEqual(rejectionEvents);
 		expect((await database.query(
 			`SELECT id FROM "${schema}"."session" WHERE "userId"=$1`, [userId],
 		)).rowCount).toBe(0);
