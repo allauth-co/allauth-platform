@@ -689,17 +689,23 @@ describe.skipIf(!existsSync(fixturePath))(
 		});
 
 		it.each([
-			["magic-link", true, "192.0.2.130"],
-			["magic-link", false, "192.0.2.131"],
-			["email-otp", true, "192.0.2.132"],
-			["email-otp", false, "192.0.2.133"],
-		] as const)("delivers native %s device replacement with active browser cookie %s", async (method, activeCookie, ip) => {
+			["magic-link", true, false, "192.0.2.130"],
+			["magic-link", false, false, "192.0.2.131"],
+			["email-otp", true, false, "192.0.2.132"],
+			["email-otp", false, false, "192.0.2.133"],
+			["magic-link", true, true, "192.0.2.134"],
+			["email-otp", true, true, "192.0.2.135"],
+		] as const)("delivers native %s session deletion with active browser cookie %s and unverified owner %s", async (method, activeCookie, promote, ip) => {
 			if (!nativeDatabase) throw new Error("Missing fixture database.");
 			const webhookDatabase = nativeDatabase;
 			const realm = `"${schema}"`;
 			const foreignRealm = `"${foreignSchema}"`;
 			const path =
 				method === "magic-link" ? "/magic-link/verify" : "/sign-in/email-otp";
+			const policy = {
+				...defaultAuthPolicy,
+				requireEmailVerification: !promote,
+			};
 			const mail: { to: string; html: string }[] = [];
 			const environment = {
 				EMAIL_PROVIDER: "cloudflare" as const,
@@ -733,6 +739,7 @@ describe.skipIf(!existsSync(fixturePath))(
 					authorizeAdmin: async () => null,
 					management: { id: "email-replacement-fixture" },
 				},
+				policy,
 			);
 			const installed = betterAuth({ ...options, logger: { disabled: true } });
 			const candidate = createOwnedProjectEngine({
@@ -741,7 +748,7 @@ describe.skipIf(!existsSync(fixturePath))(
 				baseURL: origin,
 				basePath,
 				signingSecret,
-				policy: defaultAuthPolicy,
+				policy,
 				trustedOrigins: [appOrigin],
 				trustedIP: (input) => input.headers.get("x-real-ip"),
 				emailSignIn: {
@@ -781,7 +788,7 @@ describe.skipIf(!existsSync(fixturePath))(
 				return { primary, device, deviceName, ...active.session };
 			}
 			async function exercise(writer: "legacy" | "owned", clientIP: string) {
-				const owner = await seed(`${randomUUID()}@fixture.example`);
+				const owner = await seed(`${randomUUID()}@fixture.example`, !promote);
 				const browser = await seed(`${randomUUID()}@fixture.example`);
 				const active = await savedSession(browser.email, clientIP);
 				const previous = await savedSession(owner.email, clientIP);
@@ -896,7 +903,10 @@ describe.skipIf(!existsSync(fixturePath))(
 					});
 					if (!replacement)
 						throw new Error("Expected a native-readable session.");
-					expect(replacement.user.id).toBe(owner.id);
+					expect(replacement.user).toMatchObject({
+						id: owner.id,
+						emailVerified: true,
+					});
 					expect(
 						completed.headers
 							.getSetCookie()
@@ -905,7 +915,7 @@ describe.skipIf(!existsSync(fixturePath))(
 									cookie.startsWith(`${previous.deviceName}=;`) &&
 									cookie.includes("Max-Age=0"),
 							),
-					).toBe(true);
+					).toBe(!promote);
 					expect(
 						completed.headers
 							.getSetCookie()
@@ -916,8 +926,21 @@ describe.skipIf(!existsSync(fixturePath))(
 						[[owner.id, browser.id]],
 					);
 					expect(sessions.rows.map(({ id }) => id)).toEqual(
-						[active.id, sibling.id, replacement.session.id].sort(),
+						[
+							active.id,
+							...(!promote ? [sibling.id] : []),
+							replacement.session.id,
+						].sort(),
 					);
+					if (promote)
+						expect(
+							(
+								await database.query(
+									`SELECT id FROM ${realm}."account" WHERE "userId"=$1`,
+									[owner.id],
+								)
+							).rowCount,
+						).toBe(0);
 					const remaining = await database.query<{
 						id: string;
 						revoked: boolean;
@@ -926,13 +949,21 @@ describe.skipIf(!existsSync(fixturePath))(
 						`SELECT id,revoked IS NOT NULL AS revoked,"sessionId" FROM ${realm}."oauthAccessToken" WHERE "clientId"=$1 UNION ALL SELECT id,revoked IS NOT NULL AS revoked,"sessionId" FROM ${realm}."oauthRefreshToken" WHERE "clientId"=$1`,
 						[clientId],
 					);
-					expect(remaining.rows).toHaveLength(grants.length);
-					for (const { kind, id } of grants)
-						expect(remaining.rows.find((row) => row.id === id)).toEqual({
-							id,
-							revoked: kind === "access" || kind === "online",
-							sessionId: kind === "sibling" ? sibling.id : null,
-						});
+					if (promote && writer === "owned") {
+						// The candidate strips all pre-proof grants when promoting a mailbox owner.
+						expect(remaining.rows).toEqual([]);
+					} else {
+						expect(remaining.rows).toHaveLength(grants.length);
+						for (const { kind, id } of grants)
+							expect(remaining.rows.find((row) => row.id === id)).toEqual({
+								id,
+								revoked:
+									kind === "access" ||
+									kind === "online" ||
+									(promote && kind === "sibling"),
+								sessionId: kind === "sibling" && !promote ? sibling.id : null,
+							});
+					}
 					expect(
 						(
 							await database.query(
@@ -981,27 +1012,39 @@ describe.skipIf(!existsSync(fixturePath))(
 							return 204;
 						},
 					});
-					expect(state).toMatchObject({ claimed: 1, delivered: 1 });
-					expect(delivered).toHaveLength(1);
-					const {
-						id: _id,
-						createdAt: _time,
-						actorId,
-						userId,
-						targetId,
-						...event
-					} = delivered[0]!;
-					expect(userId).toBe(owner.id);
-					expect(targetId).toBe(previous.id);
-					return {
-						...event,
-						actor:
-							actorId === undefined
-								? undefined
-								: actorId === browser.id
-									? "browser"
-									: "other",
-					};
+					const expectedCount = promote ? 2 : 1;
+					expect(state).toMatchObject({
+						claimed: expectedCount,
+						delivered: expectedCount,
+					});
+					expect(delivered).toHaveLength(expectedCount);
+					return delivered
+						.map(
+							({
+								id: _id,
+								createdAt: _time,
+								actorId,
+								userId,
+								targetId,
+								...event
+							}) => {
+								expect(userId).toBe(owner.id);
+								const target =
+									targetId === previous.id
+										? "previous"
+										: targetId === sibling.id
+											? "sibling"
+											: "other";
+								const actor =
+									actorId === undefined
+										? undefined
+										: actorId === browser.id
+											? "browser"
+											: "other";
+								return { ...event, target, actor };
+							},
+						)
+						.sort((first, second) => first.target.localeCompare(second.target));
 				} finally {
 					await database.query(
 						`DELETE FROM ${realm}."allauthWebhookEndpoint" WHERE id=$1`,
@@ -1026,12 +1069,15 @@ describe.skipIf(!existsSync(fixturePath))(
 				}
 			}
 			const expected = await exercise("legacy", ip);
-			expect(expected).toEqual({
-				type: "session.deleted",
-				outcome: "success",
-				actor: activeCookie ? "browser" : undefined,
-				metadata: { path },
-			});
+			expect(expected).toEqual(
+				(promote ? ["previous", "sibling"] : ["previous"]).map((target) => ({
+					type: "session.deleted",
+					outcome: "success",
+					target,
+					actor: activeCookie && !promote ? "browser" : undefined,
+					metadata: { path },
+				})),
+			);
 			expect(
 				await exercise("owned", ip.replace("192.0.2.", "198.51.100.")),
 			).toEqual(expected);

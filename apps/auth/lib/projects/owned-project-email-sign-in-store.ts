@@ -97,7 +97,7 @@ export function createProjectEmailSignInStore(options: {
 
 	async function lockOtp(client: PoolClient, identifier: string) {
 		await client.query(
-			"SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+			"SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", // cspell:ignore xact
 			[`allauth-email-otp:${options.schemaName}:${identifier}`],
 		);
 	}
@@ -226,15 +226,15 @@ export function createProjectEmailSignInStore(options: {
 			'DELETE FROM "session" WHERE "userId" = $1 RETURNING id',
 			[user.id],
 		);
+		// The native proof endpoint deletes pre-proof sessions before browser actor resolution.
 		for (const session of sessions.rows)
-			await store.record(
-				client,
-				"session.deleted",
-				"success",
-				path,
-				user.id,
-				session.id,
-			);
+			await store.recordEvent(client, {
+				type: "session.deleted",
+				outcome: "success",
+				userId: user.id,
+				targetId: session.id,
+				metadata: { path },
+			});
 		await client.query(
 			'UPDATE "user" SET "emailVerified" = true, "updatedAt" = statement_timestamp() WHERE id = $1',
 			[user.id],
