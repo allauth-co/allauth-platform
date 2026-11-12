@@ -5075,6 +5075,7 @@ describe.skipIf(!existsSync(fixture))(
 				const customHost = `accounts.${custom}`;
 				const callbackPath = `/api/auth/sso/saml2/sp/acs/${runtimeSamlProvider}`;
 				const canonicalAcs = `https://${customHost}${callbackPath}`;
+				const sloPath = `/api/auth/sso/saml2/sp/slo/${runtimeSamlProvider}`;
 				const pair = randomUUID();
 				for (const [domain, projectId, id] of [
 					[custom, alpha.id, pair],
@@ -5095,8 +5096,8 @@ describe.skipIf(!existsSync(fixture))(
 						);
 					}
 				}
-				const setReceiver = async (acs: string) => {
-					const metadata = runtimeSamlSPMetadata(acs);
+				const setReceiver = async (acs: string, logout?: string) => {
+					const metadata = runtimeSamlSPMetadata(acs, undefined, logout);
 					const samlConfig = {
 						...runtimeSamlConfiguration(samlKeys),
 						spMetadata: { metadata },
@@ -5119,7 +5120,11 @@ describe.skipIf(!existsSync(fixture))(
 						unsupported,
 					);
 				}
-				const metadata = await setReceiver(canonicalAcs);
+				const metadata = await setReceiver(
+					canonicalAcs,
+					`https://${customHost}${sloPath}`,
+				);
+				expect(metadata).toContain("SingleLogoutService");
 				const direct = {
 					prefix: directPrefix,
 					baseURL: `${platformOrigin}${directPrefix}`,
@@ -5184,12 +5189,24 @@ describe.skipIf(!existsSync(fixture))(
 						user: credentials.project,
 					});
 				};
+				const disabledLogout = async (
+					writer: Awaited<ReturnType<typeof openProcess>>,
+				) => {
+					const response = await writer.request(sloPath, { host: customHost });
+					expect(response.status).toBe(400);
+					expect(await response.json()).toEqual({
+						code: "SINGLE_LOGOUT_NOT_ENABLED",
+						message: "Single Logout is not enabled",
+					});
+				};
 				service = await openProcess(databaseURL, alpha, false);
+				await disabledLogout(service);
 				const nativePending = await start(service);
 				await service.stop();
 				service = undefined;
 
 				service = await openProcess(databaseURL, alpha, true);
+				await disabledLogout(service);
 				for (const [prefix, host] of [
 					[directPrefix, undefined],
 					["/api/auth", defaultHost],
@@ -5209,6 +5226,7 @@ describe.skipIf(!existsSync(fixture))(
 				service = undefined;
 
 				service = await openProcess(databaseURL, alpha, false);
+				await disabledLogout(service);
 				for (const pending of ownedPending) await finish(service, pending);
 				const directAcs = `${direct.baseURL}/sso/saml2/sp/acs/${runtimeSamlProvider}`;
 				await setReceiver(directAcs);

@@ -92,14 +92,12 @@ function assertProjectSamlConfiguration(
 	allowEncrypted?: boolean,
 ) {
 	const { saved, service, idp, postLocations, requestsSigned } = configuration;
-	const logout = service.entityMeta.getSingleLogoutService(undefined);
 	if (
 		saved.issuer !== provider.issuer ||
 		configuration.encrypted !== Boolean(allowEncrypted) ||
 		postLocations.length !== 1 ||
 		postLocations[0] !== acs ||
-		saved.idpInitiatedCallbackUrl ||
-		(logout && (!Array.isArray(logout) || logout.length))
+		saved.idpInitiatedCallbackUrl
 	)
 		throw new Error(
 			"This configured SAML provider is outside the candidate transport.",

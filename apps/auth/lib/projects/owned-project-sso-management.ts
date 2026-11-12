@@ -61,6 +61,10 @@ const columns =
 const noProvider = () => failure(404, "NOT_FOUND", "Provider not found");
 const accessDenied = () =>
 	failure(403, "FORBIDDEN", "You don't have access to this provider");
+const disabledSamlLogout = () =>
+	failure(400, "SINGLE_LOGOUT_NOT_ENABLED", "Single Logout is not enabled");
+const samlLogoutReceiver = /^\/sso\/saml2\/sp\/slo\/[^/]+$/;
+const samlLogoutStart = /^\/sso\/saml2\/logout\/[^/]+$/;
 
 export interface OwnedProjectSsoManagementOptions {
 	database: Pool;
@@ -336,6 +340,31 @@ export function createOwnedProjectSsoManagement(
 		path: string,
 		request: Request,
 	): Promise<Response | undefined> => {
+		// Stored metadata can advertise an SLO receiver. The project runtime leaves SLO disabled.
+		if (samlScope) {
+			if (
+				samlLogoutReceiver.test(path) &&
+				["GET", "POST"].includes(request.method)
+			)
+				return disabledSamlLogout();
+			if (samlLogoutStart.test(path) && request.method === "POST") {
+				if (
+					request.headers.has("cookie") &&
+					!options.trustedRequest(request.headers, true)
+				)
+					return failure(
+						403,
+						"FORBIDDEN",
+						"This authentication request is not permitted.",
+					);
+				const session = await store.transaction((client) =>
+					options.readSession(request, client),
+				);
+				return session
+					? disabledSamlLogout()
+					: failure(401, "UNAUTHORIZED", "Unauthorized");
+			}
+		}
 		if (!Object.hasOwn(paths, path) || request.method !== paths[path as Path])
 			return;
 		if (path === "/sso/saml2/sp/metadata") {

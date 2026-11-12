@@ -233,7 +233,7 @@ async function pending(response: Response, receiver = acs) {
 }
 
 function signedResponse(
-	requestId: string,
+	requestId: string | undefined,
 	options: {
 		assertionId?: string;
 		issuer?: string;
@@ -253,12 +253,13 @@ function signedResponse(
 	const actualIssuer = options.issuer ?? issuer;
 	const signature = options.signature ?? "assertion";
 	const receiver = options.receiver ?? acs;
-	let xml = `<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="_${randomUUID()}" Version="2.0" IssueInstant="${now}" Destination="${receiver}" InResponseTo="${requestId}">
+	const inResponseTo = requestId ? ` InResponseTo="${requestId}"` : "";
+	let xml = `<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="_${randomUUID()}" Version="2.0" IssueInstant="${now}" Destination="${receiver}"${inResponseTo}>
 		<saml:Issuer>${actualIssuer}</saml:Issuer>
 		<samlp:Status><samlp:StatusCode Value="urn:oasis:names:tc:SAML:2.0:status:Success"/></samlp:Status>
 		<saml:Assertion ID="${assertionId}" Version="2.0" IssueInstant="${now}">
 			<saml:Issuer>${actualIssuer}</saml:Issuer>
-			<saml:Subject><saml:NameID>${subject}</saml:NameID><saml:SubjectConfirmation Method="urn:oasis:names:tc:SAML:2.0:cm:bearer"><saml:SubjectConfirmationData InResponseTo="${requestId}" Recipient="${options.recipient ?? receiver}" NotOnOrAfter="${expires}"/></saml:SubjectConfirmation></saml:Subject>
+			<saml:Subject><saml:NameID>${subject}</saml:NameID><saml:SubjectConfirmation Method="urn:oasis:names:tc:SAML:2.0:cm:bearer"><saml:SubjectConfirmationData${inResponseTo} Recipient="${options.recipient ?? receiver}" NotOnOrAfter="${expires}"/></saml:SubjectConfirmation></saml:Subject>
 			<saml:Conditions NotOnOrAfter="${expires}"><saml:AudienceRestriction><saml:Audience>${options.audience ?? sp}</saml:Audience></saml:AudienceRestriction></saml:Conditions>
 			<saml:AuthnStatement AuthnInstant="${now}" SessionIndex="_${randomUUID()}"><saml:AuthnContext><saml:AuthnContextClassRef>urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport</saml:AuthnContextClassRef></saml:AuthnContext></saml:AuthnStatement>
 			<saml:AttributeStatement><saml:Attribute Name="corpEmail"><saml:AttributeValue>${options.email ?? decoyEmail}</saml:AttributeValue></saml:Attribute></saml:AttributeStatement>
@@ -589,11 +590,11 @@ describe.skipIf(!existsSync(fixturePath))(
 			});
 		}
 
-		async function assertSession(response: Response) {
+		async function assertSession(response: Response, expected = destination) {
 			expect(
 				response.headers.get("location"),
 				await response.clone().text(),
-			).toBe(destination);
+			).toBe(expected);
 			expect(
 				await native.api.getSession({
 					headers: new Headers({ cookie: cookies(response) }),
@@ -1189,6 +1190,143 @@ describe.skipIf(!existsSync(fixturePath))(
 				);
 				expect(denied.status).toBe(400);
 				expect(cookies(denied)).toBe("");
+			} finally {
+				await storeSamlConfiguration(configuration());
+			}
+		});
+
+		it("preserves saved SingleLogoutService metadata and disabled SLO across both project writers", async () => {
+			const slo = `${origin}/api/auth/sso/saml2/sp/slo/${providerId}`;
+			const binding = "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST";
+			const metadata = saml
+				.SPMetadata({
+					entityID: sp,
+					authnRequestsSigned: true,
+					wantAssertionsSigned: true,
+					signingCert: fixtureKeys.certificate,
+					singleLogoutService: [{ Binding: binding, Location: slo }],
+					assertionConsumerService: [{ Binding: binding, Location: acs }],
+				})
+				.getMetadata();
+			expect(metadata).toContain("SingleLogoutService");
+			await storeSamlConfiguration({
+				...configuration(),
+				authnRequestsSigned: true,
+				spMetadata: { metadata, privateKey: fixtureKeys.privateKey },
+			});
+			try {
+				const candidate = managementEngine();
+				const dispatches = [native.handler, candidate.dispatch];
+				const logout = `${origin}/api/auth/sso/saml2/logout/${providerId}`;
+				for (const [index, dispatch] of dispatches.entries()) {
+					const other = dispatches[1 - index]!;
+					const published = await dispatch(
+						new Request(
+							`${origin}/api/auth/sso/saml2/sp/metadata?providerId=${providerId}`,
+						),
+					);
+					expect(published.status).toBe(200);
+					expect(published.headers.get("content-type")).toBe("application/xml");
+					expect(await published.text()).toBe(metadata);
+					const state = await pending(await dispatch(startRequest()));
+					expect(state.redirect.searchParams.has("Signature")).toBe(true);
+					const signedIn = await other(
+						callback(signedResponse(state.requestId).encoded, state.relay),
+					);
+					await assertSession(signedIn);
+					const headers = {
+						cookie: cookies(signedIn),
+						origin,
+						"content-type": "application/json",
+					};
+					for (const request of [
+						new Request(slo),
+						new Request(slo, {
+							method: "POST",
+							headers: { origin: idpOrigin },
+							body: new URLSearchParams(),
+						}),
+						new Request(logout, { method: "POST", headers, body: "{}" }),
+					]) {
+						const disabled = await dispatch(request);
+						expect(disabled.status, await disabled.clone().text()).toBe(400);
+						expect(await disabled.json()).toEqual({
+							code: "SINGLE_LOGOUT_NOT_ENABLED",
+							message: "Single Logout is not enabled",
+						});
+						expect(disabled.headers.getSetCookie()).toEqual([]);
+					}
+					const anonymous = await dispatch(
+						new Request(logout, {
+							method: "POST",
+							headers: { origin, "content-type": "application/json" },
+							body: "{}",
+						}),
+					);
+					expect(anonymous.status).toBe(401);
+					expect(await anonymous.json()).toEqual({
+						code: "UNAUTHORIZED",
+						message: "Unauthorized",
+					});
+					expect(
+						await native.api.getSession({
+							headers: new Headers(headers),
+							query: { disableRefresh: true },
+						}),
+					).toMatchObject({ user: { id: managed } });
+				}
+				expect(
+					(
+						await database.query(
+							`SELECT id FROM "${schema}"."verification"
+					 WHERE identifier LIKE 'saml-session:%' OR identifier LIKE 'saml-session-by-id:%'`,
+						)
+					).rows,
+				).toEqual([]);
+			} finally {
+				await storeSamlConfiguration(configuration());
+			}
+		});
+
+		it("uses a saved IdP callback as the native redirect fallback with IdP-initiated login disabled", async () => {
+			const fallback = `${origin}/account?from=saved-saml-fallback`;
+			await storeSamlConfiguration({
+				...configuration(),
+				idpInitiatedCallbackUrl: fallback,
+			});
+			try {
+				const state = await pending(await native.handler(startRequest()));
+				await assertSession(
+					await native.handler(
+						callback(signedResponse(state.requestId).encoded, state.relay),
+					),
+				);
+
+				const withReceiverDestination = await pending(
+					await native.handler(startRequest({ ...body, callbackURL: acs })),
+				);
+				await assertSession(
+					await native.handler(
+						callback(
+							signedResponse(withReceiverDestination.requestId).encoded,
+							withReceiverDestination.relay,
+						),
+					),
+					fallback,
+				);
+
+				const unsolicited = await native.handler(
+					callback(signedResponse(undefined).encoded),
+				);
+				expect(unsolicited.status).toBe(302);
+				expect(cookies(unsolicited)).toBe("");
+				const redirected = new URL(unsolicited.headers.get("location")!);
+				expect(redirected.pathname).toBe("/account");
+				expect(Object.fromEntries(redirected.searchParams)).toEqual({
+					from: "saved-saml-fallback",
+					error: "unsolicited_response",
+					error_description: "IdP-initiated SSO not allowed",
+				});
 			} finally {
 				await storeSamlConfiguration(configuration());
 			}

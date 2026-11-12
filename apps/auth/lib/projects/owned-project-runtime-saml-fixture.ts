@@ -80,16 +80,19 @@ export function runtimeSamlAuthnRequest(location: URL) {
 	return { id, acs, relay };
 }
 
-export function runtimeSamlSPMetadata(acs: string, encryptCert?: string) {
+export function runtimeSamlSPMetadata(
+	acs: string,
+	encryptCert?: string,
+	logout?: string,
+) {
+	const binding = "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST";
 	return saml
 		.SPMetadata({
 			entityID: runtimeSamlEntity,
-			assertionConsumerService: [
-				{
-					Binding: "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST",
-					Location: acs,
-				},
-			],
+			assertionConsumerService: [{ Binding: binding, Location: acs }],
+			singleLogoutService: logout
+				? [{ Binding: binding, Location: logout }]
+				: undefined,
 			wantAssertionsSigned: true,
 			authnRequestsSigned: true,
 			encryptCert,
