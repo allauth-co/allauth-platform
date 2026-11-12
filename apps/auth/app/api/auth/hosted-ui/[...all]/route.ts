@@ -1,7 +1,7 @@
 import { authOrigin } from "@/lib/configuration";
 import { edgeHeaders } from "@/lib/domains/edge";
 import { hostedSdkEndpoint } from "@/lib/domains/hosted-sdk-policy";
-import { hostedSdkSelected } from "@/lib/domains/hosted-sdk-selection";
+import { hostedSdkTransportEnabled } from "@/lib/domains/hosted-sdk-selection";
 import {
 	hostedSdkFailure,
 	hostedSdkResponse,
@@ -27,7 +27,7 @@ async function handle(request: Request) {
 		if (
 			!binding ||
 			binding.kind !== "accounts" ||
-			!hostedSdkSelected(env, binding.project)
+			!hostedSdkTransportEnabled(env, binding.project)
 		)
 			return hostedSdkFailure(404, "Authentication route is unavailable.");
 		const url = new URL(bound.url);

@@ -57,11 +57,23 @@ The records cover sign-in and second-factor requests, provider callbacks, sessio
 
 ## Internal project selection
 
-`ALLAUTH_PROJECT_ENGINE_INTERNAL_ID` selects one immutable development project in the protected AllAuth platform workspace. Set it to the project ID after its configured flows and rollback have passed. The selected project uses the AllAuth writer and the verified accounts hostname uses the first-party forms. The factory checks the registry binding, derived schema, keys and configured features before accepting the realm. Requests outside that selection use the existing writer. The setting defaults to empty. Deployment readiness builds both transports during startup and checks that their registry binding still matches before accepting traffic.
+`ALLAUTH_PROJECT_ENGINE_INTERNAL_ID` allows one immutable development project in the protected AllAuth platform workspace to enter the pilot. The setting defaults to empty. Deployment readiness checks the registry and builds the AllAuth engine for both the signed proxy and verified managed accounts hostname. The admitted writer comes from PostgreSQL and starts at `legacy` revision `0`. When the admitted writer is `allauth`, new sign-in pages on the verified accounts hostname use the first-party forms.
 
-Before starting the candidate, stop the preceding writer and confirm that no application connections remain for the selected database. Configure zero deployment overlap and keep one deployment serving the realm. To switch back, stop the candidate, confirm its database connections have closed, and start the previous deployment with the setting cleared. Use the existing project session comparison, route metrics and saved compatibility fixtures for the same immutable project ID.
+Deploy the pilot-capable release with the exact project ID and confirm readiness. Before switching, confirm that the preceding deployment has drained and that each running replica uses the pilot-capable release with the same selection. Check the configuration, signed proxy, default accounts and any active custom domains while the legacy writer is still active. Use the existing project session comparison and collect baseline route metrics for the same project ID.
 
-Rehearse the release selector using the normal runtime image and an isolated Docker database. The harness checks the verified hosted API, signed app proxy, saved sessions and legacy-readable writes.
+Run the following commands from the application directory in the release container using the deployment database role.
+
+```sh
+node scripts/project-engine-writer.mjs status
+node scripts/project-engine-writer.mjs switch legacy 0 allauth
+node scripts/project-engine-writer.mjs status
+```
+
+The switch waits for admitted requests and guarded database transactions to finish. The first switch installs guards for the protected realm and records the writer in the same transaction. The guards reject credential and authorization writes carrying a stale engine revision. Other realms continue using their existing runtime. A concurrent transition or lock timeout leaves the stored writer unchanged by the rejected command. Read the current writer and revision before deciding whether to retry.
+
+For rollback, read the current revision and use it as the expected revision for the switch to `legacy`. For example, the first rollback uses `node scripts/project-engine-writer.mjs switch allauth 1 legacy`. Confirm the signed proxy, new hosted pages, existing sessions and all affected integrations after the switch. First-party forms already open retain their request transport while the pilot-capable release is running. Keep the same keys and leave the database migration installed. Switch the stored writer back to `legacy` before reverting to a release that predates the fence.
+
+Rehearse the release selector using the normal runtime image and an isolated Docker database. The harness checks both hosted sign-in views, the signed app proxy, persisted selection after restart, saved sessions and legacy-readable writes.
 
 ```sh
 docker build --target runtime -f apps/auth/Dockerfile -t allauth-auth:internal-rehearsal .

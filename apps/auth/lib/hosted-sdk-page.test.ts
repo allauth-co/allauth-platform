@@ -11,6 +11,7 @@ const runtime = vi.hoisted(() => ({
 	getAuthEnvironment: vi.fn(),
 	withPortalHeadersEngine: vi.fn(),
 	portalSession: vi.fn(),
+	readWriter: vi.fn(),
 }));
 vi.mock("next/headers", () => ({ headers: runtime.headers }));
 vi.mock("next/navigation", () => ({
@@ -19,6 +20,9 @@ vi.mock("next/navigation", () => ({
 	},
 }));
 vi.mock("./auth", () => ({ getAuthEnvironment: runtime.getAuthEnvironment }));
+vi.mock("./projects/project-engine-writer-lease", () => ({
+	createProjectEngineWriterLease: () => ({ read: runtime.readWriter }),
+}));
 vi.mock("./domains/hosting", () => ({
 	withPortalHeadersEngine: runtime.withPortalHeadersEngine,
 	portalSession: runtime.portalSession,
@@ -56,6 +60,7 @@ beforeEach(() => {
 		.mockResolvedValue({ ALLAUTH_PROJECT_HOSTED_UI_PROJECT_IDS: project.id });
 	runtime.withPortalHeadersEngine.mockReset();
 	runtime.portalSession.mockReset();
+	runtime.readWriter.mockReset();
 });
 
 it("preserves exact sign-out destinations, verifies a direct OAuth query, and defaults to native UI", async () => {
@@ -540,7 +545,13 @@ it("uses the first-party sign-in on the verified accounts domain of the selected
 			view: "signIn",
 			searchParams: Promise.resolve({}),
 		});
+	runtime.readWriter.mockResolvedValue({ writer: "legacy", revision: 0 });
+	expect((await read()).type).toBe(AllAuthAuth);
+	runtime.readWriter.mockResolvedValue({ writer: "allauth", revision: 1 });
 	expect((await read()).type).toBe(HostedProjectAuth);
+	runtime.readWriter.mockResolvedValue({ writer: "legacy", revision: 2 });
+	expect((await read()).type).toBe(AllAuthAuth);
+	runtime.readWriter.mockResolvedValue({ writer: "allauth", revision: 3 });
 	binding = { ...binding, kind: "frontend-api" };
 	expect((await read()).type).toBe(AllAuthAuth);
 	binding = {

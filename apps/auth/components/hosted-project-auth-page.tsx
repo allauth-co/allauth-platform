@@ -67,7 +67,7 @@ export async function HostedProjectAuthPage({
 			if (
 				!binding ||
 				binding.kind !== "accounts" ||
-				!hostedSdkSelected(env, binding.project)
+				!(await hostedSdkSelected(env, binding.project))
 			)
 				return null;
 			if (

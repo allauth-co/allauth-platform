@@ -18,7 +18,6 @@ export async function hostedOrganizationPreview(headers: Headers) {
 		setting(env, "ALLAUTH_EDGE_SECRET"),
 	);
 	const binding = hostname ? await resolveHostedBinding(hostname, env) : null;
-	return (
-		binding?.kind === "accounts" && hostedSdkSelected(env, binding.project)
-	);
+	if (binding?.kind !== "accounts") return false;
+	return hostedSdkSelected(env, binding.project);
 }

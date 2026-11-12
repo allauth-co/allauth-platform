@@ -66,6 +66,7 @@ WORKDIR /app/apps/auth
 COPY --from=build-input --chown=node:node /app/apps/auth/public ./public
 COPY --from=build-input --chown=node:node /app/apps/auth/migrations ./migrations
 COPY --from=build-input --chown=node:node /app/apps/auth/scripts/database.mjs ./scripts/database.mjs
+COPY --from=build-input --chown=node:node /app/apps/auth/scripts/project-engine-writer.mjs ./scripts/project-engine-writer.mjs
 COPY --from=build-input --chown=node:node /app/LICENSE.md /app/LICENSE.md
 USER node
 EXPOSE 3000

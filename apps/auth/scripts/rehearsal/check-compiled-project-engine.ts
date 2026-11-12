@@ -540,6 +540,19 @@ try {
 		await stop(restored);
 	}
 
+	async function internalWriter(...args: string[]) {
+		const output = await docker(
+			"exec", application, "node", "scripts/project-engine-writer.mjs", ...args,
+		);
+		return JSON.parse(output) as { writer: string; revision: number };
+	}
+
+	async function hostedPage(hostname: string, firstParty: boolean) {
+		const page = await request("/sign-in", { host: hostname });
+		expectStatus(page, 200, "Render sign-in for the verified project hostname.");
+		assert.equal(page.body.includes("/api/auth/hosted-ui"), firstParty);
+	}
+
 	async function currentSession(
 		path: string,
 		options: Parameters<typeof request>[1],
@@ -556,6 +569,7 @@ try {
 		);
 	}
 
+	let internalEnvironment: Record<string, string> = {};
 	if (internalSelection) {
 		const mail = {
 			EMAIL_PROVIDER: "cloudflare",
@@ -582,10 +596,20 @@ try {
 			503,
 		);
 		await stop(restored);
-		await start(releaseImage, restored, {
-			...mail,
-			ALLAUTH_PROJECT_ENGINE_INTERNAL_ID: owned.id,
+		internalEnvironment = { ...mail, ALLAUTH_PROJECT_ENGINE_INTERNAL_ID: owned.id };
+		await start(releaseImage, restored, internalEnvironment);
+		assert.deepEqual(await internalWriter("status"), { writer: "legacy", revision: 0 });
+		expectStatus(
+			await request(`${direct}/not-installed`, { realm: owned }),
+			404,
+			"The protected project keeps the legacy writer until the database switch.",
+		);
+		await hostedPage(managedHost, false);
+		assert.deepEqual(await internalWriter("switch", "legacy", "0", "allauth"), {
+			writer: "allauth", revision: 1,
 		});
+		await assert.rejects(internalWriter("switch", "legacy", "0", "allauth"));
+		await hostedPage(managedHost, true);
 		expectStatus(
 			await request("/api/auth/hosted-ui/sdk/config", { host }),
 			200,
@@ -775,7 +799,24 @@ try {
 	await checkKey("/api/auth", { host, cookie: ownedHostedCookie });
 	await stop(restored);
 
-	await start(releaseImage, restored, selected);
+	if (internalSelection) {
+		await start(releaseImage, restored, internalEnvironment);
+		assert.deepEqual(await internalWriter("status"), { writer: "allauth", revision: 1 });
+		expectStatus(
+			await request(`${direct}/not-installed`, { realm: owned }),
+			501,
+			"The restored deployment reads the committed AllAuth writer.",
+		);
+		assert.deepEqual(await internalWriter("switch", "allauth", "1", "legacy"), {
+			writer: "legacy", revision: 2,
+		});
+		await hostedPage(managedHost, false);
+		expectStatus(
+			await request("/api/auth/hosted-ui/sdk/config", { host: managedHost }),
+			200,
+			"A first-party page already open at rollback keeps its transport.",
+		);
+	} else await start(releaseImage, restored, selected);
 	expectStatus(
 		await request(`${direct}/not-installed`, { realm: owned }),
 		404,
@@ -847,7 +888,7 @@ try {
 	await stop(restored);
 	console.log(
 		internalSelection
-			? "Compiled internal project selection passed from legacy to AllAuth and back."
+			? "Compiled internal project writer fence and hosted sign-in passed from legacy to AllAuth and back."
 			: "Compiled project rehearsal passed from legacy to AllAuth and back.",
 	);
 } finally {

@@ -71,7 +71,12 @@ import {
 	internalProjectEngineSelected,
 	selectInternalProjectEngine,
 } from "./project-engine-internal-selection";
+import { internalProjectWriterLease } from "./project-engine-internal-writer";
 import { selectRehearsalProjectEngine } from "./project-engine-rehearsal-selection";
+import {
+	projectEngineWriterConnectionOptions,
+	type ProjectEngineWriterState,
+} from "./project-engine-writer-lease";
 import { localizeProjectErrors } from "./project-error-localization";
 import { verifiedProjectRequest } from "./proxy";
 import type { Project } from "./registry";
@@ -228,6 +233,7 @@ async function build(
 	googleProvider: StoredGoogleProvider,
 	publicOrigin?: string,
 	owned?: ProjectEngineBuilder,
+	writer?: ProjectEngineWriterState,
 ): Promise<Entry> {
 	const schema = checkedProjectSchema(project.schemaName);
 	const pool = new Pool({
@@ -236,7 +242,9 @@ async function build(
 		connectionTimeoutMillis: 10000,
 		idleTimeoutMillis: 10000,
 		allowExitOnIdle: true,
-		options: `-c search_path=${schema}`,
+		options: writer
+			? `-c search_path=${schema} ${projectEngineWriterConnectionOptions(project.id, writer)}`
+			: `-c search_path=${schema}`,
 	});
 	pool.on("error", () =>
 		console.error("AllAuth project database connection error."),
@@ -526,8 +534,28 @@ async function withProjectEntry<T>(
 	const rehearsal =
 		fixtureFor(project, env)?.build ??
 		(await selectRehearsalProjectEngine(project, env));
-	const internal = rehearsal ? undefined : selectInternalProjectEngine(project, env);
-	const owned = rehearsal ?? internal;
+	if (rehearsal)
+		return withConfiguredProjectEntry(project, env, publicOrigin, callback, rehearsal);
+	const lease = internalProjectWriterLease(project, env);
+	if (!lease) return withConfiguredProjectEntry(project, env, publicOrigin, callback);
+	return lease.withCurrent(({ writer, revision }) => {
+		const candidate = writer === "allauth" ? selectInternalProjectEngine(project, env) : undefined;
+		if (writer === "allauth" && !candidate)
+			throw new Error("The internal project writer is unavailable.");
+		return withConfiguredProjectEntry(
+			project, env, publicOrigin, callback, candidate, { writer, revision },
+		);
+	});
+}
+
+async function withConfiguredProjectEntry<T>(
+	project: Project,
+	env: AuthEnvironment,
+	publicOrigin: string | undefined,
+	callback: (entry: Entry, project: Project) => Promise<T>,
+	owned?: ProjectEngineBuilder,
+	writer?: ProjectEngineWriterState,
+) {
 	const [configured, googleProvider] = await Promise.all([
 		readAuthPolicy(project.id, env),
 		readGoogleProvider(project.id, env),
@@ -537,8 +565,8 @@ async function withProjectEntry<T>(
 	// Transport secrets can rotate while the native auth instance remains cached.
 	// Verification must receive the registry row read for this request.
 	return entries.use(
-		`${project.id}:${configured.version}:engine:${rehearsal ? "owned-fixture" : internal ? "owned-internal" : "legacy"}:metrics:${projectEngineMetricsSelected(env, project.id)}:shadow:${projectSessionShadowSelected(env, project)}:origins:${projectOriginFingerprint(project)}:owned-avatars:${ownedAvatarSelected(env, project.id)}:native-passkeys:${selectedNativePasskeys(env, project, publicOrigin).version}:google:${googleProvider.version}:microsoft:${microsoftConfigurationVersion(microsoft)}:apple:${appleConfigurationVersion(apple)}:${apple ? Math.floor(Date.now() / 86400000) : 0}:${publicOrigin ?? ""}`,
-		() => build(project, env, configured.policy, googleProvider, publicOrigin, owned),
+		`${project.id}:${configured.version}:engine:${writer ? `${writer.writer}:${writer.revision}` : owned ? "owned-fixture" : "legacy"}:metrics:${projectEngineMetricsSelected(env, project.id)}:shadow:${projectSessionShadowSelected(env, project)}:origins:${projectOriginFingerprint(project)}:owned-avatars:${ownedAvatarSelected(env, project.id)}:native-passkeys:${selectedNativePasskeys(env, project, publicOrigin).version}:google:${googleProvider.version}:microsoft:${microsoftConfigurationVersion(microsoft)}:apple:${appleConfigurationVersion(apple)}:${apple ? Math.floor(Date.now() / 86400000) : 0}:${publicOrigin ?? ""}`,
+		() => build(project, env, configured.policy, googleProvider, publicOrigin, owned, writer),
 		(entry) => callback(entry, project),
 	);
 }
@@ -691,17 +719,21 @@ export function confirmInternalProjectEngine(
 	env: AuthEnvironment,
 	hostname?: string,
 ) {
-	if (!internalProjectEngineSelected(env, project))
+	const candidate = selectInternalProjectEngine(project, env);
+	const lease = internalProjectWriterLease(project, env);
+	if (!candidate || !lease)
 		throw new Error("The internal project selection changed.");
-	return withProjectEntry(
-		project,
-		env,
-		hostname ? `https://${hostname}` : undefined,
-		async (entry) => {
+	const origin = hostname ? `https://${hostname}` : undefined;
+	return lease.withCurrent(async (active) => {
+		const prepared: ProjectEngineWriterState = {
+			writer: "allauth",
+			revision: active.revision + (active.writer === "legacy" ? 1 : 0),
+		};
+		await withConfiguredProjectEntry(project, env, origin, async (entry) => {
 			if (entry.kind !== "owned" || !internalProjectEngineSelected(env, entry.project))
 				throw new Error("The internal project writer is unavailable.");
-		},
-	);
+		}, candidate, prepared);
+	});
 }
 
 /** Use the same verified custom hostname binding and project pool as hosted auth. */

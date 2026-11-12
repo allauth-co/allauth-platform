@@ -13,6 +13,7 @@ const fixture = vi.hoisted(() => {
 	return {
 		getProject: vi.fn(), readAuthPolicy: vi.fn(),
 		resolveHostedBinding: vi.fn(),
+		admitted: { writer: "legacy" as "legacy" | "allauth", revision: 0 },
 		readGoogleProvider: vi.fn(async () => ({ version: 0, enabled: false, clientId: "", encryptedClientSecret: "", updatedAt: null as string | null })),
 		createOwned: vi.fn(async (_options: unknown) => ({
 			dispatch: async () => new Response(null, { status: 202 }),
@@ -30,6 +31,16 @@ const fixture = vi.hoisted(() => {
 vi.mock("../project-providers/repository", () => ({ readGoogleProvider: fixture.readGoogleProvider, googleProviderCredentials: async (stored: { enabled: boolean; clientId: string }) => stored.enabled ? { clientId: stored.clientId, clientSecret: "fixture-direct-secret" } : undefined }));
 vi.mock("../auth-policy/storage", () => ({ readAuthPolicy: fixture.readAuthPolicy }));
 vi.mock("../domains/hosting", () => ({ resolveHostedBinding: fixture.resolveHostedBinding }));
+vi.mock("./project-engine-writer-lease", async (original) => {
+	const implementation = await original<typeof import("./project-engine-writer-lease")>();
+	return {
+		...implementation,
+		createProjectEngineWriterLease: vi.fn(() => ({
+			withCurrent: async (work: (lease: typeof fixture.admitted) => Promise<unknown>) =>
+				work({ ...fixture.admitted }),
+		})),
+	};
+});
 vi.mock("./owned-project-runtime-factory", () => ({
 	createOwnedProjectRuntimeCandidate: fixture.createOwned,
 }));
@@ -39,7 +50,11 @@ vi.mock("pg", () => ({ Pool: vi.fn(function fixturePool() { return { on: vi.fn()
 
 const environment: AuthEnvironment = { BETTER_AUTH_URL: "https://allauth.example", BETTER_AUTH_SECRET: "fixture-runtime-auth-secret-longer-than-thirty-two", SCIM_CREDENTIAL_HASH_SECRET: "fixture-runtime-scim-secret-longer-than-thirty-two", DATABASE_URL: "postgres://fixture:fixture@127.0.0.1:1/never-connected" };
 const project = (): Project => ({ id: "fixture-runtime-project", slug: "fixture-app", name: "Fixture App", schemaName: "allauth_project_0123456789abcdef0123456789abcdef", applicationId: "fixture-application", workspaceId: "7046c686-3816-42ae-82e3-ad71b96d3282", environment: "production", primaryOrigin: "https://app.example", origins: ["https://app.example"], brokerClientId: "fixture-broker", brokerSecret: "fixture-encrypted", proxyVersion: "old-proxy-version", createdBy: "fixture-owner", createdAt: new Date(), updatedAt: new Date() });
-afterEach(async () => { await closeProjectInstances(); vi.clearAllMocks(); });
+afterEach(async () => {
+	await closeProjectInstances();
+	fixture.admitted = { writer: "legacy", revision: 0 };
+	vi.clearAllMocks();
+});
 
 describe("project runtime transport rotation", () => {
 	it("rebuilds origin trust and RP options when registry origins change without policy or credential rotation", async () => {
@@ -151,6 +166,8 @@ describe("protected internal project writer selection", () => {
 			);
 		};
 		expect((await dispatch(internal, environment)).status).toBe(204);
+		expect((await dispatch(internal, selected)).status).toBe(204);
+		fixture.admitted = { writer: "allauth", revision: 1 };
 		expect((await dispatch(internal, selected)).status).toBe(202);
 		const hostname = "accounts.internal.fixture.example";
 		const hosted = await withHostedProjectAuthEngine(
@@ -168,6 +185,8 @@ describe("protected internal project writer selection", () => {
 		])
 			expect((await dispatch(rejected, selected)).status).toBe(204);
 		expect((await dispatch(internal, { ...selected, ALLAUTH_PROJECT_ENGINE_INTERNAL_ID: `${id},*` })).status).toBe(204);
+		fixture.admitted = { writer: "legacy", revision: 2 };
+		expect((await dispatch(internal, selected)).status).toBe(204);
 		expect((await dispatch(internal, environment)).status).toBe(204);
 		expect(fixture.createOwned).toHaveBeenCalledTimes(2);
 		expect(fixture.createOwned.mock.calls[0]?.[0]).toMatchObject({

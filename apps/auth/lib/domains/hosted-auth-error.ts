@@ -69,7 +69,7 @@ export async function hostedAuthErrorRetry(
 	return withPortalHeadersEngine(headers, async (engine, _bound, binding) => {
 		if (
 			binding?.kind !== "accounts" ||
-			!hostedSdkSelected(env, binding.project)
+			!(await hostedSdkSelected(env, binding.project))
 		)
 			return undefined;
 		const { query, callback } = retryIntent(params);

@@ -127,6 +127,7 @@ jobs:
         run: >-
           pnpm exec vitest run --root apps/auth --config vitest.config.ts
           lib/projects/owned-project-runtime.pg.test.ts
+          lib/projects/project-engine-writer-lease.pg.test.ts
       - name: Test billing, platform administration, self-hosting and public pages
         run: >-
           pnpm exec vitest run --root apps/auth --config vitest.config.ts
