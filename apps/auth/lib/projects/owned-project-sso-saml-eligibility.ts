@@ -96,8 +96,7 @@ function assertProjectSamlConfiguration(
 		saved.issuer !== provider.issuer ||
 		configuration.encrypted !== Boolean(allowEncrypted) ||
 		postLocations.length !== 1 ||
-		postLocations[0] !== acs ||
-		saved.idpInitiatedCallbackUrl
+		postLocations[0] !== acs
 	)
 		throw new Error(
 			"This configured SAML provider is outside the candidate transport.",

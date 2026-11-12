@@ -94,6 +94,10 @@ function invalid(): never {
 	throw new Error("Invalid configured SAML authentication message.");
 }
 
+export function isSamlRelativeRedirect(value: string) {
+	return /^\/(?!\/|\\|%2f|%5c)/i.test(value);
+}
+
 function parseXML(xml: string) {
 	if (/<!\s*(?:DOCTYPE|ENTITY)\b/i.test(xml)) invalid();
 	const options = { locator: false, onError: invalid };
@@ -693,9 +697,14 @@ export async function verifyOwnedSaml(
 		).getAttribute("Value") !== success
 	)
 		invalid();
-	const requestId = response.getAttribute("InResponseTo") ?? "";
+	const requestId = response.getAttribute("InResponseTo");
 	const destination = response.getAttribute("Destination") ?? "";
-	if (!signedId.test(requestId) || !configured.recipients.has(destination))
+	if (
+		(requestId === null
+			? !configured.saved.idpInitiatedCallbackUrl
+			: !signedId.test(requestId)) ||
+		!configured.recipients.has(destination)
+	)
 		invalid();
 	const now = Date.now();
 	const entityId = configured.service.entityMeta.getEntityID();
@@ -728,6 +737,8 @@ export async function verifyOwnedSaml(
 	const statement = child(assertion, assertionNS, "AuthnStatement");
 	const sessionUntil = optionalTime(statement, "SessionNotOnOrAfter");
 	if (sessionUntil !== undefined && now >= sessionUntil + clockSkew) invalid();
+	// A verified assertion without a request may only produce the disabled-flow redirect.
+	if (requestId === null) return { requestId: null } as const;
 	const nameId = text(child(subject, assertionNS, "NameID"));
 	if (
 		!nameId.trim() ||

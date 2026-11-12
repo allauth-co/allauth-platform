@@ -19,6 +19,7 @@ const callbackCodes = new Set([
 	"saml_error",
 	"state_mismatch",
 	"state_not_found",
+	"unsolicited_response",
 	"validation_failed",
 ]);
 const failures = new WeakMap<Response, string>();

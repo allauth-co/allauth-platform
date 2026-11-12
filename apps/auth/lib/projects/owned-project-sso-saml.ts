@@ -6,7 +6,10 @@ import { markOwnedCallbackFailure } from "./owned-project-callback-failure";
 import type { OwnedProjectSsoOptions } from "./owned-project-sso";
 import type { ProjectCustomSamlTransport } from "./owned-project-sso-saml-eligibility";
 import { configureProjectSamlTransport } from "./owned-project-sso-saml-eligibility";
-import { verifyOwnedSaml } from "./owned-project-sso-saml-protocol";
+import {
+	isSamlRelativeRedirect,
+	verifyOwnedSaml,
+} from "./owned-project-sso-saml-protocol";
 import type {
 	createProjectSsoStore,
 	SsoProvider,
@@ -37,6 +40,7 @@ const requestRecord = z.object({
 });
 
 type SsoStore = ReturnType<typeof createProjectSsoStore>;
+type VerifiedSaml = Awaited<ReturnType<typeof verifyOwnedSaml>>;
 type StartFlow = Pick<
 	SsoState,
 	"callbackURL" | "newUserURL" | "errorURL" | "requestSignUp"
@@ -170,6 +174,51 @@ export function createOwnedProjectSaml(options: {
 		return url;
 	}
 
+	function configuredReturn(
+		receiver: string,
+		...destinations: (string | undefined)[]
+	) {
+		for (const destination of destinations) {
+			if (
+				destination &&
+				(!destination.startsWith("/") || isSamlRelativeRedirect(destination)) &&
+				returnURL(destination, receiver)
+			)
+				return destination;
+		}
+		return options.origin;
+	}
+
+	function refuseUnsolicited(destination: string) {
+		const code = "unsolicited_response";
+		const description = "IdP-initiated SSO not allowed";
+		let location: string;
+		if (isSamlRelativeRedirect(destination)) {
+			const hashIndex = destination.indexOf("#");
+			const path =
+				hashIndex < 0 ? destination : destination.slice(0, hashIndex);
+			const fragment = hashIndex < 0 ? "" : destination.slice(hashIndex);
+			const delimiter = path.includes("?") ? "&" : "?";
+			location = `${path}${delimiter}error=${code}&error_description=${encodeURIComponent(description)}${fragment}`;
+		} else {
+			const target = new URL(destination);
+			target.searchParams.set("error", code);
+			target.searchParams.set("error_description", description);
+			location = target.href;
+		}
+		return markOwnedCallbackFailure(
+			new Response(null, {
+				status: 302,
+				headers: {
+					location,
+					"cache-control": "no-store",
+					"referrer-policy": "no-referrer",
+				},
+			}),
+			code,
+		);
+	}
+
 	function failure(code: string, flow?: SsoState, receiver?: string) {
 		const destination =
 			returnURL(flow?.errorURL, receiver) ||
@@ -281,7 +330,7 @@ export function createOwnedProjectSaml(options: {
 
 	async function consume(
 		provider: SsoProvider,
-		proof: Awaited<ReturnType<typeof verifyOwnedSaml>>,
+		proof: Extract<VerifiedSaml, { requestId: string }>,
 		relay: string | undefined,
 	) {
 		const providerId = provider.providerId;
@@ -361,7 +410,7 @@ export function createOwnedProjectSaml(options: {
 		const provider = await store.getProvider(providerId);
 		if (!provider?.samlConfig) return failure("invalid_provider");
 		let selected: Awaited<ReturnType<typeof configureProjectSamlTransport>>;
-		let proof: Awaited<ReturnType<typeof verifyOwnedSaml>>;
+		let proof: VerifiedSaml;
 		try {
 			selected = await configureProjectSamlTransport(
 				{ ...provider, samlConfig: provider.samlConfig },
@@ -384,6 +433,19 @@ export function createOwnedProjectSaml(options: {
 				"saml_error",
 			);
 		}
+		const saved = selected.configured.saved;
+		const receiver =
+			selected.custom || saved.idpInitiatedCallbackUrl
+				? selected.acs
+				: undefined;
+		if (proof.requestId === null)
+			return refuseUnsolicited(
+				configuredReturn(
+					selected.acs,
+					saved.idpInitiatedCallbackUrl,
+					saved.callbackUrl,
+				),
+			);
 		let flow: SsoState | undefined;
 		const abort = Symbol("SAML sign-in refused");
 		let rejection = "account_not_linked";
@@ -391,17 +453,21 @@ export function createOwnedProjectSaml(options: {
 			const consumed = await consume(provider, proof, form.relay);
 			if (typeof consumed === "string") return failure(consumed);
 			flow = consumed.flow ?? undefined;
-			const fallback =
-				selected.configured.saved.idpInitiatedCallbackUrl ||
-				selected.configured.saved.callbackUrl;
-			const receiver = selected.custom ? selected.acs : undefined;
-			let destination = returnURL(flow?.callbackURL, receiver)?.href;
+			let destination = saved.idpInitiatedCallbackUrl
+				? configuredReturn(
+						selected.acs,
+						flow?.callbackURL,
+						saved.idpInitiatedCallbackUrl,
+						saved.callbackUrl,
+					)
+				: returnURL(flow?.callbackURL, receiver)?.href;
 			if (!destination && (selected.custom || !flow)) {
 				destination =
-					returnURL(fallback, receiver)?.href ??
+					returnURL(saved.callbackUrl, receiver)?.href ??
 					(selected.custom ? options.origin : new URL(options.origin).href);
 			}
 			if (!destination) return failure("invalid_state", flow, receiver);
+			const absoluteDestination = new URL(destination, options.origin).href;
 			return finish(
 				await store.transaction(async (client) => {
 					const current = await store.getProvider(providerId, client);
@@ -424,10 +490,21 @@ export function createOwnedProjectSaml(options: {
 						request,
 						...linked,
 						providerId,
-						destination,
+						destination: absoluteDestination,
 						protocol: "saml",
 					});
 					if (response.status >= 400) throw abort;
+					if (
+						destination !== absoluteDestination &&
+						response.headers.get("location") === absoluteDestination
+					) {
+						const headers = new Headers(response.headers);
+						headers.set("location", destination);
+						return new Response(response.body, {
+							status: response.status,
+							headers,
+						});
+					}
 					return response;
 				}),
 			);
@@ -435,7 +512,7 @@ export function createOwnedProjectSaml(options: {
 			return failure(
 				error === abort ? rejection : "internal_server_error",
 				flow,
-				selected.custom ? selected.acs : undefined,
+				receiver,
 			);
 		}
 	}

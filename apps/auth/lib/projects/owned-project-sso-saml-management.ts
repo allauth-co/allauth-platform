@@ -2,7 +2,10 @@ import * as z from "zod";
 import { ssoHttpsUrl } from "./owned-project-sso-network";
 import type { ProjectCustomSamlTransport } from "./owned-project-sso-saml-eligibility";
 import { configureProjectSamlTransport } from "./owned-project-sso-saml-eligibility";
-import { configureOwnedSaml } from "./owned-project-sso-saml-protocol";
+import {
+	configureOwnedSaml,
+	isSamlRelativeRedirect,
+} from "./owned-project-sso-saml-protocol";
 
 const identifier = z.string().min(1).max(2048);
 const metadata = z.string().min(1).max(102400);
@@ -22,13 +25,18 @@ const digest =
 	/^(?:sha(?:256|384|512)|http:\/\/www\.w3\.org\/2001\/(?:04\/xmlenc#sha(?:256|512)|04\/xmldsig-more#sha384))$/i;
 const signature =
 	/^(?:(?:rsa-|ecdsa-)?sha(?:256|384|512)|http:\/\/www\.w3\.org\/2001\/04\/xmldsig-more#(?:rsa|ecdsa)-sha(?:256|384|512))$/i;
+const samlCallback = identifier.refine(
+	(value) =>
+		isSamlRelativeRedirect(value) ||
+		(/^https?:\/\//i.test(value) && z.url().safeParse(value).success),
+);
 
 const projectSamlInput = z.strictObject({
 	entryPoint: https,
 	cert: cert.optional(),
 	audience: identifier.optional(),
 	callbackUrl: identifier.refine((url) => !url.includes("#")).optional(),
-	idpInitiatedCallbackUrl: z.null().optional(),
+	idpInitiatedCallbackUrl: samlCallback.nullable().optional(),
 	idpMetadata: z.strictObject({
 		metadata: metadata.optional(),
 		entityID: identifier.optional(),
@@ -86,8 +94,11 @@ export async function prepareProjectSamlRegistration(
 ) {
 	ssoHttpsUrl(issuer);
 	const parsed = projectSamlInput.parse(input);
-	const { idpInitiatedCallbackUrl: _disabled, ...fields } = parsed;
-	const configuration = { ...fields, issuer };
+	const configuration = {
+		...parsed,
+		idpInitiatedCallbackUrl: parsed.idpInitiatedCallbackUrl ?? undefined,
+		issuer,
+	};
 	await configureProjectSamlTransport(
 		{ issuer, providerId, samlConfig: configuration },
 		projectSamlAcs(scope.baseURL, providerId),

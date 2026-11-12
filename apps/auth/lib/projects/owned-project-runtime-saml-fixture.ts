@@ -102,19 +102,20 @@ export function runtimeSamlSPMetadata(
 
 export async function runtimeSamlResponse(
 	keys: Awaited<ReturnType<typeof createRuntimeSamlKeys>>,
-	input: ReturnType<typeof runtimeSamlAuthnRequest>,
+	input: { acs: string; id?: string; relay?: string },
 	email: string,
 	encryption?: { certificate: string; dataAlgorithm?: string },
 ) {
 	const now = new Date().toISOString();
 	const expires = new Date(Date.now() + 120_000).toISOString();
 	const id = `_${randomUUID()}`;
-	const xml = `<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="_${randomUUID()}" Version="2.0" IssueInstant="${now}" Destination="${input.acs}" InResponseTo="${input.id}">
+	const inResponseTo = input.id ? ` InResponseTo="${input.id}"` : "";
+	const xml = `<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="_${randomUUID()}" Version="2.0" IssueInstant="${now}" Destination="${input.acs}"${inResponseTo}>
 	<saml:Issuer>${runtimeSamlIssuer}</saml:Issuer>
 	<samlp:Status><samlp:StatusCode Value="urn:oasis:names:tc:SAML:2.0:status:Success"/></samlp:Status>
 	<saml:Assertion ID="${id}" Version="2.0" IssueInstant="${now}">
 		<saml:Issuer>${runtimeSamlIssuer}</saml:Issuer>
-		<saml:Subject><saml:NameID>${runtimeSamlSubject}</saml:NameID><saml:SubjectConfirmation Method="urn:oasis:names:tc:SAML:2.0:cm:bearer"><saml:SubjectConfirmationData InResponseTo="${input.id}" Recipient="${input.acs}" NotOnOrAfter="${expires}"/></saml:SubjectConfirmation></saml:Subject>
+		<saml:Subject><saml:NameID>${runtimeSamlSubject}</saml:NameID><saml:SubjectConfirmation Method="urn:oasis:names:tc:SAML:2.0:cm:bearer"><saml:SubjectConfirmationData${inResponseTo} Recipient="${input.acs}" NotOnOrAfter="${expires}"/></saml:SubjectConfirmation></saml:Subject>
 		<saml:Conditions NotOnOrAfter="${expires}"><saml:AudienceRestriction><saml:Audience>${runtimeSamlEntity}</saml:Audience></saml:AudienceRestriction></saml:Conditions>
 		<saml:AuthnStatement AuthnInstant="${now}"><saml:AuthnContext><saml:AuthnContextClassRef>urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport</saml:AuthnContextClassRef></saml:AuthnContext></saml:AuthnStatement>
 		<saml:AttributeStatement><saml:Attribute Name="email"><saml:AttributeValue>${email}</saml:AttributeValue></saml:Attribute></saml:AttributeStatement>
@@ -139,10 +140,9 @@ export async function runtimeSamlResponse(
 	const encoded = encryption
 		? await encryptRuntimeSamlAssertion(signed, input.acs, encryption)
 		: Buffer.from(signed).toString("base64");
-	return new URLSearchParams({
-		SAMLResponse: encoded,
-		RelayState: input.relay,
-	});
+	const form = new URLSearchParams({ SAMLResponse: encoded });
+	if (input.relay) form.set("RelayState", input.relay);
+	return form;
 }
 
 function encryptRuntimeSamlAssertion(

@@ -347,7 +347,11 @@ export function createOwnedProjectSso(options: OwnedProjectSsoOptions) {
 					400,
 				);
 			return saml.start(provider, {
-				callbackURL: destination.href,
+				callbackURL:
+					provider.samlConfig.idpInitiatedCallbackUrl &&
+					body.callbackURL.startsWith("/")
+						? body.callbackURL
+						: destination.href,
 				newUserURL: newUser?.href,
 				errorURL: error?.href,
 				requestSignUp: body.requestSignUp,

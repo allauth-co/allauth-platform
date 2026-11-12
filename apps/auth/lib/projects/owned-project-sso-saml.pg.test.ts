@@ -1288,45 +1288,88 @@ describe.skipIf(!existsSync(fixturePath))(
 			}
 		});
 
-		it("uses a saved IdP callback as the native redirect fallback with IdP-initiated login disabled", async () => {
+		it("preserves saved IdP callback precedence while both writers refuse IdP-initiated login", async () => {
 			const fallback = `${origin}/account?from=saved-saml-fallback`;
-			await storeSamlConfiguration({
-				...configuration(),
-				idpInitiatedCallbackUrl: fallback,
-			});
 			try {
-				const state = await pending(await native.handler(startRequest()));
-				await assertSession(
-					await native.handler(
-						callback(signedResponse(state.requestId).encoded, state.relay),
-					),
-				);
-
-				const withReceiverDestination = await pending(
-					await native.handler(startRequest({ ...body, callbackURL: acs })),
-				);
-				await assertSession(
-					await native.handler(
-						callback(
-							signedResponse(withReceiverDestination.requestId).encoded,
-							withReceiverDestination.relay,
-						),
-					),
-					fallback,
-				);
-
-				const unsolicited = await native.handler(
-					callback(signedResponse(undefined).encoded),
-				);
-				expect(unsolicited.status).toBe(302);
-				expect(cookies(unsolicited)).toBe("");
-				const redirected = new URL(unsolicited.headers.get("location")!);
-				expect(redirected.pathname).toBe("/account");
-				expect(Object.fromEntries(redirected.searchParams)).toEqual({
-					from: "saved-saml-fallback",
-					error: "unsolicited_response",
-					error_description: "IdP-initiated SSO not allowed",
-				});
+				const candidate = managementEngine();
+				const writers = [native.handler, candidate.dispatch];
+				for (const [override, callbackUrl, expected] of [
+					[fallback, "/account?from=secondary", fallback],
+					[
+						"/account?from=saved-relative",
+						undefined,
+						"/account?from=saved-relative",
+					],
+					[
+						"https://untrusted.fixture.example/account",
+						"/account?from=secondary",
+						"/account?from=secondary",
+					],
+					[acs, "/account?from=secondary", "/account?from=secondary"],
+				] as const) {
+					await storeSamlConfiguration({
+						...configuration(),
+						idpInitiatedCallbackUrl: override,
+						callbackUrl,
+					});
+					for (const [index, writer] of writers.entries()) {
+						const other = writers[1 - index]!;
+						for (const [returnTo, expectedLocation] of [
+							[destination, destination],
+							[
+								"/account?from=explicit-relative",
+								"/account?from=explicit-relative",
+							],
+							["/%2freturn", expected],
+							[acs, expected],
+						]) {
+							const state = await pending(
+								await writer(startRequest({ ...body, callbackURL: returnTo })),
+							);
+							await assertSession(
+								await other(
+									callback(
+										signedResponse(state.requestId).encoded,
+										state.relay,
+									),
+								),
+								expectedLocation,
+							);
+						}
+						const { encoded, assertionId } = signedResponse(undefined);
+						const sessions = async () =>
+							(
+								await database.query(
+									`SELECT id FROM "${schema}"."session" WHERE "userId"=$1 ORDER BY id`,
+									[managed],
+								)
+							).rows;
+						const before = await sessions();
+						const unsolicited = await writer(callback(encoded));
+						expect(unsolicited.status).toBe(302);
+						expect(cookies(unsolicited)).toBe("");
+						const target = new URL(expected, origin);
+						target.searchParams.set("error", "unsolicited_response");
+						target.searchParams.set(
+							"error_description",
+							"IdP-initiated SSO not allowed",
+						);
+						expect(unsolicited.headers.get("location")).toBe(
+							expected.startsWith("/")
+								? target.pathname + target.search.replaceAll("+", "%20")
+								: target.href,
+						);
+						expect(await sessions()).toEqual(before);
+						expect(
+							(
+								await database.query(
+									`SELECT id FROM "${schema}"."verification" WHERE identifier=$1`,
+									[`saml-used-assertion:${assertionId}`],
+								)
+							).rows,
+						).toEqual([]);
+					}
+				}
 			} finally {
 				await storeSamlConfiguration(configuration());
 			}
@@ -1600,6 +1643,15 @@ describe.skipIf(!existsSync(fixturePath))(
 				checkProjectSamlConfiguration(
 					{
 						issuer: sp,
+						samlConfig: { ...samlConfig, idpInitiatedCallbackUrl: "/account" },
+					},
+					acs,
+				),
+			).not.toThrow();
+			expect(() =>
+				checkProjectSamlConfiguration(
+					{
+						issuer: sp,
 						samlConfig: {
 							...samlConfig,
 							authnRequestsSigned: true,
@@ -1614,7 +1666,6 @@ describe.skipIf(!existsSync(fixturePath))(
 				{ cert: "bad-fixture-certificate" },
 				{ authnRequestsSigned: true, privateKey: "invalid fixture key" },
 				{ spMetadata: { isAssertionEncrypted: true } },
-				{ idpInitiatedCallbackUrl: `${origin}/account` },
 			]) {
 				expect(() =>
 					checkProjectSamlConfiguration(
@@ -1662,6 +1713,7 @@ describe.skipIf(!existsSync(fixturePath))(
 					...samlConfig,
 					authnRequestsSigned: true,
 					privateKey: fixtureKeys.privateKey,
+					idpInitiatedCallbackUrl: "/account?from=registration",
 					signatureAlgorithm: "sha256",
 					digestAlgorithm: "sha256",
 					mapping: { email: "corpEmail", name: "displayName" },
@@ -1760,6 +1812,7 @@ describe.skipIf(!existsSync(fixturePath))(
 					samlConfig: {
 						identifierFormat:
 							"urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress",
+						idpInitiatedCallbackUrl: `${origin}/account?from=native-update`,
 					},
 				}),
 			);
@@ -1778,7 +1831,10 @@ describe.skipIf(!existsSync(fixturePath))(
 				managementRequest("update-provider", cookie, {
 					providerId: nativeId,
 					domain: "corp.new.example",
-					samlConfig: { mapping: { email: "corpEmail", name: "fullName" } },
+					samlConfig: {
+						mapping: { email: "corpEmail", name: "fullName" },
+						idpInitiatedCallbackUrl: "/account?from=owned-update",
+					},
 				}),
 			);
 			expect(ownedUpdate.status, await ownedUpdate.clone().text()).toBe(200);
@@ -1790,6 +1846,22 @@ describe.skipIf(!existsSync(fixturePath))(
 				).json(),
 			);
 			expect(await ownedUpdate.text()).not.toContain("BEGIN PRIVATE KEY");
+			const cleared = await ownedEngine.dispatch(
+				managementRequest("update-provider", cookie, {
+					providerId: nativeId,
+					samlConfig: { idpInitiatedCallbackUrl: null },
+				}),
+			);
+			expect(cleared.status).toBe(200);
+			const legacyCleared = await native.handler(
+				managementRequest(`get-provider?providerId=${nativeId}`, cookie),
+			);
+			const clearedProvider = (await legacyCleared.json()) as {
+				samlConfig: unknown;
+			};
+			expect(clearedProvider.samlConfig).not.toHaveProperty(
+				"idpInitiatedCallbackUrl",
+			);
 			const freshProof = await native.handler(
 				managementRequest("request-domain-verification", cookie, {
 					providerId: nativeId,

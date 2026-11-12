@@ -5076,6 +5076,7 @@ describe.skipIf(!existsSync(fixture))(
 				const callbackPath = `/api/auth/sso/saml2/sp/acs/${runtimeSamlProvider}`;
 				const canonicalAcs = `https://${customHost}${callbackPath}`;
 				const sloPath = `/api/auth/sso/saml2/sp/slo/${runtimeSamlProvider}`;
+				const savedReturn = `https://${customHost}/account?from=saved-saml-return`;
 				const pair = randomUUID();
 				for (const [domain, projectId, id] of [
 					[custom, alpha.id, pair],
@@ -5096,11 +5097,16 @@ describe.skipIf(!existsSync(fixture))(
 						);
 					}
 				}
-				const setReceiver = async (acs: string, logout?: string) => {
+				const setReceiver = async (
+					acs: string,
+					logout?: string,
+					idpInitiatedCallbackUrl?: string,
+				) => {
 					const metadata = runtimeSamlSPMetadata(acs, undefined, logout);
 					const samlConfig = {
 						...runtimeSamlConfiguration(samlKeys),
 						spMetadata: { metadata },
+						idpInitiatedCallbackUrl,
 					};
 					await database!.query(
 						`UPDATE "${alpha.schemaName}"."ssoProvider" SET "samlConfig"=$1 WHERE "providerId"=$2`,
@@ -5123,6 +5129,7 @@ describe.skipIf(!existsSync(fixture))(
 				const metadata = await setReceiver(
 					canonicalAcs,
 					`https://${customHost}${sloPath}`,
+					savedReturn,
 				);
 				expect(metadata).toContain("SingleLogoutService");
 				const direct = {
@@ -5149,6 +5156,11 @@ describe.skipIf(!existsSync(fixture))(
 						startRuntimeSaml(writer, direct, canonicalAcs),
 						startRuntimeSaml(writer, hosted, canonicalAcs),
 						startRuntimeSaml(writer, sameHost, canonicalAcs),
+						startRuntimeSaml(
+							writer,
+							{ ...sameHost, destination: canonicalAcs },
+							canonicalAcs,
+						),
 					]);
 				const finish = async (
 					writer: Awaited<ReturnType<typeof openProcess>>,
@@ -5177,8 +5189,9 @@ describe.skipIf(!existsSync(fixture))(
 					});
 					expect(response.status, await response.clone().text()).toBe(302);
 					expect(response.headers.get("location")).toBe(
-						pending.transport.host === defaultHost
-							? `https://${customHost}`
+						pending.transport.host === defaultHost ||
+							pending.transport.destination === canonicalAcs
+							? savedReturn
 							: pending.transport.destination,
 					);
 					const signedIn = await writer.request("/api/auth/get-session", {
@@ -5199,14 +5212,38 @@ describe.skipIf(!existsSync(fixture))(
 						message: "Single Logout is not enabled",
 					});
 				};
+				const refusedUnsolicited = async (
+					writer: Awaited<ReturnType<typeof openProcess>>,
+				) => {
+					const response = await writer.request(callbackPath, {
+						host: customHost,
+						origin: runtimeSamlOrigin,
+						body: await runtimeSamlResponse(
+							samlKeys,
+							{ acs: canonicalAcs },
+							credentials.project.email,
+						),
+					});
+					expect(response.status).toBe(302);
+					expect(response.headers.getSetCookie()).toEqual([]);
+					const refused = new URL(savedReturn);
+					refused.searchParams.set("error", "unsolicited_response");
+					refused.searchParams.set(
+						"error_description",
+						"IdP-initiated SSO not allowed",
+					);
+					expect(response.headers.get("location")).toBe(refused.href);
+				};
 				service = await openProcess(databaseURL, alpha, false);
 				await disabledLogout(service);
+				await refusedUnsolicited(service);
 				const nativePending = await start(service);
 				await service.stop();
 				service = undefined;
 
 				service = await openProcess(databaseURL, alpha, true);
 				await disabledLogout(service);
+				await refusedUnsolicited(service);
 				for (const [prefix, host] of [
 					[directPrefix, undefined],
 					["/api/auth", defaultHost],
@@ -5227,6 +5264,7 @@ describe.skipIf(!existsSync(fixture))(
 
 				service = await openProcess(databaseURL, alpha, false);
 				await disabledLogout(service);
+				await refusedUnsolicited(service);
 				for (const pending of ownedPending) await finish(service, pending);
 				const directAcs = `${direct.baseURL}/sso/saml2/sp/acs/${runtimeSamlProvider}`;
 				await setReceiver(directAcs);
