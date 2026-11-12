@@ -31,6 +31,7 @@ const providerAdmission = new Map<string, { methods: string[]; max: number }>([
 	["/oauth2/public-client", { methods: ["GET"], max: 100 }],
 	["/oauth2/public-client-prelogin", { methods: ["POST"], max: 100 }],
 	["/oauth2/delete-client", { methods: ["POST"], max: 100 }],
+	["/oauth2/client/rotate-secret", { methods: ["POST"], max: 100 }],
 	["/oauth2/end-session", { methods: ["GET", "POST"], max: 100 }],
 	["/oauth2/end-session/confirm", { methods: ["POST"], max: 100 }],
 	["/jwks", { methods: ["GET"], max: 100 }],

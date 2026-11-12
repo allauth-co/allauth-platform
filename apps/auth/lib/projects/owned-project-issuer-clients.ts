@@ -1,3 +1,4 @@
+import { randomInt } from "node:crypto";
 import type { PoolClient } from "pg";
 import * as z from "zod";
 import { isPlatformAdmin } from "../configuration";
@@ -6,7 +7,11 @@ import type {
 	ProjectUser,
 } from "./owned-project-engine-store";
 import { readSignedProjectIssuerQuery } from "./owned-project-issuer-authorization-query";
-import { issuerJSON, ProjectOAuthError } from "./owned-project-issuer-http";
+import {
+	issuerDigest,
+	issuerJSON,
+	ProjectOAuthError,
+} from "./owned-project-issuer-http";
 
 const clientInput = z.object({ client_id: z.string().min(1).max(2048) });
 const publicInput = clientInput.extend({
@@ -71,6 +76,7 @@ const clientSelect = Object.keys(clientFields)
 	.map((key) => `"${key}"`)
 	.join(",");
 const reference = "allauth:platform";
+const secretAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 const unauthorized = () =>
 	Response.json(
 		{ code: "UNAUTHORIZED", message: "Unauthorized" },
@@ -141,7 +147,9 @@ export function createOwnedProjectIssuerClients(options: {
 		const publicRead = get && path === "/oauth2/public-client";
 		const prelogin = post && path === "/oauth2/public-client-prelogin";
 		const remove = post && path === "/oauth2/delete-client";
-		if (!list && !privateRead && !publicRead && !prelogin && !remove) return;
+		const rotate = post && path === "/oauth2/client/rotate-secret";
+		const write = remove || rotate;
+		if (!list && !privateRead && !publicRead && !prelogin && !write) return;
 		const input = post
 			? await options.readBody(request)
 			: {
@@ -171,7 +179,7 @@ export function createOwnedProjectIssuerClients(options: {
 		return options.store.transaction(async (client) => {
 			const user = prelogin
 				? null
-				: await options.readManagementUser(client, request, remove);
+				: await options.readManagementUser(client, request, write);
 			if (!prelogin && (!user || (!publicRead && !isPlatformAdmin(user))))
 				return unauthorized();
 			if (list) {
@@ -199,7 +207,7 @@ export function createOwnedProjectIssuerClients(options: {
 				rows: [row],
 			} = await client.query(
 				`SELECT ${clientSelect},scopes,"createdAt",jwks,metadata,"clientSecret" IS NOT NULL AS "hasSecret"
-				 FROM "oauthClient" WHERE "clientId"=$1 AND "clientDiscoveryId" IS NULL${remove ? " FOR UPDATE" : ""}`,
+				 FROM "oauthClient" WHERE "clientId"=$1 AND "clientDiscoveryId" IS NULL${write ? " FOR UPDATE" : ""}`,
 				[id],
 			);
 			if (!row) return missing();
@@ -212,6 +220,27 @@ export function createOwnedProjectIssuerClients(options: {
 				return new Response(null, {
 					headers: { "cache-control": "no-store", pragma: "no-cache" },
 				});
+			}
+			if (rotate) {
+				if (
+					!row.hasSecret ||
+					!["client_secret_basic", "client_secret_post"].some(
+						(method) => method === row.tokenEndpointAuthMethod,
+					)
+				)
+					return new ProjectOAuthError(
+						"invalid_client",
+						"secret rotation is only available for clients using client_secret authentication",
+					).response();
+				const secret = Array.from(
+					{ length: 32 },
+					() => secretAlphabet[randomInt(secretAlphabet.length)],
+				).join("");
+				await client.query(
+					`UPDATE "oauthClient" SET "clientSecret"=$2,"updatedAt"=date_trunc('second',statement_timestamp()) WHERE "clientId"=$1`,
+					[id, issuerDigest(secret)],
+				);
+				return issuerJSON({ ...clientResult(row), client_secret: secret });
 			}
 			return issuerJSON(clientResult(row));
 		});

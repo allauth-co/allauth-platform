@@ -450,6 +450,48 @@ describe.skipIf(!existsSync(fixture))(
 				(await engine.dispatch(prelogin(clientId, "client_id=unverified")))
 					.status,
 			).toBe(401);
+			const rotation = () =>
+				request("/oauth2/client/rotate-secret", {
+					cookie: administrator.cookie,
+					body: { client_id: clientId },
+				});
+			const introspection = (credential: string) => {
+				const input = request("/oauth2/introspect", {
+					body: new URLSearchParams({ token: "synthetic-unissued-token" }),
+				});
+				input.headers.set(
+					"authorization",
+					`Basic ${Buffer.from(`${clientId}:${credential}`).toString("base64")}`,
+				);
+				return input;
+			};
+			const rotated = await engine.dispatch(rotation());
+			expect(rotated.status).toBe(200);
+			expect(rotated.headers.get("cache-control")).toBe("no-store");
+			const { client_secret: ownedSecret } = (await rotated.json()) as {
+				client_secret: string;
+			};
+			expect(ownedSecret).toMatch(/^[a-zA-Z]{32}$/);
+			expect(await (await legacy(introspection(ownedSecret))).json()).toEqual({
+				active: false,
+			});
+			expect(
+				(await legacy(introspection("synthetic-client-credential"))).status,
+			).toBeGreaterThanOrEqual(400);
+			expect(await (await engine.dispatch(detail())).json()).not.toHaveProperty(
+				"client_secret",
+			);
+			const rolledBack = await legacy(rotation());
+			expect(rolledBack.status).toBe(200);
+			const { client_secret: legacySecret } = (await rolledBack.json()) as {
+				client_secret: string;
+			};
+			expect(
+				await (await engine.dispatch(introspection(legacySecret))).json(),
+			).toEqual({ active: false });
+			expect(
+				(await engine.dispatch(introspection(ownedSecret))).status,
+			).toBeGreaterThanOrEqual(400);
 			const remove = (id: string) =>
 				request("/oauth2/delete-client", {
 					cookie: administrator.cookie,
