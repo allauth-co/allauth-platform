@@ -3,6 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import { useSearchParams } from "next/navigation";
 import { useRef, useState } from "react";
 import { toast } from "sonner";
+import * as z from "zod";
 import {
 	oauthBrowserQuery,
 	submitOAuthBrowserAction,
@@ -17,11 +18,14 @@ import {
 	CardTitle,
 } from "./ui/card";
 
-interface Context {
-	client: { client_id: string; client_name?: string | null };
-	scopes: string[];
-	continueURL: string;
-}
+const consentContext = z.object({
+	client: z.object({
+		client_id: z.string(),
+		client_name: z.string().nullish(),
+	}),
+	scopes: z.array(z.string()),
+	continueURL: z.string(),
+});
 const invalidRequest = "This authorization request is invalid or has expired";
 const labels: Record<string, string> = {
 	openid: "Confirm your identity",
@@ -37,22 +41,23 @@ export function OAuthConsent({ name, email }: { name: string; email: string }) {
 	const [busy, setBusy] = useState(false);
 	const context = useQuery({
 		queryKey: ["oauth-context", signed],
-		queryFn: async ({ signal }): Promise<Context> => {
+		queryFn: async ({ signal }) => {
 			if (!signed) throw new Error(invalidRequest);
 			const response = await fetch(`/api/oauth/context?${signed}`, {
 				cache: "no-store",
 				signal,
 			});
 			if (!response.ok) throw new Error(invalidRequest);
-			const verified: Context | null = await response.json().catch(() => null);
+			const verified = consentContext.safeParse(
+				await response.json().catch(() => null),
+			);
 			if (
-				verified?.continueURL !== `/oauth2/continue?${signed}` ||
-				verified.client?.client_id !== params?.get("client_id") ||
-				!Array.isArray(verified.scopes) ||
-				verified.scopes.some((scope) => typeof scope !== "string")
+				!verified.success ||
+				verified.data.continueURL !== `/oauth2/continue?${signed}` ||
+				verified.data.client.client_id !== params?.get("client_id")
 			)
 				throw new Error(invalidRequest);
-			return verified;
+			return verified.data;
 		},
 		enabled: Boolean(signed),
 		staleTime: 0,
