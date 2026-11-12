@@ -413,7 +413,7 @@ describe.skipIf(!existsSync(fixture))(
 					signingSecret,
 					policy: defaultAuthPolicy,
 					trustedOrigins: [],
-					trustedIP: () => "192.0.2.46",
+					trustedIP: (incoming) => incoming.headers.get("x-real-ip"),
 					adminDeletion: {
 						id: project.id,
 						workspaceId: project.workspaceId,
@@ -2265,6 +2265,66 @@ describe.skipIf(!existsSync(fixture))(
 			expect(await exercise("owned")).toEqual(nativeEvents);
 		});
 
+		it("preserves the installed password-change bucket across writers", async () => {
+			const path = "/change-password";
+			const realm = `"${alpha.schemaName}"`;
+			const { handler } = installedNative();
+			const subscription = await endpoint(
+				"legacy",
+				"password-change-admission",
+				["user.*"],
+			);
+			const rates: string[] = [];
+			async function attempt(dispatch: typeof handler, ip: string) {
+				const input = request(`${alpha.path}${path}`, {
+					currentPassword: password,
+					newPassword: "Synthetic-replacement-password-4!",
+				});
+				input.headers.set("x-real-ip", ip);
+				return dispatch(input);
+			}
+			try {
+				for (const [first, second, ip] of [
+					[handler, owned.dispatch, "192.0.2.234"],
+					[owned.dispatch, handler, "192.0.2.235"],
+				] as const) {
+					const key = `${ip}|${path}`;
+					rates.push(key);
+					await database.query(
+						`INSERT INTO ${realm}."rateLimit" (id,"key",count,"lastRequest") VALUES ($1,$2,2,$3)`,
+						[randomUUID(), key, Date.now()],
+					);
+					expect((await attempt(first, ip)).status).toBe(401);
+					expect(await signedEvents(subscription, [password])).toEqual([
+						{
+							event: {
+								type: "user.password-changed",
+								outcome: "failure",
+								ipAddress: ip,
+								userAgent: "webhook-management-fixture",
+								metadata: { path, errorCode: "UNAUTHORIZED" },
+							},
+						},
+					]);
+					const limited = await attempt(second, ip);
+					expect(limited.status).toBe(429);
+					expect(await limited.json()).toEqual({
+						message: "Too many requests. Please try again later.",
+					});
+					expect(await signedEvents(subscription, [password])).toEqual([]);
+				}
+			} finally {
+				await database.query(
+					`DELETE FROM ${realm}."allauthWebhookEndpoint" WHERE id=$1`,
+					[subscription.endpoint.id],
+				);
+				await database.query(
+					`DELETE FROM ${realm}."rateLimit" WHERE "key"=ANY($1::text[])`,
+					[rates],
+				);
+			}
+		});
+
 		it("delivers native password-change results with safe request context to user subscribers", async () => {
 			const replacement = "Replacement-fixture-password-31!";
 			const compromised = "Compromised-fixture-password-31!";
@@ -2314,17 +2374,24 @@ describe.skipIf(!existsSync(fixture))(
 					`password-change-${writer}`,
 					["user.*"],
 				);
+				let attempts = 0;
 				async function change(
 					currentPassword: string,
 					newPassword: string,
 					session = cookie,
 				) {
-					return send(
-						writer,
-						"/change-password",
+					const input = request(
+						`${alpha.path}/change-password`,
 						{ currentPassword, newPassword },
 						session,
 					);
+					input.headers.set(
+						"x-real-ip",
+						`192.0.2.${120 + Math.floor(attempts++ / 3)}`,
+					);
+					return writer === "legacy"
+						? legacy.handler(input)
+						: owned.dispatch(input);
 				}
 				try {
 					expect((await change(password, replacement, "")).status).toBe(401);
@@ -2381,10 +2448,10 @@ describe.skipIf(!existsSync(fixture))(
 				for (const { event, user } of native) {
 					expect(event).toMatchObject({
 						type: "user.password-changed",
-						ipAddress: "192.0.2.46",
 						userAgent: "webhook-management-fixture",
 						metadata: { path: "/change-password" },
 					});
+					expect(event.ipAddress).toMatch(/^192\.0\.2\.12[0-2]$/);
 					if (event.metadata.errorCode === "UNAUTHORIZED") {
 						expect(event.userId).toBeUndefined();
 						expect(event.actorId).toBeUndefined();

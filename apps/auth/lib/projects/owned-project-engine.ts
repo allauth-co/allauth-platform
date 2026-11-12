@@ -3798,6 +3798,13 @@ export function createOwnedProjectEngine(
 			path === "/change-password"
 		) {
 			if (!trustedRequest(request.headers, true)) return forbidden();
+			const limited = await store.transaction((client) =>
+				admitOwnedProjectNativeRoute(client, options.trustedIP(request), path, {
+					max: 3,
+					windowMs: 10_000,
+				}),
+			);
+			if (limited) return limited;
 			const denied = await factorAdmission(request, "change-password");
 			if (denied) return denied;
 			return passwordChange.change(request, await requestBody(request));

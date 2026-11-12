@@ -1095,6 +1095,7 @@ try {
 		fencedSelection ? "/api/auth/hosted-ui/sign-in/email" : "/api/auth/sign-in/email",
 		{
 			host,
+			clientIP: "192.0.2.58",
 			accept: "application/json",
 			body: { ...ownedLogin, password: fixturePassword },
 		},
@@ -1242,6 +1243,7 @@ try {
 	expectStatus(
 		await request(`${direct}/sign-in/email`, {
 			realm: owned,
+			clientIP: "192.0.2.59",
 			body: { ...ownedLogin, password: fixturePassword },
 		}),
 		200,

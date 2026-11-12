@@ -3160,6 +3160,8 @@ describe.skipIf(!existsSync(fixture))(
 					["192.0.2.74", "192.0.2.75"].map(async (clientIP) => {
 						const login = await service!.request(`${alphaPath}/sign-in/email`, {
 							clientIP,
+							proxy: alpha,
+							origin: alpha.primaryOrigin,
 							body: {
 								email: credentials.realmAdmin.email,
 								password: credentials.password,
@@ -3403,6 +3405,9 @@ describe.skipIf(!existsSync(fixture))(
 					},
 				});
 				const upgraded = await service.request(`${alphaPath}/sign-in/email`, {
+					clientIP: "192.0.2.76",
+					proxy: alpha,
+					origin: alpha.primaryOrigin,
 					cookie: guestCookies,
 					body: login,
 				});
@@ -5427,6 +5432,7 @@ describe.skipIf(!existsSync(fixture))(
 					"/api/auth/sign-in/email",
 					{
 						host: alphaHost,
+						clientIP: "192.0.2.77",
 						body: { ...login, password: credentials.updated },
 					},
 				);
@@ -5739,8 +5745,12 @@ describe.skipIf(!existsSync(fixture))(
 					).json(),
 				).toBeNull();
 				expect(
-					(await service.request(`${alphaPath}/sign-in/email`, { body: login }))
-						.status,
+					(await service.request(`${alphaPath}/sign-in/email`, {
+						clientIP: "192.0.2.79",
+						proxy: alpha,
+						origin: alpha.primaryOrigin,
+						body: login,
+					})).status,
 				).toBe(401);
 				expect(
 					(
