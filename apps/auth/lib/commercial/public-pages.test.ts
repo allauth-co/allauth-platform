@@ -36,7 +36,7 @@ beforeEach(() => { state.authProvider.mockClear(); state.accountShell.mockClear(
 describe("commercial public pages", () => {
 	it.each(pages)("renders %s without entering account providers or a session shell", (path, Page, metadata) => {
 		state.pathname = path;
-		const html = renderToStaticMarkup(createElement(Providers, null, createElement(SiteFrame, null, createElement(Page))));
+		const html = renderToStaticMarkup(createElement(Providers, null, createElement(SiteFrame, { header: null, children: createElement(Page) })));
 		expect(html.match(/<h1\b/g)).toHaveLength(1);
 		expect(html).toContain('id="main-content"');
 		expect(state.authProvider).not.toHaveBeenCalled(); expect(state.accountShell).not.toHaveBeenCalled();

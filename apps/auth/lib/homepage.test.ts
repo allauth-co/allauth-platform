@@ -17,9 +17,9 @@ vi.mock("next-themes", () => ({
 	useTheme: () => ({ resolvedTheme: "light", setTheme: state.setTheme }),
 }));
 vi.mock("@/components/console/account-shell", () => ({
-	AccountShell: ({ children }: { children: ReactNode }) => {
+	AccountShell: ({ children, header }: { children: ReactNode; header: ReactNode }) => {
 		state.accountShell();
-		return createElement("div", { "data-account-shell": true }, children);
+		return createElement("div", { "data-account-shell": true }, header, children);
 	},
 }));
 vi.mock("@/components/legacy-auth-ui", () => ({
@@ -108,13 +108,14 @@ describe("AllAuth public homepage", () => {
 });
 
 describe("homepage layout isolation", () => {
+	const header = createElement("header", null, "Fixture account header");
 	it.each(["/sdk", "/sdk/quickstart", "/releases", "/releases/sdk-1-4-3"])("renders public documentation at %s without account configuration or session dependencies", pathname => {
 		state.pathname = pathname;
-		const html = renderToStaticMarkup(createElement(Providers, null, createElement(SiteFrame, null, createElement("p", null, "Public SDK content"))));
+		const html = renderToStaticMarkup(createElement(Providers, null, createElement(SiteFrame, { header, children: createElement("p", null, "Public SDK content") })));
 		expect(html).toContain("Public SDK content"); expect(state.authProvider).not.toHaveBeenCalled(); expect(state.accountShell).not.toHaveBeenCalled();
 	});
 	it("shows the public root without entering the account shell", () => {
-		const html = renderToStaticMarkup(createElement(SiteFrame, null, createElement("p", null, "Public homepage")));
+		const html = renderToStaticMarkup(createElement(SiteFrame, { header, children: createElement("p", null, "Public homepage") }));
 		expect(html).toBe("<p>Public homepage</p>");
 		expect(state.accountShell).not.toHaveBeenCalled();
 	});
@@ -123,16 +124,18 @@ describe("homepage layout isolation", () => {
 		"retains the account shell for %s",
 		(pathname) => {
 			state.pathname = pathname;
-			const html = renderToStaticMarkup(createElement(SiteFrame, null, createElement("p", null, "Account content")));
+			const html = renderToStaticMarkup(createElement(SiteFrame, { header, children: createElement("p", null, "Account content") }));
 			expect(html).toContain('data-account-shell="true"');
+			expect(html).toContain("<header>Fixture account header</header>");
 			expect(state.accountShell).toHaveBeenCalledOnce();
 		},
 	);
 
 	it.each(["/admin", "/admin/workspaces"])("retains the console shell for %s", (pathname) => {
 		state.pathname = pathname;
-		const html = renderToStaticMarkup(createElement(SiteFrame, null, createElement("p", null, "Console content")));
+		const html = renderToStaticMarkup(createElement(SiteFrame, { header, children: createElement("p", null, "Console content") }));
 		expect(html).toContain('<main class="console-root">');
+		expect(html).not.toContain("Fixture account header");
 		expect(state.accountShell).not.toHaveBeenCalled();
 	});
 

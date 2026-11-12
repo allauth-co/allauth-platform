@@ -14,7 +14,7 @@ import {
 	DropdownMenuSeparator,
 	DropdownMenuTrigger,
 } from "./ui/dropdown-menu";
-import "./better-auth-ui/user/user-button.css";
+import "./user-menu.css";
 
 type HostedUser = AllAuthUser & { username?: string; displayUsername?: string };
 

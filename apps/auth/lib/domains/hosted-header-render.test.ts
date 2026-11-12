@@ -6,30 +6,20 @@ import type { ComponentProps, ReactNode } from "react";
 import { act, createElement } from "react";
 import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import Header from "@/components/header";
+import { SiteFrame } from "@/components/console/site-frame";
+import { HostedAccountHeader } from "@/components/hosted-account-header";
 import { HostedOrganizationProvider } from "@/components/hosted-organization-client";
 
-const native = vi.hoisted(() => ({
-	session: vi.fn(),
-	menu: vi.fn(),
-	provider: vi.fn(),
+const state = vi.hoisted(() => ({
+	nativeClientLoaded: vi.fn(),
 	toast: vi.fn(),
 	query: "",
 	pathname: "/organization/people",
 }));
-vi.mock("@/lib/auth-client", () => ({
-	authClient: { useSession: native.session },
-}));
-vi.mock("@/components/allauth-user-menu", () => ({
-	AllAuthUserMenu: native.menu,
-}));
-vi.mock("@/components/better-auth-ui/lib/use-auth", () => ({
-	useAuth: native.provider,
-}));
-vi.mock(
-	"@/components/better-auth-ui/organization/organization-switcher",
-	() => ({ OrganizationSwitcher: () => null }),
-);
+vi.mock("@/lib/auth-client", () => {
+	state.nativeClientLoaded();
+	return { authClient: {} };
+});
 vi.mock("@/components/theme-toggle", () => ({
 	ThemeToggle: () => createElement("button", { type: "button" }, "Theme"),
 }));
@@ -39,14 +29,14 @@ vi.mock("@/lib/configuration-client", () => ({
 	}),
 }));
 vi.mock("next/navigation", () => ({
-	usePathname: () => native.pathname,
-	useSearchParams: () => new URLSearchParams(native.query),
+	usePathname: () => state.pathname,
+	useSearchParams: () => new URLSearchParams(state.query),
 }));
 vi.mock("next/link", () => ({
 	default: ({ children, ...props }: ComponentProps<"a">) =>
 		createElement("a", props, children),
 }));
-vi.mock("sonner", () => ({ toast: { error: native.toast } }));
+vi.mock("sonner", () => ({ toast: { error: state.toast } }));
 vi.mock("@/components/ui/dropdown-menu", () => {
 	const block = ({ children, className }: ComponentProps<"div">) =>
 		createElement("div", { className }, children);
@@ -86,12 +76,9 @@ let unmount: (() => Promise<void>) | undefined;
 
 beforeEach(() => {
 	vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
-	native.session.mockReset();
-	native.menu.mockReset();
-	native.provider.mockReset();
-	native.toast.mockReset();
-	native.query = "";
-	native.pathname = "/organization/people";
+	state.toast.mockReset();
+	state.query = "";
+	state.pathname = "/organization/people";
 });
 
 afterEach(async () => {
@@ -134,7 +121,10 @@ async function render(
 				client: query,
 				children: createElement(HostedOrganizationProvider, {
 					enabled: true,
-					children: createElement(Header),
+					children: createElement(SiteFrame, {
+						header: createElement(HostedAccountHeader),
+						children: "Fixture account page",
+					}),
 				}),
 			}),
 		),
@@ -143,7 +133,7 @@ async function render(
 }
 
 it("renders verified hosted identity and workspace navigation with the original sign-out continuation", async () => {
-	native.query = new URLSearchParams({
+	state.query = new URLSearchParams({
 		client_id: "fixture-client",
 		state: "fixture-state",
 		callbackUrl: "/account",
@@ -179,9 +169,7 @@ it("renders verified hosted identity and workspace navigation with the original 
 		["state", "fixture-state"],
 		["callbackUrl", "/account"],
 	]);
-	expect(native.session).not.toHaveBeenCalled();
-	expect(native.menu).not.toHaveBeenCalled();
-	expect(native.provider).not.toHaveBeenCalled();
+	expect(state.nativeClientLoaded).not.toHaveBeenCalled();
 });
 
 it("restores the actor only through the existing impersonation stop operation", async () => {
@@ -219,18 +207,18 @@ it("restores the actor only through the existing impersonation stop operation", 
 		button.click();
 	});
 	expect(stop).toHaveBeenCalledExactlyOnceWith("POST");
-	expect(native.toast).toHaveBeenCalledExactlyOnceWith(
+	expect(state.toast).toHaveBeenCalledExactlyOnceWith(
 		"The original account could not be confirmed.",
 	);
 	expect(assign).not.toHaveBeenCalled();
 	confirmed = true;
 	await act(async () => button.click());
 	expect(assign).toHaveBeenCalledExactlyOnceWith("/admin/users");
-	expect(native.session).not.toHaveBeenCalled();
+	expect(state.nativeClientLoaded).not.toHaveBeenCalled();
 });
 
 it("retains the local authentication callback when the hosted header has no session", async () => {
-	native.query = new URLSearchParams({
+	state.query = new URLSearchParams({
 		callbackUrl: "/account/security",
 	}).toString();
 	const { container, calls } = await render((path) => {
@@ -244,12 +232,12 @@ it("retains the local authentication callback when the hosted header has no sess
 	expect(url.pathname).toBe("/sign-in");
 	expect(url.searchParams.get("callbackUrl")).toBe("/account/security");
 	expect(calls).toHaveBeenCalledOnce();
-	expect(native.session).not.toHaveBeenCalled();
+	expect(state.nativeClientLoaded).not.toHaveBeenCalled();
 });
 
 it("leaves retry continuation on the verified error page instead of propagating raw header query fields", async () => {
-	native.pathname = "/auth-error";
-	native.query = new URLSearchParams({
+	state.pathname = "/auth-error";
+	state.query = new URLSearchParams({
 		client_id: "unverified-client",
 		sig: "unverified-proof",
 		callbackUrl: "//elsewhere.example/account",

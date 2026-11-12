@@ -28,7 +28,7 @@ import { deleteUserPlugin } from "./lib/delete-user-plugin";
 import { emailOtpPlugin } from "./lib/email-otp-plugin";
 import { lastLoginMethodPlugin } from "./lib/last-login-method-plugin";
 import { magicLinkPlugin } from "./lib/magic-link-plugin";
-import { isAuthenticationPath, localNavigation } from "./lib/navigation";
+import { isAuthenticationPath, localNavigation } from "@/lib/auth-navigation";
 import { organizationPlugin } from "./lib/organization-plugin";
 import { passkeyPlugin } from "./lib/passkey-plugin";
 import { twoFactorPlugin } from "./lib/two-factor-plugin";

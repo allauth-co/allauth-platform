@@ -1,99 +1,20 @@
 "use client";
+
 import Link from "next/link";
 import { usePathname, useSearchParams } from "next/navigation";
-import { useRef, useState } from "react";
-import type { ReactNode } from "react";
+import { type ReactNode, useRef, useState } from "react";
 import { toast } from "sonner";
-import { authClient } from "@/lib/auth-client";
 import { useConfiguration } from "@/lib/configuration-client";
-import {
-	hostedImpersonatingActor,
-	stopHostedImpersonation,
-} from "@/lib/domains/hosted-header-session";
-import type { AllAuthClient } from "@/sdk/client";
 import {
 	accountNavigationHref,
 	consoleReturnFromSearch,
 } from "@/lib/console/user-menu-navigation";
-import { Button } from "./ui/button";
-import { ThemeToggle } from "./theme-toggle";
-import { Logo } from "./logo";
-import { AllAuthUserMenu } from "./allauth-user-menu";
-import { OrganizationSwitcher } from "./better-auth-ui/organization/organization-switcher";
-import { useAuth } from "./better-auth-ui/lib/use-auth";
-import { localNavigation } from "./better-auth-ui/lib/navigation";
 import { ApplicationLogo } from "./application-brand";
-import { useHostedOrganizationClient } from "./hosted-organization-client";
-import { HostedOrganizationSwitcher } from "./hosted-organizations";
-import { HostedUserMenu } from "./hosted-user-menu";
-export default function Header() {
-	const hosted = useHostedOrganizationClient();
-	return hosted ? <HostedHeader client={hosted} /> : <LegacyHeader />;
-}
+import { Logo } from "./logo";
+import { ThemeToggle } from "./theme-toggle";
+import { Button } from "./ui/button";
 
-function LegacyHeader() {
-	const { data } = authClient.useSession();
-	const { Link: AuthenticationLink } = useAuth();
-	return (
-		<HeaderContent
-			session={data}
-			allowConsole
-			signIn={
-				<AuthenticationLink href="/sign-in" className="account-sign-in-link">
-					Sign in
-				</AuthenticationLink>
-			}
-			accountMenu={<AllAuthUserMenu />}
-			organizationSwitcher={
-				<OrganizationSwitcher
-					className="account-organization-switcher"
-					hideSettings
-				/>
-			}
-			stopImpersonation={async () => {
-				const { error } = await authClient.admin.stopImpersonating();
-				if (error) throw new Error(error.message);
-			}}
-		/>
-	);
-}
-
-function HostedHeader({ client }: { client: AllAuthClient }) {
-	const { data } = client.useSession();
-	const pathname = usePathname();
-	const search = useSearchParams();
-	// The error page supplies its own realm-verified retry link.
-	const params = new URLSearchParams(pathname === "/auth-error" ? undefined : search.toString());
-	const signInHref =
-		localNavigation("/sign-in", "https://allauth.invalid", params) ??
-		"/sign-in";
-	const signOutHref =
-		localNavigation("/sign-out", "https://allauth.invalid", params) ??
-		"/sign-out";
-	const actor = hostedImpersonatingActor(data);
-	return (
-		<HeaderContent
-			session={
-				data ? { user: data.user, session: { impersonatedBy: actor } } : null
-			}
-			allowConsole={false}
-			signIn={
-				<Link href={signInHref} className="account-sign-in-link">
-					Sign in
-				</Link>
-			}
-			accountMenu={
-				data && <HostedUserMenu user={data.user} signOutHref={signOutHref} />
-			}
-			organizationSwitcher={<HostedOrganizationSwitcher client={client} />}
-			stopImpersonation={
-				actor ? () => stopHostedImpersonation(actor) : undefined
-			}
-		/>
-	);
-}
-
-function HeaderContent({
+export function AccountHeader({
 	session,
 	allowConsole,
 	signIn,

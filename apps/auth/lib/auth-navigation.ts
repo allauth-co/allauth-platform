@@ -31,7 +31,7 @@ export function localNavigation(
 		target.pathname !== "/console"
 	)
 		return null;
-	// Better Auth UI reads redirectTo directly from the URL. AllAuth owns continuation instead.
+	// Only preserve validated account and signed authorization continuations.
 	target.searchParams.delete("redirectTo");
 	const consoleReturnTo = consoleReturnFromSearch(
 		target.searchParams.has("consoleReturnTo") ? target.searchParams : current,

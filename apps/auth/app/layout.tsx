@@ -4,7 +4,9 @@ import { GeistMono } from "geist/font/mono";
 import { GeistSans } from "geist/font/sans";
 import { headers } from "next/headers";
 import { SiteFrame } from "@/components/console/site-frame";
+import { HostedAccountHeader } from "@/components/hosted-account-header";
 import { HostedOrganizationProvider } from "@/components/hosted-organization-client";
+import { LegacyAccountHeader } from "@/components/legacy-auth-ui";
 import Providers from "@/components/providers";
 import { portalBranding } from "@/lib/branding/portal";
 import { applicationMetadata } from "@/lib/branding/presentation";
@@ -26,7 +28,13 @@ export default async function RootLayout({
 			>
 				<Providers hostedPreview={preview}>
 					<HostedOrganizationProvider enabled={preview}>
-						<SiteFrame>{children}</SiteFrame>
+						<SiteFrame
+							header={
+								preview ? <HostedAccountHeader /> : <LegacyAccountHeader />
+							}
+						>
+							{children}
+						</SiteFrame>
 					</HostedOrganizationProvider>
 				</Providers>
 			</body>

@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { jwt } from "better-auth/plugins";
 import { getTestInstance } from "better-auth/test";
 import { describe, expect, it } from "vitest";
-import { isAuthenticationPath, localNavigation } from "../components/better-auth-ui/lib/navigation";
+import { isAuthenticationPath, localNavigation } from "./auth-navigation";
 
 const origin = "http://localhost:3000";
 const secret = "fixture-ui-oauth-secret-longer-than-thirty-two-characters";
