@@ -152,7 +152,7 @@ export async function readOwnedBrowserAgent(
 	});
 }
 
-export function ownedBrowserAgentRevokeInput(body: unknown) {
+export function ownedAgentRevokeInput(body: unknown) {
 	if (hasRemoteAgentKeys(body))
 		return json(
 			{
@@ -165,19 +165,54 @@ export function ownedBrowserAgentRevokeInput(body: unknown) {
 	return parsed.success ? parsed.data : invalidAgentBody(parsed.error);
 }
 
+function missingRevocationTarget() {
+	return problem(
+		400,
+		"invalid_request",
+		"Malformed request, missing required fields, or invalid parameter types",
+	);
+}
+
+async function revokeLockedAgent(client: PoolClient, id: string) {
+	await client.query(
+		`UPDATE "agent" SET status='revoked',"publicKey"='',kid=NULL,"updatedAt"=transaction_timestamp() WHERE id=$1`,
+		[id],
+	);
+	await client.query(
+		`UPDATE "agentCapabilityGrant" SET status='revoked',"updatedAt"=transaction_timestamp() WHERE "agentId"=$1`,
+		[id],
+	);
+	return json({ agent_id: id, status: "revoked" });
+}
+
+/** A live signed host may disconnect an explicitly selected agent on that host. */
+export async function revokeOwnedHostAgent(
+	client: PoolClient,
+	hostId: string,
+	input: z.infer<typeof revokeInput>,
+) {
+	const id = input.agent_id;
+	if (!id) return missingRevocationTarget();
+	if (id.includes("\0")) return notFound();
+	const target = await client.query(
+		`SELECT 1 FROM "agent" WHERE id=$1 AND "hostId"=$2 FOR UPDATE`,
+		[id, hostId],
+	);
+	if (target.rowCount) return revokeLockedAgent(client, id);
+	const existing = await client.query(`SELECT 1 FROM "agent" WHERE id=$1`, [
+		id,
+	]);
+	return existing.rowCount ? forbidden() : notFound();
+}
+
 /** Revoke the selected agent under its live browser or persisted host owner. */
 export async function revokeOwnedBrowserAgent(
 	client: PoolClient,
 	userId: string,
 	input: z.infer<typeof revokeInput>,
 ) {
-	if (!input.agent_id)
-		return problem(
-			400,
-			"invalid_request",
-			"Malformed request, missing required fields, or invalid parameter types",
-		);
 	const id = input.agent_id;
+	if (!id) return missingRevocationTarget();
 	if (id.includes("\0")) return notFound();
 	const {
 		rows: [target],
@@ -200,13 +235,5 @@ export async function revokeOwnedBrowserAgent(
 	);
 	if (!agent) return notFound();
 	if (agent.userId !== userId && host?.userId !== userId) return forbidden();
-	await client.query(
-		`UPDATE "agent" SET status='revoked',"publicKey"='',kid=NULL,"updatedAt"=transaction_timestamp() WHERE id=$1`,
-		[id],
-	);
-	await client.query(
-		`UPDATE "agentCapabilityGrant" SET status='revoked',"updatedAt"=transaction_timestamp() WHERE "agentId"=$1`,
-		[id],
-	);
-	return json({ agent_id: id, status: "revoked" });
+	return revokeLockedAgent(client, id);
 }

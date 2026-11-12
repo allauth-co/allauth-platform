@@ -1461,6 +1461,125 @@ describe.skipIf(!existsSync(fixture))(
 			});
 		});
 
+		it("disconnects the signed host's selected agent and keeps native retries and rollback readable", async () => {
+			const path = "/agent/revoke";
+			const nativeHost = await nativeMachineHost(
+				"Native signed disconnect",
+				ownerCookie,
+			);
+			const ownedHost = await nativeMachineHost(
+				"Owned signed disconnect",
+				ownerCookie,
+			);
+			const [nativeAgent] = await seedDependents(nativeHost.hostId);
+			const [ownedAgent, sibling] = await seedDependents(ownedHost.hostId);
+			const machine = {
+				...ownedHost,
+				agentId: ownedAgent,
+				agentKey: await generateKeyPair("EdDSA", { extractable: true }),
+			};
+			await database.query(
+				`UPDATE "${alpha.schemaName}"."agent" SET "publicKey"=$2,"activatedAt"=now(),"expiresAt"=now()+interval '15 minutes' WHERE id=$1`,
+				[
+					ownedAgent,
+					JSON.stringify(await exportJWK(machine.agentKey.publicKey)),
+				],
+			);
+			const active = await legacy.handler(
+				request(
+					alpha,
+					statusPath,
+					"",
+					undefined,
+					`Bearer ${await agentProof(machine)}`,
+				),
+			);
+			expect(active.status).toBe(200);
+			const ownedProof = `Bearer ${await nativeClientHostProof(ownedHost)}`;
+			const nativeProof = `Bearer ${await nativeClientHostProof(nativeHost)}`;
+			const target = { agent_id: ownedAgent };
+			await expectSame(
+				path,
+				ownerCookie,
+				403,
+				{ agent_id: nativeAgent },
+				ownedProof,
+			);
+			await expectSame(path, "", 400, {}, ownedProof);
+			await expectSame(path, "", 404, { agent_id: randomUUID() }, ownedProof);
+			await expectSame(
+				path,
+				"",
+				401,
+				target,
+				`Bearer ${await hostProof({ ...ownedHost, hostKey: nativeHost.hostKey })}`,
+			);
+			expect(
+				(await outside.dispatch(request(beta, path, "", target, ownedProof)))
+					.status,
+			).toBe(401);
+			expect(
+				(await disabled.dispatch(request(alpha, path, "", target, ownedProof)))
+					.status,
+			).toBe(501);
+			const priorHost = (await persisted(ownedHost.hostId)).hosts;
+			for (let attempt = 0; attempt < 2; attempt += 1) {
+				const previous = await legacy.handler(
+					request(alpha, path, "", { agent_id: nativeAgent }, nativeProof),
+				);
+				const current = await owned.dispatch(
+					request(alpha, path, "", target, ownedProof),
+				);
+				expect(previous.status).toBe(200);
+				expect(current.status).toBe(200);
+				expect(await previous.json()).toEqual({
+					agent_id: nativeAgent,
+					status: "revoked",
+				});
+				expect(await current.json()).toEqual({
+					agent_id: ownedAgent,
+					status: "revoked",
+				});
+			}
+			const saved = await persisted(ownedHost.hostId);
+			expect(saved.hosts).toEqual(priorHost);
+			expect(saved.agents).toEqual((await persisted(nativeHost.hostId)).agents);
+			expect(saved.agents).toContainEqual({
+				name: "active",
+				status: "revoked",
+				publicKey: "",
+				kid: null,
+				grantStatus: "revoked",
+			});
+			legacy = await native(nativePool);
+			const revoked = await legacy.handler(
+				request(
+					alpha,
+					statusPath,
+					"",
+					undefined,
+					`Bearer ${await agentProof(machine)}`,
+				),
+			);
+			expect(revoked.status).toBe(403);
+			expect(await revoked.json()).toMatchObject({ error: "agent_revoked" });
+			const other = await legacy.handler(
+				request(
+					alpha,
+					`${statusPath}?agent_id=${sibling}`,
+					"",
+					undefined,
+					ownedProof,
+				),
+			);
+			expect(other.status).toBe(200);
+			expect(await other.json()).toMatchObject({
+				agent_id: sibling,
+				host_id: ownedHost.hostId,
+				status: "pending",
+			});
+		});
+
 		it("validates native host status reads against its own inline host and projects legacy grants", async () => {
 			const machine = await nativeMachine("Status host");
 			const other = await nativeMachine("Other status host");

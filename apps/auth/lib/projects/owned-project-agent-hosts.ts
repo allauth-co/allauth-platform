@@ -7,10 +7,11 @@ import {
 	listOwnedAgentApprovals,
 } from "./owned-project-agent-approvals";
 import {
+	ownedAgentRevokeInput,
 	ownedBrowserAgentQuery,
-	ownedBrowserAgentRevokeInput,
 	readOwnedBrowserAgent,
 	revokeOwnedBrowserAgent,
+	revokeOwnedHostAgent,
 } from "./owned-project-agent-browser";
 import {
 	agentHostCapabilities,
@@ -42,6 +43,7 @@ const detailInput = z.object({ host_id: z.string() });
 const revokeInput = z.object({ host_id: z.string().optional() });
 const ownerRequired = "Only the owner of this agent host can change it.";
 const revokePath = "/host/revoke";
+const agentRevokePath = "/agent/revoke";
 
 type Host = {
 	id: string;
@@ -137,31 +139,25 @@ async function revokeBrowserHost(
 		: forbidden(ownerRequired);
 }
 
-async function signedHostRevoke(
-	client: PoolClient,
-	request: Request,
-	body: unknown,
-) {
+function hasSignedHostType(request: Request) {
 	const token = /^Bearer\s+(\S+)$/i.exec(
 		request.headers.get("authorization") ?? "",
 	)?.[1];
 	try {
-		if (
+		return Boolean(
 			token &&
-			token.length <= 8192 &&
-			decodeProtectedHeader(token).typ === "host+jwt"
-		)
-			return revokeAuthenticatedHost(client, request, body);
+				token.length <= 8192 &&
+				decodeProtectedHeader(token).typ === "host+jwt",
+		);
 	} catch {
-		// The native project boundary rejects a non-host authorization header.
+		return false;
 	}
-	return forbidden("Use your browser session or a valid signed host request.");
 }
 
-async function revokeAuthenticatedHost(
+async function verifyRevokingHost(
 	client: PoolClient,
 	request: Request,
-	body: unknown,
+	path: typeof revokePath | typeof agentRevokePath,
 ) {
 	const url = new URL(request.url);
 	const decoded = decodeAgentMachineJWT(request);
@@ -171,7 +167,7 @@ async function revokeAuthenticatedHost(
 		!validAgentIdentifier(decoded.claims.iss)
 	)
 		return invalidAgentJWT(url.origin);
-	const audience = agentMachineAudience(url, revokePath);
+	const audience = agentMachineAudience(url, path);
 	if (
 		![decoded.claims.aud]
 			.flat()
@@ -191,6 +187,36 @@ async function revokeAuthenticatedHost(
 		url.origin,
 	);
 	if (proof instanceof Response) return proof;
+	const locked = await readAgentMachineHost(
+		client,
+		issuer,
+		path === revokePath ? "update" : "share",
+	);
+	if (!locked || locked.id !== host.id || locked.status !== "active")
+		return hostUnavailable();
+	if (
+		locked.userId !== host.userId ||
+		locked.publicKey !== host.publicKey ||
+		locked.jwksUrl !== host.jwksUrl
+	)
+		return invalidAgentJWT(url.origin);
+	return locked;
+}
+
+async function signedHostRevoke(
+	client: PoolClient,
+	request: Request,
+	path: typeof revokePath | typeof agentRevokePath,
+	body: unknown,
+) {
+	const host = await verifyRevokingHost(client, request, path);
+	if (host instanceof Response) return host;
+	if (path === agentRevokePath) {
+		const input = ownedAgentRevokeInput(body);
+		return input instanceof Response
+			? input
+			: revokeOwnedHostAgent(client, host.id, input);
+	}
 	if (hasRemoteAgentKeys(body))
 		return json(
 			{
@@ -207,16 +233,7 @@ async function revokeAuthenticatedHost(
 			"unauthorized",
 			"Caller is not authorized for this operation",
 		);
-	const locked = await readAgentMachineHost(client, issuer, "update");
-	if (!locked || locked.id !== host.id || locked.status !== "active")
-		return hostUnavailable();
-	if (
-		locked.userId !== host.userId ||
-		locked.publicKey !== host.publicKey ||
-		locked.jwksUrl !== host.jwksUrl
-	)
-		return invalidAgentJWT(url.origin);
-	return revokeLockedHost(client, locked.id, locked.status);
+	return revokeLockedHost(client, host.id, host.status);
 }
 
 /** Browser host management and token enrollment for the isolated candidate fixture. */
@@ -233,7 +250,7 @@ export function createOwnedProjectAgentHosts(options: BrowserHosts) {
 		const agentRead =
 			request.method === "GET" &&
 			(path === "/agent/get" || path === "/agent/list");
-		const agentRevoke = request.method === "POST" && path === "/agent/revoke";
+		const agentRevoke = request.method === "POST" && path === agentRevokePath;
 		const hostRevoke = request.method === "POST" && path === revokePath;
 		const write =
 			decision ||
@@ -280,12 +297,16 @@ export function createOwnedProjectAgentHosts(options: BrowserHosts) {
 			);
 		}
 		if (request.headers.has("authorization")) {
-			if (hostRevoke && request.headers.get("authorization")) {
+			if ((hostRevoke || agentRevoke) && hasSignedHostType(request)) {
 				const body = await options.readBody(request);
 				return options.store.transaction((client) =>
-					signedHostRevoke(client, request, body),
+					signedHostRevoke(client, request, path, body),
 				);
 			}
+			if (hostRevoke && request.headers.get("authorization"))
+				return forbidden(
+					"Use your browser session or a valid signed host request.",
+				);
 			return forbidden("Use your signed-in browser session for this action.");
 		}
 		if (!options.trustedRequest(request.headers, write))
@@ -316,9 +337,7 @@ export function createOwnedProjectAgentHosts(options: BrowserHosts) {
 		const browserQuery = agentRead
 			? ownedBrowserAgentQuery(path, request)
 			: null;
-		const browserRevoke = agentRevoke
-			? ownedBrowserAgentRevokeInput(body)
-			: null;
+		const browserRevoke = agentRevoke ? ownedAgentRevokeInput(body) : null;
 		if (browserQuery instanceof Response) return browserQuery;
 		if (browserRevoke instanceof Response) return browserRevoke;
 		return options.store.transaction(async (client) => {
