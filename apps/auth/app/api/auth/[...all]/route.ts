@@ -1,6 +1,7 @@
 import { withPortalAuthEngine } from "@/lib/domains/hosting";
 import { authOrigin } from "@/lib/configuration";
 import { localDevelopmentAuthRequest } from "@/lib/local-development";
+import { projectOpenApiPath } from "@/lib/projects/owned-project-openapi";
 
 const publicProtocolPaths = new Set(["/api/auth/oauth2/token", "/api/auth/oauth2/userinfo", "/api/auth/jwks"]);
 function protocolHeaders(request: Request, headers: Headers) {
@@ -13,7 +14,25 @@ function protocolHeaders(request: Request, headers: Headers) {
 }
 async function handle(request: Request) {
 	const response = await withPortalAuthEngine(request, async (engine, env, bound, binding) => {
-		const result=await engine.dispatch(binding ? bound : localDevelopmentAuthRequest(bound, authOrigin(env), process.env.NODE_ENV));
+		// The hosted gateway removes Authorization before the browser request reaches auth.
+		const mixedSchemaCredentials =
+			binding &&
+			request.method === "GET" &&
+			request.headers.has("authorization") &&
+			new URL(bound.url).pathname === `/api/auth${projectOpenApiPath}`;
+		const result = mixedSchemaCredentials
+			? Response.json(
+					{
+						code: "FORBIDDEN",
+						message: "Use your signed-in browser session for this action.",
+					},
+					{ status: 403 },
+				)
+			: await engine.dispatch(
+					binding
+						? bound
+						: localDevelopmentAuthRequest(bound, authOrigin(env), process.env.NODE_ENV),
+				);
 		protocolHeaders(request,result.headers);
 		const origin=bound.headers.get("origin");
 		if(binding && origin && binding.project.origins.includes(origin)) {result.headers.set("Access-Control-Allow-Origin",origin);result.headers.set("Access-Control-Allow-Credentials","true");result.headers.append("Vary","Origin");}

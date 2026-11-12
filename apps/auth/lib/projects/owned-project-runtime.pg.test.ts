@@ -26,6 +26,7 @@ import { googleProviderRepository } from "../project-providers/repository";
 import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
 import { createWorkspace } from "../workspaces/repository";
 import { signProjectIssuerQuery } from "./owned-project-issuer-authorization-query";
+import { projectOpenApiPath } from "./owned-project-openapi";
 import type { ProjectRuntimeFixtureBoot } from "./owned-project-runtime-fixture";
 import {
 	runtimeFixtureApple,
@@ -1009,6 +1010,31 @@ describe.skipIf(!existsSync(fixture))(
 					},
 				);
 				expect(realmAdminLogin.status).toBe(200);
+				const realmAdminCookie = cookie(realmAdminLogin);
+				const hostedSchemaPath = `/api/auth${projectOpenApiPath}`;
+				const directSchemaPath = `${alphaPath}${projectOpenApiPath}`;
+				const nativeSchema = await service.request(hostedSchemaPath, {
+					host: alphaHost,
+					cookie: realmAdminCookie,
+				});
+				expect(nativeSchema.status).toBe(200);
+				expect(nativeSchema.headers.get("cache-control")).toBe("no-store");
+				expect(await nativeSchema.json()).toMatchObject({
+					openapi: "3.1.1",
+					servers: [{ url: hostedIssuer }],
+					paths: { "/get-session": expect.any(Object) },
+				});
+				const mixedSchemaCredentials = {
+					host: alphaHost,
+					cookie: realmAdminCookie,
+					authorization: "Bearer fixture-other-credential",
+				};
+				expect(
+					(await service.request(hostedSchemaPath, mixedSchemaCredentials)).status,
+				).toBe(403);
+				expect(
+					(await service.request("/api/auth/reference", { host: alphaHost })).status,
+				).toBe(404);
 				const nativeRealmSupport = await service.request(
 					"/api/auth/admin/impersonate-user",
 					{
@@ -1175,6 +1201,111 @@ describe.skipIf(!existsSync(fixture))(
 
 				service = await open(restored, true);
 				expect((await service.request("/api/health")).status).toBe(200);
+				for (const [path, host, issuer] of [
+					[hostedSchemaPath, alphaHost, hostedIssuer],
+					[directSchemaPath, undefined, directIssuer],
+				] as const) {
+					const schema = await service.request(path, {
+						host,
+						cookie: realmAdminCookie,
+					});
+					expect(schema.status).toBe(200);
+					expect(schema.headers.get("cache-control")).toBe("no-store");
+					expect(schema.headers.getSetCookie()).toEqual([]);
+					const document = await schema.json();
+					expect(document).toMatchObject({
+						openapi: "3.1.1",
+						servers: [{ url: issuer }],
+						components: {
+							securitySchemes: {
+								sessionCookie: {
+									name: `__Secure-allauth_project_${alpha.slug}.session_token`,
+								},
+							},
+						},
+						paths: {
+							"/get-session": { get: expect.any(Object) },
+							"/sign-in/email": { post: expect.any(Object) },
+						},
+					});
+					const serialized = JSON.stringify(document);
+					for (const privateValue of [
+						platformSecret,
+						credentials.realmAdmin.email,
+						alpha.schemaName,
+						realmAdminCookie,
+					])
+						expect(serialized).not.toContain(privateValue);
+					for (const refused of [undefined, rootCookie, realmSupportCookie])
+						expect(
+							(await service.request(path, { host, cookie: refused })).status,
+						).toBe(403);
+				}
+				expect(
+					(await service.request(hostedSchemaPath, mixedSchemaCredentials)).status,
+				).toBe(403);
+				expect(
+					(await service.request(directSchemaPath, {
+						...mixedSchemaCredentials,
+						host: undefined,
+					})).status,
+				).toBe(403);
+				expect(
+					(await service.request(`${betaPath}${projectOpenApiPath}`, {
+						cookie: realmAdminCookie,
+					})).status,
+				).toBe(403);
+				expect(
+					(await service.request("/api/auth/reference", { host: alphaHost })).status,
+				).toBe(404);
+				const schemaAuthority = new Pool({ connectionString: url(restored), max: 1 });
+				try {
+					for (const [role, verified, banned] of [
+						["user", true, false],
+						["admin", false, false],
+						["admin", true, true],
+					]) {
+						await schemaAuthority.query(
+							`UPDATE "${alpha.schemaName}"."user" SET role=$2,"emailVerified"=$3,banned=$4 WHERE id=$1`,
+							[credentials.realmAdmin.id, role, verified, banned],
+						);
+						expect(
+							(await service.request(directSchemaPath, { cookie: realmAdminCookie })).status,
+						).toBe(403);
+					}
+					await schemaAuthority.query(
+						`UPDATE "${alpha.schemaName}"."user" SET role='admin',"emailVerified"=true,banned=false WHERE id=$1`,
+						[credentials.realmAdmin.id],
+					);
+				} finally {
+					await schemaAuthority.end();
+				}
+				const [ownedSchemaCookie, revokedSchemaCookie] = await Promise.all(
+					["192.0.2.74", "192.0.2.75"].map(async (clientIP) => {
+						const login = await service!.request(`${alphaPath}/sign-in/email`, {
+							clientIP,
+							body: {
+								email: credentials.realmAdmin.email,
+								password: credentials.password,
+							},
+						});
+						expect(login.status).toBe(200);
+						return cookie(login);
+					}),
+				);
+				for (const browserCookie of [ownedSchemaCookie, revokedSchemaCookie])
+					expect(
+						(await service.request(directSchemaPath, { cookie: browserCookie })).status,
+					).toBe(200);
+				expect(
+					(await service.request(`${alphaPath}/sign-out`, {
+						cookie: revokedSchemaCookie,
+						body: {},
+					})).status,
+				).toBe(200);
+				expect(
+					(await service.request(directSchemaPath, { cookie: revokedSchemaCookie })).status,
+				).toBe(403);
 				const realmSupport = await service.request("/api/auth/get-session", {
 					host: alphaHost,
 					cookie: realmSupportCookie,
@@ -2161,6 +2292,9 @@ describe.skipIf(!existsSync(fixture))(
 				service = undefined;
 
 				service = await open(restored, false);
+				expect(
+					(await service.request(directSchemaPath, { cookie: ownedSchemaCookie })).status,
+				).toBe(200);
 				expect((await service.request("/api/health")).status).toBe(200);
 				const nativeRealmStop = await service.request(
 					"/api/auth/admin/stop-impersonating",

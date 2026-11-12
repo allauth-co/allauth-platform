@@ -61,6 +61,10 @@ import {
 	ownedProjectOAuthUnlinkInput,
 	projectOAuthProvider,
 } from "./owned-project-oauth";
+import {
+	ownedProjectOpenApi,
+	projectOpenApiPath,
+} from "./owned-project-openapi";
 import type { OwnedProjectOrganizationOptions } from "./owned-project-organization";
 import { createOwnedProjectOrganizationHttp } from "./owned-project-organization";
 import { createOwnedProjectOneTimeToken } from "./owned-project-one-time-token";
@@ -243,6 +247,7 @@ interface OwnedProjectEngineOptions {
 	};
 	passkeys?: Parameters<typeof createOwnedProjectPasskeyHttp>[0]["rp"];
 	walletOrigin?: string;
+	openApi?: boolean;
 	webhookManagement?: Pick<
 		Parameters<typeof createOwnedProjectWebhookManagement>[0],
 		"resolver"
@@ -380,6 +385,7 @@ export function createOwnedProjectEngine(
 			schemaName: options.project.schemaName,
 			issuer: `${origin}${options.basePath}`,
 			signingSecret: options.signingSecret,
+			managementOrigins: acceptedOrigins,
 			trustedIP: options.trustedIP,
 			projectSlug: slug,
 			platformOrigin:
@@ -2428,6 +2434,37 @@ export function createOwnedProjectEngine(
 		)
 			return forbidden();
 		const path = url.pathname.slice(options.basePath.length);
+		if (
+			options.openApi &&
+			(path === projectOpenApiPath || path === "/reference")
+		) {
+			if (path !== projectOpenApiPath || request.method !== "GET")
+				return failure(404, "NOT_FOUND", "Not found.");
+			if (request.headers.has("authorization"))
+				return failure(
+					403,
+					"FORBIDDEN",
+					"Use your signed-in browser session for this action.",
+				);
+			if (!trustedRequest(request.headers, false)) return forbidden();
+			const current = await currentSession(request.headers);
+			if (!isPlatformAdmin(current?.user, current?.session))
+				return failure(
+					403,
+					"FORBIDDEN",
+					"An administrator is required to view the API schema.",
+				);
+			return json(
+				ownedProjectOpenApi({
+					serverURL: `${origin}${options.basePath}`,
+					cookieName: sessionCookie,
+					passwordMaxLength:
+						policy.emailAndPasswordEnabled && !missingSupportAdapter
+							? defaultPasswordPolicy.maxLength
+							: undefined,
+				}),
+			);
+		}
 		const impersonation = await realmImpersonation.dispatch(path, request);
 		if (impersonation) return impersonation;
 		if (

@@ -6,7 +6,7 @@ import {
 } from "@better-auth/oauth-provider";
 import { jwt, organization } from "better-auth/plugins";
 import { getTestInstance } from "better-auth/test";
-import { decodeJwt } from "jose";
+import { decodeJwt, exportJWK, generateKeyPair } from "jose";
 import { Kysely, PostgresDialect } from "kysely";
 import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -381,6 +381,129 @@ describe.skipIf(!existsSync(fixture))(
 			);
 			expect(removed.status).toBe(200);
 			expect((await legacy(consentRequest())).status).toBe(404);
+		});
+
+		it("creates and updates project clients in the native registration format", async () => {
+			const engine = managementEngine();
+			const administrator = await browser();
+			const ordinary = await browser();
+			await database.query(
+				`UPDATE "${schema}"."user" SET role='admin' WHERE id=$1`,
+				[administrator.userId],
+			);
+			const cookie = administrator.cookie;
+			const metadata = {
+				client_name: "Fixture Registration",
+				redirect_uris: [callback],
+				scope: "openid profile",
+			};
+			const create = (body: object, ownerCookie = cookie) =>
+				request("/oauth2/create-client", { cookie: ownerCookie, body });
+			const detail = (id: string) =>
+				request("/oauth2/get-client", {
+					cookie,
+					query: new URLSearchParams({ client_id: id }),
+				});
+			const patch = (id: string, update: object) =>
+				request("/oauth2/update-client", {
+					cookie,
+					body: { client_id: id, update },
+				});
+			expect(
+				(await engine.dispatch(create(metadata, ordinary.cookie))).status,
+			).toBe(401);
+			expect(
+				(await engine.dispatch(create({ ...metadata, require_pkce: false })))
+					.status,
+			).toBe(400);
+			expect(
+				(
+					await engine.dispatch(
+						create({
+							...metadata,
+							redirect_uris: ["https://*.fixture.example/callback"],
+						}),
+					)
+				).status,
+			).toBe(400);
+			const nativeRegistration = await legacy(create(metadata));
+			expect(nativeRegistration.status).toBe(201);
+			const { client_id: nativeId } = (await nativeRegistration.json()) as {
+				client_id: string;
+			};
+			const updated = await engine.dispatch(
+				patch(nativeId, { client_name: "Updated by AllAuth" }),
+			);
+			expect(updated.status).toBe(200);
+			expect(await updated.json()).toEqual(
+				await (await legacy(detail(nativeId))).json(),
+			);
+			expect(
+				(await engine.dispatch(patch(nativeId, { require_pkce: false })))
+					.status,
+			).toBe(400);
+			const { publicKey, privateKey } = await generateKeyPair("RS256", {
+				extractable: true,
+			});
+			const asymmetric = {
+				...metadata,
+				token_endpoint_auth_method: "private_key_jwt",
+			};
+			expect(
+				(
+					await engine.dispatch(
+						create({
+							...asymmetric,
+							jwks: { keys: [await exportJWK(privateKey)] },
+						}),
+					)
+				).status,
+			).toBe(400);
+			const ownedRegistration = await engine.dispatch(
+				create({ ...asymmetric, jwks: { keys: [await exportJWK(publicKey)] } }),
+			);
+			expect(
+				ownedRegistration.status,
+				ownedRegistration.ok
+					? undefined
+					: await ownedRegistration.clone().text(),
+			).toBe(201);
+			expect(ownedRegistration.headers.get("cache-control")).toBe("no-store");
+			const ownedData = (await ownedRegistration.json()) as {
+				client_id: string;
+			};
+			expect(ownedData).not.toHaveProperty("client_secret");
+			expect(await (await legacy(detail(ownedData.client_id))).json()).toEqual(
+				ownedData,
+			);
+			expect(
+				(
+					await legacy(
+						patch(ownedData.client_id, {
+							client_name: "Updated by the prior writer",
+						}),
+					)
+				).status,
+			).toBe(200);
+			expect(
+				await (await engine.dispatch(detail(ownedData.client_id))).json(),
+			).toMatchObject({ client_name: "Updated by the prior writer" });
+			const stored = await database.query(
+				`SELECT "actorId",action,"targetId" FROM "${schema}"."allauthAudit" WHERE "targetId"=ANY($1::text[]) ORDER BY "createdAt"`,
+				[[nativeId, ownedData.client_id]],
+			);
+			expect(stored.rows).toEqual([
+				{
+					actorId: administrator.userId,
+					action: "/oauth2/update-client",
+					targetId: nativeId,
+				},
+				{
+					actorId: administrator.userId,
+					action: "/oauth2/create-client",
+					targetId: ownedData.client_id,
+				},
+			]);
 		});
 
 		it("preserves client catalog fields, private ownership, signed prelogin and native deletion semantics", async () => {

@@ -32,6 +32,8 @@ const providerAdmission = new Map<string, { methods: string[]; max: number }>([
 	["/oauth2/public-client-prelogin", { methods: ["POST"], max: 100 }],
 	["/oauth2/delete-client", { methods: ["POST"], max: 100 }],
 	["/oauth2/client/rotate-secret", { methods: ["POST"], max: 100 }],
+	["/oauth2/create-client", { methods: ["POST"], max: 100 }],
+	["/oauth2/update-client", { methods: ["POST"], max: 100 }],
 	["/oauth2/end-session", { methods: ["GET", "POST"], max: 100 }],
 	["/oauth2/end-session/confirm", { methods: ["POST"], max: 100 }],
 	["/jwks", { methods: ["GET"], max: 100 }],
@@ -42,6 +44,7 @@ export function createOwnedProjectIssuer(
 		keys: LegacyMfaKeys;
 		projectSlug: string;
 		platformOrigin: string;
+		managementOrigins: ReadonlySet<string>;
 		trustedIP(request: Request): string | null;
 		readManagementUser: Parameters<
 			typeof createOwnedProjectIssuerClients
@@ -63,7 +66,11 @@ export function createOwnedProjectIssuer(
 			);
 		},
 	});
-	const clients = createOwnedProjectIssuerClients({ ...options, store });
+	const clients = createOwnedProjectIssuerClients({
+		...options,
+		store,
+		trustedOrigins: options.managementOrigins,
+	});
 	const device = createOwnedProjectIssuerDevice(options);
 	const logout = createOwnedProjectIssuerLogout({
 		...options,

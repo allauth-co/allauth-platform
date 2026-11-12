@@ -491,6 +491,7 @@ export async function createOwnedProjectRuntimeCandidate(options: Options) {
 		trustedOrigins,
 		trustedIP,
 		appName: project.name,
+		openApi: true,
 		sdk: {
 			avatar: avatarStorage,
 			personalApiKeys: true,

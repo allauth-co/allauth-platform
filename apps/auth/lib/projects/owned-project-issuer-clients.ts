@@ -1,4 +1,4 @@
-import { randomInt } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import type { PoolClient } from "pg";
 import * as z from "zod";
 import { isPlatformAdmin } from "../configuration";
@@ -7,6 +7,12 @@ import type {
 	ProjectUser,
 } from "./owned-project-engine-store";
 import { readSignedProjectIssuerQuery } from "./owned-project-issuer-authorization-query";
+import {
+	createProjectIssuerClient,
+	projectIssuerClientCredential,
+	projectIssuerClientUpdate,
+	updateProjectIssuerClient,
+} from "./owned-project-issuer-client-writes";
 import {
 	issuerDigest,
 	issuerJSON,
@@ -76,7 +82,7 @@ const clientSelect = Object.keys(clientFields)
 	.map((key) => `"${key}"`)
 	.join(",");
 const reference = "allauth:platform";
-const secretAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+const privateSelect = `${clientSelect},scopes,"createdAt",jwks,metadata,"clientSecret" IS NOT NULL AS "hasSecret"`;
 const unauthorized = () =>
 	Response.json(
 		{ code: "UNAUTHORIZED", message: "Unauthorized" },
@@ -128,10 +134,34 @@ function clientResult(row: Record<string, unknown>) {
 	};
 }
 
+async function readClient(client: PoolClient, clientId: string, lock = false) {
+	const {
+		rows: [row],
+	} = await client.query(
+		`SELECT ${privateSelect} FROM "oauthClient" WHERE "clientId"=$1 AND "clientDiscoveryId" IS NULL${lock ? " FOR UPDATE" : ""}`,
+		[clientId],
+	);
+	return row;
+}
+
+async function auditClient(
+	client: PoolClient,
+	path: string,
+	userId: string,
+	clientId: string,
+) {
+	await client.query(
+		`INSERT INTO "allauthAudit" (id,"actorId",action,"targetId","createdAt")
+		 VALUES ($1,$2,$3,$4,statement_timestamp())`,
+		[randomUUID(), userId, path, clientId],
+	);
+}
+
 /** Keep project client details scoped to the authenticated realm and redact stored client secrets. */
 export function createOwnedProjectIssuerClients(options: {
 	store: ReturnType<typeof createProjectEngineStore>;
 	signingSecret: string;
+	trustedOrigins: ReadonlySet<string>;
 	readBody(request: Request): Promise<unknown>;
 	readManagementUser(
 		client: PoolClient,
@@ -148,7 +178,9 @@ export function createOwnedProjectIssuerClients(options: {
 		const prelogin = post && path === "/oauth2/public-client-prelogin";
 		const remove = post && path === "/oauth2/delete-client";
 		const rotate = post && path === "/oauth2/client/rotate-secret";
-		const write = remove || rotate;
+		const create = post && path === "/oauth2/create-client";
+		const update = post && path === "/oauth2/update-client";
+		const write = remove || rotate || create || update;
 		if (!list && !privateRead && !publicRead && !prelogin && !write) return;
 		const input = post
 			? await options.readBody(request)
@@ -174,75 +206,102 @@ export function createOwnedProjectIssuerClients(options: {
 					401,
 				).response();
 		}
-		const parsed = list ? null : clientInput.safeParse(input);
+		const changes = update ? projectIssuerClientUpdate.safeParse(input) : null;
+		const parsed =
+			list || create ? null : (changes ?? clientInput.safeParse(input));
 		if (parsed && !parsed.success) return invalid();
-		return options.store.transaction(async (client) => {
-			const user = prelogin
-				? null
-				: await options.readManagementUser(client, request, write);
-			if (!prelogin && (!user || (!publicRead && !isPlatformAdmin(user))))
-				return unauthorized();
-			if (list) {
-				const { rows } = await client.query(
-					`SELECT ${clientSelect},scopes,"createdAt",jwks,metadata,"clientSecret" IS NOT NULL AS "hasSecret"
-					 FROM "oauthClient" WHERE "referenceId"=$1`,
-					[reference],
-				);
-				return issuerJSON(rows.map(clientResult));
-			}
-			const id = parsed?.data?.client_id;
-			if (!id) return invalid();
-			if (publicRead || prelogin) {
-				const {
-					rows: [row],
-				} = await client.query(
-					`SELECT ${publicSelect} FROM "oauthClient" WHERE "clientId"=$1 AND "clientDiscoveryId" IS NULL AND disabled IS DISTINCT FROM TRUE`,
-					[id],
-				);
-				return row
-					? issuerJSON({ ...mapped(row, publicFields), redirect_uris: [] })
-					: missing();
-			}
-			const {
-				rows: [row],
-			} = await client.query(
-				`SELECT ${clientSelect},scopes,"createdAt",jwks,metadata,"clientSecret" IS NOT NULL AS "hasSecret"
-				 FROM "oauthClient" WHERE "clientId"=$1 AND "clientDiscoveryId" IS NULL${write ? " FOR UPDATE" : ""}`,
-				[id],
-			);
-			if (!row) return missing();
-			if (row.userId ? row.userId !== user?.id : row.referenceId !== reference)
-				return unauthorized();
-			if (remove) {
-				await client.query('DELETE FROM "oauthClient" WHERE "clientId"=$1', [
-					id,
-				]);
-				return new Response(null, {
-					headers: { "cache-control": "no-store", pragma: "no-cache" },
-				});
-			}
-			if (rotate) {
+		try {
+			return await options.store.transaction(async (client) => {
+				const user = prelogin
+					? null
+					: await options.readManagementUser(client, request, write);
+				if (!prelogin && (!user || (!publicRead && !isPlatformAdmin(user))))
+					return unauthorized();
+				if (list) {
+					const { rows } = await client.query(
+						`SELECT ${privateSelect} FROM "oauthClient" WHERE "referenceId"=$1`,
+						[reference],
+					);
+					return issuerJSON(rows.map(clientResult));
+				}
+				if (create && user) {
+					const created = await createProjectIssuerClient(
+						client,
+						input,
+						options.trustedOrigins,
+						reference,
+					);
+					const row = await readClient(client, created.clientId);
+					if (!row) throw new Error("The project client was not registered.");
+					await auditClient(client, path, user.id, created.clientId);
+					return issuerJSON(
+						{ ...clientResult(row), client_secret: created.secret },
+						201,
+					);
+				}
+				const id = parsed?.data?.client_id;
+				if (!id) return invalid();
+				if (publicRead || prelogin) {
+					const {
+						rows: [row],
+					} = await client.query(
+						`SELECT ${publicSelect} FROM "oauthClient" WHERE "clientId"=$1 AND "clientDiscoveryId" IS NULL AND disabled IS DISTINCT FROM TRUE`,
+						[id],
+					);
+					return row
+						? issuerJSON({ ...mapped(row, publicFields), redirect_uris: [] })
+						: missing();
+				}
+				const row = await readClient(client, id, write);
+				if (!row) return missing();
 				if (
-					!row.hasSecret ||
-					!["client_secret_basic", "client_secret_post"].some(
-						(method) => method === row.tokenEndpointAuthMethod,
-					)
+					row.userId ? row.userId !== user?.id : row.referenceId !== reference
 				)
-					return new ProjectOAuthError(
-						"invalid_client",
-						"secret rotation is only available for clients using client_secret authentication",
-					).response();
-				const secret = Array.from(
-					{ length: 32 },
-					() => secretAlphabet[randomInt(secretAlphabet.length)],
-				).join("");
-				await client.query(
-					`UPDATE "oauthClient" SET "clientSecret"=$2,"updatedAt"=date_trunc('second',statement_timestamp()) WHERE "clientId"=$1`,
-					[id, issuerDigest(secret)],
-				);
-				return issuerJSON({ ...clientResult(row), client_secret: secret });
-			}
-			return issuerJSON(clientResult(row));
-		});
+					return unauthorized();
+				if (remove) {
+					await client.query('DELETE FROM "oauthClient" WHERE "clientId"=$1', [
+						id,
+					]);
+					return new Response(null, {
+						headers: { "cache-control": "no-store", pragma: "no-cache" },
+					});
+				}
+				if (rotate) {
+					if (
+						!row.hasSecret ||
+						!["client_secret_basic", "client_secret_post"].some(
+							(method) => method === row.tokenEndpointAuthMethod,
+						)
+					)
+						return new ProjectOAuthError(
+							"invalid_client",
+							"secret rotation is only available for clients using client_secret authentication",
+						).response();
+					const secret = projectIssuerClientCredential();
+					await client.query(
+						`UPDATE "oauthClient" SET "clientSecret"=$2,"updatedAt"=date_trunc('second',statement_timestamp()) WHERE "clientId"=$1`,
+						[id, issuerDigest(secret)],
+					);
+					return issuerJSON({ ...clientResult(row), client_secret: secret });
+				}
+				if (update && changes?.success && user) {
+					await updateProjectIssuerClient(
+						client,
+						id,
+						changes.data.update,
+						clientResult(row),
+						options.trustedOrigins,
+					);
+					const saved = await readClient(client, id);
+					if (!saved) throw new Error("The project client was not updated.");
+					await auditClient(client, path, user.id, id);
+					return issuerJSON(clientResult(saved));
+				}
+				return issuerJSON(clientResult(row));
+			});
+		} catch (error) {
+			if (error instanceof ProjectOAuthError) return error.response();
+			throw error;
+		}
 	};
 }

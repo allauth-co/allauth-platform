@@ -23,8 +23,8 @@ export class ProjectOAuthError extends Error {
 	}
 }
 
-export function issuerJSON(body: object) {
-	return Response.json(body, { headers: noStore });
+export function issuerJSON(body: object, status = 200) {
+	return Response.json(body, { status, headers: noStore });
 }
 
 export function issuerDigest(value: string) {
