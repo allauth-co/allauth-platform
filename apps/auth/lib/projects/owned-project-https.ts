@@ -42,6 +42,10 @@ function publicAddress(address: string) {
 	);
 }
 
+export class UnsafeProjectHttpsTarget extends Error {}
+
+export class ProjectHttpsResponseTooLarge extends Error {}
+
 export function publicProjectHttpsURL(input: string, allowIP = false) {
 	const url = new URL(input);
 	const hostname = url.hostname.replace(/^\[|\]$/g, "").replace(/\.$/, "");
@@ -58,14 +62,18 @@ export function publicProjectHttpsURL(input: string, allowIP = false) {
 				/(?:^|\.)(?:localhost|local|internal)$/.test(hostname) ||
 				hostname === "metadata.goog")
 	)
-		throw new Error("Invalid outbound project HTTPS URL.");
+		throw new UnsafeProjectHttpsTarget("Invalid outbound project HTTPS URL.");
 	return url;
 }
 
 /** Resolve and pin a public address while TLS verifies the original hostname. */
 export async function fetchPublicProjectHttps(
 	request: Request,
-	options: { timeoutMs: number; headersOnly?: boolean },
+	options: {
+		timeoutMs: number;
+		headersOnly?: boolean;
+		maximumResponseBytes?: number;
+	},
 ): Promise<Response> {
 	const url = publicProjectHttpsURL(request.url, true);
 	const hostname = url.hostname.replace(/^\[|\]$/g, "");
@@ -75,6 +83,7 @@ export async function fetchPublicProjectHttps(
 		request.signal,
 		AbortSignal.timeout(options.timeoutMs),
 	]);
+	const maximumResponseBytes = options.maximumResponseBytes ?? 256 * 1024;
 	let onAbort: (() => void) | undefined;
 	try {
 		const addresses = family
@@ -87,12 +96,13 @@ export async function fetchPublicProjectHttps(
 						else signal.addEventListener("abort", onAbort, { once: true });
 					}),
 				]);
+		if (!addresses.length)
+			throw new Error("The outbound HTTPS target did not resolve.");
 		if (
-			!addresses.length ||
 			addresses.length > 32 ||
 			addresses.some(({ address }) => !publicAddress(address))
 		)
-			throw new Error(
+			throw new UnsafeProjectHttpsTarget(
 				"The outbound HTTPS target must resolve to public addresses.",
 			);
 		const selected =
@@ -127,7 +137,11 @@ export async function fetchPublicProjectHttps(
 					}
 					if (status >= 300 && status < 400) {
 						upstream.destroy();
-						reject(new Error("Outbound project HTTPS target redirected."));
+						reject(
+							new UnsafeProjectHttpsTarget(
+								"Outbound project HTTPS target redirected.",
+							),
+						);
 						return;
 					}
 					const headers = new Headers();
@@ -144,14 +158,20 @@ export async function fetchPublicProjectHttps(
 						upstream.destroy();
 						return;
 					}
+					const tooLarge = () =>
+						new ProjectHttpsResponseTooLarge(
+							"Outbound project HTTPS response is too large.",
+						);
+					if (Number(headers.get("content-length")) > maximumResponseBytes) {
+						upstream.destroy();
+						reject(tooLarge());
+						return;
+					}
 					const chunks: Uint8Array[] = [];
 					let length = 0;
 					upstream.on("data", (chunk: Uint8Array) => {
 						length += chunk.length;
-						if (length > 256 * 1024)
-							upstream.destroy(
-								new Error("Outbound project HTTPS response is too large."),
-							);
+						if (length > maximumResponseBytes) upstream.destroy(tooLarge());
 						else chunks.push(chunk);
 					});
 					upstream.on("error", reject);

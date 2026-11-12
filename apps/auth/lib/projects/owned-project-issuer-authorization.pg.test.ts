@@ -17,7 +17,7 @@ import {
 } from "jose";
 import { Kysely, PostgresDialect } from "kysely";
 import { Pool } from "pg";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { defaultAuthPolicy } from "../auth-policy/policy";
 import { isPlatformAdmin } from "../configuration";
 import { allauthControl } from "../control";
@@ -26,6 +26,7 @@ import type { ControlWebhookEnvelope } from "../control/webhook-delivery";
 import { deliverPendingWebhooks, webhookSignature } from "../control/webhooks";
 import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
 import { readLegacySessionCookie } from "./legacy-session-cookie";
+import * as projectHttps from "./owned-project-https";
 import { createOwnedProjectEngine } from "./owned-project-engine";
 import { createOwnedProjectIssuerAuthorization } from "./owned-project-issuer-authorization";
 import { readSignedProjectIssuerQuery } from "./owned-project-issuer-authorization-query";
@@ -312,16 +313,16 @@ describe.skipIf(!existsSync(fixture))(
 			return response;
 		}
 
-		function managementEngine() {
+		function managementEngine(schemaName = schema, address = "192.0.2.29") {
 			return createOwnedProjectEngine({
 				database,
-				project: { slug: "issuer-fixture", schemaName: schema },
+				project: { slug: "issuer-fixture", schemaName },
 				policy: defaultAuthPolicy,
 				baseURL: origin,
 				basePath: "/api/auth",
 				trustedOrigins: [origin],
 				signingSecret: secret,
-				trustedIP: () => "192.0.2.29",
+				trustedIP: () => address,
 				issuer: true,
 			});
 		}
@@ -921,6 +922,254 @@ describe.skipIf(!existsSync(fixture))(
 				expect(await response.json()).toMatchObject({
 					refresh_token: expect.any(String),
 				});
+			}
+		});
+
+		it("keeps registered remote client keys available during code exchange, rotation and transient outages", async () => {
+			const owner = await browser();
+			const admin = await browser();
+			await database.query(
+				`UPDATE "${schema}"."user" SET role='admin' WHERE id=$1`,
+				[admin.userId],
+			);
+			const jwksURI = `${origin}/keys/fixture`;
+			const pairs = await Promise.all([
+				generateKeyPair("RS256"),
+				generateKeyPair("RS256"),
+			]);
+			const keys = await Promise.all(
+				pairs.map(async ({ publicKey }, index) => ({
+					...(await exportJWK(publicKey)),
+					kid: `fixture-remote-${index}`,
+					alg: "RS256",
+				})),
+			);
+			const document = (key: number) => Response.json({ keys: [keys[key]] });
+			let response = () => document(0);
+			const readRemoteKeys = (input: Request) => {
+				expect([jwksURI, `${origin}/keys/replacement`]).toContain(input.url);
+				expect(input.headers.get("accept")).toBe("application/json");
+				return response();
+			};
+			const nativeFetch = vi
+				.spyOn(globalThis, "fetch")
+				.mockImplementation(async (input, init) =>
+					readRemoteKeys(new Request(input as RequestInfo, init)),
+				);
+			const ownedFetch = vi
+				.spyOn(projectHttps, "fetchPublicProjectHttps")
+				.mockImplementation(async (input) => readRemoteKeys(input));
+			try {
+				const created = await legacy(
+					request("/oauth2/create-client", {
+						cookie: admin.cookie,
+						body: {
+							client_name: "Remote keys",
+							redirect_uris: [callback],
+							grant_types: ["authorization_code", "refresh_token"],
+							scope: "openid offline_access",
+							token_endpoint_auth_method: "private_key_jwt",
+							jwks_uri: jwksURI,
+						},
+					}),
+				);
+				expect(created.status, await created.clone().text()).toBe(201);
+				const { client_id: clientId } = (await created.json()) as {
+					client_id: string;
+				};
+				await database.query(
+					`UPDATE "${schema}"."oauthClient" SET "skipConsent"=true WHERE "clientId"=$1`,
+					[clientId],
+				);
+				const owned = managementEngine(schema, "192.0.2.30").dispatch;
+				const tokenEndpoint = `${issuer}/oauth2/token`;
+				async function send(
+					writer: typeof legacy,
+					grant: Record<string, string>,
+					key = 0,
+					audience = tokenEndpoint,
+					signingKey = pairs[key]!.privateKey,
+				) {
+					const proof = await new SignJWT({})
+						.setProtectedHeader({ alg: "RS256", kid: keys[key]!.kid })
+						.setIssuer(clientId)
+						.setSubject(clientId)
+						.setAudience(audience)
+						.setIssuedAt()
+						.setExpirationTime("2m")
+						.setJti(randomUUID())
+						.sign(signingKey);
+					return writer(
+						request("/oauth2/token", {
+							body: new URLSearchParams({
+								...grant,
+								client_id: clientId,
+								client_assertion: proof,
+								client_assertion_type:
+									"urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+							}),
+						}),
+					);
+				}
+				async function mint(writer: typeof legacy) {
+					const issued = await resultURL(
+						await legacy(
+							request("/oauth2/authorize", {
+								cookie: owner.cookie,
+								query: query(clientId, { scope: "openid offline_access" }),
+							}),
+						),
+					);
+					const code = issued.searchParams.get("code");
+					expect(code).toBeTruthy();
+					return token(
+						await send(writer, {
+							grant_type: "authorization_code",
+							code: code!,
+							redirect_uri: callback,
+							code_verifier: verifier,
+						}),
+					);
+				}
+				async function token(result: Response) {
+					expect(result.status, await result.clone().text()).toBe(200);
+					const { id_token, refresh_token } = (await result.json()) as {
+						id_token: string;
+						refresh_token: string;
+					};
+					expect(decodeJwt(id_token)).toMatchObject({
+						iss: issuer,
+						aud: clientId,
+						sub: owner.userId,
+					});
+					expect(refresh_token).toBeTruthy();
+					return refresh_token;
+				}
+				const refresh = (value: string) => ({
+					grant_type: "refresh_token",
+					refresh_token: value,
+				});
+				let current = await mint(legacy);
+				current = await token(await send(owned, refresh(current)));
+				expect(nativeFetch).toHaveBeenCalledTimes(1);
+				expect(ownedFetch).toHaveBeenCalledTimes(1);
+				response = () => {
+					throw new Error("Temporary remote keys outage");
+				};
+				current = await token(await send(owned, refresh(current)));
+				expect(ownedFetch).toHaveBeenCalledTimes(1);
+				const forbidden = async (result: Response) => {
+					expect(result.status).toBe(401);
+					expect(await result.json()).toMatchObject({
+						error: "invalid_client",
+					});
+				};
+				const siblingSchema = `allauth_project_${randomUUID().replaceAll("-", "")}`;
+				await database.query(`
+					CREATE SCHEMA "${siblingSchema}";
+					CREATE TABLE "${siblingSchema}"."oauthClient" (LIKE "${schema}"."oauthClient" INCLUDING ALL);
+					CREATE TABLE "${siblingSchema}"."rateLimit" (LIKE "${schema}"."rateLimit" INCLUDING ALL);
+				`);
+				await database.query(
+					`INSERT INTO "${siblingSchema}"."oauthClient" SELECT * FROM "${schema}"."oauthClient" WHERE "clientId"=$1`,
+					[clientId],
+				);
+				await forbidden(
+					await send(
+						managementEngine(siblingSchema).dispatch,
+						refresh(current),
+					),
+				);
+				expect(ownedFetch).toHaveBeenCalledTimes(2);
+
+				await database.query(
+					`UPDATE "${schema}"."oauthClient" SET "jwksUri"=$2 WHERE "clientId"=$1`,
+					[clientId, `${origin}/keys/replacement`],
+				);
+				await forbidden(await send(owned, refresh(current)));
+				expect(ownedFetch).toHaveBeenCalledTimes(3);
+				await database.query(
+					`UPDATE "${schema}"."oauthClient" SET "jwksUri"=$2 WHERE "clientId"=$1`,
+					[clientId, "https://unregistered.fixture.example/keys"],
+				);
+				await forbidden(await send(owned, refresh(current)));
+				expect(ownedFetch).toHaveBeenCalledTimes(3);
+				await database.query(
+					`UPDATE "${schema}"."oauthClient" SET "jwksUri"=$2 WHERE "clientId"=$1`,
+					[clientId, jwksURI],
+				);
+				await database.query(
+					`UPDATE "${schema}"."oauthClient" SET disabled=true WHERE "clientId"=$1`,
+					[clientId],
+				);
+				await forbidden(await send(owned, refresh(current)));
+				expect(ownedFetch).toHaveBeenCalledTimes(3);
+				await database.query(
+					`UPDATE "${schema}"."oauthClient" SET disabled=false WHERE "clientId"=$1`,
+					[clientId],
+				);
+
+				const realTime = Date.now();
+				vi.useFakeTimers({ toFake: ["Date"] });
+				vi.setSystemTime(realTime + 6 * 60_000);
+				current = await token(await send(legacy, refresh(current)));
+				current = await token(await send(owned, refresh(current)));
+				expect(nativeFetch).toHaveBeenCalledTimes(2);
+				expect(ownedFetch).toHaveBeenCalledTimes(4);
+				for (const failedLookup of [
+					() => Response.json({}, { status: 404 }),
+					() => new Response("Temporary proxy response"),
+				]) {
+					response = failedLookup;
+					current = await token(await send(legacy, refresh(current)));
+					current = await token(await send(owned, refresh(current)));
+				}
+				expect(nativeFetch).toHaveBeenCalledTimes(4);
+				expect(ownedFetch).toHaveBeenCalledTimes(6);
+
+				response = () => document(1);
+				await forbidden(
+					await send(owned, refresh(current), 1, `${issuer}/oauth2/introspect`),
+				);
+				expect(ownedFetch).toHaveBeenCalledTimes(6);
+				current = await token(await send(owned, refresh(current), 1));
+				expect(ownedFetch).toHaveBeenCalledTimes(7);
+				await forbidden(
+					await send(owned, refresh(current), 1, `${issuer}/oauth2/introspect`),
+				);
+				await forbidden(
+					await send(
+						owned,
+						refresh(current),
+						1,
+						tokenEndpoint,
+						pairs[0]!.privateKey,
+					),
+				);
+				expect(ownedFetch).toHaveBeenCalledTimes(7);
+				response = () => Response.json({ keys: [{ kty: "RSA" }] });
+				vi.setSystemTime(realTime + 12 * 60_000);
+				await forbidden(await send(owned, refresh(current), 1));
+				expect(ownedFetch).toHaveBeenCalledTimes(8);
+				response = () => document(1);
+				current = await token(await send(owned, refresh(current), 1));
+				expect(ownedFetch).toHaveBeenCalledTimes(9);
+				vi.setSystemTime(realTime + 18 * 60_000);
+				response = () => {
+					throw new projectHttps.UnsafeProjectHttpsTarget("Disallowed address");
+				};
+				await forbidden(await send(owned, refresh(current), 1));
+				expect(ownedFetch).toHaveBeenCalledTimes(10);
+				response = () => document(1);
+				current = await token(await send(owned, refresh(current), 1));
+				vi.setSystemTime(realTime + 29 * 60_000);
+				response = () => Response.json({}, { status: 503 });
+				await forbidden(await send(owned, refresh(current), 1));
+				expect(ownedFetch).toHaveBeenCalledTimes(12);
+			} finally {
+				vi.useRealTimers();
+				nativeFetch.mockRestore();
+				ownedFetch.mockRestore();
 			}
 		});
 

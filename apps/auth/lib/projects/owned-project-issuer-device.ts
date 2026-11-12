@@ -4,9 +4,12 @@ import * as z from "zod";
 import { freshFeatureSession } from "../features/helpers";
 import { createProjectEngineStore } from "./owned-project-engine-store";
 import type { OwnedProjectIssuerAuthorizationOptions } from "./owned-project-issuer-authorization";
-import type { ProjectIssuerClient } from "./owned-project-issuer-client";
+import type {
+	IssuerClientAuthenticator,
+	ProjectIssuerClient,
+} from "./owned-project-issuer-client";
 import {
-	authenticateIssuerClient,
+	createIssuerClientAuthenticator,
 	readIssuerClient,
 } from "./owned-project-issuer-client";
 import {
@@ -71,6 +74,7 @@ export interface OwnedProjectIssuerDeviceOptions
 	projectSlug: string;
 	trustedOrigins?: readonly string[];
 	trustedIP(request: Request): string | null;
+	authenticateClient?: IssuerClientAuthenticator;
 }
 
 export interface ProjectDeviceGrant {
@@ -265,6 +269,9 @@ export function createOwnedProjectIssuerDevice(
 	]);
 	const verificationURL = new URL("/device", platform);
 	verificationURL.searchParams.set("project", slug);
+	const authenticateClient =
+		options.authenticateClient ??
+		createIssuerClientAuthenticator(options.issuer, browserOrigins);
 
 	function formEncoded(request: Request) {
 		return (
@@ -349,13 +356,7 @@ export function createOwnedProjectIssuerDevice(
 				!(await readIssuerClient(database, bodyId))
 			)
 				throw new ProjectOAuthError("invalid_client", "Invalid client ID");
-			const client = await authenticateIssuerClient(
-				database,
-				request,
-				form,
-				options.issuer,
-				true,
-			);
+			const client = await authenticateClient(database, request, form, true);
 			try {
 				requireDeviceClient(client);
 				const scopes = deviceScopes(form.get("scope"), client);

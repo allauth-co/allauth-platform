@@ -2,6 +2,7 @@ import type { LegacyMfaKeys } from "./legacy-mfa-record";
 import { createProjectEngineStore } from "./owned-project-engine-store";
 import type { OwnedProjectIssuerAuthorizationOptions } from "./owned-project-issuer-authorization";
 import { createOwnedProjectIssuerAuthorization } from "./owned-project-issuer-authorization";
+import { createIssuerClientAuthenticator } from "./owned-project-issuer-client";
 import { createOwnedProjectIssuerClients } from "./owned-project-issuer-clients";
 import { createOwnedProjectConsentManagement } from "./owned-project-issuer-consent-management";
 import { createOwnedProjectIssuerDevice } from "./owned-project-issuer-device";
@@ -71,15 +72,25 @@ export function createOwnedProjectIssuer(
 		store,
 		trustedOrigins: options.managementOrigins,
 	});
-	const device = createOwnedProjectIssuerDevice(options);
+	const authenticateClient = createIssuerClientAuthenticator(
+		options.issuer,
+		options.managementOrigins,
+	);
+	const device = createOwnedProjectIssuerDevice({
+		...options,
+		authenticateClient,
+	});
 	const logout = createOwnedProjectIssuerLogout({
 		...options,
 		...options.logout,
 	});
 	const keyring = createOwnedProjectIssuerKeys(options);
-	const token = createOwnedProjectIssuerToken(options);
+	const token = createOwnedProjectIssuerToken({
+		...options,
+		authenticateClient,
+	});
 	const { activeAccess, introspect, revoke } =
-		createOwnedProjectIssuerIntrospection(options);
+		createOwnedProjectIssuerIntrospection({ ...options, authenticateClient });
 	const userinfo = createOwnedProjectIssuerUserInfo({
 		...options,
 		activeAccess,

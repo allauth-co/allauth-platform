@@ -2,7 +2,9 @@ import { EventEmitter } from "node:events";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	fetchPublicProjectHttps,
+	ProjectHttpsResponseTooLarge,
 	publicProjectHttpsURL,
+	UnsafeProjectHttpsTarget,
 } from "./owned-project-https";
 
 const { lookup, https } = vi.hoisted(() => ({
@@ -38,7 +40,7 @@ describe("public project HTTPS transport", () => {
 					timeoutMs: 1000,
 				},
 			),
-		).rejects.toThrow("must resolve to public addresses");
+		).rejects.toBeInstanceOf(UnsafeProjectHttpsTarget);
 		expect(https).not.toHaveBeenCalled();
 	});
 
@@ -99,7 +101,41 @@ describe("public project HTTPS transport", () => {
 					timeoutMs: 1000,
 				},
 			),
-		).rejects.toThrow("redirected");
+		).rejects.toBeInstanceOf(UnsafeProjectHttpsTarget);
 		expect(https).toHaveBeenCalledTimes(1);
+	});
+
+	it.each([
+		true,
+		false,
+	])("bounds the HTTPS response before buffering (declared length: %s)", async (declared) => {
+		lookup.mockResolvedValue([{ address: "93.184.216.34", family: 4 }]);
+		const destroy = vi.fn();
+		https.mockImplementation((_url, _options, respond) =>
+			Object.assign(new EventEmitter(), {
+				end() {
+					const response = Object.assign(new EventEmitter(), {
+						statusCode: 200,
+						headers: declared ? { "content-length": "65537" } : {},
+						destroy(error?: Error) {
+							destroy();
+							if (error) response.emit("error", error);
+						},
+					});
+					respond(response);
+					if (!declared) {
+						response.emit("data", Buffer.alloc(65536));
+						response.emit("data", Buffer.alloc(1));
+					}
+				},
+			}),
+		);
+		await expect(
+			fetchPublicProjectHttps(new Request("https://rp.fixture.example/keys"), {
+				timeoutMs: 1000,
+				maximumResponseBytes: 64 * 1024,
+			}),
+		).rejects.toBeInstanceOf(ProjectHttpsResponseTooLarge);
+		expect(destroy).toHaveBeenCalledOnce();
 	});
 });

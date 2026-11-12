@@ -1,8 +1,14 @@
 import { createHash, timingSafeEqual } from "node:crypto";
-import { createLocalJWKSet, decodeJwt, jwtVerify } from "jose";
+import type { JWTPayload } from "jose";
+import { createLocalJWKSet, decodeJwt, errors, jwtVerify } from "jose";
 import type { PoolClient } from "pg";
 import * as z from "zod";
-import { fetchPublicProjectHttps } from "./owned-project-https";
+import {
+	fetchPublicProjectHttps,
+	ProjectHttpsResponseTooLarge,
+	publicProjectHttpsURL,
+	UnsafeProjectHttpsTarget,
+} from "./owned-project-https";
 import { issuerDigest, ProjectOAuthError } from "./owned-project-issuer-http";
 
 export const issuerAssertionAlgorithms = [
@@ -19,6 +25,7 @@ export const issuerAssertionAlgorithms = [
 ];
 
 export interface ProjectIssuerClient {
+	id: string;
 	clientId: string;
 	clientSecret: string | null;
 	tokenEndpointAuthMethod: string | null;
@@ -41,16 +48,24 @@ export interface ProjectIssuerClient {
 	name: string | null;
 }
 
-const clientColumns = `"clientId","clientSecret","tokenEndpointAuthMethod",disabled,
+const clientColumns = `id,"clientId","clientSecret","tokenEndpointAuthMethod",disabled,
 	"grantTypes",scopes,"enableEndSession","backchannelLogoutUri","dpopBoundAccessTokens",
 	"subjectType",jwks,"jwksUri",metadata,"redirectUris","postLogoutRedirectUris","applicationType","responseTypes","requirePKCE","skipConsent",name`;
 const assertionType = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
-const publicJwks = z.object({
-	keys: z
-		.array(z.looseObject({ kty: z.enum(["RSA", "EC", "OKP"]) }))
-		.min(1)
-		.max(30),
-});
+const publicJwk = z.looseObject({ kty: z.enum(["RSA", "EC", "OKP"]) });
+const inlinePublicJwks = z.object({ keys: z.array(publicJwk).min(1).max(30) });
+const remotePublicJwks = z.object({ keys: z.array(publicJwk).min(1) });
+const privateJwkFields = ["d", "p", "q", "dp", "dq", "qi", "oth", "k"];
+const jwksFreshMs = 5 * 60_000;
+const jwksMaximumAgeMs = 2 * jwksFreshMs;
+const maximumJwksBytes = 64 * 1024;
+const maximumCachedClients = 500;
+const jsonMediaType = /^application\/(?:[-\w.]+\+)?json\s*(?:;|$)/i;
+const ecAlgorithmByCurve = new Map([
+	["P-256", "ES256"],
+	["P-384", "ES384"],
+	["P-521", "ES512"],
+]);
 
 function invalidClient(message: string, method?: string) {
 	return new ProjectOAuthError(
@@ -94,39 +109,143 @@ export async function readIssuerClient(database: PoolClient, id: string) {
 	return rows[0];
 }
 
-async function registeredKeys(
-	client: ProjectIssuerClient,
-	signal: AbortSignal,
-) {
-	let value: unknown;
-	if (client.jwks) {
-		value = JSON.parse(client.jwks);
-	} else if (client.jwksUri) {
-		const response = await fetchPublicProjectHttps(
-			new Request(client.jwksUri, {
-				signal,
-				headers: { accept: "application/json" },
-			}),
-			{ timeoutMs: 3000 },
-		);
-		if (
-			!response.ok ||
-			Number(response.headers.get("content-length")) > 64 * 1024
-		)
-			throw invalidClient("Could not read registered client keys.");
-		const raw = await response.text();
-		if (raw.length > 64 * 1024)
-			throw invalidClient("Could not read registered client keys.");
-		value = JSON.parse(raw);
-	}
-	const keys = publicJwks.parse(value);
-	if (
-		keys.keys.some((key) =>
-			["d", "p", "q", "dp", "dq", "qi", "oth", "k"].some((name) => name in key),
-		)
-	)
+function publicClientKeys(value: unknown, remote = false) {
+	// Native remote documents are bounded by bytes, not by the inline registration limit.
+	const keys = (remote ? remotePublicJwks : inlinePublicJwks).parse(value);
+	if (keys.keys.some((key) => privateJwkFields.some((name) => name in key)))
 		throw invalidClient("Registered client keys must be public.");
+	if (
+		remote &&
+		!keys.keys.every((key) => {
+			const field = (name: string) =>
+				typeof key[name] === "string" && key[name].length > 0;
+			if (
+				key.alg !== undefined &&
+				(typeof key.alg !== "string" ||
+					!issuerAssertionAlgorithms.includes(key.alg))
+			)
+				return false;
+			if (key.kty === "RSA")
+				return (
+					field("n") &&
+					field("e") &&
+					(key.alg === undefined || /^(RS|PS)/.test(key.alg))
+				);
+			if (key.kty === "OKP")
+				return (
+					key.crv === "Ed25519" &&
+					field("x") &&
+					(key.alg === undefined || key.alg === "EdDSA")
+				);
+			const algorithm =
+				typeof key.crv === "string" && ecAlgorithmByCurve.get(key.crv);
+			return Boolean(
+				algorithm &&
+					field("x") &&
+					field("y") &&
+					(key.alg === undefined || key.alg === algorithm),
+			);
+		})
+	)
+		throw invalidClient("The registered public key document is invalid.");
 	return createLocalJWKSet(keys);
+}
+
+type ClientKeys = ReturnType<typeof publicClientKeys>;
+type CachedClientKeys = { keys: ClientKeys; fetchedAt: number };
+
+/** Keep the remote key document cache local to one project issuer and transport. */
+function createRegisteredClientKeys(trustedOrigins: ReadonlySet<string>) {
+	const cache = new Map<string, CachedClientKeys>();
+	const pending = new Map<string, Promise<CachedClientKeys | undefined>>();
+
+	async function load(uri: string) {
+		let response: Response;
+		try {
+			response = await fetchPublicProjectHttps(
+				new Request(uri, { headers: { accept: "application/json" } }),
+				{ timeoutMs: 5000, maximumResponseBytes: maximumJwksBytes },
+			);
+		} catch (error) {
+			if (
+				error instanceof UnsafeProjectHttpsTarget ||
+				error instanceof ProjectHttpsResponseTooLarge
+			)
+				throw error;
+			return;
+		}
+		if (response.redirected || (response.status >= 300 && response.status < 400))
+			throw invalidClient("The registered key document redirected.");
+		if (Number(response.headers.get("content-length")) > maximumJwksBytes)
+			throw invalidClient("Could not read registered client keys.");
+		if (
+			response.status !== 200 ||
+			!jsonMediaType.test(response.headers.get("content-type") ?? "")
+		)
+			return;
+		const bytes = await response.arrayBuffer();
+		if (bytes.byteLength > maximumJwksBytes)
+			throw invalidClient("Could not read registered client keys.");
+		const raw = new TextDecoder().decode(bytes);
+		return {
+			keys: publicClientKeys(JSON.parse(raw), true),
+			fetchedAt: Date.now(),
+		};
+	}
+
+	return async function registeredKeys(
+		client: ProjectIssuerClient,
+		signal: AbortSignal,
+		previous?: ClientKeys,
+	): Promise<ClientKeys> {
+		signal.throwIfAborted();
+		if (client.jwks && !previous)
+			return publicClientKeys(JSON.parse(client.jwks));
+		if (!client.jwksUri || client.jwks)
+			throw invalidClient("Registered client keys are unavailable.");
+		const uri = client.jwksUri;
+		if (!trustedOrigins.has(publicProjectHttpsURL(uri, true).origin))
+			throw invalidClient(
+				"The registered key document origin is no longer trusted.",
+			);
+		const key = JSON.stringify([client.id, client.clientId, uri]);
+		const cached = cache.get(key);
+		if (
+			cached &&
+			cached.keys !== previous &&
+			Date.now() - cached.fetchedAt < jwksFreshMs
+		)
+			return cached.keys;
+		let lookup = pending.get(key);
+		if (!lookup) {
+			lookup = load(uri)
+				.then(
+					(result) => {
+						if (result) {
+							cache.delete(key);
+							cache.set(key, result);
+							if (cache.size > maximumCachedClients)
+								cache.delete(cache.keys().next().value!);
+						}
+						return result;
+					},
+					(error: unknown) => {
+						// Reject a malformed replacement or an unsafe destination even if
+						// a previously valid document remains within its stale window.
+						cache.delete(key);
+						throw error;
+					},
+				)
+				.finally(() => pending.delete(key));
+			pending.set(key, lookup);
+		}
+		const current = await lookup;
+		signal.throwIfAborted();
+		if (current) return current.keys;
+		if (!previous && cached && Date.now() - cached.fetchedAt < jwksMaximumAgeMs)
+			return cached.keys;
+		throw invalidClient("Could not read registered client keys.");
+	};
 }
 
 async function verifyAssertion(
@@ -135,37 +254,47 @@ async function verifyAssertion(
 	assertion: string,
 	issuer: string,
 	request: Request,
+	registeredKeys: ReturnType<typeof createRegisteredClientKeys>,
 ) {
+	const endpoint = new URL(request.url);
+	const audience = [issuer, endpoint.origin + endpoint.pathname];
 	let claims: Awaited<ReturnType<typeof jwtVerify>>["payload"];
 	try {
-		({ payload: claims } = await jwtVerify(
-			assertion,
-			await registeredKeys(client, request.signal),
-			{
-				issuer: client.clientId,
-				subject: client.clientId,
-				audience: [
-					issuer,
-					new URL(request.url).origin + new URL(request.url).pathname,
-				],
-				algorithms: issuerAssertionAlgorithms,
-				requiredClaims: ["exp", "jti"],
-			},
-		));
+		// These unverified fields can only reject early. JOSE still authenticates
+		// the signature and every binding before any assertion state is written.
+		const preview = decodeJwt(assertion);
+		const audiences = Array.isArray(preview.aud) ? preview.aud : [preview.aud];
+		if (
+			preview.iss !== client.clientId ||
+			preview.sub !== client.clientId ||
+			!audience.some((value) => audiences.includes(value)) ||
+			!validAssertionLifetime(preview)
+		)
+			throw invalidClient("Invalid client assertion claims.");
+		const settings = {
+			issuer: client.clientId,
+			subject: client.clientId,
+			audience,
+			algorithms: issuerAssertionAlgorithms,
+			requiredClaims: ["exp", "jti"],
+		};
+		const keys = await registeredKeys(client, request.signal);
+		try {
+			({ payload: claims } = await jwtVerify(assertion, keys, settings));
+		} catch (error) {
+			if (
+				!(error instanceof errors.JWKSNoMatchingKey) ||
+				!client.jwksUri ||
+				client.jwks
+			)
+				throw error;
+			const refreshed = await registeredKeys(client, request.signal, keys);
+			({ payload: claims } = await jwtVerify(assertion, refreshed, settings));
+		}
 	} catch {
 		throw invalidClient("Client assertion signature verification failed.");
 	}
-	const now = Math.floor(Date.now() / 1000);
-	if (
-		typeof claims.exp !== "number" ||
-		claims.exp <= now ||
-		claims.exp > now + 300 ||
-		(typeof claims.iat === "number" &&
-			(claims.iat < now - 300 || claims.iat > now + 5)) ||
-		typeof claims.jti !== "string" ||
-		!claims.jti ||
-		claims.jti.length > 1024
-	)
+	if (!validAssertionLifetime(claims))
 		throw invalidClient("Invalid client assertion lifetime or identifier.");
 	const id = createHash("sha256")
 		.update(`private_key_jwt:${client.clientId}:${claims.jti}`)
@@ -183,12 +312,31 @@ async function verifyAssertion(
 		);
 }
 
-export async function authenticateIssuerClient(
+function validAssertionLifetime(
+	claims: JWTPayload,
+): claims is JWTPayload & { exp: number; jti: string } {
+	const now = Math.floor(Date.now() / 1000);
+	return (
+		typeof claims.exp === "number" &&
+		claims.exp > now &&
+		claims.exp <= now + 300 &&
+		(claims.nbf === undefined ||
+			(typeof claims.nbf === "number" && claims.nbf <= now)) &&
+		(typeof claims.iat !== "number" ||
+			(claims.iat >= now - 300 && claims.iat <= now + 5)) &&
+		typeof claims.jti === "string" &&
+		claims.jti.length > 0 &&
+		claims.jti.length <= 1024
+	);
+}
+
+async function authenticateIssuerClient(
 	database: PoolClient,
 	request: Request,
 	form: URLSearchParams,
 	issuer: string,
 	allowPublic: boolean,
+	registeredKeys: ReturnType<typeof createRegisteredClientKeys>,
 ) {
 	const authorization = request.headers.get("authorization");
 	const bodyId = form.get("client_id");
@@ -232,7 +380,14 @@ export async function authenticateIssuerClient(
 	)
 		throw invalidClient("Invalid client credentials.", method);
 	if (method === "private_key_jwt") {
-		await verifyAssertion(database, client, assertion!, issuer, request);
+		await verifyAssertion(
+			database,
+			client,
+			assertion!,
+			issuer,
+			request,
+			registeredKeys,
+		);
 	} else if (
 		method !== "none" &&
 		(!secret || !equalDigest(secret, client.clientSecret))
@@ -241,3 +396,28 @@ export async function authenticateIssuerClient(
 	}
 	return client;
 }
+
+export function createIssuerClientAuthenticator(
+	issuer: string,
+	trustedOrigins: ReadonlySet<string> = new Set([new URL(issuer).origin]),
+) {
+	const registeredKeys = createRegisteredClientKeys(trustedOrigins);
+	return (
+		database: PoolClient,
+		request: Request,
+		form: URLSearchParams,
+		allowPublic: boolean,
+	) =>
+		authenticateIssuerClient(
+			database,
+			request,
+			form,
+			issuer,
+			allowPublic,
+			registeredKeys,
+		);
+}
+
+export type IssuerClientAuthenticator = ReturnType<
+	typeof createIssuerClientAuthenticator
+>;

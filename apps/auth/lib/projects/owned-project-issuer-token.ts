@@ -3,8 +3,11 @@ import { SignJWT } from "jose";
 import type { Pool, PoolClient } from "pg";
 import type { LegacyMfaKeys } from "./legacy-mfa-record";
 import { createProjectEngineStore } from "./owned-project-engine-store";
-import type { ProjectIssuerClient } from "./owned-project-issuer-client";
-import { authenticateIssuerClient } from "./owned-project-issuer-client";
+import type {
+	IssuerClientAuthenticator,
+	ProjectIssuerClient,
+} from "./owned-project-issuer-client";
+import { createIssuerClientAuthenticator } from "./owned-project-issuer-client";
 import { readAuthorizationCode } from "./owned-project-issuer-code";
 import {
 	consumeDeviceGrant,
@@ -60,6 +63,7 @@ interface RefreshOptions {
 	schemaName: string;
 	issuer: string;
 	keys: LegacyMfaKeys;
+	authenticateClient?: IssuerClientAuthenticator;
 }
 
 function tokenValue() {
@@ -221,6 +225,9 @@ export function createOwnedProjectIssuerToken(options: RefreshOptions) {
 	const store = createProjectEngineStore(options.database, options.schemaName);
 	const keyring = createOwnedProjectIssuerKeys(options);
 	const origin = new URL(options.issuer).origin;
+	const authenticateClient =
+		options.authenticateClient ??
+		createIssuerClientAuthenticator(options.issuer);
 
 	async function rotate(
 		database: PoolClient,
@@ -566,13 +573,7 @@ export function createOwnedProjectIssuerToken(options: RefreshOptions) {
 					"This token grant is unavailable.",
 				);
 			return await store.transaction(async (database) => {
-				const client = await authenticateIssuerClient(
-					database,
-					request,
-					form,
-					options.issuer,
-					true,
-				);
+				const client = await authenticateClient(database, request, form, true);
 				// Protocol failures may consume a verified client assertion or a
 				// replayed grant. Their response must commit with that decision.
 				try {

@@ -3,9 +3,12 @@ import type { Pool, PoolClient } from "pg";
 import * as z from "zod";
 import type { LegacyMfaKeys } from "./legacy-mfa-record";
 import { createProjectEngineStore } from "./owned-project-engine-store";
-import type { ProjectIssuerClient } from "./owned-project-issuer-client";
+import type {
+	IssuerClientAuthenticator,
+	ProjectIssuerClient,
+} from "./owned-project-issuer-client";
 import {
-	authenticateIssuerClient,
+	createIssuerClientAuthenticator,
 	readIssuerClient,
 } from "./owned-project-issuer-client";
 import {
@@ -190,11 +193,15 @@ export function createOwnedProjectIssuerIntrospection(options: {
 	schemaName: string;
 	issuer: string;
 	keys: LegacyMfaKeys;
+	authenticateClient?: IssuerClientAuthenticator;
 }) {
 	const store = createProjectEngineStore(options.database, options.schemaName);
 	const keyring = createOwnedProjectIssuerKeys(options);
 	const origin = new URL(options.issuer).origin;
 	const userinfo = `${options.issuer}/oauth2/userinfo`;
+	const authenticateClient =
+		options.authenticateClient ??
+		createIssuerClientAuthenticator(options.issuer);
 
 	async function existingResources(
 		database: PoolClient,
@@ -489,11 +496,10 @@ export function createOwnedProjectIssuerIntrospection(options: {
 		try {
 			const form = await issuerForm(request);
 			return await store.transaction(async (database) => {
-				const caller = await authenticateIssuerClient(
+				const caller = await authenticateClient(
 					database,
 					request,
 					form,
-					options.issuer,
 					operation === "revoke",
 				);
 				try {
