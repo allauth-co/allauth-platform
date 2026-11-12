@@ -422,25 +422,38 @@ export function createOwnedRecoveryHttp(options: RecoveryHttpOptions) {
 			return failure(400, "INVALID_TOKEN", "Invalid token");
 		const limited = await admission(request, "reset-password");
 		if (limited) return limited;
+		const auditContext = options.auditContext?.(request);
+		const rejected = async (status: number, code: string, message: string) => {
+			await store.transaction((client) =>
+				store.recordEvent(client, {
+					type: "user.password-reset",
+					outcome: "failure",
+					...auditContext,
+					metadata: { path: "/reset-password", errorCode: code },
+				}),
+			);
+			return failure(status, code, message);
+		};
 		const result = await reset({
 			token: parsed.data.token ?? query[0] ?? "",
 			newPassword: parsed.data.newPassword,
+			auditContext,
 		});
 		switch (result.status) {
 			case "reset":
 				return json({ status: true });
 			case "invalid-token":
-				return failure(400, "INVALID_TOKEN", "Invalid token");
+				return rejected(400, "INVALID_TOKEN", "Invalid token");
 			case "password-policy":
-				return failure(400, "INVALID_PASSWORD", result.message);
+				return rejected(400, "INVALID_PASSWORD", result.message);
 			case "breached-password":
-				return failure(
+				return rejected(
 					400,
 					"PASSWORD_COMPROMISED",
 					"Choose a password that has not appeared in a data breach.",
 				);
 			case "unavailable":
-				return failure(
+				return rejected(
 					503,
 					"PASSWORD_RESET_UNAVAILABLE",
 					"Password reset is unavailable.",

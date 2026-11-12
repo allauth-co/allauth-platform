@@ -41,6 +41,7 @@ async function legacyFixture(
 			emailAndPassword: {
 				enabled: true,
 				autoSignIn: false,
+				revokeSessionsOnPasswordReset: true,
 				password: clerkCompatiblePasswords,
 				async sendResetPassword() {},
 			},
@@ -320,6 +321,69 @@ describe.skipIf(!existsSync(fixturePath))(
 			);
 			expect(ownedEvents.map(({ id, ...event }) => event)).toEqual(
 				nativeEvents.map(({ id, ...event }) => event),
+			);
+		});
+
+		it("keeps password reset completion events and session removal compatible with the native writer", async () => {
+			const user = await seed("completed-reset@recovery-fixture.example");
+			const sessionId = "fixture-recovery-reset-session";
+			const headers = {
+				origin: appOrigin,
+				"user-agent": "synthetic-recovery-client",
+				"x-real-ip": "192.0.2.39",
+			};
+			const list = async () =>
+				(
+					await database.query(
+						`SELECT id, type, outcome, "actorId", "userId", "targetId", metadata,
+					 "ipAddress", "userAgent" FROM "${schema}"."allauthEvent"
+					 WHERE type IN ('user.password-reset','session.deleted')
+					 ORDER BY type, outcome, "createdAt", id`,
+					)
+				).rows;
+			const before = new Set((await list()).map((event) => event.id));
+			const setup = async () => {
+				const token = randomUUID().replaceAll("-", "").slice(0, 24);
+				await database.query(
+					`INSERT INTO "${schema}"."verification"(id,identifier,value,"expiresAt")
+					 VALUES ($1,$2,$3,now()+interval '1 hour')`,
+					[randomUUID(), `reset-password:${token}`, user.id],
+				);
+				await database.query(
+					`INSERT INTO "${schema}"."session"(id,token,"userId","expiresAt","updatedAt")
+					 VALUES ($1,$2,$3,now()+interval '1 hour',now())`,
+					[sessionId, randomUUID(), user.id],
+				);
+				return token;
+			};
+			const nativeToken = await setup();
+			for (const status of [200, 400]) {
+				const result = await native.auth.api.resetPassword({
+					headers,
+					body: { token: nativeToken, newPassword },
+					asResponse: true,
+				});
+				expect(result.status).toBe(status);
+			}
+			const legacyEvents = (await list()).filter(
+				(event) => !before.has(event.id),
+			);
+			expect(legacyEvents).toHaveLength(3);
+			for (const event of legacyEvents) before.add(event.id);
+
+			const token = await setup();
+			const recovery = fixture();
+			for (const status of [200, 400]) {
+				const request = post("/reset-password", { token, newPassword });
+				for (const [name, value] of Object.entries(headers))
+					request.headers.set(name, value);
+				expect((await recovery.handler(request))?.status).toBe(status);
+			}
+			const ownedEvents = (await list()).filter(
+				(event) => !before.has(event.id),
+			);
+			expect(ownedEvents.map(({ id, ...event }) => event)).toEqual(
+				legacyEvents.map(({ id, ...event }) => event),
 			);
 		});
 

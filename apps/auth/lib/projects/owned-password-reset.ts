@@ -4,6 +4,7 @@ import { passwordPolicyError } from "../auth-policy/password";
 import type { AuthPolicy } from "../auth-policy/policy";
 import { authPolicySchema } from "../auth-policy/policy";
 import { clerkCompatiblePasswords } from "../clerk-password";
+import type { ControlEventInput } from "../control/types";
 import { createProjectEngineStore } from "./owned-project-engine-store";
 import { checkedProjectSchema } from "./validation";
 
@@ -52,6 +53,7 @@ export function createOwnedPasswordReset(options: PasswordResetOptions) {
 	return async function consumePasswordReset(input: {
 		token: string;
 		newPassword: string;
+		auditContext?: Pick<ControlEventInput, "ipAddress" | "userAgent">;
 	}): Promise<PasswordResetResult> {
 		if (!policy.emailAndPasswordEnabled) return { status: "unavailable" };
 		if (!isLegacyPasswordResetToken(input.token))
@@ -124,14 +126,13 @@ export function createOwnedPasswordReset(options: PasswordResetOptions) {
 					VALUES ($1, $2, $2, 'credential', $3, statement_timestamp())`,
 					[accountId, userId, hashed],
 				);
-				await store.record(
-					client,
-					"account.linked",
-					"success",
-					"/reset-password",
+				await store.recordEvent(client, {
+					type: "account.linked",
+					outcome: "success",
 					userId,
-					accountId,
-				);
+					targetId: accountId,
+					metadata: { path: "/reset-password", provider: "credential" },
+				});
 			}
 			await client.query('DELETE FROM "oauthAccessToken" WHERE "userId" = $1', [
 				userId,
@@ -145,35 +146,30 @@ export function createOwnedPasswordReset(options: PasswordResetOptions) {
 				[userId],
 			);
 			for (const session of sessions.rows)
-				await store.record(
-					client,
-					"session.deleted",
-					"success",
-					"/reset-password",
+				await store.recordEvent(client, {
+					type: "session.deleted",
+					outcome: "success",
 					userId,
-					session.id,
-				);
+					targetId: session.id,
+					metadata: { path: "/reset-password" },
+				});
 			await client.query(
 				`INSERT INTO "allauthAudit"(id, "actorId", action, "targetId", "createdAt")
 				VALUES ($1, $2, 'password-reset', $2, statement_timestamp())`,
 				[randomUUID(), userId],
 			);
-			await store.record(
-				client,
-				"password-reset",
-				"success",
-				"/reset-password",
-				userId,
-				userId,
-			);
-			await store.record(
-				client,
-				"user.password-reset",
-				"success",
-				"/reset-password",
-				userId,
-				userId,
-			);
+			await store.recordEvent(client, {
+				type: "password-reset",
+				outcome: "success",
+				actorId: userId,
+				targetId: userId,
+			});
+			await store.recordEvent(client, {
+				type: "user.password-reset",
+				outcome: "success",
+				...input.auditContext,
+				metadata: { path: "/reset-password" },
+			});
 			return { status: "reset" };
 		});
 	};
