@@ -252,6 +252,24 @@ async function analyticsResponse(
 	return response.json();
 }
 
+async function projectSignInMetadata(
+	databaseURL: string,
+	project: Project,
+	userId: string,
+) {
+	const database = new Pool({ connectionString: databaseURL, max: 1 });
+	try {
+		const result = await database.query<{ metadata: Record<string, unknown> }>(
+			`SELECT metadata FROM "${project.schemaName}"."allauthEvent"
+			 WHERE type='auth.sign-in' AND outcome='success' AND "userId"=$1 ORDER BY "createdAt",id`,
+			[userId],
+		);
+		return result.rows.map(({ metadata }) => metadata);
+	} finally {
+		await database.end();
+	}
+}
+
 async function analyticsActivity(database: Pool, project: Project) {
 	const result = await database.query(
 		`SELECT "entityType","entityId",sources FROM "${project.schemaName}"."allauthAnalyticsActivity"
@@ -2743,10 +2761,27 @@ describe.skipIf(!existsSync(fixture))(
 					appleSignUp.status,
 					appleSignUp.ok ? undefined : await appleSignUp.clone().text(),
 				).toBe(200);
-				expect(await appleSignUp.json()).toMatchObject({
+				const appleDirectSignUp = (await appleSignUp.json()) as {
+					redirect: boolean;
+					user: { id: string; email: string; emailVerified: boolean };
+				};
+				expect(appleDirectSignUp).toMatchObject({
 					redirect: false,
 					user: { email: appleDirectEmail, emailVerified: false },
 				});
+				expect(
+					await projectSignInMetadata(
+						url(restored),
+						alpha,
+						appleDirectSignUp.user.id,
+					),
+				).toEqual([]);
+				const appleOwnedLoginEvents = await projectSignInMetadata(
+					url(restored),
+					alpha,
+					appleBrowserUser.id,
+				);
+				expect(appleOwnedLoginEvents).toHaveLength(1);
 				const appleVerification = await fixtureVerificationMail(
 					service,
 					appleDirectEmail,
@@ -4465,17 +4500,14 @@ describe.skipIf(!existsSync(fixture))(
 						body: { id: retainedSecurityRule?.id },
 					}),
 				).toEqual({ success: true });
-				const nativeBlocked = await service.request(
-					"/api/auth/sign-in/email",
-					{
-						host: alphaHost,
-						clientIP: "192.0.2.119",
-						body: {
-							email: "account@fixture-denied.example",
-							password: credentials.password,
-						},
+				const nativeBlocked = await service.request("/api/auth/sign-in/email", {
+					host: alphaHost,
+					clientIP: "192.0.2.119",
+					body: {
+						email: "account@fixture-denied.example",
+						password: credentials.password,
 					},
-				);
+				});
 				expect(nativeBlocked.status).toBe(429);
 				expect(await nativeBlocked.json()).toMatchObject({
 					code: "ALLAUTH_SECURITY_BLOCKED",
@@ -4655,6 +4687,13 @@ describe.skipIf(!existsSync(fixture))(
 				).toMatchObject({
 					user: { id: appleBrowserUser.id, email: runtimeFixtureApple.email },
 				});
+				expect(
+					await projectSignInMetadata(
+						url(restored),
+						alpha,
+						appleBrowserUser.id,
+					),
+				).toEqual([appleOwnedLoginEvents[0], appleOwnedLoginEvents[0]]);
 				const rolledBackMicrosoft = await service.request(ownedMicrosoft.path, {
 					cookie: ownedMicrosoft.cookie,
 				});

@@ -658,6 +658,14 @@ export function createOwnedProjectEngine(
 		path: string,
 		prior?: ProjectSession,
 	) {
+		const callback =
+			/^(\/(?:callback|oauth2\/callback|sso\/callback|sso\/saml2\/sp\/acs))\/([^/]+)$/.exec(
+				path,
+			);
+		const enterprise = Boolean(callback && path.startsWith("/sso/"));
+		const auditPath = callback
+			? `${callback[1]}/:${enterprise ? "providerId" : "id"}`
+			: path;
 		const headers = new Headers();
 		const existing = multiSessionTokens(request.headers);
 		const owned = [];
@@ -670,7 +678,7 @@ export function createOwnedProjectEngine(
 		if (owned.length) {
 			const removed = await store.revoke(
 				{ tokens: owned.map((item) => item.token) },
-				path,
+				auditPath,
 				Boolean(backchannel),
 				client,
 			);
@@ -699,33 +707,33 @@ export function createOwnedProjectEngine(
 			outcome: "success",
 			userId: user.id,
 			targetId: id,
-			metadata: { path },
+			metadata: { path: auditPath },
 		});
-		if (!prior) {
-			const passwordMethod =
-				path === "/sign-in/email"
-					? "email"
-					: path === "/sign-in/username"
-						? "username"
-						: undefined;
+		const primaryPath = isPrimaryAuthenticationPath(path);
+		if (!prior && primaryPath) {
+			const method = callback
+				? enterprise
+					? "sso"
+					: "social"
+				: path.split("/").pop();
 			await store.recordEvent(client, {
 				type: "auth.sign-in",
 				outcome: "success",
 				actorId: user.id,
 				userId: user.id,
 				targetId: id,
-				...(passwordMethod ? browserEventContext(request) : {}),
-				metadata: { path, method: passwordMethod },
+				...browserEventContext(request),
+				metadata: { path: auditPath, method, provider: callback?.[2] },
 			});
 		}
-		// The audit trigger already records ordinary primary sign-ins. Rotation
-		// and organization attribution require the committed replacement session.
+		// The audit trigger records ordinary primary sign-ins. Rotation and
+		// organization attribution use the surviving replacement session.
 		if (
 			analytics &&
 			!user.isAnonymous &&
-			(prior || session.activeOrganizationId)
+			(prior || (primaryPath && session.activeOrganizationId))
 		) {
-			const source = !prior || isPrimaryAuthenticationPath(path) ? 1 : 4;
+			const source = primaryPath ? 1 : 4;
 			afterOwnedProjectCommit(client, () =>
 				analyticsSessions.set(request, { session, source }),
 			);
@@ -741,7 +749,7 @@ export function createOwnedProjectEngine(
 			);
 		}
 		rememberPreference(headers, rememberMe);
-		if (!prior && user.emailVerified) {
+		if (!prior && primaryPath && user.emailVerified) {
 			const name = `${prefix}control_device`;
 			const known = await security.registerDevice(
 				client,
