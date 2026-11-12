@@ -65,9 +65,11 @@ async function bindPortalRequest(request: Request, permitProtocolAuthorization =
 	const env = await getAuthEnvironment();
 	const hosted = await requestHostedBinding(request, env);
 	if (!hosted) return { env, request, binding: null };
-	const url = new URL(request.url);
-	url.protocol = "https:";
-	url.host = hosted.binding.hostname;
+	const incoming = new URL(request.url);
+	// Assigning URL.host would keep the standalone listener port.
+	const url = new URL(`https://${hosted.binding.hostname}`);
+	url.pathname = incoming.pathname;
+	url.search = incoming.search;
 	// The signed gateway proves the realm. The protocol endpoint independently
 	// authenticates the client credential against that realm.
 	const authorization = permitProtocolAuthorization && hostedProtocolAuthorization(request);

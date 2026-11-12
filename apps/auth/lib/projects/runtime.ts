@@ -66,6 +66,7 @@ import { createBoundedProjectCache } from "./cache";
 import { projectManagement } from "./management-plugin";
 import { projectOriginFingerprint } from "./origins";
 import type { OwnedProjectSCIMConsole } from "./owned-project-scim-console";
+import { selectRehearsalProjectEngine } from "./project-engine-rehearsal-selection";
 import { verifiedProjectRequest } from "./proxy";
 import type { Project } from "./registry";
 import {
@@ -99,19 +100,22 @@ const entries = createBoundedProjectCache<Entry>(8, async (entry) => {
 });
 const instances = new WeakMap<Instance, LegacyEntry>();
 
+/** Assemble a realm's selected engine with the same authority as the legacy runtime. */
+export type ProjectEngineBuilder = (input: {
+	database: Pool;
+	project: Project;
+	policy: AuthPolicy;
+	baseURL: string;
+	basePath: string;
+	signingSecret: string;
+	credentialHashSecret: string;
+}) => AuthEngine | Promise<AuthEngine>;
+
 interface IsolatedProjectEngineFixture {
 	projectId: string;
 	schemaName: string;
 	databaseURL: string;
-	build(input: {
-		database: Pool;
-		project: Project;
-		policy: AuthPolicy;
-		baseURL: string;
-		basePath: string;
-		signingSecret: string;
-		credentialHashSecret: string;
-	}): AuthEngine | Promise<AuthEngine>;
+	build: ProjectEngineBuilder;
 }
 
 let fixture: Readonly<IsolatedProjectEngineFixture> | undefined;
@@ -193,13 +197,31 @@ export function projectSecret(env: AuthEnvironment, projectId: string): string {
 		.digest("hex");
 }
 
+function bindOwnedDirectTransport(engine: AuthEngine, origin: string): AuthEngine {
+	function bind(request: Request) {
+		const incoming = new URL(request.url);
+		if (incoming.origin === origin) return request;
+		// Standalone Next may use the listener address in Request.url. The project
+		// route already selects the realm and verifies signed requests before dispatch.
+		const url = new URL(origin);
+		url.pathname = incoming.pathname;
+		url.search = incoming.search;
+		return new Request(url, request);
+	}
+	return {
+		...engine,
+		dispatch: (request) => engine.dispatch(bind(request)),
+		readSession: (request) => engine.readSession(bind(request)),
+	};
+}
+
 async function build(
 	project: Project,
 	environment: AuthEnvironment,
 	policy: AuthPolicy,
 	googleProvider: StoredGoogleProvider,
 	publicOrigin?: string,
-	owned?: Readonly<IsolatedProjectEngineFixture>,
+	owned?: ProjectEngineBuilder,
 ): Promise<Entry> {
 	const schema = checkedProjectSchema(project.schemaName);
 	const pool = new Pool({
@@ -231,16 +253,23 @@ async function build(
 			? "/api/auth"
 			: `/api/projects/${project.slug}/auth`;
 		if (owned) {
-			const engine = await owned.build({
+			const baseURL = publicOrigin ?? authOrigin(environment);
+			const engine = await owned({
 				database: pool,
 				project,
 				policy,
-				baseURL: publicOrigin ?? authOrigin(environment),
+				baseURL,
 				basePath,
 				signingSecret: secret,
 				credentialHashSecret: env.SCIM_CREDENTIAL_HASH_SECRET,
 			});
-			return { kind: "owned", engine, env, project, pool };
+			return {
+				kind: "owned",
+				engine: publicOrigin ? engine : bindOwnedDirectTransport(engine, baseURL),
+				env,
+				project,
+				pool,
+			};
 		}
 		const requirePlatformAdmin = async (ctx: GenericEndpointContext) => {
 			const currentProject = await getProject(project.slug, environment);
@@ -477,7 +506,9 @@ async function withProjectEntry<T>(
 	callback: (entry: Entry, project: Project) => Promise<T>,
 ): Promise<T> {
 	projectRuntimeStarted = true;
-	const owned = fixtureFor(project, env);
+	const owned =
+		fixtureFor(project, env)?.build ??
+		(await selectRehearsalProjectEngine(project, env));
 	const [configured, googleProvider] = await Promise.all([
 		readAuthPolicy(project.id, env),
 		readGoogleProvider(project.id, env),
