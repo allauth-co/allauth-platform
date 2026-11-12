@@ -18,6 +18,7 @@ import { defaultAuthPolicy } from "../auth-policy/policy";
 import { clerkCompatiblePasswords } from "../clerk-password";
 import { allauthControl } from "../control";
 import { newWebhookSigningSecret } from "../control/webhook-contract";
+import type { ControlWebhookEnvelope } from "../control/webhooks";
 import { deliverPendingWebhooks } from "../control/webhooks";
 import { productionTwoFactor } from "../mfa";
 import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
@@ -500,7 +501,7 @@ describe.skipIf(!existsSync(fixturePath))(
 										webhookSecret,
 									])
 										expect(body).not.toContain(sensitive);
-									const envelope = JSON.parse(body);
+									const envelope = JSON.parse(body) as ControlWebhookEnvelope;
 									const { id, createdAt, ...event } = envelope.data.event;
 									expect(envelope).toMatchObject({
 										id,
@@ -561,7 +562,9 @@ describe.skipIf(!existsSync(fixturePath))(
 								failed: 0,
 							});
 							expect(received).toHaveLength(expected.length);
-							expect(received).toEqual(expect.arrayContaining(expected));
+							expect(received).toEqual(
+								expect.arrayContaining<unknown>(expected),
+							);
 							if (scenario.code) {
 								expect(await identity(account.id)).toMatchObject({
 									email: account.email,
