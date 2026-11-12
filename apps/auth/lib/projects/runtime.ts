@@ -63,6 +63,7 @@ import {
 import { backendCredentialRepository } from "./backend-credentials";
 import { projectBrokerTwoFactor } from "./broker-two-factor";
 import { createBoundedProjectCache } from "./cache";
+import { observeProjectEngine, projectEngineMetricsSelected } from "./engine-metrics";
 import { projectManagement } from "./management-plugin";
 import { projectOriginFingerprint } from "./origins";
 import type { OwnedProjectSCIMConsole } from "./owned-project-scim-console";
@@ -252,6 +253,14 @@ async function build(
 		const basePath = publicOrigin
 			? "/api/auth"
 			: `/api/projects/${project.slug}/auth`;
+		const metricsEnabled = projectEngineMetricsSelected(environment, project.id);
+		const observe = (engine: AuthEngine, writer: "legacy" | "allauth") =>
+			metricsEnabled ? observeProjectEngine(engine, {
+				projectId: project.id,
+				writer,
+				transport: publicOrigin ? "hosted" : "project",
+				basePath,
+			}) : engine;
 		if (owned) {
 			const baseURL = publicOrigin ?? authOrigin(environment);
 			const engine = await owned({
@@ -265,7 +274,7 @@ async function build(
 			});
 			return {
 				kind: "owned",
-				engine: publicOrigin ? engine : bindOwnedDirectTransport(engine, baseURL),
+				engine: observe(publicOrigin ? engine : bindOwnedDirectTransport(engine, baseURL), "allauth"),
 				env,
 				project,
 				pool,
@@ -489,7 +498,7 @@ async function build(
 				}),
 			});
 		}
-		const entry: LegacyEntry = { kind: "legacy", auth: instance, engine, env, project, pool, shadowPool };
+		const entry: LegacyEntry = { kind: "legacy", auth: instance, engine: observe(engine, "legacy"), env, project, pool, shadowPool };
 		instances.set(instance, entry);
 		return entry;
 	} catch (error) {
@@ -518,7 +527,7 @@ async function withProjectEntry<T>(
 	// Transport secrets can rotate while the native auth instance remains cached.
 	// Verification must receive the registry row read for this request.
 	return entries.use(
-		`${project.id}:${configured.version}:engine:${owned ? "owned-fixture" : "legacy"}:shadow:${projectSessionShadowSelected(env, project)}:origins:${projectOriginFingerprint(project)}:owned-avatars:${ownedAvatarSelected(env, project.id)}:native-passkeys:${selectedNativePasskeys(env, project, publicOrigin).version}:google:${googleProvider.version}:microsoft:${microsoftConfigurationVersion(microsoft)}:apple:${appleConfigurationVersion(apple)}:${apple ? Math.floor(Date.now() / 86400000) : 0}:${publicOrigin ?? ""}`,
+		`${project.id}:${configured.version}:engine:${owned ? "owned-fixture" : "legacy"}:metrics:${projectEngineMetricsSelected(env, project.id)}:shadow:${projectSessionShadowSelected(env, project)}:origins:${projectOriginFingerprint(project)}:owned-avatars:${ownedAvatarSelected(env, project.id)}:native-passkeys:${selectedNativePasskeys(env, project, publicOrigin).version}:google:${googleProvider.version}:microsoft:${microsoftConfigurationVersion(microsoft)}:apple:${appleConfigurationVersion(apple)}:${apple ? Math.floor(Date.now() / 86400000) : 0}:${publicOrigin ?? ""}`,
 		() => build(project, env, configured.policy, googleProvider, publicOrigin, owned),
 		(entry) => callback(entry, project),
 	);

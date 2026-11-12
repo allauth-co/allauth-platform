@@ -15,6 +15,12 @@ Use the hosted preview to exercise email and username password sign-in, registra
 
 The session comparison emits only the project ID and the result `match`, `different` or `unavailable`. A revocation that commits between the two reads can produce a difference. Review unexplained differences in the isolated fixture before using the reader for authorization.
 
+## Measure a rollout cohort
+
+Set `ALLAUTH_PROJECT_ENGINE_METRICS_IDS` to the same comma-separated immutable project IDs on the legacy baseline and candidate. The service emits one `allauth.project_engine_metrics` record per active project, writer, transport and operation in each process window. Aggregate the outcome counts and latency histogram counts across processes before comparing periods. The last histogram bucket counts requests above the highest reported bound.
+
+The records cover sign-in and second-factor requests, provider callbacks, session reads and refreshes, and OAuth token exchanges and refreshes. HTTP redirects have a separate outcome, while known error redirects count as rejected. Compare these response outcomes with the realm's authentication event counts when assessing completed sign-ins. The metric records contain the project ID and fixed labels and counts.
+
 ## Project cutover
 
 - The AllAuth engine candidate covers password sign-in by email or username, registration, password recovery, email verification, session refresh and scoped session revocation in fixtures. Existing scrypt and Clerk bcrypt credentials still verify. Password recovery consumes legacy links and revokes project sessions, grants and outstanding challenges in the same transaction as the password change.
