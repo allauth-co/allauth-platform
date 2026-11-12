@@ -1,5 +1,7 @@
+import { decodeProtectedHeader } from "jose";
 import type { PoolClient } from "pg";
 import * as z from "zod";
+import { hasRemoteAgentKeys } from "../features/helpers";
 import {
 	decideOwnedAgentApproval,
 	listOwnedAgentApprovals,
@@ -15,7 +17,17 @@ import {
 	agentHostJSON as json,
 	createOwnedAgentHost,
 	enrollOwnedAgentHost,
+	invalidAgentBody,
 } from "./owned-project-agent-enrollment";
+import {
+	agentMachineAudience,
+	agentMachineProblem,
+	decodeAgentMachineJWT,
+	invalidAgentJWT,
+	readAgentMachineHost,
+	validAgentIdentifier,
+	verifyAgentMachineJWT,
+} from "./owned-project-agent-machine";
 import { registerOwnedProjectAgent } from "./owned-project-agent-registration";
 import { readOwnedAgentStatus } from "./owned-project-agent-status";
 import type { createProjectEngineStore } from "./owned-project-engine-store";
@@ -29,6 +41,7 @@ const listInput = z.object({
 const detailInput = z.object({ host_id: z.string() });
 const revokeInput = z.object({ host_id: z.string().optional() });
 const ownerRequired = "Only the owner of this agent host can change it.";
+const revokePath = "/host/revoke";
 
 type Host = {
 	id: string;
@@ -80,15 +93,12 @@ function forbidden(message: string) {
 	return json({ message }, 403);
 }
 
-async function revoke(client: PoolClient, userId: string, hostId: string) {
-	const host = (
-		await client.query<{ status: string }>(
-			`SELECT status FROM "agentHost" WHERE id=$1 AND "userId"=$2 FOR UPDATE`,
-			[hostId, userId],
-		)
-	).rows[0];
-	if (!host) return forbidden(ownerRequired);
-	if (host.status === "revoked")
+async function revokeLockedHost(
+	client: PoolClient,
+	hostId: string,
+	status: string,
+) {
+	if (status === "revoked")
 		return json({ host_id: hostId, status: "revoked", agents_revoked: 0 });
 	const { rows: agents } = await client.query<{ id: string }>(
 		`UPDATE "agent" SET status='revoked',"publicKey"='',kid=NULL,"updatedAt"=transaction_timestamp()
@@ -111,6 +121,104 @@ async function revoke(client: PoolClient, userId: string, hostId: string) {
 	});
 }
 
+async function revokeBrowserHost(
+	client: PoolClient,
+	userId: string,
+	hostId: string,
+) {
+	const {
+		rows: [host],
+	} = await client.query<{ status: string }>(
+		`SELECT status FROM "agentHost" WHERE id=$1 AND "userId"=$2 FOR UPDATE`,
+		[hostId, userId],
+	);
+	return host
+		? revokeLockedHost(client, hostId, host.status)
+		: forbidden(ownerRequired);
+}
+
+async function signedHostRevoke(
+	client: PoolClient,
+	request: Request,
+	body: unknown,
+) {
+	const token = /^Bearer\s+(\S+)$/i.exec(
+		request.headers.get("authorization") ?? "",
+	)?.[1];
+	try {
+		if (
+			token &&
+			token.length <= 8192 &&
+			decodeProtectedHeader(token).typ === "host+jwt"
+		)
+			return revokeAuthenticatedHost(client, request, body);
+	} catch {
+		// The native project boundary rejects a non-host authorization header.
+	}
+	return forbidden("Use your browser session or a valid signed host request.");
+}
+
+async function revokeAuthenticatedHost(
+	client: PoolClient,
+	request: Request,
+	body: unknown,
+) {
+	const url = new URL(request.url);
+	const decoded = decodeAgentMachineJWT(request);
+	if (
+		!decoded ||
+		decoded.typ !== "host+jwt" ||
+		!validAgentIdentifier(decoded.claims.iss)
+	)
+		return invalidAgentJWT(url.origin);
+	const audience = agentMachineAudience(url, revokePath);
+	if (
+		![decoded.claims.aud]
+			.flat()
+			.some((value) => value && audience.includes(value))
+	)
+		return invalidAgentJWT(url.origin);
+	const issuer = decoded.claims.iss;
+	const hostUnavailable = () =>
+		agentMachineProblem(401, "agent_not_found", "Agent not found", url.origin);
+	const host = await readAgentMachineHost(client, issuer);
+	if (!host?.userId || !host.publicKey || host.status !== "active")
+		return hostUnavailable();
+	const proof = await verifyAgentMachineJWT(
+		decoded.token,
+		host,
+		audience,
+		url.origin,
+	);
+	if (proof instanceof Response) return proof;
+	if (hasRemoteAgentKeys(body))
+		return json(
+			{
+				message:
+					"Use an inline public key. Remote key discovery is not active.",
+			},
+			400,
+		);
+	const parsed = revokeInput.safeParse(body);
+	if (!parsed.success) return invalidAgentBody(parsed.error);
+	if (parsed.data.host_id !== undefined && parsed.data.host_id !== host.id)
+		return agentMachineProblem(
+			403,
+			"unauthorized",
+			"Caller is not authorized for this operation",
+		);
+	const locked = await readAgentMachineHost(client, issuer, "update");
+	if (!locked || locked.id !== host.id || locked.status !== "active")
+		return hostUnavailable();
+	if (
+		locked.userId !== host.userId ||
+		locked.publicKey !== host.publicKey ||
+		locked.jwksUrl !== host.jwksUrl
+	)
+		return invalidAgentJWT(url.origin);
+	return revokeLockedHost(client, locked.id, locked.status);
+}
+
 /** Browser host management and token enrollment for the isolated candidate fixture. */
 export function createOwnedProjectAgentHosts(options: BrowserHosts) {
 	return async (
@@ -126,11 +234,12 @@ export function createOwnedProjectAgentHosts(options: BrowserHosts) {
 			request.method === "GET" &&
 			(path === "/agent/get" || path === "/agent/list");
 		const agentRevoke = request.method === "POST" && path === "/agent/revoke";
+		const hostRevoke = request.method === "POST" && path === revokePath;
 		const write =
 			decision ||
 			agentRevoke ||
-			(request.method === "POST" &&
-				(path === "/host/revoke" || path === "/host/create"));
+			hostRevoke ||
+			(request.method === "POST" && path === "/host/create");
 		const enroll = request.method === "POST" && path === "/host/enroll";
 		const read =
 			request.method === "GET" &&
@@ -171,10 +280,12 @@ export function createOwnedProjectAgentHosts(options: BrowserHosts) {
 			);
 		}
 		if (request.headers.has("authorization")) {
-			if (path === "/host/revoke" && request.headers.get("authorization"))
-				return forbidden(
-					"Use your browser session or a valid signed host request.",
+			if (hostRevoke && request.headers.get("authorization")) {
+				const body = await options.readBody(request);
+				return options.store.transaction((client) =>
+					signedHostRevoke(client, request, body),
 				);
+			}
 			return forbidden("Use your signed-in browser session for this action.");
 		}
 		if (!options.trustedRequest(request.headers, write))
@@ -240,7 +351,7 @@ export function createOwnedProjectAgentHosts(options: BrowserHosts) {
 				// AllAuth's owner guard rejects missing IDs along with unknown and foreign hosts.
 				const target = revokeInput.safeParse(body);
 				return target.success && target.data.host_id
-					? revoke(client, userId, target.data.host_id)
+					? revokeBrowserHost(client, userId, target.data.host_id)
 					: forbidden(ownerRequired);
 			}
 			if ("host_id" in input) {

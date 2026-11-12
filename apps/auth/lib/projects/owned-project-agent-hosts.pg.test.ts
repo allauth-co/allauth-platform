@@ -655,11 +655,31 @@ describe.skipIf(!existsSync(fixture))(
 		it.each([
 			"host",
 			"agent",
+			"signed host",
 		] as const)("preserves all prior rows if a %s grant transition fails", async (target) => {
-			const host = await createHost(`Rollback ${target} device`);
+			const machine =
+				target === "signed host"
+					? await nativeMachineHost("Rollback signed host device", ownerCookie)
+					: null;
+			const host = machine ?? (await createHost(`Rollback ${target} device`));
 			const [agent] = await seedDependents(host.hostId);
-			const body =
-				target === "host" ? { host_id: host.hostId } : { agent_id: agent };
+			const input =
+				target === "agent"
+					? { path: "/agent/revoke", body: { agent_id: agent } }
+					: { path: "/host/revoke", body: { host_id: host.hostId } };
+			const proof = machine
+				? `Bearer ${await nativeClientHostProof(machine)}`
+				: undefined;
+			const revoke = () =>
+				owned.dispatch(
+					request(
+						alpha,
+						input.path,
+						proof ? "" : ownerCookie,
+						input.body,
+						proof,
+					),
+				);
 			const prior = await persisted(host.hostId);
 			const schema = `"${alpha.schemaName}"`;
 			await database.query(`CREATE FUNCTION ${schema}."rejectFixtureGrant"() RETURNS trigger LANGUAGE plpgsql AS $$
@@ -668,11 +688,9 @@ describe.skipIf(!existsSync(fixture))(
 			try {
 				await database.query(`CREATE TRIGGER "rejectFixtureGrant" BEFORE UPDATE ON ${schema}."agentCapabilityGrant"
 					FOR EACH ROW WHEN (NEW.status='revoked') EXECUTE FUNCTION ${schema}."rejectFixtureGrant"()`);
-				await expect(
-					owned.dispatch(
-						request(alpha, `/${target}/revoke`, ownerCookie, body),
-					),
-				).rejects.toThrow("fixture grant transition failed");
+				await expect(revoke()).rejects.toThrow(
+					"fixture grant transition failed",
+				);
 				expect(await persisted(host.hostId)).toEqual(prior);
 			} finally {
 				await database.query(
@@ -680,6 +698,7 @@ describe.skipIf(!existsSync(fixture))(
 				);
 				await database.query(`DROP FUNCTION ${schema}."rejectFixtureGrant"()`);
 			}
+			if (machine) expect((await revoke()).status).toBe(200);
 		});
 
 		async function enrollmentKey(kid: string) {
@@ -1313,6 +1332,24 @@ describe.skipIf(!existsSync(fixture))(
 				.sign(machine.hostKey.privateKey);
 		}
 
+		async function nativeClientHostProof(
+			machine: Awaited<ReturnType<typeof nativeMachineHost>>,
+		) {
+			const publicKey = {
+				...(await exportJWK(machine.hostKey.publicKey)),
+				kid: machine.kid,
+			};
+			return new SignJWT({ host_public_key: publicKey })
+				.setProtectedHeader({ alg: "EdDSA", typ: "host+jwt", kid: machine.kid })
+				.setIssuer(machine.kid)
+				.setSubject(machine.kid)
+				.setAudience(agentAudience)
+				.setIssuedAt()
+				.setExpirationTime("60s")
+				.setJti(randomUUID())
+				.sign(machine.hostKey.privateKey);
+		}
+
 		function agentProof(
 			machine: Awaited<ReturnType<typeof nativeMachine>>,
 			target = `${agentAudience}${statusPath}`,
@@ -1327,6 +1364,102 @@ describe.skipIf(!existsSync(fixture))(
 				.setJti(randomUUID())
 				.sign(machine.agentKey.privateKey);
 		}
+
+		it("accepts only the host's own live signed self-revocation and clears its keys across rollback", async () => {
+			const path = "/host/revoke";
+			const nativeHost = await nativeMachineHost(
+				"Native signed revoke",
+				ownerCookie,
+			);
+			const ownedHost = await nativeMachineHost(
+				"Owned signed revoke",
+				ownerCookie,
+			);
+			await seedDependents(nativeHost.hostId);
+			const [agent] = await seedDependents(ownedHost.hostId);
+			const proof = `Bearer ${await hostProof(ownedHost)}`;
+			const target = { host_id: ownedHost.hostId };
+			await expectSame(path, "", 403, { host_id: nativeHost.hostId }, proof);
+			await expectSame(
+				path,
+				ownerCookie,
+				401,
+				target,
+				`Bearer ${await hostProof(ownedHost, ownedHost.hostId, "https://elsewhere.fixture.example")}`,
+			);
+			const wrongKey = { ...ownedHost, hostKey: nativeHost.hostKey };
+			await expectSame(
+				path,
+				"",
+				401,
+				target,
+				`Bearer ${await hostProof(wrongKey)}`,
+			);
+			expect(
+				(await outside.dispatch(request(beta, path, "", target, proof))).status,
+			).toBe(401);
+			expect(
+				(await disabled.dispatch(request(alpha, path, "", target, proof)))
+					.status,
+			).toBe(501);
+			const nativeRevoke = await legacy.handler(
+				request(
+					alpha,
+					path,
+					"",
+					{ host_id: nativeHost.hostId },
+					`Bearer ${await nativeClientHostProof(nativeHost)}`,
+				),
+			);
+			expect(nativeRevoke.status).toBe(200);
+			expect(await nativeRevoke.json()).toEqual({
+				host_id: nativeHost.hostId,
+				status: "revoked",
+				agents_revoked: 2,
+			});
+			const revoke = () =>
+				owned.dispatch(
+					new Request(request(alpha, path, "", undefined, proof), {
+						method: "POST",
+					}),
+				);
+			const results = await Promise.all([revoke(), revoke()]);
+			expect(results.map(({ status }) => status).sort()).toEqual([200, 401]);
+			expect(await results.find(({ ok }) => ok)?.json()).toEqual({
+				host_id: ownedHost.hostId,
+				status: "revoked",
+				agents_revoked: 2,
+			});
+			expect(await persisted(ownedHost.hostId)).toEqual(
+				await persisted(nativeHost.hostId),
+			);
+			expect((await persisted(ownedHost.hostId)).hosts).toEqual([
+				{ status: "revoked", publicKey: "", kid: null },
+			]);
+			legacy = await native(nativePool);
+			const oldCredential = await legacy.handler(
+				request(alpha, path, "", target, proof),
+			);
+			expect(oldCredential.status).toBe(401);
+			expect(await oldCredential.json()).toEqual({
+				error: "agent_not_found",
+				message: "Agent not found",
+			});
+			expect(oldCredential.headers.get("www-authenticate")).toBe(
+				`AgentAuth discovery="${origin}/.well-known/agent-configuration"`,
+			);
+			const afterRollback = await legacy.handler(
+				request(alpha, `/agent/get?agent_id=${agent}`, ownerCookie),
+			);
+			expect(afterRollback.status).toBe(200);
+			expect(await afterRollback.json()).toMatchObject({
+				agent_id: agent,
+				status: "revoked",
+				agent_capability_grants: [
+					{ capability: "fixture.read", status: "revoked" },
+				],
+			});
+		});
 
 		it("validates native host status reads against its own inline host and projects legacy grants", async () => {
 			const machine = await nativeMachine("Status host");

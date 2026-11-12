@@ -6,7 +6,7 @@ The platform installs `@better-auth/agent-auth` 0.6.2. The endpoint inventory be
 | --- | --- | --- |
 | Discovery | `GET /agent-configuration` | Pending |
 | Host listing and detail | `GET /host/list`, `GET /host/get` | Signed browser session |
-| Host revocation | `POST /host/revoke` | Fresh verified owner cookie. Signed host revocation is pending. |
+| Host revocation | `POST /host/revoke` | Fresh verified owner cookie or signed self-revocation by an active owned inline Ed25519 host. |
 | Host provisioning and enrollment | `POST /host/create`, `POST /host/enroll` | Fresh verified browser provisioning, inline Ed25519, and one-time enrollment across writers. |
 | Host maintenance | `POST /host/update`, `POST /host/rotate-key`, `POST /host/switch-account` | Pending |
 | Delegated registration | `POST /agent/register` | Existing active owned host with a verified inline Ed25519 JWT and one-time JWT ID. The agent starts active with an empty capability budget. |
@@ -40,3 +40,5 @@ Signed status accepts a host ID or unique key ID and scopes the requested agent 
 Delegated registration binds the new agent to the same owner and host, retains its inline public key and native 15-minute lifetime, and updates the host heartbeat on success. The fixture serializes the five-active-agent limit across an owner’s hosts and consumes registration JWT IDs separately from repeatable host status reads. Legacy reads recognize the owned rows. Forced or pending enrollment and registration retries that create a new approval remain outside this slice.
 
 Browser agent list and detail accept the current owner’s signed session and expose the native grant projections. List preserves status, mode, and host filters and pagination. Browser revocation locks the live session and target authority, clears the agent’s inline signing key and key ID, and revokes its grants in one realm-scoped transaction. The persisted host owner can revoke an agent on that host even when the agent is unbound. Legacy reads after rollback recognize the updated rows. Machine-authorized revocation still requires separate coverage.
+
+Signed host self-revocation verifies the active host’s existing inline key, accepts its exact ID or an unambiguous key ID as the issuer, and applies the same grant cascade as browser revocation. Successful revocation clears the verifying key. A retry using that key receives the native authentication error, including after rollback. The fixture covers direct requests to the selected realm. Host and agent key rotation and hosted machine transport still require separate coverage.
