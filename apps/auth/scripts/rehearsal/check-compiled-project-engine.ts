@@ -489,17 +489,20 @@ async function startConnectedDevice(realm: Realm, client: string) {
 			} finally {
 				await shiftFixtureSessionAge("+");
 			}
-			expectStatus(
-				handoff,
-				307,
-				"The original platform link opens verified project device review.",
-			);
 			assert.deepEqual(handoff.cookies, []);
-			assert.ok(handoff.location);
-			const destination = new URL(handoff.location);
 			const userCode = new URLSearchParams({ user_code: codes.user_code });
 			const reviewPath = `/account/device?${userCode}`;
-			assert.equal(destination.href, `https://${managedHostname}${reviewPath}`);
+			const destination = new URL(reviewPath, `https://${managedHostname}`);
+			if (handoff.status === 307) assert.equal(handoff.location, destination.href);
+			else {
+				expectStatus(handoff, 200, "Render the streamed project device handoff.");
+				// Next serializes a temporary redirect as a refresh tag after streaming begins.
+				const redirect = handoff.body.match(
+					/<meta id="__next-page-redirect" http-equiv="refresh" content="1;url=([^"<>]+)"\s*\/?\s*>/,
+				);
+				assert.ok(redirect, "The original device link must redirect the browser.");
+				assert.equal(redirect[1], destination.href);
+			}
 			const browser = { host: destination.hostname, clientIP: "192.0.2.65" };
 			const page = await request(reviewPath, browser);
 			expectStatus(
