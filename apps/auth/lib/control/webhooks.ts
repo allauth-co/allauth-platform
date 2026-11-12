@@ -3,8 +3,11 @@ import type { RequestOptions } from "node:https";
 import type { GenericEndpointContext } from "@better-auth/core";
 import { APIError } from "better-auth";
 import { createAuthEndpoint } from "better-auth/api";
-import { symmetricDecrypt, symmetricEncrypt } from "better-auth/crypto";
 import { sql } from "kysely";
+import {
+	openLegacyUnversionedRecord,
+	sealLegacyUnversionedRecord,
+} from "../legacy-encrypted-record";
 import { publicControlEvent } from "./events";
 import type { ControlDatabase, ControlEvent, ControlEventInput, ControlPrincipal } from "./types";
 
@@ -56,7 +59,8 @@ export function createControlWebhooks(options: ControlWebhookOptions) {
 				const actor = await requireAdmin(ctx, true);
 				let destination: Awaited<ReturnType<typeof validateWebhookDestination>>;
 				try { destination = await validateWebhookDestination(ctx.body.url, options.resolver); } catch { throw new APIError("BAD_REQUEST", { message: "Webhook destinations require public HTTPS on port 443." }); }
-				const secret = newWebhookSigningSecret(); const encryptedSecret = await symmetricEncrypt({ key: options.secret, data: secret });
+				const secret = newWebhookSigningSecret();
+				const encryptedSecret = sealLegacyUnversionedRecord(secret, options.secret);
 				const endpoint = await database.transaction().execute(async (transaction) => {
 					await sql`SELECT pg_advisory_xact_lock(hashtext('allauth-webhook-endpoint-limit'))`.execute(transaction);
 					const total = await sql<{ total: string }>`SELECT COUNT(*)::text AS total FROM "allauthWebhookEndpoint"`.execute(transaction);
@@ -67,7 +71,8 @@ export function createControlWebhooks(options: ControlWebhookOptions) {
 				return ctx.json({ endpoint: publicEndpoint(endpoint), secret });
 			}),
 			controlWebhookRotate: createAuthEndpoint("/control/webhooks/rotate", { method: "POST", requireHeaders: true, body: webhookEndpointInput }, async (ctx) => {
-				const actor = await requireAdmin(ctx, true); const secret = newWebhookSigningSecret(); const encrypted = await symmetricEncrypt({ key: options.secret, data: secret });
+				const actor = await requireAdmin(ctx, true); const secret = newWebhookSigningSecret();
+				const encrypted = sealLegacyUnversionedRecord(secret, options.secret);
 				const updated = await sql`UPDATE "allauthWebhookEndpoint" SET "encryptedSecret"=${encrypted},"updatedAt"=CURRENT_TIMESTAMP WHERE id=${ctx.body.id} RETURNING id`.execute(database);
 				if (!updated.rows.length) throw new APIError("NOT_FOUND", { message: "Webhook endpoint not found." });
 				await options.recordEvent(ctx, { type: "webhook.secret-rotated", outcome: "success", actorId: actor.user.id, targetId: ctx.body.id });
@@ -146,7 +151,8 @@ export async function deliverPendingWebhooks(options: { database: ControlDatabas
 			const destination = await validateWebhookDestination(endpoint.url, options.resolver);
 			const payload = publicWebhookEnvelope(delivery.payload); const body = JSON.stringify(payload);
 			if (new TextEncoder().encode(body).byteLength > 262144) { permanent=true; throw new Error("INVALID_PAYLOAD"); }
-			const secret = await symmetricDecrypt({ key: options.secret, data: endpoint.encryptedSecret }); const timestamp = String(Math.floor((options.now?.() || new Date()).getTime()/1000));
+			const secret = openLegacyUnversionedRecord(endpoint.encryptedSecret, options.secret);
+			const timestamp = String(Math.floor((options.now?.() || new Date()).getTime()/1000));
 			status = await (options.transport || pinnedHttpsTransport)({ destination, body, headers: { "content-type": "application/json", "user-agent": "AllAuth-Webhooks/1.0", "webhook-id": delivery.id, "webhook-timestamp": timestamp, "webhook-signature": await webhookSignature(secret, delivery.id, timestamp, body), "content-length": String(new TextEncoder().encode(body).byteLength) } });
 			if (status >= 200 && status < 300) {
 				await sql`UPDATE "allauthWebhookDelivery" SET status='delivered',"deliveredAt"=${options.now?.() || new Date()},"statusCode"=${status},"lastError"=NULL,"leaseId"=NULL,"lockedUntil"=NULL WHERE id=${delivery.id} AND "leaseId"=${delivery.leaseId}`.execute(database); result.delivered++; continue;

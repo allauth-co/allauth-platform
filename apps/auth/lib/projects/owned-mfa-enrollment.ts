@@ -313,14 +313,15 @@ export function createOwnedMfaEnrollment<
 			`DELETE FROM "${schema}"."session" WHERE "userId" = $1 AND id <> $2 AND ($3::boolean OR id = $4) RETURNING id`,
 			[userId, replacement.sessionId, changed, auth.session.id],
 		);
-		for (const row of revoked.rows)
+		// The native MFA endpoint audits the active rotation. Its account-wide cleanup deletes sibling sessions directly.
+		if (revoked.rows.some(({ id }) => id === auth.session.id))
 			await store.record(
 				client,
 				"session.deleted",
 				"success",
 				path,
 				userId,
-				row.id,
+				auth.session.id,
 			);
 		if (changed) {
 			await client.query(

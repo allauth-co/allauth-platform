@@ -441,13 +441,15 @@ export function createOwnedProjectEngine(
 			readBody: requestBody,
 			logout: {
 				sessionCookie,
+				requireMfa: policy.mfaMode === "required",
 				clearBrowserSession: clearSessionCookies,
-				async revokeSession(client, request, target) {
+				async revokeSession(client, request, target, path, actorId) {
 					const removed = await store.revoke(
-						{ tokens: [target.token] },
-						"/oauth2/end-session",
+						{ tokens: [target.token], userId: target.userId },
+						path,
 						Boolean(backchannel),
 						client,
+						actorId,
 					);
 					if (!removed)
 						throw new ProjectOAuthError(
@@ -749,11 +751,21 @@ export function createOwnedProjectEngine(
 			}
 		}
 		if (owned.length) {
+			let actorId: string | null | undefined;
+			if (path === "/sign-in/email") {
+				// The legacy anonymous-session hook reads the incoming browser session before multi-session cleanup.
+				const browserToken = tokenFrom(request.headers);
+				const browser = browserToken
+					? await store.session(browserToken, refreshWindow, client)
+					: null;
+				actorId = browser?.user.id ?? null;
+			}
 			const removed = await store.revoke(
 				{ tokens: owned.map((item) => item.token) },
 				eventMetadata.path,
 				Boolean(backchannel),
 				client,
+				actorId,
 			);
 			if (!removed) throw unavailableLogout;
 			deliverLogoutAfterCommit(client, request, removed.targets);
@@ -1849,6 +1861,110 @@ export function createOwnedProjectEngine(
 		});
 	}
 
+	async function confirmSessionListAuthority(
+		request: Request,
+		client: PoolClient,
+		current: NonNullable<Awaited<ReturnType<typeof store.session>>>,
+		headers: Headers,
+	) {
+		if (!current.session.impersonatedBy) return current;
+		const administrator = await realmImpersonation.readAuthority(
+			request,
+			client,
+		);
+		const proof =
+			administrator === undefined
+				? await support?.readBrowserAuthority(request, client)
+				: administrator;
+		if (proof === "clear") clearSessionCookies(headers);
+		return proof &&
+			typeof proof !== "string" &&
+			proof.session.id === current.session.id &&
+			proof.user.id === current.user.id
+			? proof
+			: null;
+	}
+
+	async function listNativeSessions(request: Request) {
+		const path = "/list-sessions";
+		const limited = await store.transaction((client) =>
+			admitOwnedProjectNativeRoute(client, options.trustedIP(request), path, {
+				max: 100,
+				windowMs: 60_000,
+			}),
+		);
+		if (limited) return limited;
+		const caller = request.headers.get("origin");
+		if (
+			request.headers.get("sec-fetch-site") === "cross-site" ||
+			(caller !== null && !acceptedOrigins.has(caller))
+		)
+			return forbidden();
+		const direct = options.basePath !== "/api/auth";
+		const token =
+			(direct ? serverSessionBearer(request.headers) : null) ??
+			tokenFrom(request.headers);
+		const headers = new Headers();
+		const unauthorized = () =>
+			failure(401, "UNAUTHORIZED", "Unauthorized", headers);
+		if (!token) return unauthorized();
+		return store.transaction(async (client) => {
+			let observed: Awaited<ReturnType<typeof store.session>> | null =
+				await store.session(token, refreshWindow, client, { includeExpired: true });
+			if (observed?.expired) {
+				const removed = await store.revoke(
+					{ tokens: [token], expiredOnly: true },
+					path,
+					Boolean(backchannel),
+					client,
+				);
+				if (removed) deliverLogoutAfterCommit(client, request, removed.targets);
+				observed =
+					removed?.ids.length === 0
+						? await store.session(token, refreshWindow, client)
+						: null;
+			}
+			if (!observed) {
+				clearSessionCookies(headers);
+				return unauthorized();
+			}
+			if (observed.user.banned || observed.user.directoryDisabled)
+				return unauthorized();
+			const current = await confirmSessionListAuthority(
+				request,
+				client,
+				observed,
+				headers,
+			);
+			if (!current) return unauthorized();
+			const { session, user } = current;
+			if (!session.impersonatedBy) {
+				await renewAuthorizedSession(
+					request,
+					{ ...current, token },
+					client,
+					headers,
+					direct,
+				);
+				const renewedBearer = headers.get("set-auth-token");
+				if (renewedBearer)
+					headers.set("set-auth-token", decodeURIComponent(renewedBearer));
+				if (
+					policy.mfaMode === "required" &&
+					(!user.emailVerified || !user.twoFactorEnabled)
+				)
+					return json(
+						{ message: "This application requires an already verified account enrolled in MFA." },
+						403,
+						headers,
+					);
+			}
+			if (Date.now() - Date.parse(session.createdAt) >= 86_400_000)
+				return failure(403, "SESSION_NOT_FRESH", "Session is not fresh", headers);
+			return json(await store.listNativeSessions(user.id, client), 200, headers);
+		});
+	}
+
 	async function listSdkSessions(request: Request) {
 		if (request.headers.has("authorization"))
 			return json(
@@ -1864,20 +1980,16 @@ export function createOwnedProjectEngine(
 		const token = tokenFrom(request.headers);
 		if (!token) return unauthorized();
 		return store.transaction(async (client) => {
-			let current = await store.session(token, refreshWindow, client);
-			if (!current || current.user.directoryDisabled)
+			const observed = await store.session(token, refreshWindow, client);
+			if (!observed || observed.user.directoryDisabled)
 				return unauthorized();
-			if (current.session.impersonatedBy) {
-				const administrator = await realmImpersonation.readAuthority(request, client);
-				const proof = administrator === undefined
-					? await support?.readBrowserAuthority(request, client)
-					: administrator;
-				if (proof === "clear") clearSessionCookies(headers);
-				if (!proof || typeof proof === "string" ||
-					proof.session.id !== current.session.id || proof.user.id !== current.user.id)
-					return unauthorized();
-				current = proof;
-			}
+			const current = await confirmSessionListAuthority(
+				request,
+				client,
+				observed,
+				headers,
+			);
+			if (!current) return unauthorized();
 			const { session, user } = current;
 			if (
 				policy.mfaMode === "required" &&
@@ -3589,6 +3701,8 @@ export function createOwnedProjectEngine(
 			return signIn(request, "username");
 		if (request.method === "GET" && path === "/get-session")
 			return readSession(request);
+		if (request.method === "GET" && path === "/list-sessions")
+			return listNativeSessions(request);
 		if (request.method === "POST" && path === "/get-session")
 			return failure(
 				405,

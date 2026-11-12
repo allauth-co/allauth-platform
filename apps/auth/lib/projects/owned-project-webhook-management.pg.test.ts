@@ -6,6 +6,7 @@ import { APIError } from "better-auth";
 import { symmetricDecrypt } from "better-auth/crypto";
 import {
 	admin,
+	anonymous,
 	haveIBeenPwned,
 	jwt,
 	multiSession,
@@ -164,8 +165,6 @@ async function native(
 					? [
 							featureBoundaries(),
 							haveIBeenPwned({ paths: ["/change-password"] }),
-							authPolicyPlugin(defaultAuthPolicy),
-							multiSession({ maximumSessions: 5 }),
 							organization(),
 							projectManagement({
 								projectId: realm.id,
@@ -191,6 +190,13 @@ async function native(
 					...control,
 					endpoints: { ...control.endpoints, ...webhooks?.endpoints },
 				},
+				...(realm
+					? [
+							anonymous(),
+							authPolicyPlugin(defaultAuthPolicy),
+							multiSession({ maximumSessions: 5 }),
+						]
+					: []),
 			],
 		},
 		{ disableTestUser: true },
@@ -1562,6 +1568,109 @@ describe.skipIf(!existsSync(fixture))(
 						userId: eventUserId,
 						targetId: "expired-browser",
 						metadata: { path: "/get-session" },
+					},
+				},
+			]);
+			expect(await exercise("owned")).toEqual(native);
+		});
+
+		it.each([
+			true,
+			false,
+		])("delivers the native session deletion on password sign-in with active browser cookie %s", async (hasActiveCookie) => {
+			const path = "/sign-in/email";
+			const schema = `"${alpha.schemaName}"`;
+			async function exercise(writer: "legacy" | "owned") {
+				const active = await browserSession(userEmail);
+				const previous = await browserSession(eventEmail);
+				const otherBrowser = await browserSession(eventEmail);
+				expect(active.deviceCookie).toBeTruthy();
+				expect(previous.deviceCookie).toBeTruthy();
+				const subscription = await endpoint(
+					"legacy",
+					`re-sign-in-${hasActiveCookie}-${writer}`,
+					["session.deleted"],
+				);
+				const sessionIds = [active.id, previous.id, otherBrowser.id];
+				try {
+					const incoming = [active.deviceCookie, previous.deviceCookie];
+					if (hasActiveCookie) incoming.unshift(active.cookie);
+					const signedIn = await send(
+						writer,
+						path,
+						{ email: eventEmail, password },
+						incoming.join("; "),
+					);
+					expect(signedIn.status).toBe(200);
+					const cookies = signedIn.headers.getSetCookie();
+					const primaryName = active.cookie.split("=", 1)[0];
+					const primary = cookies
+						.find((cookie) => cookie.startsWith(`${primaryName}=`))
+						?.split(";", 1)[0];
+					expect(primary).toBeTruthy();
+					const read = await send("legacy", "/get-session", undefined, primary);
+					const { session: replacement } = (await read.json()) as {
+						session: { id: string; token: string; userId: string };
+					};
+					expect(replacement.userId).toBe(eventUserId);
+					expect(replacement.id).not.toBe(previous.id);
+					sessionIds.push(replacement.id);
+					const previousCookieName = previous.deviceCookie.split("=", 1)[0];
+					const activeCookieName = active.deviceCookie.split("=", 1)[0];
+					expect(
+						cookies.some(
+							(cookie) =>
+								cookie.startsWith(`${previousCookieName}=;`) &&
+								cookie.includes("Max-Age=0"),
+						),
+					).toBe(true);
+					expect(
+						cookies.some((cookie) => cookie.startsWith(`${activeCookieName}=`)),
+					).toBe(false);
+					const { rows } = await database.query<{ id: string }>(
+						`SELECT id FROM ${schema}.session WHERE id=ANY($1::text[]) ORDER BY id`,
+						[sessionIds],
+					);
+					expect(rows.map(({ id }) => id)).toEqual(
+						[active.id, otherBrowser.id, replacement.id].sort(),
+					);
+					return await signedEvents(
+						subscription,
+						[
+							password,
+							eventEmail,
+							userEmail,
+							active.token,
+							previous.token,
+							otherBrowser.token,
+							replacement.token,
+						],
+						new Map([[previous.id, "replaced-device"]]),
+					);
+				} finally {
+					await database.query(
+						`DELETE FROM ${schema}.session WHERE id=ANY($1::text[])`,
+						[sessionIds],
+					);
+					expect(
+						(
+							await send("legacy", `${base}/delete`, {
+								id: subscription.endpoint.id,
+							})
+						).status,
+					).toBe(200);
+				}
+			}
+			const native = await exercise("legacy");
+			expect(native).toEqual([
+				{
+					event: {
+						type: "session.deleted",
+						outcome: "success",
+						...(hasActiveCookie ? { actorId: userId } : {}),
+						userId: eventUserId,
+						targetId: "replaced-device",
+						metadata: { path },
 					},
 				},
 			]);

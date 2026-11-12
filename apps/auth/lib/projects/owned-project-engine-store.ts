@@ -282,6 +282,17 @@ export function createProjectEngineStore(database: Pool, schemaName: string) {
 		).rows;
 	}
 
+	/** Preserve the native list's active membership without selecting stored credentials. */
+	async function listNativeSessions(userId: string, client: PoolClient) {
+		return (
+			await client.query<ProjectSession>(
+				`SELECT ${sessionFields} FROM "${schema}"."session" s
+				 WHERE s."userId" = $1 AND s."expiresAt" > statement_timestamp() LIMIT 100`,
+				[userId],
+			)
+		).rows;
+	}
+
 	/** Delete only sessions in this realm, recording existing audit events in the same transaction. */
 	async function revoke(
 		selector:
@@ -404,6 +415,7 @@ export function createProjectEngineStore(database: Pool, schemaName: string) {
 		credential,
 		createSession,
 		list,
+		listNativeSessions,
 		lockProviderIdentity,
 		lockSession,
 		lockUser,

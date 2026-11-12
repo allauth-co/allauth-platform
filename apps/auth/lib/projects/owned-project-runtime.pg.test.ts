@@ -8,9 +8,10 @@ import {
 } from "node:crypto";
 import { once } from "node:events";
 import { existsSync, readFileSync } from "node:fs";
+import { get as httpGet, type IncomingMessage } from "node:http";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
-import { symmetricEncrypt } from "better-auth/crypto";
+import { symmetricDecrypt, symmetricEncrypt } from "better-auth/crypto";
 import type { JSONWebKeySet } from "jose";
 import {
 	createLocalJWKSet,
@@ -384,6 +385,7 @@ async function openProcess(
 		return {
 			mail,
 			logout,
+			port,
 			async request(
 				path: string,
 				options: {
@@ -950,11 +952,10 @@ async function seed(databaseURL: string, protectedAgentRealm = false) {
 	const env = { ...childEnvironment(), DATABASE_URL: databaseURL };
 	// The production registry owns one pool per process. Each isolated test seeds its own database.
 	vi.resetModules();
-	const [{ projectRegistryPool, provisionProject }, { createWorkspace }] =
-		await Promise.all([
-			import("./registry"),
-			import("../workspaces/repository"),
-		]);
+	const [
+		{ projectBrokerSecret, projectRegistryPool, provisionProject },
+		{ createWorkspace },
+	] = await Promise.all([import("./registry"), import("../workspaces/repository")]);
 	const database = projectRegistryPool(env);
 	const cwd = vi.spyOn(process, "cwd").mockReturnValue(appRoot);
 	try {
@@ -1009,6 +1010,7 @@ async function seed(databaseURL: string, protectedAgentRealm = false) {
 			origins: string[] = [],
 			workspaceId = workspace.id,
 		) {
+			const clientSecret = "disposable-fixture-broker-client-secret";
 			const project = await provisionProject(
 				{
 					name: slug,
@@ -1019,12 +1021,22 @@ async function seed(databaseURL: string, protectedAgentRealm = false) {
 				},
 				{
 					clientId: `fixture-${slug}`,
-					clientSecret: "disposable-fixture-broker-client-secret",
+					clientSecret,
 				},
 				owner.user.id,
 				env,
 				{ workspaceId, principal: owner },
 			);
+			await expect(
+				symmetricDecrypt({ key: platformSecret, data: project.brokerSecret }),
+			).resolves.toBe(clientSecret);
+			const brokerSecret = await symmetricEncrypt({
+				key: platformSecret,
+				data: clientSecret,
+			});
+			await expect(
+				projectBrokerSecret({ ...project, brokerSecret }, env),
+			).resolves.toBe(clientSecret);
 			await insertAccount(project.schemaName, credentials.project);
 			await database.query(
 				`INSERT INTO "${project.schemaName}"."oauthClient" (id,"clientId","redirectUris","grantTypes",scopes,"tokenEndpointAuthMethod","skipConsent","backchannelLogoutUri","createdAt","updatedAt")
@@ -1696,7 +1708,7 @@ describe.skipIf(!existsSync(fixture))(
 			}
 		}, 60_000);
 
-		it("preserves the signed SDK browser-session list across project writers", async () => {
+		it("preserves SDK and credential-safe native session lists across project writers", async () => {
 			const local: { container: string; DATABASE_URL: string } = JSON.parse(
 				readFileSync(fixture, "utf8"),
 			);
@@ -1720,6 +1732,9 @@ describe.skipIf(!existsSync(fixture))(
 				database = new Pool({ connectionString: databaseURL, max: 1 });
 				const basePath = `/api/projects/${alpha.slug}/auth`;
 				const listPath = `${basePath}/sdk/sessions`;
+				const nativeListPath = `${basePath}/list-sessions`;
+				const hostedListPath = "/api/auth/list-sessions";
+				const host = `${alpha.slug}-accounts.allauth.co`;
 				const proxy = { proxy: alpha, origin: alpha.primaryOrigin };
 				service = await openProcess(databaseURL, alpha, false);
 				const login = await service.request(`${basePath}/sign-in/email`, {
@@ -1728,10 +1743,13 @@ describe.skipIf(!existsSync(fixture))(
 				});
 				expect(login.status).toBe(200);
 				const browser = { ...proxy, cookie: cookie(login) };
+				const sessionCookie = browser.cookie.split("; ").find((entry) => entry.includes(".session_token="));
+				if (!sessionCookie) throw new Error("The fixture did not issue a project session cookie.");
+				const signedSession = sessionCookie.slice(sessionCookie.indexOf("=") + 1);
 				const userId = credentials.project.id;
-				const { rows: [current] } = await database.query<{ id: string }>(
+				const { rows: [current] } = await database.query<{ id: string; updatedAt: Date }>(
 					`UPDATE "${alpha.schemaName}"."session" SET "ipAddress"='', "userAgent"=NULL
-					 WHERE "userId"=$1 RETURNING id`,
+					 WHERE "userId"=$1 RETURNING id,"updatedAt"`,
 					[userId],
 				);
 				expect(current?.id).toBeTruthy();
@@ -1751,6 +1769,94 @@ describe.skipIf(!existsSync(fixture))(
 					 VALUES ('sdk-other-realm','fixture-other-realm-token',$1,now(),now()+interval '1 hour')`,
 					[userId],
 				);
+				type RuntimeProcess = NonNullable<typeof service>;
+				type ListedSession = {
+					id: string;
+					userId: string;
+					createdAt: string;
+					updatedAt: string;
+					expiresAt: string;
+					token?: string;
+				};
+				async function serverList(writer: RuntimeProcess, authorization: string) {
+					const incoming = await new Promise<IncomingMessage>((resolve, reject) => {
+						httpGet({
+							hostname: "127.0.0.1",
+							port: writer.port,
+							path: nativeListPath,
+							headers: { authorization },
+							signal: AbortSignal.timeout(10_000),
+						}, resolve).once("error", reject);
+					});
+					const chunks: Uint8Array[] = [];
+					for await (const chunk of incoming) chunks.push(chunk);
+					const headers = new Headers();
+					for (let index = 0; index < incoming.rawHeaders.length; index += 2)
+						headers.append(incoming.rawHeaders[index]!, incoming.rawHeaders[index + 1]!);
+					return new Response(Buffer.concat(chunks), { status: incoming.statusCode, headers });
+				}
+				async function expectNativeList(writer: RuntimeProcess, legacy: boolean) {
+					const directBrowser = { cookie: browser.cookie };
+					const verifyListing = async (response: Response) => {
+						expect(response.status).toBe(200);
+						expect(response.headers.get("cache-control")).toBe("no-store");
+						expect(response.headers.get("pragma")).toBe("no-cache");
+						const sessions = (await response.json()) as ListedSession[];
+						expect(sessions.every(({ userId: selected }) => selected === userId)).toBe(true);
+						expect(sessions.map(({ id }) => id).sort()).toEqual([
+							current!.id,
+							...Array.from({ length: 99 }, (_, index) => `sdk-list-${index + 1}`),
+						].sort());
+						expect(sessions.every((session) => Object.hasOwn(session, "token") === legacy)).toBe(true);
+						return sessions.map(({ token: _token, ...session }) => session).sort((a, b) => a.id.localeCompare(b.id));
+					};
+					const observed = await verifyListing(await writer.request(nativeListPath, directBrowser));
+					const hosted = await writer.request(hostedListPath, { ...directBrowser, host });
+					expect(hosted.headers.get("set-auth-token")).toBeNull();
+					expect(await verifyListing(hosted)).toEqual(observed);
+					expect(await verifyListing(await serverList(writer, `Bearer ${signedSession}`))).toEqual(observed);
+					for (const denied of [
+						await writer.request(nativeListPath),
+						await writer.request(`/api/projects/${beta.slug}/auth/list-sessions`, directBrowser),
+						await writer.request(nativeListPath, { authorization: `Bearer ${signedSession}` }),
+						await writer.request(hostedListPath, { host, authorization: `Bearer ${signedSession}` }),
+						await serverList(writer, "Bearer fixture-hidden-token-1"),
+					]) {
+						expect(denied.status).toBe(401);
+						expect(denied.headers.get("cache-control")).toBe("no-store");
+						expect(await denied.json()).toMatchObject({ code: "UNAUTHORIZED", message: "Unauthorized" });
+					}
+					const active = observed.find(({ id }) => id === current!.id)!;
+					await database!.query(
+						`UPDATE "${alpha.schemaName}"."session" SET "createdAt"=now()-interval '25 hours' WHERE id=$1`,
+						[active.id],
+					);
+					const stale = await writer.request(nativeListPath, directBrowser);
+					expect(stale.status).toBe(403);
+					expect(await stale.json()).toMatchObject({ code: "SESSION_NOT_FRESH", message: "Session is not fresh" });
+					await database!.query(
+						`UPDATE "${alpha.schemaName}"."session" SET "createdAt"=$2,"expiresAt"=now()+interval '1 minute' WHERE id=$1`,
+						[active.id, active.createdAt],
+					);
+					const renewed = await writer.request(hostedListPath, { ...directBrowser, host });
+					expect(renewed.headers.get("set-auth-token")).toBeNull();
+					expect(renewed.headers.getSetCookie().some((entry) => entry.includes(".session_token="))).toBe(true);
+					const afterRenewal = (await verifyListing(renewed)).find(({ id }) => id === active.id)!;
+					expect(Date.parse(afterRenewal.expiresAt)).toBeGreaterThan(Date.now() + 60_000);
+					await database!.query(
+						`UPDATE "${alpha.schemaName}"."session" SET "expiresAt"=now()+interval '1 minute' WHERE id=$1`,
+						[active.id],
+					);
+					const serverRenewal = await serverList(writer, `Bearer ${signedSession}`);
+					expect(serverRenewal.headers.get("set-auth-token")).toBe(decodeURIComponent(signedSession));
+					const renewedServerSession = (await verifyListing(serverRenewal)).find(({ id }) => id === active.id)!;
+					expect(Date.parse(renewedServerSession.expiresAt)).toBeGreaterThan(Date.now() + 60_000);
+					await database!.query(
+						`UPDATE "${alpha.schemaName}"."session" SET "expiresAt"=$2,"updatedAt"=$3 WHERE id=$1`,
+						[active.id, active.expiresAt, active.updatedAt],
+					);
+					return observed;
+				}
 				async function expectList(writer: NonNullable<typeof service>) {
 					const unauthorized = await writer.request(listPath, proxy);
 					expect(unauthorized.status).toBe(401);
@@ -1818,16 +1924,18 @@ describe.skipIf(!existsSync(fixture))(
 					expect(renewedList.currentSessionId).toBe(data.currentSessionId);
 					expect(Date.parse(renewedList.sessions[0]!.expiresAt)).toBeGreaterThan(Date.now() + 60_000);
 					await database!.query(
-						`UPDATE "${alpha.schemaName}"."session" SET "expiresAt"=$2 WHERE id=$1`,
-						[current!.id, data.sessions[0]!.expiresAt],
+						`UPDATE "${alpha.schemaName}"."session" SET "expiresAt"=$2,"updatedAt"=$3 WHERE id=$1`,
+						[current!.id, data.sessions[0]!.expiresAt, current!.updatedAt],
 					);
 					return data;
 				}
 				const native = await expectList(service);
+				const nativeSessions = await expectNativeList(service, true);
 				await service.stop();
 				service = undefined;
 				service = await openProcess(databaseURL, alpha, true);
 				expect(await expectList(service)).toEqual(native);
+				expect(await expectNativeList(service, false)).toEqual(nativeSessions);
 			} finally {
 				try {
 					await service?.stop();

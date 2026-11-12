@@ -1,11 +1,13 @@
 import { createHmac, randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
+import { betterAuth } from "better-auth";
 import { symmetricDecrypt, symmetricEncrypt } from "better-auth/crypto";
 import { admin } from "better-auth/plugins";
 import { getTestInstance } from "better-auth/test";
 import { Kysely, PostgresDialect } from "kysely";
 import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { createAuthOptions } from "../auth";
 import { authPolicyPlugin } from "../auth-policy/plugin";
 import { defaultAuthPolicy } from "../auth-policy/policy";
 import { clerkCompatiblePasswords } from "../clerk-password";
@@ -803,6 +805,245 @@ describe.skipIf(!existsSync(fixturePath))(
 				await database.query(
 					`DELETE FROM "${schema}"."allauthWebhookEndpoint" WHERE id=$1`,
 					[endpoint],
+				);
+			}
+		});
+
+		it("delivers only the native active-session deletion when MFA changes revoke sibling sessions", async () => {
+			if (!nativeDatabase) throw new Error("Missing fixture database.");
+			const webhookDatabase = nativeDatabase;
+			const policy = { ...defaultAuthPolicy, requireEmailVerification: false };
+			const legacyOptions = createAuthOptions(
+				{ db: webhookDatabase, type: "postgres", transaction: true },
+				{
+					ALLAUTH_AUTH_URL: origin,
+					ALLAUTH_AUTH_SECRET: secret,
+					AUTH_RUNTIME: "node",
+					SCIM_CREDENTIAL_HASH_SECRET:
+						"synthetic-mfa-revocation-scim-fixture-key",
+				},
+				{
+					name: issuer,
+					basePath: "/api/auth",
+					cookiePrefix: `allauth_project_${slug}`,
+					primaryOrigin: origin,
+					publicOrigin: origin,
+					origins: [],
+					broker: {
+						clientId: "fixture-broker",
+						clientSecret: "synthetic-broker-secret",
+					},
+					authorizeAdmin: async () => null,
+					management: { id: "mfa-revocation-fixture" },
+				},
+				policy,
+			);
+			const installed = betterAuth({
+				...legacyOptions,
+				logger: { disabled: true },
+			});
+			const candidate = createOwnedProjectEngine({
+				database,
+				project: { schemaName: schema, slug },
+				baseURL: origin,
+				basePath: "/api/auth",
+				trustedOrigins: [],
+				signingSecret: secret,
+				policy,
+				trustedIP: (input) => input.headers.get("x-real-ip"),
+			});
+			const webhookSecret = newWebhookSigningSecret();
+			const endpointId = randomUUID();
+			const endpoint = "https://mfa-revocation.fixture.example/receive";
+			const realm = `"${schema}"`;
+			await database.query(
+				`INSERT INTO ${realm}."allauthWebhookEndpoint" (id,url,"eventTypes","encryptedSecret") VALUES ($1,$2,'["session.deleted"]',$3)`,
+				[
+					endpointId,
+					endpoint,
+					await symmetricEncrypt({ key: secret, data: webhookSecret }),
+				],
+			);
+			const request = (
+				path: string,
+				body: unknown,
+				cookie: string,
+				ip: string,
+			) => {
+				const input = post(path, body, cookie);
+				input.headers.set("x-real-ip", ip);
+				input.headers.set("user-agent", auditContext.userAgent);
+				return input;
+			};
+			async function exercise(
+				dispatch: (input: Request) => Promise<Response>,
+				ip: string,
+			) {
+				const user = await signedIn();
+				let { cookie, sessionId } = user;
+				const setup = await dispatch(
+					request("/two-factor/enable", { password }, cookie, ip),
+				);
+				expect(setup.status).toBe(200);
+				const code = await verifyCode(user.id);
+				const unaffected = await signedIn();
+				const unaffectedGrant = await protectedState(unaffected);
+				const events: Array<
+					Omit<
+						ControlWebhookEnvelope["data"]["event"],
+						"id" | "createdAt" | "actorId" | "userId" | "targetId"
+					> & { actor: boolean; owner: boolean; target: string }
+				> = [];
+				for (const enabled of [true, false]) {
+					const path = enabled
+						? "/two-factor/verify-totp"
+						: "/two-factor/disable";
+					const sibling = randomUUID();
+					await database.query(
+						`INSERT INTO ${realm}.session (id,token,"userId","expiresAt","updatedAt") VALUES ($1,$2,$3,now()+interval '1 day',now())`,
+						[sibling, randomUUID(), user.id],
+					);
+					const state = await protectedState({
+						id: user.id,
+						sessionId: sibling,
+					});
+					await database.query(
+						`UPDATE ${realm}."oauthRefreshToken" SET scopes='["openid","offline_access"]' WHERE "sessionId"=$1`,
+						[sibling],
+					);
+					const result = await dispatch(
+						request(path, enabled ? { code } : { password }, cookie, ip),
+					);
+					expect(result.status, await result.clone().text()).toBe(200);
+					const next = cookies(result);
+					const current = await installed.api.getSession({
+						headers: new Headers({ cookie: next }),
+					});
+					expect(current).toMatchObject({
+						user: { id: user.id, twoFactorEnabled: enabled },
+					});
+					const replacement = current!.session.id;
+					expect(replacement).not.toBe(sessionId);
+					expect(
+						(
+							await database.query(
+								`SELECT id FROM ${realm}.session WHERE "userId"=$1`,
+								[user.id],
+							)
+						).rows,
+					).toEqual([{ id: replacement }]);
+					for (const table of ["oauthAccessToken", "oauthRefreshToken"]) {
+						expect(
+							(
+								await database.query(
+									`SELECT "userId" FROM ${realm}."${table}" WHERE "userId"=ANY($1::text[])`,
+									[[user.id, unaffected.id]],
+								)
+							).rows,
+						).toEqual([{ userId: unaffected.id }]);
+					}
+					const challenges = await database.query<{ id: string }>(
+						`SELECT id FROM ${realm}.verification WHERE id=ANY($1::text[]) AND NOT starts_with(identifier, '2fa-attempts-') ORDER BY id`,
+						[[...state.identifiers, ...unaffectedGrant.identifiers]],
+					);
+					expect(challenges.rows.map(({ id }) => id)).toEqual(
+						[
+							state.untouched,
+							...unaffectedGrant.identifiers.filter(
+								(id) => !id.startsWith("2fa-attempts-"),
+							),
+						].sort(),
+					);
+					expect(
+						(
+							await database.query(
+								`SELECT action FROM ${realm}."allauthAudit" WHERE "actorId"=$1 AND action=$2`,
+								[
+									user.id,
+									enabled ? "two-factor.enrolled" : "two-factor.disabled",
+								],
+							)
+						).rowCount,
+					).toBe(1);
+					const delivered = await deliverPendingWebhooks({
+						database: webhookDatabase,
+						secret,
+						resolver: async () => [{ address: "93.184.216.34", family: 4 }],
+						now: () => new Date(Date.now() + 1_000),
+						transport: async ({ destination, body, headers }) => {
+							expect(destination.url.href).toBe(endpoint);
+							expect(headers["webhook-signature"]).toBe(
+								await webhookSignature(
+									webhookSecret,
+									headers["webhook-id"],
+									headers["webhook-timestamp"],
+									body,
+								),
+							);
+							const { id, type, timestamp, data } = JSON.parse(
+								body,
+							) as ControlWebhookEnvelope;
+							expect(data.event).toMatchObject({
+								id,
+								type,
+								createdAt: timestamp,
+							});
+							for (const value of [
+								password,
+								code,
+								user.email,
+								current!.session.token,
+								webhookSecret,
+							])
+								expect(body).not.toContain(JSON.stringify(value));
+							expect(data.user).toBeUndefined();
+							const {
+								id: _id,
+								createdAt: _time,
+								actorId,
+								userId,
+								targetId,
+								...event
+							} = data.event;
+							events.push({
+								...event,
+								actor: actorId === user.id,
+								owner: userId === user.id,
+								target:
+									targetId === sessionId
+										? "active"
+										: targetId === sibling
+											? "sibling"
+											: "unexpected",
+							});
+							return 204;
+						},
+					});
+					expect(delivered.failed).toBe(0);
+					cookie = next;
+					sessionId = replacement;
+				}
+				return events;
+			}
+			try {
+				const native = await exercise(installed.handler, "192.0.2.117");
+				expect(native).toEqual(
+					["/two-factor/verify-totp", "/two-factor/disable"].map((path) => ({
+						type: "session.deleted",
+						outcome: "success",
+						actor: true,
+						owner: true,
+						target: "active",
+						metadata: { path },
+					})),
+				);
+				expect(await exercise(candidate.dispatch, "192.0.2.118")).toEqual(
+					native,
+				);
+			} finally {
+				await database.query(
+					`DELETE FROM ${realm}."allauthWebhookEndpoint" WHERE id=$1`,
+					[endpointId],
 				);
 			}
 		});

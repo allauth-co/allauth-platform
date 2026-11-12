@@ -1,12 +1,13 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { oauthProvider } from "@better-auth/oauth-provider";
-import { symmetricDecrypt } from "better-auth/crypto";
+import { symmetricDecrypt, symmetricEncrypt } from "better-auth/crypto";
 import { admin, jwt, username } from "better-auth/plugins";
 import { getTestInstance } from "better-auth/test";
 import {
 	calculateJwkThumbprint,
 	createLocalJWKSet,
+	decodeJwt,
 	exportJWK,
 	generateKeyPair,
 	jwtVerify,
@@ -14,9 +15,14 @@ import {
 } from "jose";
 import { Kysely, PostgresDialect } from "kysely";
 import { Pool } from "pg";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { authPolicyPlugin } from "../auth-policy/plugin";
 import { defaultAuthPolicy } from "../auth-policy/policy";
 import { clerkCompatiblePasswords } from "../clerk-password";
+import { allauthControl } from "../control";
+import { webhookSignature } from "../control/webhook-contract";
+import type { ControlWebhookEnvelope } from "../control/webhooks";
+import { deliverPendingWebhooks } from "../control/webhooks";
 import { productionTwoFactor } from "../mfa";
 import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
 import { createOwnedProjectEngine } from "./owned-project-engine";
@@ -95,7 +101,10 @@ function connection(connectionString: string, searchPath = false) {
 	});
 }
 
-async function openLegacy(connectionString: string) {
+async function openLegacy(
+	connectionString: string,
+	auditPolicy?: typeof defaultAuthPolicy,
+) {
 	const database = new Kysely<Record<string, Record<string, unknown>>>({
 		dialect: new PostgresDialect({ pool: connection(connectionString, true) }),
 	});
@@ -132,6 +141,9 @@ async function openLegacy(connectionString: string) {
 							openidConfig: true,
 						},
 					}),
+					...(auditPolicy
+						? [authPolicyPlugin(auditPolicy), allauthControl()]
+						: []),
 				],
 			},
 			{ disableTestUser: true },
@@ -153,6 +165,7 @@ async function prepareRealm(connectionString: string) {
 			for (const filename of [
 				"001-initial-auth.sql",
 				"002-control-plane.sql",
+				"004-webhooks.sql",
 				"005-free-plugins.sql",
 				"013-owned-user-avatars.sql",
 			]) {
@@ -357,10 +370,15 @@ const mfaEmail = "mfa@rollback.fixture.example";
 
 type Legacy = Awaited<ReturnType<typeof openLegacy>>;
 
-async function legacyAccount(legacy: Legacy, email: string, name: string) {
-	const response = await legacy.auth.handler(
-		request("/sign-up/email", "", { email, name, password }),
-	);
+async function legacyAccount(
+	legacy: Legacy,
+	email: string,
+	name: string,
+	ip?: string,
+) {
+	const input = request("/sign-up/email", "", { email, name, password });
+	if (ip) input.headers.set("x-real-ip", ip);
+	const response = await legacy.auth.handler(input);
 	expect(response.status).toBe(200);
 	const {
 		user: { id },
@@ -528,6 +546,253 @@ async function confirmLogout(
 	expect(result.headers.get("location")).toBe(
 		`${signedOut}?state=browser-logout-state`,
 	);
+}
+
+async function seedLogoutWebhooks(url: string, client: OAuthClient) {
+	const legacy = await openLegacy(url, defaultAuthPolicy);
+	try {
+		async function session(name: string, ip: string) {
+			const account = await legacyAccount(
+				legacy,
+				`${name}@logout.rollback.fixture.example`,
+				name,
+				ip,
+			);
+			const tokens = await grant(
+				legacy.auth.handler,
+				account.cookie,
+				client,
+				"openid offline_access",
+			);
+			const id = decodeJwt(tokens.id_token!).sid;
+			if (typeof id !== "string")
+				throw new Error("The fixture logout hint is missing its session.");
+			return { ...account, sessionId: id, tokens };
+		}
+		const hinted = await session("hinted", "192.0.2.81");
+		const browser = await session("browser", "192.0.2.82");
+		const sibling = await session("sibling", "192.0.2.83");
+		const enrolled = await session("enrolled", "192.0.2.84");
+		await legacy.database
+			.updateTable("user")
+			.set({ twoFactorEnabled: true })
+			.where("id", "=", enrolled.id)
+			.execute();
+		const webhookSecret = `whsec_${randomBytes(32).toString("base64")}`;
+		await legacy.database
+			.insertInto("allauthWebhookEndpoint")
+			.values({
+				id: randomUUID(),
+				url: "https://hooks.rollback.fixture.example/logout",
+				eventTypes: JSON.stringify(["session.deleted"]),
+				encryptedSecret: await symmetricEncrypt({
+					key: secret,
+					data: webhookSecret,
+				}),
+			})
+			.execute();
+		return { hinted, browser, sibling, enrolled, webhookSecret };
+	} finally {
+		await legacy.close();
+	}
+}
+
+async function verifyLogoutWebhooks(
+	url: string,
+	client: OAuthClient,
+	fixture: Awaited<ReturnType<typeof seedLogoutWebhooks>>,
+	writer: "legacy" | "allauth",
+) {
+	const legacy = await openLegacy(url, defaultAuthPolicy);
+	const mfaPolicy = {
+		...defaultAuthPolicy,
+		mfaMode: "required" as const,
+		signUpEnabled: false,
+		requireEmailVerification: true,
+	};
+	let mfaLegacy: Legacy | undefined;
+	const database = connection(url, true);
+	const fetchMock = vi.spyOn(globalThis, "fetch");
+	try {
+		if (writer === "legacy") mfaLegacy = await openLegacy(url, mfaPolicy);
+		const jwks = await legacy.auth.api.getJwks();
+		fetchMock.mockImplementation(async (input) => {
+			const target = input instanceof Request ? input.url : String(input);
+			if (target !== `${issuer}/jwks`)
+				throw new Error("Unexpected fixture outbound request.");
+			return Response.json(jwks);
+		});
+		const ownedDispatch = (policy: typeof defaultAuthPolicy) =>
+			createOwnedProjectEngine({
+				database,
+				project,
+				baseURL: origin,
+				basePath,
+				trustedOrigins: [],
+				signingSecret: secret,
+				policy,
+				trustedIP: () => "192.0.2.26",
+				issuer: true,
+			}).dispatch;
+		const dispatch =
+			writer === "legacy"
+				? legacy.auth.handler
+				: ownedDispatch(defaultAuthPolicy);
+		const dispatchMfa = mfaLegacy?.auth.handler ?? ownedDispatch(mfaPolicy);
+		const { hinted, browser, sibling, enrolled, webhookSecret } = fixture;
+		const endSession = "/oauth2/end-session";
+		const logout = (idToken: string, cookie = "", handler = dispatch) => {
+			const query = new URLSearchParams({
+				client_id: client.client_id,
+				id_token_hint: idToken,
+				post_logout_redirect_uri: signedOut,
+				state: "browser-logout-state",
+			});
+			const input = request(`${endSession}?${query}`, cookie);
+			input.headers.set("accept", "text/html");
+			return handler(input);
+		};
+		for (let attempt = 0; attempt < 2; attempt++) {
+			const result = await logout(hinted.tokens.id_token!);
+			expect(result.status, await result.clone().text()).toBe(302);
+			expect(result.headers.get("location")).toBe(
+				`${signedOut}?state=browser-logout-state`,
+			);
+		}
+		const prompt = await logout(sibling.tokens.id_token!, browser.cookie);
+		expect(prompt.status).toBe(200);
+		expect(await prompt.clone().text()).toContain(
+			"data-oidc-logout-confirmation",
+		);
+		const remaining = () =>
+			database
+				.query<{ id: string }>(
+					'SELECT id FROM "session" WHERE id=ANY($1::text[]) ORDER BY id',
+					[
+						[
+							hinted.sessionId,
+							browser.sessionId,
+							sibling.sessionId,
+							enrolled.sessionId,
+						],
+					],
+				)
+				.then(({ rows }) => rows.map(({ id }) => id));
+		expect(await remaining()).toEqual(
+			[browser.sessionId, sibling.sessionId, enrolled.sessionId].sort(),
+		);
+		await confirmLogout(dispatch, browser.cookie, cookies(prompt));
+		const denied = await logout(
+			sibling.tokens.id_token!,
+			sibling.cookie,
+			dispatchMfa,
+		);
+		expect(denied.status).toBe(403);
+		expect(await denied.json()).toMatchObject({
+			message:
+				"This application requires an already verified account enrolled in MFA.",
+		});
+		const mfaPrompt = await logout(
+			sibling.tokens.id_token!,
+			enrolled.cookie,
+			dispatchMfa,
+		);
+		expect(mfaPrompt.status).toBe(200);
+		expect(await mfaPrompt.clone().text()).toContain(
+			"data-oidc-logout-confirmation",
+		);
+		expect(await remaining()).toEqual(
+			[sibling.sessionId, enrolled.sessionId].sort(),
+		);
+		await confirmLogout(dispatchMfa, enrolled.cookie, cookies(mfaPrompt));
+		expect(await remaining()).toEqual([sibling.sessionId]);
+		for (const ended of [hinted, browser, enrolled]) {
+			expect(
+				await introspect(dispatch, client, ended.tokens.access_token),
+			).toMatchObject({ active: false });
+			const refresh = await dispatch(
+				request(
+					"/oauth2/token",
+					"",
+					new URLSearchParams({
+						...clientCredentials(client),
+						grant_type: "refresh_token",
+						refresh_token: ended.tokens.refresh_token!,
+					}),
+				),
+			);
+			expect(refresh.status).toBe(200);
+		}
+		expect(
+			await introspect(dispatch, client, sibling.tokens.access_token),
+		).toMatchObject({ active: true });
+		const deliveries: Array<{ body: string; headers: Record<string, string> }> =
+			[];
+		const result = await deliverPendingWebhooks({
+			database: legacy.database,
+			secret,
+			resolver: async () => [{ address: "93.184.216.34", family: 4 }],
+			now: () => new Date(Date.now() + 1_000),
+			transport: async ({ body, headers }) => {
+				deliveries.push({ body, headers });
+				return 204;
+			},
+		});
+		expect(result).toEqual({ claimed: 3, delivered: 3, retried: 0, failed: 0 });
+		const events = await Promise.all(
+			deliveries.map(async ({ body, headers }) => {
+				const envelope = JSON.parse(body) as ControlWebhookEnvelope;
+				expect(headers["webhook-signature"]).toBe(
+					await webhookSignature(
+						webhookSecret,
+						headers["webhook-id"],
+						headers["webhook-timestamp"],
+						body,
+					),
+				);
+				for (const current of [hinted, browser, sibling, enrolled]) {
+					expect(body).not.toContain(current.tokens.id_token!);
+					expect(body).not.toContain(current.tokens.refresh_token!);
+				}
+				const { id, createdAt, ...event } = envelope.data.event;
+				expect(envelope).toMatchObject({
+					id,
+					timestamp: createdAt,
+					type: "session.deleted",
+				});
+				return event;
+			}),
+		);
+		expect(events).toEqual(
+			expect.arrayContaining([
+				{
+					type: "session.deleted",
+					outcome: "success",
+					userId: hinted.id,
+					targetId: hinted.sessionId,
+					metadata: { path: endSession },
+				},
+				{
+					type: "session.deleted",
+					outcome: "success",
+					userId: browser.id,
+					targetId: browser.sessionId,
+					metadata: { path: `${endSession}/confirm` },
+				},
+				{
+					type: "session.deleted",
+					outcome: "success",
+					actorId: enrolled.id,
+					userId: enrolled.id,
+					targetId: enrolled.sessionId,
+					metadata: { path: `${endSession}/confirm` },
+				},
+			]),
+		);
+	} finally {
+		fetchMock.mockRestore();
+		await Promise.all([database.end(), legacy.close(), mfaLegacy?.close()]);
+	}
 }
 
 type SeededRealm = Awaited<ReturnType<typeof seedLegacyRealm>>;
@@ -941,6 +1206,10 @@ describe.skipIf(!existsSync(fixture))(
 				created.push(source);
 				await prepareRealm(fixtureURL(source));
 				const initial = await seedLegacyRealm(fixtureURL(source));
+				const logout = await seedLogoutWebhooks(
+					fixtureURL(source),
+					initial.client,
+				);
 
 				// PostgreSQL copies the quiesced source database, including every realm row and key.
 				await administrator.query(
@@ -948,6 +1217,18 @@ describe.skipIf(!existsSync(fixture))(
 				);
 				created.push(restored);
 				const destination = fixtureURL(restored);
+				await verifyLogoutWebhooks(
+					fixtureURL(source),
+					initial.client,
+					logout,
+					"legacy",
+				);
+				await verifyLogoutWebhooks(
+					destination,
+					initial.client,
+					logout,
+					"allauth",
+				);
 				const state = await useCandidate(destination, initial);
 				await verifyRollback(destination, initial, state);
 			} finally {

@@ -3,7 +3,7 @@ import { createHmac, randomUUID } from "node:crypto";
 import type { BetterAuthPlugin } from "@better-auth/core";
 import { getTestInstance } from "better-auth/test";
 import { admin } from "better-auth/plugins";
-import { symmetricEncrypt } from "better-auth/crypto";
+import { symmetricDecrypt, symmetricEncrypt } from "better-auth/crypto";
 import { Kysely, PostgresDialect, sql } from "kysely";
 import { Pool } from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -121,10 +121,16 @@ describe.skipIf(!existsSync(fixturePath))("PostgreSQL durable signed webhook out
 		const create=await instance.auth.api.controlWebhookCreate({ headers,body:{ url:"https://hooks.example.com/receiver",eventTypes:["user.*","session.*","passkey.*","sso.*","api-key.*"] } });
 		expect(create.endpoint.eventTypes).toEqual(["user.*","session.*","passkey.*","sso.*","api-key.*"]);
 		expect(create.secret).toMatch(/^whsec_/); expect(create.endpoint).not.toHaveProperty("encryptedSecret");
+		const readWithPreviousCodec = async () => {
+			const { rows: [row] } = await sql<{ encryptedSecret: string }>`SELECT "encryptedSecret" FROM "allauthWebhookEndpoint" WHERE id=${create.endpoint.id}`.execute(database);
+			return symmetricDecrypt({ key: secret, data: row.encryptedSecret });
+		};
+		await expect(readWithPreviousCodec()).resolves.toBe(create.secret);
 		const listing=await instance.auth.api.controlWebhooks({ headers }); expect(JSON.stringify(listing)).not.toContain(create.secret); expect(JSON.stringify(listing)).not.toContain("encryptedSecret");
 		const wrongOrigin=new Headers(headers); wrongOrigin.set("origin","https://attacker.example");
 		await expect(instance.auth.api.controlWebhookRotate({ headers:wrongOrigin,body:{ id:create.endpoint.id } })).rejects.toMatchObject({ statusCode:403 });
 		const rotated=await instance.auth.api.controlWebhookRotate({ headers,body:{ id:create.endpoint.id } }); expect(rotated.secret).not.toBe(create.secret);
+		await expect(readWithPreviousCodec()).resolves.toBe(rotated.secret);
 		const history=await instance.auth.api.controlWebhookDeliveries({ headers }); expect(JSON.stringify(history)).not.toMatch(/payload|encryptedSecret|whsec_/);
 		await instance.auth.api.controlWebhookDelete({ headers,body:{ id:create.endpoint.id } });
 		expect((await instance.auth.api.controlWebhooks({ headers })).endpoints.some((endpoint)=>endpoint.id===create.endpoint.id)).toBe(false);

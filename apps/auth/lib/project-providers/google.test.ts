@@ -1,3 +1,5 @@
+import { createHmac } from "node:crypto";
+import { symmetricDecrypt, symmetricEncrypt } from "better-auth/crypto";
 import { describe, expect, it } from "vitest";
 import { googleProviderPatch, googleCallbackURL, selectGoogleProvider } from "./google";
 import { decryptGoogleSecret, encryptGoogleSecret } from "./repository";
@@ -19,11 +21,22 @@ describe("environment-specific direct Google configuration", () => {
 		expect(selectGoogleProvider(false, true)).toBe("allauth");
 		expect(selectGoogleProvider(false, false)).toBeNull();
 	});
-	it("binds encrypted credentials to the selected environment and never stores plaintext", async () => {
+	it("preserves the native encrypted format and binds credentials to the selected environment", async () => {
 		const secret = "fixture-tenant-client-secret";
-		const encrypted = await encryptGoogleSecret(secret, "environment-alpha", env);
+		const projectId = "environment-alpha";
+		const key = createHmac("sha256", env.BETTER_AUTH_SECRET)
+			.update(`allauth:project-google:${projectId}`)
+			.digest("hex");
+		const configured = {
+			...env,
+			ALLAUTH_AUTH_SECRET: env.BETTER_AUTH_SECRET,
+			BETTER_AUTH_SECRETS: "4:fixture-rotated-session-key",
+		};
+		const native = await symmetricEncrypt({ key, data: secret });
+		await expect(decryptGoogleSecret(native, projectId, configured)).resolves.toBe(secret);
+		const encrypted = await encryptGoogleSecret(secret, projectId, configured);
 		expect(encrypted).not.toContain(secret);
-		expect(await decryptGoogleSecret(encrypted, "environment-alpha", env)).toBe(secret);
+		await expect(symmetricDecrypt({ key, data: encrypted })).resolves.toBe(secret);
 		await expect(decryptGoogleSecret(encrypted, "environment-beta", env)).rejects.toThrow();
 	});
 	it("builds a direct native provider with the tenant client and the same-origin proxy callback", () => {

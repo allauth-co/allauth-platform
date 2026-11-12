@@ -11,6 +11,8 @@ import { issuerForm, ProjectOAuthError } from "./owned-project-issuer-http";
 import { createOwnedProjectIssuerKeys } from "./owned-project-issuer-keys";
 
 const confirmLifetime = 300;
+const endSessionPath = "/oauth2/end-session";
+const confirmSessionPath = "/oauth2/end-session/confirm";
 const logoutRequest = z.object({
 	id_token_hint: z.string().min(1).max(8192).optional(),
 	client_id: z.string().min(1).max(256).optional(),
@@ -39,11 +41,14 @@ export interface OwnedProjectIssuerLogoutOptions {
 	keys: LegacyMfaKeys;
 	signingSecret: string;
 	sessionCookie: string;
+	requireMfa: boolean;
 	readBody(request: Request): Promise<unknown>;
 	revokeSession(
 		database: PoolClient,
 		request: Request,
 		target: LogoutSession,
+		path: typeof endSessionPath | typeof confirmSessionPath,
+		actorId: string | null,
 	): Promise<void>;
 	clearBrowserSession(headers: Headers): void;
 }
@@ -114,8 +119,8 @@ export function createOwnedProjectIssuerLogout(
 ) {
 	const store = createProjectEngineStore(options.database, options.schemaName);
 	const keys = createOwnedProjectIssuerKeys(options);
-	const endpoint = `${options.issuer}/oauth2/end-session`;
-	const confirmEndpoint = `${endpoint}/confirm`;
+	const endpoint = `${options.issuer}${endSessionPath}`;
+	const confirmEndpoint = `${options.issuer}${confirmSessionPath}`;
 	const confirmPath = new URL(confirmEndpoint).pathname;
 	const origin = new URL(options.issuer).origin;
 	const cookieName = `${options.sessionCookie}.oauth_logout_confirmation`;
@@ -143,8 +148,16 @@ export function createOwnedProjectIssuerLogout(
 			options.signingSecret,
 		);
 		if (!token) return;
-		const { rows } = await database.query<LogoutSession>(
-			`SELECT id,"userId",token FROM "session" WHERE token=$1 AND "expiresAt">statement_timestamp() FOR UPDATE`,
+		const { rows } = await database.query<
+			LogoutSession & {
+				impersonatedBy: string | null;
+				emailVerified: boolean;
+				twoFactorEnabled: boolean | null;
+			}
+		>(
+			`SELECT s.id,s."userId",s.token,s."impersonatedBy",u."emailVerified",u."twoFactorEnabled"
+			 FROM "session" s JOIN "user" u ON u.id=s."userId"
+			 WHERE s.token=$1 AND s."expiresAt">statement_timestamp() FOR UPDATE OF s`,
 			[token],
 		);
 		return rows[0];
@@ -239,7 +252,8 @@ export function createOwnedProjectIssuerLogout(
 
 	return async function logout(path: string, request: Request) {
 		const url = new URL(request.url);
-		const confirm = path === "/oauth2/end-session/confirm";
+		if (path !== endSessionPath && path !== confirmSessionPath) return;
+		const confirm = path === confirmSessionPath;
 		if (
 			url.origin + url.pathname !== (confirm ? confirmEndpoint : endpoint) ||
 			(confirm
@@ -266,6 +280,22 @@ export function createOwnedProjectIssuerLogout(
 					: {};
 			return await store.transaction(async (database) => {
 				const current = await browserSession(database, request);
+				if (
+					options.requireMfa &&
+					current &&
+					!current.impersonatedBy &&
+					(!current.emailVerified || !current.twoFactorEnabled)
+				)
+					return Response.json(
+						{
+							message:
+								"This application requires an already verified account enrolled in MFA.",
+						},
+						{ status: 403, headers },
+					);
+				// The legacy MFA policy reads the browser session before dispatch. The
+				// logout handler's own cookie and ID-token lookup never supplies an actor.
+				const actorId = options.requireMfa ? (current?.userId ?? null) : null;
 				if (confirm) {
 					const supplied = z
 						.object({ action: z.literal("confirm") })
@@ -320,7 +350,13 @@ export function createOwnedProjectIssuerLogout(
 								)
 							: undefined;
 					if (current) {
-						await options.revokeSession(database, request, current);
+						await options.revokeSession(
+							database,
+							request,
+							current,
+							path,
+							actorId,
+						);
 						options.clearBrowserSession(headers);
 					} else if (!isNavigation(request) && !redirect) {
 						throw new ProjectOAuthError(
@@ -418,7 +454,14 @@ export function createOwnedProjectIssuerLogout(
 					`SELECT id,"userId",token FROM "session" WHERE id=$1 AND "userId"=$2 FOR UPDATE`,
 					[hint.id, hint.subject],
 				);
-				if (rows[0]) await options.revokeSession(database, request, rows[0]);
+				if (rows[0])
+					await options.revokeSession(
+						database,
+						request,
+						rows[0],
+						path,
+						actorId,
+					);
 				if (current) options.clearBrowserSession(headers);
 				setConfirmation(headers);
 				const redirect = logoutRedirect(

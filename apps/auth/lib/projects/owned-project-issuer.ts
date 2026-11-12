@@ -51,7 +51,7 @@ export function createOwnedProjectIssuer(
 		>[0]["readManagementUser"];
 		logout: Pick<
 			OwnedProjectIssuerLogoutOptions,
-			"sessionCookie" | "revokeSession" | "clearBrowserSession"
+			"sessionCookie" | "requireMfa" | "revokeSession" | "clearBrowserSession"
 		>;
 	},
 ) {

@@ -1,6 +1,7 @@
-import { createHash } from "node:crypto";
-import { xchacha20poly1305 } from "@noble/ciphers/chacha.js";
-import { bytesToHex, hexToBytes, managedNonce } from "@noble/ciphers/utils.js";
+import {
+	openLegacyUnversionedRecord,
+	sealLegacyUnversionedRecord,
+} from "../legacy-encrypted-record";
 
 /** Supply only the keys that historically encrypted records in this realm. */
 export type LegacyMfaKeys =
@@ -8,10 +9,6 @@ export type LegacyMfaKeys =
 	| { currentVersion: number; keys: ReadonlyMap<number, string>; legacySecret?: string };
 
 const versionedRecord = /^\$ba\$(0|[1-9]\d*)\$([a-fA-F0-9]+)$/;
-
-function cipher(secret: string) {
-	return managedNonce(xchacha20poly1305)(createHash("sha256").update(secret).digest());
-}
 
 /** Open an existing nonce-prefixed XChaCha20-Poly1305 record. */
 export function openLegacyMfaRecord(record: string, keys: LegacyMfaKeys): string {
@@ -26,7 +23,7 @@ export function openLegacyMfaRecord(record: string, keys: LegacyMfaKeys): string
 		if (!secret || !/^(?:[a-f0-9]{2}){40,}$/i.test(ciphertext)) {
 			throw new Error("Invalid encrypted record.");
 		}
-		return new TextDecoder("utf-8", { fatal: true }).decode(cipher(secret).decrypt(hexToBytes(ciphertext)));
+		return openLegacyUnversionedRecord(ciphertext, secret, { fatal: true });
 	} catch {
 		throw new Error("Could not read the existing MFA record.");
 	}
@@ -36,13 +33,13 @@ export function openLegacyMfaRecord(record: string, keys: LegacyMfaKeys): string
 export function sealLegacyMfaRecord(value: string, keys: LegacyMfaKeys): string {
 	if ("secret" in keys) {
 		if (!keys.secret) throw new Error("No MFA encryption key is configured.");
-		return bytesToHex(cipher(keys.secret).encrypt(new TextEncoder().encode(value)));
+		return sealLegacyUnversionedRecord(value, keys.secret);
 	}
 	const { currentVersion } = keys;
 	const secret = keys.keys.get(currentVersion);
 	if (!secret || !Number.isSafeInteger(currentVersion) || currentVersion < 0) {
 		throw new Error("No active MFA encryption key is configured.");
 	}
-	const ciphertext = bytesToHex(cipher(secret).encrypt(new TextEncoder().encode(value)));
+	const ciphertext = sealLegacyUnversionedRecord(value, secret);
 	return `$ba$${currentVersion}$${ciphertext}`;
 }
