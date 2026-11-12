@@ -177,7 +177,10 @@ async function verifyAssertion(
 		[id, new Date(claims.exp * 1000)],
 	);
 	if (!consumed.rowCount)
-		throw invalidClient("Client assertion has already been used.");
+		throw new ProjectOAuthError(
+			"invalid_client",
+			"client assertion jti has already been used",
+		);
 }
 
 export async function authenticateIssuerClient(

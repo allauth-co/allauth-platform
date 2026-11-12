@@ -6,7 +6,7 @@ import {
 } from "@better-auth/oauth-provider";
 import { jwt, organization } from "better-auth/plugins";
 import { getTestInstance } from "better-auth/test";
-import { decodeJwt, exportJWK, generateKeyPair } from "jose";
+import { decodeJwt, exportJWK, generateKeyPair, SignJWT } from "jose";
 import { Kysely, PostgresDialect } from "kysely";
 import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -504,6 +504,156 @@ describe.skipIf(!existsSync(fixture))(
 					targetId: ownedData.client_id,
 				},
 			]);
+		});
+
+		it("redeems private-key clients and preserves assertion replay decisions across writers", async () => {
+			const engine = managementEngine();
+			const administrator = await browser();
+			await database.query(
+				`UPDATE "${schema}"."user" SET role='admin' WHERE id=$1`,
+				[administrator.userId],
+			);
+			const current = await browser();
+			const { privateKey, publicKey } = await generateKeyPair("RS256", {
+				extractable: true,
+			});
+			const kid = "fixture-private-key-client";
+			const registered = await legacy(
+				request("/oauth2/create-client", {
+					cookie: administrator.cookie,
+					body: {
+						client_name: "Asymmetric Client Fixture",
+						redirect_uris: [callback],
+						grant_types: ["authorization_code", "refresh_token"],
+						scope: "openid profile offline_access",
+						token_endpoint_auth_method: "private_key_jwt",
+						jwks: {
+							keys: [{ ...(await exportJWK(publicKey)), kid, alg: "RS256" }],
+						},
+					},
+				}),
+			);
+			expect(registered.status, await registered.clone().text()).toBe(201);
+			const { client_id: clientId } = (await registered.json()) as {
+				client_id: string;
+			};
+			const ownedWriter = (input: Request) => engine.dispatch(input);
+			const tokenEndpoint = `${issuer}/oauth2/token`;
+			const sign = (audience = tokenEndpoint) =>
+				new SignJWT({})
+					.setProtectedHeader({ alg: "RS256", kid })
+					.setIssuer(clientId)
+					.setSubject(clientId)
+					.setAudience(audience)
+					.setIssuedAt()
+					.setExpirationTime("2m")
+					.setJti(randomUUID())
+					.sign(privateKey);
+			const issueCode = async (writer: typeof legacy) => {
+				const selected = await resultURL(
+					await writer(
+						request("/oauth2/authorize", {
+							cookie: current.cookie,
+							query: query(clientId, {
+								scope: "openid profile offline_access",
+							}),
+						}),
+					),
+				);
+				const result =
+					selected.pathname === "/oauth/consent"
+						? await resultURL(
+								await writer(
+									request("/oauth2/consent", {
+										cookie: current.cookie,
+										body: {
+											accept: true,
+											oauth_query: selected.searchParams.toString(),
+										},
+									}),
+								),
+							)
+						: selected;
+				expect(result.pathname).toBe(new URL(callback).pathname);
+				const code = result.searchParams.get("code");
+				expect(code).toBeTruthy();
+				return code!;
+			};
+			const grant = (
+				writer: typeof legacy,
+				input: Record<string, string>,
+				proof: string,
+			) =>
+				writer(
+					request("/oauth2/token", {
+						body: new URLSearchParams({
+							...input,
+							client_id: clientId,
+							client_assertion_type:
+								"urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+							client_assertion: proof,
+						}),
+					}),
+				);
+			const redeem = (writer: typeof legacy, code: string, proof: string) =>
+				grant(
+					writer,
+					{
+						grant_type: "authorization_code",
+						code,
+						redirect_uri: callback,
+						code_verifier: verifier,
+					},
+					proof,
+				);
+			const firstCode = await issueCode(legacy);
+			const firstProof = await sign();
+			const firstToken = await redeem(ownedWriter, firstCode, firstProof);
+			expect(firstToken.status, await firstToken.clone().text()).toBe(200);
+			const ownedTokens = (await firstToken.json()) as {
+				refresh_token: string;
+				id_token: string;
+			};
+			expect(decodeJwt(ownedTokens.id_token)).toMatchObject({
+				iss: issuer,
+				aud: clientId,
+				sub: current.userId,
+			});
+			const secondCode = await issueCode(ownedWriter);
+			const nativeReplay = await redeem(legacy, secondCode, firstProof);
+			expect(nativeReplay.status).toBe(400);
+			const replayError = await nativeReplay.json();
+			expect(replayError).toMatchObject({ error: "invalid_client" });
+			const secondProof = await sign(issuer);
+			const secondToken = await redeem(legacy, secondCode, secondProof);
+			expect(secondToken.status, await secondToken.clone().text()).toBe(200);
+			const nativeTokens = (await secondToken.json()) as {
+				refresh_token: string;
+			};
+			const thirdCode = await issueCode(legacy);
+			const ownedReplay = await redeem(ownedWriter, thirdCode, secondProof);
+			expect(ownedReplay.status).toBe(nativeReplay.status);
+			expect(await ownedReplay.json()).toEqual(replayError);
+			expect((await redeem(ownedWriter, thirdCode, await sign())).status).toBe(
+				200,
+			);
+			for (const [writer, refresh] of [
+				[ownedWriter, nativeTokens.refresh_token],
+				[legacy, ownedTokens.refresh_token],
+			] as const) {
+				const response = await grant(
+					writer,
+					{
+						grant_type: "refresh_token",
+						refresh_token: refresh,
+					},
+					await sign(),
+				);
+				expect(response.status, await response.clone().text()).toBe(200);
+				expect(await response.json()).toMatchObject({
+					refresh_token: expect.any(String),
+				});
+			}
 		});
 
 		it("preserves client catalog fields, private ownership, signed prelogin and native deletion semantics", async () => {
