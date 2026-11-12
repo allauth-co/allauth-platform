@@ -3617,7 +3617,271 @@ describe.skipIf(!existsSync(fixture))(
 			expect(await exercise("owned")).toEqual(native);
 		});
 
-		it("keeps a session whose concurrent renewal commits during expiration cleanup", async () => {
+		it.each([
+			["/revoke-session", "cookie"],
+			["/revoke-sessions", "cookie"],
+			["/revoke-other-sessions", "cookie"],
+			["/revoke-session", "bearer"],
+		] as const)("cleans up an expired %s caller authenticated by %s", async (path, authority) => {
+			const realm = `"${alpha.schemaName}"`;
+			const shadow = `"${beta.schemaName}"`;
+			const installed = installedNative();
+			const operation =
+				path === "/revoke-session"
+					? "session.revoked"
+					: path === "/revoke-sessions"
+						? "session.revoked-all"
+						: "session.revoked-others";
+			for (const [writer, dispatch] of [
+				["legacy", installed.handler],
+				["owned", owned.dispatch],
+			] as const) {
+				const expired = await browserSession(eventEmail);
+				const active = await browserSession(eventEmail);
+				const client = randomUUID();
+				const shadowOwner = randomUUID();
+				const foreignGrant = randomUUID();
+				const grants = ["access", "online", "offline", "unrelated"].map(
+					(kind) => ({ id: randomUUID(), kind }),
+				);
+				const subscription = await endpoint(
+					"legacy",
+					`nested-expiry-${operation.split(".")[1]}-${authority}-${writer}`,
+					["session.*"],
+				);
+				try {
+					await database.query(
+						`UPDATE ${realm}.session SET "expiresAt"=statement_timestamp()-interval '1 minute' WHERE id=$1`,
+						[expired.id],
+					);
+					await database.query(
+						`INSERT INTO ${shadow}."user" (id,name,email,"emailVerified") VALUES ($1,'Shadow owner',$2,true)`,
+						[shadowOwner, `${shadowOwner}@fixture.example`],
+					);
+					await database.query(
+						`INSERT INTO ${shadow}.session (id,token,"userId","expiresAt","updatedAt") VALUES ($1,$2,$3,now()+interval '1 day',now())`,
+						[expired.id, expired.token, shadowOwner],
+					);
+					for (const scope of [realm, shadow])
+						await database.query(
+							`INSERT INTO ${scope}."oauthClient" (id,"clientId","redirectUris") VALUES ($1,$1,'[]')`,
+							[client],
+						);
+					for (const { id, kind } of grants) {
+						const table =
+							kind === "access" ? "oauthAccessToken" : "oauthRefreshToken";
+						await database.query(
+							`INSERT INTO ${realm}."${table}" (id,token,"sessionId","userId","clientId","expiresAt","createdAt",scopes)
+							 VALUES ($1,$1,$2,$3,$4,now()+interval '1 day',now(),$5)`,
+							[
+								id,
+								kind === "unrelated" ? active.id : expired.id,
+								eventUserId,
+								client,
+								JSON.stringify(
+									kind === "offline"
+										? ["openid", "offline_access"]
+										: ["openid"],
+								),
+							],
+						);
+					}
+					await database.query(
+						`INSERT INTO ${shadow}."oauthRefreshToken" (id,token,"sessionId","userId","clientId","expiresAt","createdAt",scopes)
+						 VALUES ($1,$1,$2,$3,$4,now()+interval '1 day',now(),'["openid"]')`,
+						[foreignGrant, expired.id, shadowOwner, client],
+					);
+					const expiredRequest = (body: object) => {
+						const incoming = request(
+							`${alpha.path}${path}`,
+							body,
+							authority === "cookie" ? expired.cookie : "",
+						);
+						if (authority === "bearer") {
+							incoming.headers.delete("origin");
+							incoming.headers.set(
+								"authorization",
+								`Bearer ${expired.cookie.slice(expired.cookie.indexOf("=") + 1)}`,
+							);
+						}
+						return incoming;
+					};
+					const audit = () =>
+						signedEvents(
+							subscription,
+							[
+								expired.cookie,
+								active.cookie,
+								expired.token,
+								active.token,
+								...grants.map(({ id }) => id),
+								foreignGrant,
+							],
+							new Map([[expired.id, "expired-caller"]]),
+						);
+					const grantState = async () =>
+						(
+							await database.query(
+								`SELECT id,revoked IS NOT NULL AS revoked,"sessionId" FROM ${realm}."oauthAccessToken" WHERE "clientId"=$1
+							 UNION ALL SELECT id,revoked IS NOT NULL AS revoked,"sessionId" FROM ${realm}."oauthRefreshToken" WHERE "clientId"=$1 ORDER BY id`,
+								[client],
+							)
+						).rows;
+					if (path === "/revoke-session") {
+						const malformed = await dispatch(expiredRequest({}));
+						expect(malformed.status).toBe(400);
+						expect(
+							(await audit()).filter(
+								({ event }) => event.type === "session.deleted",
+							),
+						).toEqual([]);
+						expect(
+							(
+								await database.query(
+									`SELECT 1 FROM ${realm}.session WHERE id=$1`,
+									[expired.id],
+								)
+							).rowCount,
+						).toBe(1);
+					}
+					const body =
+						path === "/revoke-session" ? { token: active.token } : {};
+					if (
+						writer === "owned" &&
+						path === "/revoke-session" &&
+						authority === "cookie"
+					) {
+						const before = await grantState();
+						await database.query(
+							`CREATE FUNCTION ${realm}.fail_nested_expiry_audit() RETURNS trigger LANGUAGE plpgsql AS $$
+							 BEGIN RAISE EXCEPTION 'Synthetic nested expiry audit failure'; END $$`,
+						);
+						try {
+							await database.query(
+								`CREATE TRIGGER fail_nested_expiry_audit BEFORE INSERT ON ${realm}."allauthEvent"
+								 FOR EACH ROW WHEN (NEW.type='session.deleted' AND NEW.metadata->>'path'='/revoke-session')
+								 EXECUTE FUNCTION ${realm}.fail_nested_expiry_audit()`,
+							);
+							await expect(dispatch(expiredRequest(body))).rejects.toThrow(
+								"Synthetic nested expiry audit failure",
+							);
+							expect(await grantState()).toEqual(before);
+							expect(
+								(
+									await database.query(
+										`SELECT id FROM ${realm}.session WHERE id=ANY($1::text[]) ORDER BY id`,
+										[[expired.id, active.id]],
+									)
+								).rows.map(({ id }) => id),
+							).toEqual([expired.id, active.id].sort());
+							expect(await audit()).toEqual([]);
+						} finally {
+							await database.query(
+								`DROP TRIGGER IF EXISTS fail_nested_expiry_audit ON ${realm}."allauthEvent"`,
+							);
+							await database.query(
+								`DROP FUNCTION ${realm}.fail_nested_expiry_audit()`,
+							);
+						}
+					}
+					for (const response of [
+						await dispatch(expiredRequest(body)),
+						await dispatch(expiredRequest(body)),
+					]) {
+						expect(response.status).toBe(401);
+						expect(await response.json()).toEqual({
+							code: "UNAUTHORIZED",
+							message: "Unauthorized",
+						});
+						expect(response.headers.getSetCookie()).toEqual(
+							expect.arrayContaining([
+								expect.stringMatching(/\.session_token=;.*Max-Age=0/),
+							]),
+						);
+					}
+					const events = await audit();
+					expect(
+						events.filter(({ event }) => event.type === "session.deleted"),
+					).toEqual([
+						{
+							event: {
+								type: "session.deleted",
+								outcome: "success",
+								actorId: eventUserId,
+								userId: eventUserId,
+								targetId: "expired-caller",
+								metadata: { path },
+							},
+						},
+					]);
+					expect(
+						events.filter(({ event }) => event.type === operation),
+					).toEqual(
+						Array.from({ length: 2 }, () => ({
+							event: {
+								type: operation,
+								outcome: "failure",
+								ipAddress: "192.0.2.46",
+								userAgent: "webhook-management-fixture",
+								metadata: { path, errorCode: "UNAUTHORIZED" },
+							},
+						})),
+					);
+					expect(
+						(
+							await database.query(
+								`SELECT id FROM ${realm}.session WHERE id=ANY($1::text[])`,
+								[[expired.id, active.id]],
+							)
+						).rows,
+					).toEqual([{ id: active.id }]);
+					expect(
+						(
+							await database.query(
+								`SELECT s."userId",g.revoked,g."sessionId" FROM ${shadow}.session s
+						 JOIN ${shadow}."oauthRefreshToken" g ON g."sessionId"=s.id WHERE s.token=$1 AND g.id=$2`,
+								[expired.token, foreignGrant],
+							)
+						).rows,
+					).toEqual([
+						{ userId: shadowOwner, revoked: null, sessionId: expired.id },
+					]);
+					const state = await grantState();
+					expect(state).toHaveLength(grants.length);
+					for (const { id, kind } of grants)
+						expect(state.find((grant) => grant.id === id)).toEqual({
+							id,
+							revoked: kind === "access" || kind === "online",
+							sessionId: kind === "unrelated" ? active.id : null,
+						});
+				} finally {
+					expect(
+						(
+							await send("legacy", `${base}/delete`, {
+								id: subscription.endpoint.id,
+							})
+						).status,
+					).toBe(200);
+					for (const scope of [realm, shadow])
+						await database.query(
+							`DELETE FROM ${scope}."oauthClient" WHERE id=$1`,
+							[client],
+						);
+					await database.query(
+						`DELETE FROM ${realm}.session WHERE id=ANY($1::text[])`,
+						[[expired.id, active.id]],
+					);
+					await database.query(`DELETE FROM ${shadow}."user" WHERE id=$1`, [
+						shadowOwner,
+					]);
+				}
+			}
+		});
+
+		it.each([
+			"/get-session",
+			"/revoke-session",
+		] as const)("keeps a session whose concurrent renewal commits during expiration cleanup on %s", async (path) => {
 			const active = await browserSession(eventEmail);
 			const realm = `"${alpha.schemaName}"`;
 			const renewal = await database.connect();
@@ -3647,13 +3911,15 @@ describe.skipIf(!existsSync(fixture))(
 						{ timeout: 5000 },
 					)
 					.toBe(true);
-				pending = owned.readSession(
-					request(
-						`${alpha.path}/get-session?disableRefresh=true`,
-						undefined,
-						active.cookie,
-					),
+				const incoming = request(
+					`${alpha.path}${path}?disableRefresh=true`,
+					path === "/revoke-session" ? { token: randomUUID() } : undefined,
+					active.cookie,
 				);
+				pending =
+					path === "/get-session"
+						? owned.readSession(incoming)
+						: owned.dispatch(incoming);
 				void pending.catch(() => {});
 				await expect
 					.poll(
@@ -3671,10 +3937,20 @@ describe.skipIf(!existsSync(fixture))(
 				committed = true;
 				const result = await pending;
 				expect(result.status).toBe(200);
-				expect(await result.json()).toMatchObject({
-					session: { id: active.id },
-				});
+				expect(await result.json()).toMatchObject(
+					path === "/get-session"
+						? { session: { id: active.id } }
+						: { status: true },
+				);
 				expect(result.headers.getSetCookie()).toEqual([]);
+				expect(
+					(
+						await database.query(
+							`SELECT id FROM ${realm}.session WHERE id=$1 AND "expiresAt">statement_timestamp()`,
+							[active.id],
+						)
+					).rows,
+				).toEqual([{ id: active.id }]);
 				expect(
 					(
 						await database.query(

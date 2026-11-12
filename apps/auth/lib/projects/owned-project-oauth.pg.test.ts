@@ -15,6 +15,12 @@ import {
 	defaultSecurityPolicy,
 	securitySubject,
 } from "../control/security-policy";
+import {
+	newWebhookSigningSecret,
+	webhookSignature,
+} from "../control/webhook-contract";
+import type { ControlWebhookEnvelope } from "../control/webhooks";
+import { deliverPendingWebhooks } from "../control/webhooks";
 import { discoveryDocument } from "../discovery";
 import { extraServerPlugins } from "../features/server";
 import { productionTwoFactor } from "../mfa";
@@ -285,6 +291,7 @@ describe.skipIf(!existsSync(fixturePath))(
 					for (const migration of [
 						"001-initial-auth.sql",
 						"002-control-plane.sql",
+						"004-webhooks.sql",
 						"005-free-plugins.sql",
 						"006-analytics.sql",
 						"016-invitation-import-provenance.sql",
@@ -385,6 +392,12 @@ describe.skipIf(!existsSync(fixturePath))(
 				google,
 				fetch: network,
 				authorizeLinkedAccounts,
+				auditContext(request) {
+					return {
+						ipAddress: request.headers.get("x-real-ip") ?? undefined,
+						userAgent: request.headers.get("user-agent") ?? undefined,
+					};
+				},
 				async complete(client, { user, destination: target }) {
 					const token = randomUUID();
 					await store.createSession(client, {
@@ -2574,6 +2587,134 @@ describe.skipIf(!existsSync(fixturePath))(
 			).toMatchObject([googleAccount]);
 		});
 
+		it("delivers the installed signed unlink events and preserves the remaining account", async () => {
+			const stock = await legacyProject(nativeDatabase!, config, {
+				policy: defaultAuthPolicy,
+				brokerOnly: false,
+				controlSecurity: true,
+			});
+			const candidate = owned();
+			const endpoint = randomUUID();
+			const signingSecret = newWebhookSigningSecret();
+			const webhookURL = "https://account-unlink-hook.fixture.example/events";
+			const path = "/unlink-account";
+			const ipAddress = "192.0.2.85";
+			const userAgent = "synthetic account-unlink browser";
+			await database.query(
+				`INSERT INTO "${schema}"."allauthWebhookEndpoint"(id,url,"eventTypes","encryptedSecret")
+				 VALUES ($1,$2,'["account.*"]',$3)`,
+				[
+					endpoint,
+					webhookURL,
+					await symmetricEncrypt({ key, data: signingSecret }),
+				],
+			);
+			try {
+				for (const [writer, dispatch] of [
+					["native", stock.handler],
+					[
+						"owned",
+						(request: Request, accountId: string) =>
+							candidate.unlinkAccount(request, { accountId }),
+					],
+				] as const) {
+					const owner = await accountOwner();
+					const retained = await persistedAccount(owner.userId, "credential");
+					const target = await persistedAccount(owner.userId, "google");
+					const unknownId = randomUUID();
+					for (const [accountId, status] of [
+						[unknownId, 400],
+						[target.id, 200],
+					] as const) {
+						const request = accountRequest(path, owner.cookie, { accountId });
+						request.headers.set("x-real-ip", ipAddress);
+						request.headers.set("user-agent", userAgent);
+						const response = await dispatch(request, accountId);
+						expect(response.status, writer).toBe(status);
+						expect(await response.json()).toMatchObject(
+							status === 200 ? { status: true } : { code: "ACCOUNT_NOT_FOUND" },
+						);
+					}
+					const events: unknown[] = [];
+					const result = await deliverPendingWebhooks({
+						database: nativeDatabase!,
+						secret: key,
+						now: () => new Date(Date.now() + 1000),
+						resolver: async () => [{ address: "93.184.216.34", family: 4 }],
+						async transport({ destination, body, headers }) {
+							expect(destination.url.href).toBe(webhookURL);
+							const signature = await webhookSignature(
+								signingSecret,
+								headers["webhook-id"],
+								headers["webhook-timestamp"],
+								body,
+							);
+							expect(headers["webhook-signature"]).toBe(signature);
+							expect(body).not.toContain(unknownId);
+							expect(body).not.toContain("fixture-private");
+							const envelope = JSON.parse(body) as ControlWebhookEnvelope;
+							const { id, createdAt, ...event } = envelope.data.event;
+							expect(envelope).toMatchObject({
+								id,
+								timestamp: createdAt,
+								type: event.type,
+							});
+							events.push(event);
+							return 204;
+						},
+					});
+					const actor = { actorId: owner.userId, userId: owner.userId };
+					const requestEvent = {
+						type: "account.unlinked",
+						...actor,
+						ipAddress,
+						userAgent,
+					};
+					expect(events, writer).toEqual(
+						expect.arrayContaining([
+							{
+								...requestEvent,
+								outcome: "failure",
+								metadata: { path, errorCode: "ACCOUNT_NOT_FOUND" },
+							},
+							{
+								type: "account.deleted",
+								outcome: "success",
+								...actor,
+								targetId: target.id,
+								metadata: { path, provider: "google" },
+							},
+							{ ...requestEvent, outcome: "success", metadata: { path } },
+						]),
+					);
+					expect(result).toEqual({
+						claimed: 3,
+						delivered: 3,
+						retried: 0,
+						failed: 0,
+					});
+					const remaining = await database.query(
+						`SELECT id FROM "${schema}"."account" WHERE "userId"=$1`,
+						[owner.userId],
+					);
+					expect(remaining.rows).toEqual([{ id: retained.id }]);
+					expect(
+						await stock.api.getSession({
+							headers: new Headers({ cookie: owner.cookie }),
+						}),
+					).toMatchObject({
+						user: { id: owner.userId },
+						session: { id: owner.id },
+					});
+				}
+			} finally {
+				await database.query(
+					`DELETE FROM "${schema}"."allauthWebhookEndpoint" WHERE id=$1`,
+					[endpoint],
+				);
+			}
+		});
+
 		it("serializes concurrent unlink requests and leaves the last linked sign-in account", async () => {
 			const owner = await accountOwner();
 			const brokerAccount = await persistedAccount(owner.userId, "allauth");
@@ -2599,12 +2740,13 @@ describe.skipIf(!existsSync(fixturePath))(
 			);
 			expect(await remaining.json()).toHaveLength(1);
 			const audit = await database.query(
-				`SELECT type FROM "${schema}"."allauthEvent" WHERE "userId" = $1 ORDER BY type`,
+				`SELECT type,outcome FROM "${schema}"."allauthEvent" WHERE "userId" = $1 ORDER BY type,outcome`,
 				[owner.userId],
 			);
 			expect(audit.rows).toEqual([
-				{ type: "account.deleted" },
-				{ type: "account.unlinked" },
+				{ type: "account.deleted", outcome: "success" },
+				{ type: "account.unlinked", outcome: "failure" },
+				{ type: "account.unlinked", outcome: "success" },
 			]);
 		});
 

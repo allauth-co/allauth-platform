@@ -10,6 +10,7 @@ import * as oauth from "oauth4webapi";
 import type { Pool, PoolClient } from "pg";
 import * as z from "zod";
 import { validAvatarPath } from "../avatars/protocol";
+import type { ControlEventInput } from "../control/types";
 import { hostedSocialSignInRequests } from "../domains/hosted-oauth-requests";
 import { reservedProjectEmailError } from "../project-email-alias-config";
 import type { LegacyMfaKeys } from "./legacy-mfa-record";
@@ -226,6 +227,9 @@ export interface OwnedProjectOAuthOptions {
 		},
 	): Promise<Response>;
 	authorizeLinkedAccounts?: AuthorizeLinkedAccounts;
+	auditContext?(
+		request: Request,
+	): Pick<ControlEventInput, "ipAddress" | "userAgent">;
 	passwordSignIn?: boolean;
 	passkeySignIn?: boolean;
 	otherLinkedSignIn?(client: PoolClient, user: ProjectUser): Promise<boolean>;
@@ -1003,7 +1007,12 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 				"This authentication request is not permitted.",
 				403,
 			);
-		const result = await linked.unlink(request, browserToken(request), input);
+		const result = await linked.unlink(
+			request,
+			browserToken(request),
+			input,
+			options.auditContext?.(request),
+		);
 		return result.status === "rejected"
 			? rejectedResponse(result)
 			: publicJSON({ status: true }, 200);

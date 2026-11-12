@@ -254,6 +254,7 @@ interface OwnedProjectEngineOptions {
 		| "requireEmailVerification"
 		| "reservedEmail"
 		| "authorizeLinkedAccounts"
+		| "auditContext"
 		| "passwordSignIn"
 		| "passkeySignIn"
 		| "otherLinkedSignIn"
@@ -798,8 +799,17 @@ export function createOwnedProjectEngine(
 		if (owned.length) {
 			let actorId: string | null | undefined;
 			if (
+				path === "/two-factor/verify-totp" ||
+				path === "/two-factor/verify-backup-code"
+			) {
+				// Only pending MFA creates a new session without a prior session on these routes.
+				actorId = null;
+			} else if (
 				path === "/sign-in/email" ||
 				path === "/sign-in/username" ||
+				eventMetadata.path === "/callback/:id" ||
+				path === "/verify-email" ||
+				path === "/email-otp/verify-email" ||
 				path === "/magic-link/verify" ||
 				path === "/sign-in/email-otp" ||
 				path === "/passkey/verify-authentication"
@@ -1545,6 +1555,26 @@ export function createOwnedProjectEngine(
 		});
 	}
 
+	async function cleanupExpiredSession(
+		client: PoolClient,
+		request: Request,
+		token: string,
+		path: string,
+	) {
+		const removed = await store.revoke(
+			{ tokens: [token], expiredOnly: true },
+			path,
+			Boolean(backchannel),
+			client,
+		);
+		if (!removed) return null;
+		deliverLogoutAfterCommit(client, request, removed.targets);
+		// A concurrent renewal may have committed while the expiration check waited.
+		return removed.ids.length === 0
+			? store.session(token, refreshWindow, client)
+			: null;
+	}
+
 	async function readSession(request: Request) {
 		if (!trustedRequest(request.headers, false)) return forbidden();
 		let headers = new Headers();
@@ -1554,21 +1584,10 @@ export function createOwnedProjectEngine(
 					includeExpired: true,
 				})
 			: null;
-		if (token && observed?.expired) {
-			const removed = await store.transaction(async (client) => {
-				const result = await store.revoke(
-					{ tokens: [token], expiredOnly: true },
-					"/get-session",
-					Boolean(backchannel),
-					client,
-				);
-				if (result) deliverLogoutAfterCommit(client, request, result.targets);
-				return result;
-			});
-			observed = removed?.ids.length === 0
-				? await store.session(token, refreshWindow)
-				: null;
-		}
+		if (token && observed?.expired)
+			observed = await store.transaction((client) =>
+				cleanupExpiredSession(client, request, token, "/get-session"),
+			);
 		if (observed?.session.impersonatedBy) {
 			const url = new URL(request.url);
 			if (
@@ -1870,16 +1889,27 @@ export function createOwnedProjectEngine(
 		};
 		if (!token) return store.transaction(unauthorized);
 		return store.transaction(async (client) => {
-			const observed = await store.session(token, refreshWindow, client);
+			const observed = await store.session(token, refreshWindow, client, {
+				includeExpired: true,
+			});
 			if (!observed) {
 				clearSessionCookies(headers);
 				return unauthorized(client);
 			}
-			if (!ordinarySession(token, observed)) return unauthorized(client);
+			if (!observed.expired && !ordinarySession(token, observed))
+				return unauthorized(client);
 			// Serialize this user's sign-ins and authorization mutations before
 			// locking the caller and the set of sessions it may revoke.
 			const user = await store.lockUser(client, observed.user.id);
-			if (!user || !(await store.lockSession(client, token, user.id, false)))
+			if (!user) return unauthorized(client);
+			if (
+				observed.expired &&
+				!(await cleanupExpiredSession(client, request, token, path))
+			) {
+				clearSessionCookies(headers);
+				return unauthorized(client);
+			}
+			if (!(await store.lockSession(client, token, user.id, false)))
 				return unauthorized(client);
 			const current = await eligibleSession(token, client);
 			if (!current || current.user.id !== user.id) return unauthorized(client);
@@ -2029,19 +2059,8 @@ export function createOwnedProjectEngine(
 		return store.transaction(async (client) => {
 			let observed: Awaited<ReturnType<typeof store.session>> | null =
 				await store.session(token, refreshWindow, client, { includeExpired: true });
-			if (observed?.expired) {
-				const removed = await store.revoke(
-					{ tokens: [token], expiredOnly: true },
-					path,
-					Boolean(backchannel),
-					client,
-				);
-				if (removed) deliverLogoutAfterCommit(client, request, removed.targets);
-				observed =
-					removed?.ids.length === 0
-						? await store.session(token, refreshWindow, client)
-						: null;
-			}
+			if (observed?.expired)
+				observed = await cleanupExpiredSession(client, request, token, path);
 			if (!observed) {
 				clearSessionCookies(headers);
 				return unauthorized();
@@ -3043,6 +3062,7 @@ export function createOwnedProjectEngine(
 			baseURL: origin,
 			basePath: options.basePath,
 			trustedOrigins: options.trustedOrigins,
+			auditContext: browserEventContext,
 			denyProviderProfile: security.denyProvisioning,
 			prepareProviderSignup: security.prepareProviderSignup,
 			async readGuestUserId(request) {

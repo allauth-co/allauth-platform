@@ -382,14 +382,13 @@ export function createOwnedSignUpHttp(options: OwnedSignUpOptions) {
 				user.id,
 				user.id,
 			);
-			await store.record(
-				client,
-				"account.linked",
-				"success",
-				"/sign-up/email",
-				user.id,
-				accountId,
-			);
+			await store.recordEvent(client, {
+				type: "account.linked",
+				outcome: "success",
+				userId: user.id,
+				targetId: accountId,
+				metadata: { path: "/sign-up/email", provider: "credential" },
+			});
 			return "created";
 		});
 		if (outcome === "username-taken")

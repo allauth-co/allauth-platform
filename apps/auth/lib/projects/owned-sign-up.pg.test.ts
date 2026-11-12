@@ -7,6 +7,7 @@ import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { defaultAuthPolicy } from "../auth-policy/policy";
 import { clerkCompatiblePasswords } from "../clerk-password";
+import { allauthControl } from "../control";
 import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
 import type { OwnedSignUpOptions } from "./owned-sign-up";
 import { createOwnedSignUpHttp } from "./owned-sign-up";
@@ -36,7 +37,7 @@ async function legacyFixture(
 				autoSignIn: false,
 				password: clerkCompatiblePasswords,
 			},
-			plugins: [username()],
+			plugins: [username(), allauthControl({ ipHeader: "x-real-ip" })],
 		},
 		{ disableTestUser: true },
 	);
@@ -255,6 +256,47 @@ describe.skipIf(!existsSync(fixturePath))(
 					body: { username: "CASED.Name" },
 				}),
 			).resolves.toEqual({ available: false });
+		});
+
+		it("records the native credential-link event when password signup creates an account", async () => {
+			for (const [label, dispatch] of [
+				["native", native.auth.handler],
+				["owned", fixture().handler],
+			] as const) {
+				const created = await dispatch(
+					request(
+						"sign-up/email",
+						{
+							name: "Synthetic credential link",
+							email: `${label}-credential-link@signup-fixture.example`,
+							password,
+						},
+						{ Origin: label === "native" ? origin : appOrigin },
+					),
+				);
+				expect(created?.status).toBe(200);
+				const { user } = (await created!.json()) as SignUpResponse;
+				const { rows: accounts } = await database.query<{ id: string }>(
+					`SELECT id FROM "${schema}"."account" WHERE "userId"=$1 AND "providerId"='credential'`,
+					[user.id],
+				);
+				expect(accounts).toHaveLength(1);
+				const { rows: events } = await database.query(
+					`SELECT type,outcome,"actorId","userId","targetId",metadata FROM "${schema}"."allauthEvent"
+					 WHERE "userId"=$1 AND type='account.linked'`,
+					[user.id],
+				);
+				expect(events, label).toEqual([
+					{
+						type: "account.linked",
+						outcome: "success",
+						actorId: null,
+						userId: user.id,
+						targetId: accounts[0]!.id,
+						metadata: { path: "/sign-up/email", provider: "credential" },
+					},
+				]);
+			}
 		});
 
 		it("keeps concurrent and duplicate email signup opaque, with one stored account and one verification", async () => {

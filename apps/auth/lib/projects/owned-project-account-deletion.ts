@@ -303,14 +303,14 @@ export function createOwnedProjectAccountDeletion(
 					claim.key,
 				);
 				for (const account of accounts)
-					await store.record(
-						client,
-						"account.deleted",
-						"success",
-						path,
+					await store.recordEvent(client, {
+						type: "account.deleted",
+						outcome: "success",
+						actorId: userId,
 						userId,
-						account.id,
-					);
+						targetId: account.id,
+						metadata: { path, provider: account.providerId },
+					});
 				await store.record(
 					client,
 					"user.deleted",

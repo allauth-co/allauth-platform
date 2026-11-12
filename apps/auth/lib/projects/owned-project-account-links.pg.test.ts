@@ -347,6 +347,9 @@ describe.skipIf(!existsSync(fixturePath))(
 					await user("owned-delete-post"),
 				],
 			} as const;
+			const unrelated = await user("self-erasure-unrelated");
+			const unrelatedSession = (await session(unrelated.cookie))?.session.id;
+			expect(unrelatedSession).toBeTruthy();
 			const outbound = vi
 				.spyOn(globalThis, "fetch")
 				.mockImplementation(async (input) => {
@@ -388,7 +391,7 @@ describe.skipIf(!existsSync(fixturePath))(
 				});
 				await database.query(
 					`INSERT INTO "${schema}"."allauthWebhookEndpoint"(id,url,"eventTypes","encryptedSecret")
-					 VALUES ($1,$2,'["user.*"]',$3)`,
+					 VALUES ($1,$2,'["user.*","session.deleted","account.*"]',$3)`,
 					[
 						endpoint,
 						webhookURL,
@@ -408,6 +411,35 @@ describe.skipIf(!existsSync(fixturePath))(
 						const requestContext = { ipAddress: ip, userAgent };
 						const path =
 							method === "GET" ? "/delete-user/callback" : "/delete-user";
+						const liveSession = (await session(account.cookie))?.session.id;
+						expect(liveSession).toBeTruthy();
+						const otherSessions = [randomUUID(), randomUUID()];
+						await database.query(
+							`INSERT INTO "${schema}"."session" (id,token,"userId","expiresAt","updatedAt")
+							 SELECT id, token, $1, statement_timestamp() + hours * interval '1 hour', statement_timestamp()
+							 FROM unnest($2::text[], $3::text[], ARRAY[1,-1]) AS fixture(id,token,hours)`,
+							[
+								account.id,
+								otherSessions,
+								otherSessions.map(() => randomUUID()),
+							],
+						);
+						const linkedAccount = randomUUID();
+						await database.query(
+							`INSERT INTO "${schema}"."account" (id,"accountId","providerId","userId","updatedAt")
+							 VALUES ($1,$1,'google',$2,statement_timestamp())`,
+							[linkedAccount, account.id],
+						);
+						const { rows: accounts } = await database.query<{
+							id: string;
+							providerId: string;
+						}>(
+							`SELECT id,"providerId" FROM "${schema}"."account" WHERE "userId"=$1`,
+							[account.id],
+						);
+						expect(accounts.map(({ providerId }) => providerId).sort()).toEqual(
+							["credential", "google"],
+						);
 						const userProjection = {
 							id: account.id,
 							name: userName,
@@ -480,6 +512,7 @@ describe.skipIf(!existsSync(fixturePath))(
 							const stats = await deliverPendingWebhooks({
 								database: webhookDatabase,
 								secret,
+								maxDeliveries: 10,
 								now: () => new Date(Date.now() + 1000),
 								resolver: async () => [{ address: "93.184.216.34", family: 4 }],
 								async transport({ destination: target, body, headers }) {
@@ -505,7 +538,7 @@ describe.skipIf(!existsSync(fixturePath))(
 									const { id, createdAt, ...event } = envelope.data.event;
 									expect(envelope).toMatchObject({
 										id,
-										type: "user.deleted",
+										type: event.type,
 										timestamp: createdAt,
 									});
 									received.push({
@@ -534,6 +567,24 @@ describe.skipIf(!existsSync(fixturePath))(
 											},
 										]
 								: [
+										...[liveSession, ...otherSessions].map((targetId) => ({
+											event: {
+												type: "session.deleted",
+												outcome: "success",
+												...owner,
+												targetId,
+												metadata: { path },
+											},
+										})),
+										...accounts.map(({ id, providerId }) => ({
+											event: {
+												type: "account.deleted",
+												outcome: "success",
+												...owner,
+												targetId: id,
+												metadata: { path, provider: providerId },
+											},
+										})),
 										{
 											event: {
 												...common,
@@ -555,16 +606,16 @@ describe.skipIf(!existsSync(fixturePath))(
 												]
 											: []),
 									];
-							expect(stats).toEqual({
+							expect(received, `${writer} ${method}`).toEqual(
+								expect.arrayContaining<unknown>(expected),
+							);
+							expect(stats, `${writer} ${method}`).toEqual({
 								claimed: expected.length,
 								delivered: expected.length,
 								retried: 0,
 								failed: 0,
 							});
 							expect(received).toHaveLength(expected.length);
-							expect(received).toEqual(
-								expect.arrayContaining<unknown>(expected),
-							);
 							if (scenario.code) {
 								expect(await identity(account.id)).toMatchObject({
 									email: account.email,
@@ -575,6 +626,9 @@ describe.skipIf(!existsSync(fixturePath))(
 							} else {
 								expect(await identity(account.id)).toBeUndefined();
 								expect(await session(account.cookie)).toBeNull();
+								expect((await session(unrelated.cookie))?.session.id).toBe(
+									unrelatedSession,
+								);
 							}
 						}
 					}

@@ -7373,6 +7373,642 @@ describe.skipIf(!existsSync(fixture))(
 			}
 		}, 60_000);
 
+		it("matches signed saved-device cleanup on ordinary hosted provider callbacks", async () => {
+			const local: { container: string; DATABASE_URL: string } = JSON.parse(
+				readFileSync(fixture, "utf8"),
+			);
+			const base = new URL(local.DATABASE_URL);
+			if (
+				local.container !== "allauth-production-test-20261007" ||
+				base.hostname !== "127.0.0.1" ||
+				base.port !== "55445"
+			)
+				throw new Error(
+					"Hosted callback event tests require isolated PostgreSQL.",
+				);
+			const admin = new Pool({ connectionString: base.href, max: 1 });
+			const name = `allauth_hosted_${randomUUID().replaceAll("-", "")}`;
+			const databaseURL = new URL(`/${name}`, base).href;
+			let created = false;
+			let database: Pool | undefined;
+			let scoped: ReturnType<typeof postgresDatabase>["db"] | undefined;
+			let service: Awaited<ReturnType<typeof openProcess>> | undefined;
+			try {
+				await admin.query(`CREATE DATABASE "${name}"`);
+				created = true;
+				const { alpha, beta } = await seed(databaseURL);
+				database = new Pool({ connectionString: databaseURL, max: 1 });
+				const realm = `"${alpha.schemaName}"`;
+				const sibling = `"${beta.schemaName}"`;
+				scoped = postgresDatabase(
+					new Pool({
+						connectionString: databaseURL,
+						max: 1,
+						options: `-c search_path=${alpha.schemaName}`,
+					}),
+				).db;
+				const host = `${alpha.slug}-accounts.allauth.co`;
+				const origin = `https://${host}`;
+				const cookieName = `__Secure-allauth_project_${alpha.slug}.session_token`;
+				const url = `https://${alpha.slug}.webhook.fixture.example/events`;
+				const projectKey = projectSecret(childEnvironment(), alpha.id);
+				let nextIP = 191;
+				const clientIP = () => `192.0.2.${nextIP++}`;
+				const start = () =>
+					startFixtureProvider(service!, "google", {
+						prefix: "/api/auth",
+						host,
+						clientIP: clientIP(),
+						callback: `${origin}/api/auth/callback/google`,
+						destination: `${origin}/account`,
+					});
+				async function browser(response: Response) {
+					const cookies = cookie(response).split("; ");
+					const primary = cookies.find((value) =>
+						value.startsWith(`${cookieName}=`),
+					);
+					if (!primary) throw new Error("Missing fixture browser session.");
+					const current = await service!.request("/api/auth/get-session", {
+						host,
+						cookie: primary,
+						clientIP: clientIP(),
+					});
+					const { session, user } = (await current.json()) as {
+						session: { id: string };
+						user: { id: string; email: string };
+					};
+					const {
+						rows: [stored],
+					} = await database!.query<{ token: string }>(
+						`SELECT token FROM ${realm}.session WHERE id=$1`,
+						[session.id],
+					);
+					const device = cookies.find((value) =>
+						value.startsWith(
+							`${cookieName}_multi-${stored.token.toLowerCase()}=`,
+						),
+					);
+					if (!device) throw new Error("Missing fixture saved device.");
+					return { ...session, user, token: stored.token, primary, device };
+				}
+				async function providerSignIn() {
+					const attempt = await start();
+					const response = await service!.request(attempt.path, {
+						host,
+						cookie: attempt.cookie,
+						clientIP: clientIP(),
+					});
+					expect(response.status).toBe(302);
+					expect(response.headers.get("location")).toBe(`${origin}/account`);
+					return browser(response);
+				}
+				for (const owned of [false, true]) {
+					service = await openProcess(databaseURL, alpha, owned);
+					for (const hasBrowser of [true, false]) {
+						const previous = await providerSignIn();
+						const unrelated = await providerSignIn();
+						expect(previous.user).toMatchObject({
+							email: runtimeFixtureGoogle.email,
+						});
+						expect(unrelated.user.id).toBe(previous.user.id);
+						const active = await browser(
+							await service.request("/api/auth/sign-in/email", {
+								host,
+								clientIP: clientIP(),
+								body: {
+									email: credentials.project.email,
+									password: credentials.password,
+								},
+							}),
+						);
+						expect(active.user.id).toBe(credentials.project.id);
+						const attempt = await start();
+						const endpoint = randomUUID();
+						const signingKey = newWebhookSigningSecret();
+						const encrypted = await symmetricEncrypt({
+							key: projectKey,
+							data: signingKey,
+						});
+						// Watch this event after isolated writer startup without changing selector admission.
+						for (const schema of [realm, sibling])
+							await database.query(
+								`INSERT INTO ${schema}."allauthWebhookEndpoint" (id,url,"eventTypes","encryptedSecret") VALUES ($1,$2,'["session.deleted"]',$3)`,
+								[endpoint, url, encrypted],
+							);
+						await database.query(
+							`INSERT INTO ${sibling}.session (id,token,"userId","expiresAt","updatedAt") VALUES ($1,$2,$3,now()+interval '1 day',now())`,
+							[previous.id, previous.token, credentials.project.id],
+						);
+						const client = randomUUID();
+						await database.query(
+							`INSERT INTO ${realm}."oauthClient" (id,"clientId","redirectUris") VALUES ($1,$1,'[]')`,
+							[client],
+						);
+						const grants = ["access", "online", "offline", "unrelated"].map(
+							(kind) => ({ kind, id: randomUUID() }),
+						);
+						for (const { kind, id } of grants) {
+							const table =
+								kind === "access" ? "oauthAccessToken" : "oauthRefreshToken";
+							await database.query(
+								`INSERT INTO ${realm}."${table}" (id,token,"sessionId","userId","clientId","expiresAt","createdAt",scopes)
+							 VALUES ($1,$1,$2,$3,$4,now()+interval '1 day',now(),$5)`,
+								[
+									id,
+									kind === "unrelated" ? unrelated.id : previous.id,
+									previous.user.id,
+									client,
+									JSON.stringify(
+										kind === "offline"
+											? ["openid", "offline_access"]
+											: ["openid"],
+									),
+								],
+							);
+						}
+						const response = await service.request(attempt.path, {
+							host,
+							clientIP: clientIP(),
+							cookie: [
+								attempt.cookie,
+								previous.device,
+								active.device,
+								...(hasBrowser ? [active.primary] : []),
+							].join("; "),
+						});
+						expect(response.status).toBe(302);
+						expect(response.headers.get("location")).toBe(`${origin}/account`);
+						const replacement = await browser(response);
+						expect(replacement.user.id).toBe(previous.user.id);
+						const expired = response.headers
+							.getSetCookie()
+							.find((value) =>
+								value.startsWith(`${previous.device.split("=", 1)[0]}=;`),
+							);
+						expect(expired).toContain("Max-Age=0");
+						const { rows: sessions } = await database.query<{ id: string }>(
+							`SELECT id FROM ${realm}.session WHERE id=ANY($1::text[])`,
+							[[previous.id, active.id, unrelated.id, replacement.id]],
+						);
+						expect(new Set(sessions.map(({ id }) => id))).toEqual(
+							new Set([active.id, unrelated.id, replacement.id]),
+						);
+						expect(
+							(
+								await database.query(
+									`SELECT "userId" FROM ${sibling}.session WHERE id=$1 AND token=$2`,
+									[previous.id, previous.token],
+								)
+							).rows,
+						).toEqual([{ userId: credentials.project.id }]);
+						expect(
+							(
+								await database.query(
+									`SELECT id FROM ${sibling}."allauthWebhookDelivery" WHERE "endpointId"=$1`,
+									[endpoint],
+								)
+							).rows,
+						).toEqual([]);
+						const { rows: grantState } = await database.query(
+							`SELECT id,revoked IS NOT NULL AS revoked,"sessionId" FROM ${realm}."oauthAccessToken" WHERE "clientId"=$1
+						 UNION ALL SELECT id,revoked IS NOT NULL AS revoked,"sessionId" FROM ${realm}."oauthRefreshToken" WHERE "clientId"=$1`,
+							[client],
+						);
+						expect(grantState).toHaveLength(grants.length);
+						for (const { kind, id } of grants)
+							expect(grantState.find((grant) => grant.id === id)).toEqual({
+								id,
+								revoked: kind === "access" || kind === "online",
+								sessionId: kind === "unrelated" ? unrelated.id : null,
+							});
+						const delivered: ControlWebhookEnvelope[] = [];
+						expect(
+							await deliverPendingWebhooks({
+								database: scoped,
+								secret: projectKey,
+								now: () => new Date(Date.now() + 2_000),
+								resolver: async () => [{ address: "93.184.216.34", family: 4 }],
+								async transport({ destination, body, headers }) {
+									expect(destination.url.href).toBe(url);
+									expect(headers["webhook-signature"]).toBe(
+										await webhookSignature(
+											signingKey,
+											headers["webhook-id"]!,
+											headers["webhook-timestamp"]!,
+											body,
+										),
+									);
+									for (const value of [
+										previous.token,
+										active.token,
+										unrelated.token,
+										replacement.token,
+										signingKey,
+									])
+										expect(body).not.toContain(value);
+									delivered.push(JSON.parse(body) as ControlWebhookEnvelope);
+									return 204;
+								},
+							}),
+						).toEqual({ claimed: 1, delivered: 1, failed: 0, retried: 0 });
+						const { id, createdAt } = delivered[0]!.data.event;
+						expect(
+							delivered,
+							`${owned ? "AllAuth" : "legacy"} callback with ${hasBrowser ? "an active browser" : "only saved devices"}`,
+						).toEqual([
+							{
+								id,
+								type: "session.deleted",
+								timestamp: createdAt,
+								data: {
+									event: {
+										id,
+										createdAt,
+										type: "session.deleted",
+										outcome: "success",
+										...(hasBrowser ? { actorId: active.user.id } : {}),
+										userId: previous.user.id,
+										targetId: previous.id,
+										metadata: { path: "/callback/:id" },
+									},
+								},
+							},
+						]);
+						for (const schema of [realm, sibling])
+							await database.query(
+								`DELETE FROM ${schema}."allauthWebhookEndpoint" WHERE id=$1`,
+								[endpoint],
+							);
+					}
+					await service.stop();
+					service = undefined;
+				}
+			} finally {
+				try {
+					await service?.stop();
+				} finally {
+					try {
+						await scoped?.destroy();
+						await database?.end();
+						if (created) await dropClosedFixtureDatabase(admin, name);
+					} finally {
+						await admin.end();
+					}
+				}
+			}
+		}, 60_000);
+
+		it.each([
+			{
+				flow: "email verification with active browser",
+				route: "verify-email",
+				hasBrowser: true,
+			},
+			{
+				flow: "email verification with saved device only",
+				route: "verify-email",
+				hasBrowser: false,
+			},
+			{
+				flow: "email OTP verification with active browser",
+				route: "email-otp/verify-email",
+				hasBrowser: true,
+			},
+			{
+				flow: "email OTP verification with saved device only",
+				route: "email-otp/verify-email",
+				hasBrowser: false,
+			},
+			{
+				flow: "pending recovery-code MFA completion",
+				route: "two-factor/verify-backup-code",
+				hasBrowser: false,
+			},
+			{
+				flow: "pending authenticator-code MFA completion",
+				route: "two-factor/verify-totp",
+				hasBrowser: false,
+			},
+		])("matches signed saved-device cleanup after $flow", async ({
+			route,
+			hasBrowser,
+		}) => {
+			const local: { container: string; DATABASE_URL: string } = JSON.parse(
+				readFileSync(fixture, "utf8"),
+			);
+			const base = new URL(local.DATABASE_URL);
+			if (
+				local.container !== "allauth-production-test-20261007" ||
+				base.hostname !== "127.0.0.1" ||
+				base.port !== "55445"
+			)
+				throw new Error(
+					"Hosted verification event tests require isolated PostgreSQL.",
+				);
+			const admin = new Pool({ connectionString: base.href, max: 1 });
+			const name = `allauth_hosted_${randomUUID().replaceAll("-", "")}`;
+			const databaseURL = new URL(`/${name}`, base).href;
+			let created = false;
+			let database: Pool | undefined;
+			let scoped: ReturnType<typeof postgresDatabase>["db"] | undefined;
+			let service: Awaited<ReturnType<typeof openProcess>> | undefined;
+			try {
+				await admin.query(`CREATE DATABASE "${name}"`);
+				created = true;
+				const { alpha } = await seed(databaseURL);
+				database = new Pool({ connectionString: databaseURL, max: 1 });
+				const realm = `"${alpha.schemaName}"`;
+				scoped = postgresDatabase(
+					new Pool({
+						connectionString: databaseURL,
+						max: 1,
+						options: `-c search_path=${alpha.schemaName}`,
+					}),
+				).db;
+				const host = `${alpha.slug}-accounts.allauth.co`;
+				const cookieName = `__Secure-allauth_project_${alpha.slug}.session_token`;
+				const url = `https://${alpha.slug}.webhook.fixture.example/events`;
+				const projectKey = projectSecret(childEnvironment(), alpha.id);
+				const rollout = {
+					ALLAUTH_PROJECT_HOSTED_UI_PROJECT_IDS: alpha.id,
+					EMAIL_PROVIDER: "cloudflare" as const,
+					EMAIL_FROM: runtimeFixtureVerificationMail.sender,
+					CLOUDFLARE_ACCOUNT_ID: runtimeFixtureVerificationMail.accountId,
+					CLOUDFLARE_EMAIL_API_TOKEN: runtimeFixtureVerificationMail.token,
+				};
+				let nextIP = 180;
+				const transport = () => ({
+					host,
+					accept: "application/json",
+					clientIP: `192.0.2.${nextIP++}`,
+				});
+				const login = (email: string) =>
+					service!.request("/api/auth/hosted-ui/sign-in/email", {
+						...transport(),
+						body: { email, password: credentials.password },
+					});
+				async function browser(response: Response) {
+					const cookies = cookie(response).split("; ");
+					const primary = cookies.find((value) =>
+						value.startsWith(`${cookieName}=`),
+					);
+					if (!primary) throw new Error("Missing fixture browser session.");
+					const current = await service!.request(
+						"/api/auth/hosted-ui/get-session",
+						{ ...transport(), cookie: primary },
+					);
+					const { session, user } = (await current.json()) as {
+						session: { id: string };
+						user: { id: string };
+					};
+					const {
+						rows: [stored],
+					} = await database!.query<{ token: string }>(
+						`SELECT token FROM ${realm}.session WHERE id=$1`,
+						[session.id],
+					);
+					const device = cookies.find((value) =>
+						value.startsWith(
+							`${cookieName}_multi-${stored.token.toLowerCase()}=`,
+						),
+					);
+					if (!device) throw new Error("Missing fixture saved device.");
+					return {
+						id: session.id,
+						userId: user.id,
+						token: stored.token,
+						primary,
+						device,
+					};
+				}
+				for (const owned of [false, true]) {
+					service = await openProcess(
+						databaseURL,
+						alpha,
+						owned,
+						alpha.slug,
+						undefined,
+						undefined,
+						rollout,
+					);
+					const previous = await browser(
+						await login(credentials.project.email),
+					);
+					const unrelated = await browser(
+						await login(credentials.project.email),
+					);
+					const actor = await browser(
+						await login(credentials.realmAdmin.email),
+					);
+					const devices = [
+						previous.device,
+						actor.device,
+						...(hasBrowser ? [actor.primary] : []),
+					];
+					const isMfa = route.startsWith("two-factor/");
+					let complete: () => Promise<Response>;
+					if (!isMfa)
+						await database.query(
+							`UPDATE ${realm}."user" SET "emailVerified"=false WHERE id=$1`,
+							[previous.userId],
+						);
+					if (route === "verify-email") {
+						const issued = await login(credentials.project.email);
+						expect(issued.status).toBe(403);
+						const link = await fixtureVerificationMail(
+							service,
+							credentials.project.email,
+						);
+						complete = () =>
+							service!.request(link.pathname + link.search, {
+								...transport(),
+								cookie: devices.join("; "),
+							});
+					} else if (route === "email-otp/verify-email") {
+						const email = credentials.project.email;
+						const issued = await service.request(
+							"/api/auth/email-otp/send-verification-otp",
+							{
+								...transport(),
+								body: { email, type: "email-verification" },
+							},
+						);
+						expect(issued.status, await issued.clone().text()).toBe(200);
+						const otp = await vi.waitFor(() => {
+							const message = service!.mail.find(
+								({ to, subject }) =>
+									to === email && subject.endsWith(" verification code"),
+							);
+							const codes = message?.text.match(/\b\d{6}\b/g);
+							expect(codes).toHaveLength(1);
+							return codes![0]!;
+						});
+						complete = () =>
+							service!.request(`/api/auth/${route}`, {
+								...transport(),
+								cookie: devices.join("; "),
+								body: { email, otp },
+							});
+					} else {
+						const secret = "synthetic-saved-device-factor";
+						const recoveryCode = "test0-12345";
+						const { encryptionKeys } = readLegacyProjectKeyring(
+							projectKey,
+							versionedEncryption,
+						);
+						await database.query(
+							`INSERT INTO ${realm}."twoFactor" (id,secret,"backupCodes","userId",verified) VALUES ($1,$2,$3,$4,true)`,
+							[
+								randomUUID(),
+								sealLegacyMfaRecord(secret, encryptionKeys),
+								sealLegacyMfaRecord(
+									JSON.stringify([recoveryCode]),
+									encryptionKeys,
+								),
+								previous.userId,
+							],
+						);
+						await database.query(
+							`UPDATE ${realm}."user" SET "twoFactorEnabled"=true WHERE id=$1`,
+							[previous.userId],
+						);
+						const pending = await login(credentials.project.email);
+						expect(pending.status, await pending.clone().text()).toBe(200);
+						expect(await pending.json()).toMatchObject({
+							twoFactorRedirect: true,
+						});
+						expect(cookie(pending)).toContain(".two_factor=");
+						expect(cookie(pending)).not.toContain(".session_token=");
+						complete = () => {
+							let code = recoveryCode;
+							if (route === "two-factor/verify-totp") {
+								const counter = Buffer.alloc(8);
+								counter.writeBigUInt64BE(
+									BigInt(Math.floor(Date.now() / 30_000)),
+								);
+								const digest = createHmac("sha1", secret)
+									.update(counter)
+									.digest();
+								const offset = digest[digest.length - 1]! & 15;
+								code = String(
+									(digest.readUInt32BE(offset) & 0x7fffffff) % 1_000_000,
+								).padStart(6, "0");
+							}
+							return service!.request(`/api/auth/hosted-ui/${route}`, {
+								...transport(),
+								cookie: [...devices, cookie(pending)].join("; "),
+								body: { code },
+							});
+						};
+					}
+					const endpoint = randomUUID();
+					const signingKey = newWebhookSigningSecret();
+					await database.query(
+						`INSERT INTO ${realm}."allauthWebhookEndpoint" (id,url,"eventTypes","encryptedSecret") VALUES ($1,$2,'["session.deleted"]',$3)`,
+						[
+							endpoint,
+							url,
+							await symmetricEncrypt({ key: projectKey, data: signingKey }),
+						],
+					);
+					const response = await complete();
+					expect(response.status, await response.clone().text()).toBe(
+						route === "verify-email" ? 302 : 200,
+					);
+					const replacement = await browser(response);
+					expect(replacement.userId).toBe(previous.userId);
+					const previousDevice = previous.device.split("=", 1)[0];
+					expect(
+						response.headers
+							.getSetCookie()
+							.find((value) => value.startsWith(`${previousDevice}=;`)),
+					).toContain("Max-Age=0");
+					const { rows } = await database.query<{ id: string }>(
+						`SELECT id FROM ${realm}.session WHERE id=ANY($1::text[])`,
+						[[previous.id, actor.id, unrelated.id, replacement.id]],
+					);
+					expect(new Set(rows.map(({ id }) => id))).toEqual(
+						new Set([actor.id, unrelated.id, replacement.id]),
+					);
+					const delivered: ControlWebhookEnvelope[] = [];
+					expect(
+						await deliverPendingWebhooks({
+							database: scoped,
+							secret: projectKey,
+							now: () => new Date(Date.now() + 2_000),
+							resolver: async () => [{ address: "93.184.216.34", family: 4 }],
+							async transport({ destination, body, headers }) {
+								expect(destination.url.href).toBe(url);
+								expect(headers["webhook-signature"]).toBe(
+									await webhookSignature(
+										signingKey,
+										headers["webhook-id"]!,
+										headers["webhook-timestamp"]!,
+										body,
+									),
+								);
+								expect(body).not.toContain(previous.token);
+								expect(body).not.toContain(replacement.token);
+								delivered.push(JSON.parse(body) as ControlWebhookEnvelope);
+								return 204;
+							},
+						}),
+					).toEqual({ claimed: 1, delivered: 1, failed: 0, retried: 0 });
+					const { id, createdAt } = delivered[0]!.data.event;
+					expect(
+						delivered,
+						owned ? "AllAuth verification" : "legacy verification",
+					).toEqual([
+						{
+							id,
+							type: "session.deleted",
+							timestamp: createdAt,
+							data: {
+								event: {
+									id,
+									createdAt,
+									type: "session.deleted",
+									outcome: "success",
+									...(hasBrowser ? { actorId: actor.userId } : {}),
+									userId: previous.userId,
+									targetId: previous.id,
+									metadata: { path: `/${route}` },
+								},
+							},
+						},
+					]);
+					await database.query(
+						`DELETE FROM ${realm}."allauthWebhookEndpoint" WHERE id=$1`,
+						[endpoint],
+					);
+					if (isMfa) {
+						await database.query(
+							`DELETE FROM ${realm}."twoFactor" WHERE "userId"=$1`,
+							[previous.userId],
+						);
+						await database.query(
+							`UPDATE ${realm}."user" SET "twoFactorEnabled"=false WHERE id=$1`,
+							[previous.userId],
+						);
+					}
+					await service.stop();
+					service = undefined;
+				}
+			} finally {
+				try {
+					await service?.stop();
+				} finally {
+					try {
+						await scoped?.destroy();
+						await database?.end();
+						if (created) await dropClosedFixtureDatabase(admin, name);
+					} finally {
+						await admin.end();
+					}
+				}
+			}
+		}, 60_000);
+
 		it("carries long signed hosted social returns across the project writer switch", async () => {
 			const local: { container: string; DATABASE_URL: string } = JSON.parse(
 				readFileSync(fixture, "utf8"),

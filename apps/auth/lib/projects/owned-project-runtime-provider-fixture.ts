@@ -103,7 +103,10 @@ export function runtimeProviderFixtureFetch(
 			if (
 				message.from?.address !== mail.sender ||
 				!message.to?.endsWith("@runtime.fixture.example") ||
-				!message.subject?.startsWith("Verify your ") ||
+				!message.subject ||
+				!/^(?:Verify your .+ email|Your .+ verification code)$/.test(
+					message.subject,
+				) ||
 				!message.text
 			)
 				throw new Error("Unexpected isolated verification email.");

@@ -1,5 +1,6 @@
 import type { Pool, PoolClient } from "pg";
 import * as z from "zod";
+import type { ControlEventInput } from "../control/types";
 import type { ProjectUser } from "./owned-project-engine-store";
 import { createProjectEngineStore } from "./owned-project-engine-store";
 import { checkedProjectSchema } from "./validation";
@@ -244,6 +245,7 @@ export function createOwnedProjectLinkedAccounts(
 		request: Request,
 		token: string | null,
 		input: OwnedProjectOAuthUnlink,
+		auditContext?: Pick<ControlEventInput, "ipAddress" | "userAgent">,
 	) {
 		const parsed = ownedProjectOAuthUnlinkInput.safeParse(input);
 		if (!parsed.success) return rejected("invalid");
@@ -252,6 +254,22 @@ export function createOwnedProjectLinkedAccounts(
 			const authority = await lockAuthority(client, request, token, "unlink");
 			if (authority.status === "rejected") return authority;
 			const userId = authority.user.id;
+			const path = "/unlink-account";
+			function recordUnlink(errorCode?: string) {
+				return store.recordEvent(client, {
+					...auditContext,
+					type: "account.unlinked",
+					outcome: errorCode ? "failure" : "success",
+					actorId: userId,
+					userId,
+					metadata: { path, ...(errorCode && { errorCode }) },
+				});
+			}
+			async function rejectUnlink(reason: keyof typeof failures) {
+				const result = rejected(reason);
+				await recordUnlink(result.code);
+				return result;
+			}
 			const matches = await client.query<{ id: string; providerId: string }>(
 				`SELECT id, "providerId" FROM "${schema}"."account" WHERE "userId" = $1
 				AND (
@@ -260,15 +278,15 @@ export function createOwnedProjectLinkedAccounts(
 				) ORDER BY id LIMIT 2 FOR UPDATE`,
 				[userId, providerId ?? null, accountId ?? null],
 			);
-			if (matches.rows.length > 1) return rejected("ambiguous");
+			if (matches.rows.length > 1) return rejectUnlink("ambiguous");
 			const selected = matches.rows[0];
-			if (!selected) return rejected("notFound");
+			if (!selected) return rejectUnlink("notFound");
 			// The user lock serializes link and unlink so concurrent removals cannot delete every account.
 			const another = await client.query(
 				`SELECT 1 FROM "${schema}"."account" WHERE "userId" = $1 AND id <> $2 ORDER BY id LIMIT 1 FOR SHARE`,
 				[userId, selected.id],
 			);
-			if (another.rowCount !== 1) return rejected("last");
+			if (another.rowCount !== 1) return rejectUnlink("last");
 			// Preserve the native last-row rule and avoid leaving only disabled sign-in methods.
 			const usableProviders = availability && [
 				...availability.socialProviders,
@@ -292,29 +310,22 @@ export function createOwnedProjectLinkedAccounts(
 					(!passkey || passkey.rowCount !== 1) &&
 					!(await availability?.otherSignIn?.(client, authority.user))
 				)
-					return rejected("disabledRemainder");
+					return rejectUnlink("disabledRemainder");
 			}
 			const removed = await client.query(
 				`DELETE FROM "${schema}"."account" WHERE "userId" = $1 AND id = $2`,
 				[userId, selected.id],
 			);
-			if (removed.rowCount !== 1) return rejected("notFound");
-			await store.record(
-				client,
-				"account.deleted",
-				"success",
-				"/unlink-account",
+			if (removed.rowCount !== 1) return rejectUnlink("notFound");
+			await store.recordEvent(client, {
+				type: "account.deleted",
+				outcome: "success",
+				actorId: userId,
 				userId,
-				selected.id,
-			);
-			await store.record(
-				client,
-				"account.unlinked",
-				"success",
-				"/unlink-account",
-				userId,
-				selected.id,
-			);
+				targetId: selected.id,
+				metadata: { path, provider: selected.providerId },
+			});
+			await recordUnlink();
 			return { status: "unlinked" as const };
 		});
 	}
