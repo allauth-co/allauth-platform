@@ -32,9 +32,9 @@ export interface AuthEngine {
 	readPrincipal(headers: Headers): Promise<ControlPrincipal | null>;
 	/** Read or refresh a session, preserving the HTTP body and response cookies. */
 	readSession(request: Request): Promise<Response>;
-	listAccountSessions(headers: Headers): Promise<Response>;
+	listAccountSessions(request: Request): Promise<Response>;
 	revokeAccountSession(
-		headers: Headers,
+		request: Request,
 		body: { id: string },
 	): Promise<Response>;
 	readDirectory(

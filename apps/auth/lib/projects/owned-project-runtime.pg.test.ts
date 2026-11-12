@@ -7373,7 +7373,10 @@ describe.skipIf(!existsSync(fixture))(
 			}
 		}, 60_000);
 
-		it("matches signed saved-device cleanup on ordinary hosted provider callbacks", async () => {
+		it.each([
+			{ flow: "ordinary hosted provider callbacks", direct: false },
+			{ flow: "direct provider ID-token sign-in", direct: true },
+		])("matches signed saved-device cleanup on $flow", async ({ direct }) => {
 			const local: { container: string; DATABASE_URL: string } = JSON.parse(
 				readFileSync(fixture, "utf8"),
 			);
@@ -7384,7 +7387,7 @@ describe.skipIf(!existsSync(fixture))(
 				base.port !== "55445"
 			)
 				throw new Error(
-					"Hosted callback event tests require isolated PostgreSQL.",
+					"Provider sign-in event tests require isolated PostgreSQL.",
 				);
 			const admin = new Pool({ connectionString: base.href, max: 1 });
 			const name = `allauth_hosted_${randomUUID().replaceAll("-", "")}`;
@@ -7409,27 +7412,75 @@ describe.skipIf(!existsSync(fixture))(
 				).db;
 				const host = `${alpha.slug}-accounts.allauth.co`;
 				const origin = `https://${host}`;
+				const authPath = direct
+					? `/api/projects/${alpha.slug}/auth`
+					: "/api/auth";
+				const transport = direct
+					? { proxy: alpha, origin: alpha.primaryOrigin }
+					: { host };
+				const provider = direct ? runtimeFixtureApple : runtimeFixtureGoogle;
+				const eventPath = direct ? "/sign-in/social" : "/callback/:id";
+				const appleIssuerKeys = direct
+					? await generateKeyPair("RS256", { extractable: true })
+					: undefined;
+				const appleFixture = appleIssuerKeys && {
+					credentialKey: await exportPKCS8(
+						(await generateKeyPair("ES256", { extractable: true })).privateKey,
+					),
+					issuerKey: await exportPKCS8(appleIssuerKeys.privateKey),
+					project: alpha.slug,
+				};
 				const cookieName = `__Secure-allauth_project_${alpha.slug}.session_token`;
 				const url = `https://${alpha.slug}.webhook.fixture.example/events`;
 				const projectKey = projectSecret(childEnvironment(), alpha.id);
 				let nextIP = 191;
 				const clientIP = () => `192.0.2.${nextIP++}`;
-				const start = () =>
-					startFixtureProvider(service!, "google", {
+				async function start() {
+					if (appleIssuerKeys) {
+						const token = await new SignJWT({
+							email: runtimeFixtureApple.email,
+							email_verified: true,
+						})
+							.setProtectedHeader({
+								alg: "RS256",
+								kid: "runtime-provider-fixture-key",
+							})
+							.setIssuer(runtimeFixtureAppleOrigin)
+							.setAudience(runtimeFixtureApple.appBundleIdentifier)
+							.setSubject(runtimeFixtureApple.subject)
+							.setIssuedAt()
+							.setExpirationTime("5m")
+							.sign(appleIssuerKeys.privateKey);
+						return (cookie = "") =>
+							service!.request(`${authPath}/sign-in/social`, {
+								...transport,
+								cookie,
+								clientIP: clientIP(),
+								body: { provider: "apple", idToken: { token } },
+							});
+					}
+					const attempt = await startFixtureProvider(service!, "google", {
 						prefix: "/api/auth",
 						host,
 						clientIP: clientIP(),
 						callback: `${origin}/api/auth/callback/google`,
 						destination: `${origin}/account`,
 					});
+					return (cookie = "") =>
+						service!.request(attempt.path, {
+							...transport,
+							cookie: cookie ? `${attempt.cookie}; ${cookie}` : attempt.cookie,
+							clientIP: clientIP(),
+						});
+				}
 				async function browser(response: Response) {
 					const cookies = cookie(response).split("; ");
 					const primary = cookies.find((value) =>
 						value.startsWith(`${cookieName}=`),
 					);
 					if (!primary) throw new Error("Missing fixture browser session.");
-					const current = await service!.request("/api/auth/get-session", {
-						host,
+					const current = await service!.request(`${authPath}/get-session`, {
+						...transport,
 						cookie: primary,
 						clientIP: clientIP(),
 					});
@@ -7451,29 +7502,41 @@ describe.skipIf(!existsSync(fixture))(
 					if (!device) throw new Error("Missing fixture saved device.");
 					return { ...session, user, token: stored.token, primary, device };
 				}
-				async function providerSignIn() {
-					const attempt = await start();
-					const response = await service!.request(attempt.path, {
-						host,
-						cookie: attempt.cookie,
-						clientIP: clientIP(),
-					});
-					expect(response.status).toBe(302);
-					expect(response.headers.get("location")).toBe(`${origin}/account`);
+				async function signedIn(response: Response) {
+					expect(response.status, await response.clone().text()).toBe(
+						direct ? 200 : 302,
+					);
+					if (direct)
+						expect(await response.clone().json()).toMatchObject({
+							redirect: false,
+							user: { email: provider.email, emailVerified: true },
+						});
+					else
+						expect(response.headers.get("location")).toBe(`${origin}/account`);
 					return browser(response);
 				}
+				async function providerSignIn() {
+					const complete = await start();
+					return signedIn(await complete());
+				}
 				for (const owned of [false, true]) {
-					service = await openProcess(databaseURL, alpha, owned);
+					service = await openProcess(
+						databaseURL,
+						alpha,
+						owned,
+						alpha.slug,
+						appleFixture,
+					);
 					for (const hasBrowser of [true, false]) {
 						const previous = await providerSignIn();
 						const unrelated = await providerSignIn();
 						expect(previous.user).toMatchObject({
-							email: runtimeFixtureGoogle.email,
+							email: provider.email,
 						});
 						expect(unrelated.user.id).toBe(previous.user.id);
 						const active = await browser(
-							await service.request("/api/auth/sign-in/email", {
-								host,
+							await service.request(`${authPath}/sign-in/email`, {
+								...transport,
 								clientIP: clientIP(),
 								body: {
 									email: credentials.project.email,
@@ -7526,19 +7589,14 @@ describe.skipIf(!existsSync(fixture))(
 								],
 							);
 						}
-						const response = await service.request(attempt.path, {
-							host,
-							clientIP: clientIP(),
-							cookie: [
-								attempt.cookie,
+						const response = await attempt(
+							[
 								previous.device,
 								active.device,
 								...(hasBrowser ? [active.primary] : []),
 							].join("; "),
-						});
-						expect(response.status).toBe(302);
-						expect(response.headers.get("location")).toBe(`${origin}/account`);
-						const replacement = await browser(response);
+						);
+						const replacement = await signedIn(response);
 						expect(replacement.user.id).toBe(previous.user.id);
 						const expired = response.headers
 							.getSetCookie()
@@ -7614,7 +7672,7 @@ describe.skipIf(!existsSync(fixture))(
 						const { id, createdAt } = delivered[0]!.data.event;
 						expect(
 							delivered,
-							`${owned ? "AllAuth" : "legacy"} callback with ${hasBrowser ? "an active browser" : "only saved devices"}`,
+							`${owned ? "AllAuth" : "legacy"} ${eventPath} with ${hasBrowser ? "an active browser" : "only saved devices"}`,
 						).toEqual([
 							{
 								id,
@@ -7629,7 +7687,7 @@ describe.skipIf(!existsSync(fixture))(
 										...(hasBrowser ? { actorId: active.user.id } : {}),
 										userId: previous.user.id,
 										targetId: previous.id,
-										metadata: { path: "/callback/:id" },
+										metadata: { path: eventPath },
 									},
 								},
 							},

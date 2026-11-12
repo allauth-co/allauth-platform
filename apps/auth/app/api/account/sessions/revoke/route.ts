@@ -25,6 +25,6 @@ export async function POST(request: Request) {
 	let body: unknown;
 	try { body = JSON.parse(text); }
 	catch { return Response.json({ error: "Invalid request." }, { status: 400 }); }
-	return engine.revokeAccountSession(request.headers, body as { id: string });
+	return engine.revokeAccountSession(request, body as { id: string });
 	});
 }

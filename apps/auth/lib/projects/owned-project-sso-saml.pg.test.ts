@@ -31,6 +31,10 @@ import { createProjectEngineStore } from "./owned-project-engine-store";
 import { renewRuntimeSamlCertificate } from "./owned-project-runtime-saml-fixture";
 import { createOwnedProjectSso } from "./owned-project-sso";
 import { checkSsoPolicyFixture } from "./owned-project-sso-policy-fixture";
+import {
+	checkEnterpriseSavedDeviceWebhook,
+	enterpriseSavedDevicePolicy,
+} from "./owned-project-sso-webhook-fixture";
 import { checkProjectSamlConfiguration } from "./owned-project-sso-saml-eligibility";
 import {
 	configureOwnedSaml,
@@ -426,6 +430,7 @@ describe.skipIf(!existsSync(fixturePath))(
 			for (const migration of [
 				"001-initial-auth.sql",
 				"002-control-plane.sql",
+				"004-webhooks.sql",
 				"005-free-plugins.sql",
 				"006-analytics.sql",
 			])
@@ -580,7 +585,7 @@ describe.skipIf(!existsSync(fixturePath))(
 			});
 		}
 
-		function managementEngine(enabled = true) {
+		function managementEngine(enabled = true, policy = defaultAuthPolicy) {
 			return createOwnedProjectEngine({
 				database,
 				project: { schemaName: schema, slug },
@@ -588,7 +593,7 @@ describe.skipIf(!existsSync(fixturePath))(
 				basePath: "/api/auth",
 				trustedOrigins: ["https://saml-application.fixture.example"],
 				signingSecret: secret,
-				policy: defaultAuthPolicy,
+				policy,
 				trustedIP: () => "192.0.2.31",
 				sso: { defaultErrorURL: `${origin}/auth-error`, saml: enabled },
 			});
@@ -1019,6 +1024,36 @@ describe.skipIf(!existsSync(fixturePath))(
 			await assertSession(
 				await native.handler(callback(signed.encoded, state.relay)),
 			);
+		});
+
+		it.each([
+			"optional",
+			"required",
+		] as const)("matches the signed session deletion when SAML replaces a saved device with %s MFA", async (mode) => {
+			if (!nativeDatabase)
+				throw new Error("Expected the scoped fixture database.");
+			const policy = enterpriseSavedDevicePolicy(mode);
+			await checkEnterpriseSavedDeviceWebhook({
+				database,
+				scoped: nativeDatabase,
+				schema,
+				origin,
+				idpOrigin,
+				cookiePrefix: prefix,
+				secret,
+				destination,
+				policy,
+				callbackPath: "/sso/saml2/sp/acs/:providerId",
+				userId: managed,
+				browserUserId: decoy,
+				owned: managementEngine(true, policy).dispatch,
+				async prepare(dispatch, ip) {
+					const request = startRequest();
+					request.headers.set("x-real-ip", ip);
+					const state = await pending(await dispatch(request));
+					return callback(signedResponse(state.requestId).encoded, state.relay);
+				},
+			});
 		});
 
 		it("rejects additional authorization parameters before either SAML writer issues state", async () => {

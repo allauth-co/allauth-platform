@@ -680,7 +680,11 @@ describe.skipIf(!existsSync(fixturePath))("real PostgreSQL hosted authentication
 		expect((await registry.query(`SELECT id FROM "${beta.schemaName}"."rateLimit" WHERE "key"=$1`, [key])).rowCount).toBe(0);
 
 		await withProjectAuthEngine(alpha.slug, async ({ engine }) => {
-			const revoked = await engine.revokeAccountSession(headers, { id });
+			const revoke = new Request(`${base}/account/sessions/revoke`, {
+				method: "POST",
+				headers,
+			});
+			const revoked = await engine.revokeAccountSession(revoke, { id });
 			expect(await revoked.json()).toEqual({ success: true });
 			expect(await engine.readPrincipal(headers)).toBeNull();
 			expect(await probe(alpha, headers)).toBeNull();

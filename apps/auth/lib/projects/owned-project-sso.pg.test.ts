@@ -19,6 +19,10 @@ import { createProjectEngineStore } from "./owned-project-engine-store";
 import type { OwnedProjectSsoOptions } from "./owned-project-sso";
 import { createOwnedProjectSso } from "./owned-project-sso";
 import { checkSsoPolicyFixture } from "./owned-project-sso-policy-fixture";
+import {
+	checkEnterpriseSavedDeviceWebhook,
+	enterpriseSavedDevicePolicy,
+} from "./owned-project-sso-webhook-fixture";
 
 const fixturePath = new URL(
 	"../../../../.secrets/local-postgres.json",
@@ -344,6 +348,7 @@ describe.skipIf(!existsSync(fixturePath))(
 					for (const migration of [
 						"001-initial-auth.sql",
 						"002-control-plane.sql",
+						"004-webhooks.sql",
 						"005-free-plugins.sql",
 						"006-analytics.sql",
 					]) {
@@ -696,6 +701,46 @@ describe.skipIf(!existsSync(fixturePath))(
 			await expect(
 				symmetricDecrypt({ key: secret, data: linked!.refreshToken }),
 			).resolves.toBe("synthetic-enterprise-refresh");
+		});
+
+		it.each([
+			"optional",
+			"required",
+		] as const)("matches the signed session deletion when OIDC replaces a saved device with %s MFA", async (mode) => {
+			if (!nativeDatabase)
+				throw new Error("Expected the scoped fixture database.");
+			const policy = enterpriseSavedDevicePolicy(mode);
+			const engine = createOwnedProjectEngine({
+				database,
+				project: { slug, schemaName: schema },
+				baseURL: origin,
+				basePath: "/api/auth",
+				trustedOrigins: [],
+				signingSecret: secret,
+				policy,
+				trustedIP: (request) => request.headers.get("x-real-ip"),
+				sso: { defaultErrorURL: `${origin}/auth-error`, fetch: network },
+			});
+			await checkEnterpriseSavedDeviceWebhook({
+				database,
+				scoped: nativeDatabase,
+				schema,
+				origin,
+				idpOrigin: issuer,
+				cookiePrefix,
+				secret,
+				destination,
+				policy,
+				callbackPath: "/sso/callback/:providerId",
+				userId: managed,
+				browserUserId: decoy,
+				owned: engine.dispatch,
+				async prepare(dispatch, ip) {
+					const request = startRequest();
+					request.headers.set("x-real-ip", ip);
+					return authorize(await dispatch(request));
+				},
+			});
 		});
 
 		it("issues a legacy-readable provider snapshot and state that survives rollback", async () => {

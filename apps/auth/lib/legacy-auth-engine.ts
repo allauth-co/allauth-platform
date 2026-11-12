@@ -158,10 +158,10 @@ export function legacyAuthEngine(instance: LegacyInstance): AuthEngine {
 					asResponse: true,
 				}),
 			),
-		listAccountSessions: (headers) =>
-			instance.api.accountSessions({ headers, asResponse: true }),
-		revokeAccountSession: (headers, body) =>
-			instance.api.accountRevokeSession({ headers, body, asResponse: true }),
+		listAccountSessions: (request) =>
+			instance.api.accountSessions({ headers: request.headers, asResponse: true }),
+		revokeAccountSession: (request, body) =>
+			instance.api.accountRevokeSession({ headers: request.headers, body, asResponse: true }),
 		readDirectory: (operation, headers, query) =>
 			withAdapter(async () => {
 				const endpoint: unknown = Reflect.get(instance.api, operation);

@@ -2916,14 +2916,25 @@ describe.skipIf(!existsSync(fixture))(
 		});
 
 		it.each([
-			["email", true, "192.0.2.123"],
-			["email", false, "192.0.2.124"],
-			["username", true, "192.0.2.125"],
-			["username", false, "192.0.2.126"],
-		] as const)("delivers the native session deletion on %s sign-in with active browser cookie %s", async (identifier, hasActiveCookie, ip) => {
+			["email", "live", "active", "192.0.2.123"],
+			["email", "live", "absent", "192.0.2.124"],
+			["username", "live", "active", "192.0.2.125"],
+			["username", "live", "absent", "192.0.2.126"],
+			["email", "expired", "active", "192.0.2.127"],
+			["email", "expired", "absent", "192.0.2.128"],
+			["username", "expired", "active", "192.0.2.129"],
+			["username", "expired", "absent", "192.0.2.130"],
+			["email", "expired", "expired-owner", "192.0.2.131"],
+			["email", "expired", "expired-other", "192.0.2.132"],
+			["username", "expired", "expired-owner", "192.0.2.133"],
+			["username", "expired", "expired-other", "192.0.2.134"],
+		] as const)("delivers native %s sign-in deletion for %s saved-device state and %s primary cookie", async (identifier, deviceState, primaryState, ip) => {
 			const path = `/sign-in/${identifier}`;
 			const schema = `"${alpha.schemaName}"`;
 			const foreignSchema = `"${beta.schemaName}"`;
+			const expiredOther = primaryState === "expired-other";
+			const expiredOwner = primaryState === "expired-owner";
+			const expiredPrimary = expiredOwner || expiredOther;
 			const installed = installedNative();
 			const candidate = createOwnedProjectEngine({
 				database,
@@ -2940,20 +2951,55 @@ describe.skipIf(!existsSync(fixture))(
 				const active = await browserSession(userEmail);
 				const previous = await browserSession(eventEmail);
 				const otherBrowser = await browserSession(eventEmail);
+				const unrelatedDevice = await browserSession(userEmail);
 				expect(active.deviceCookie).toBeTruthy();
 				expect(previous.deviceCookie).toBeTruthy();
+				expect(unrelatedDevice.deviceCookie).toBeTruthy();
 				const subscription = await endpoint(
 					"legacy",
-					`re-sign-in-${identifier}-${hasActiveCookie}-${writer}`,
+					`re-sign-in-${identifier}-${deviceState}-${primaryState}-${writer}`,
 					["session.deleted"],
 				);
 				const clientId = randomUUID();
 				const foreignOwner = randomUUID();
-				const grants = ["access", "online", "offline", "unrelated"].map(
-					(kind) => ({ kind, id: randomUUID() }),
-				);
-				const sessionIds = [active.id, previous.id, otherBrowser.id];
+				const foreignGrant = randomUUID();
+				const grants = (
+					[
+						["access", previous.id, eventUserId, true, null],
+						["online", previous.id, eventUserId, true, null],
+						["offline", previous.id, eventUserId, false, null],
+						["unrelated", otherBrowser.id, eventUserId, false, otherBrowser.id],
+						[
+							"other-owner",
+							unrelatedDevice.id,
+							userId,
+							expiredOther,
+							expiredOther ? null : unrelatedDevice.id,
+						],
+					] as const
+				).map(([kind, sessionId, owner, revoked, remainingSessionId]) => ({
+					kind,
+					sessionId,
+					owner,
+					revoked,
+					remainingSessionId,
+					id: randomUUID(),
+				}));
+				const sessionIds = [
+					active.id,
+					previous.id,
+					otherBrowser.id,
+					unrelatedDevice.id,
+				];
 				try {
+					const expiredIds =
+						deviceState === "expired"
+							? [previous.id, unrelatedDevice.id]
+							: [unrelatedDevice.id];
+					await database.query(
+						`UPDATE ${schema}.session SET "expiresAt"=now()-interval '1 minute' WHERE id=ANY($1::text[])`,
+						[expiredIds],
+					);
 					await database.query(
 						`INSERT INTO ${foreignSchema}."user" (id,name,email,"emailVerified") VALUES ($1,'Fixture',$2,true)`,
 						[foreignOwner, eventEmail],
@@ -2962,19 +3008,25 @@ describe.skipIf(!existsSync(fixture))(
 						`INSERT INTO ${foreignSchema}.session (id,token,"userId","expiresAt","updatedAt") VALUES ($1,$2,$3,now()+interval '1 day',now())`,
 						[previous.id, previous.token, foreignOwner],
 					);
+					for (const realm of [schema, foreignSchema])
+						await database.query(
+							`INSERT INTO ${realm}."oauthClient" (id,"clientId","redirectUris") VALUES ($1,$1,'[]')`,
+							[clientId],
+						);
 					await database.query(
-						`INSERT INTO ${schema}."oauthClient" (id,"clientId","redirectUris") VALUES ($1,$1,'[]')`,
-						[clientId],
+						`INSERT INTO ${foreignSchema}."oauthRefreshToken" (id,token,"sessionId","userId","clientId","expiresAt","createdAt",scopes)
+						 VALUES ($1,$1,$2,$3,$4,now()+interval '1 day',now(),'["openid"]')`,
+						[foreignGrant, previous.id, foreignOwner, clientId],
 					);
-					for (const { kind, id } of grants) {
+					for (const { kind, id, sessionId, owner } of grants) {
 						const table =
 							kind === "access" ? "oauthAccessToken" : "oauthRefreshToken";
 						await database.query(
 							`INSERT INTO ${schema}."${table}" (id,token,"sessionId","userId","clientId","expiresAt","createdAt",scopes) VALUES ($1,$1,$2,$3,$4,now()+interval '1 day',now(),$5)`,
 							[
 								id,
-								kind === "unrelated" ? otherBrowser.id : previous.id,
-								eventUserId,
+								sessionId,
+								owner,
 								clientId,
 								JSON.stringify(
 									kind === "offline"
@@ -2984,34 +3036,103 @@ describe.skipIf(!existsSync(fixture))(
 							],
 						);
 					}
-					const incoming = [active.deviceCookie, previous.deviceCookie];
-					if (hasActiveCookie) incoming.unshift(active.cookie);
-					const input = request(
-						`${alpha.path}${path}`,
-						{
-							[identifier]: identifier === "email" ? eventEmail : username,
-							password,
-						},
-						incoming.join("; "),
-					);
-					input.headers.set("x-real-ip", ip);
-					const signedIn = await (writer === "legacy"
-						? installed.handler(input)
-						: candidate.dispatch(input));
-					expect(signedIn.status).toBe(200);
-					const cookies = signedIn.headers.getSetCookie();
-					const primaryName = active.cookie.split("=", 1)[0];
-					const primary = cookies
-						.find((cookie) => cookie.startsWith(`${primaryName}=`))
-						?.split(";", 1)[0];
-					expect(primary).toBeTruthy();
-					const read = await send("legacy", "/get-session", undefined, primary);
-					const { session: replacement } = (await read.json()) as {
-						session: { id: string; token: string; userId: string };
+					const incoming = [
+						active.deviceCookie,
+						previous.deviceCookie,
+						unrelatedDevice.deviceCookie,
+					];
+					if (expiredOwner) incoming.unshift(previous.cookie);
+					else if (expiredOther) incoming.unshift(unrelatedDevice.cookie);
+					else if (primaryState === "active") incoming.unshift(active.cookie);
+					const dispatch =
+						writer === "legacy" ? installed.handler : candidate.dispatch;
+					const signIn = (suppliedPassword = password) => {
+						const input = request(
+							`${alpha.path}${path}`,
+							{
+								[identifier]: identifier === "email" ? eventEmail : username,
+								password: suppliedPassword,
+							},
+							incoming.join("; "),
+						);
+						input.headers.set("x-real-ip", ip);
+						return dispatch(input);
 					};
-					expect(replacement.userId).toBe(eventUserId);
-					expect(replacement.id).not.toBe(previous.id);
-					sessionIds.push(replacement.id);
+					if (deviceState === "expired") {
+						const denied = await signIn(
+							"synthetic-incorrect-replacement-password",
+						);
+						expect(denied.status).toBe(401);
+						expect(
+							await signedEvents(subscription, [
+								previous.token,
+								unrelatedDevice.token,
+							]),
+						).toEqual([]);
+						expect(
+							(
+								await database.query(
+									`SELECT id FROM ${schema}.session WHERE id=ANY($1::text[]) ORDER BY id`,
+									[expiredIds],
+								)
+							).rows.map(({ id }) => id),
+						).toEqual(expiredIds.sort());
+					}
+					const primaryName = active.cookie.split("=", 1)[0];
+					const priorSessions = (
+						await database.query<{ id: string }>(
+							`SELECT id FROM ${schema}.session WHERE "userId"=$1`,
+							[eventUserId],
+						)
+					).rows.map(({ id }) => id);
+					type Session = { id: string; token: string; userId: string };
+					async function readReplacement(response: Response) {
+						expect(response.status).toBe(200);
+						const cookies = response.headers.getSetCookie();
+						const primary = cookies
+							.find(
+								(cookie) =>
+									cookie.startsWith(`${primaryName}=`) &&
+									!cookie.includes("Max-Age=0"),
+							)
+							?.split(";", 1)[0];
+						const clearedPrimary = cookies.some(
+							(cookie) =>
+								cookie.startsWith(`${primaryName}=;`) &&
+								cookie.includes("Max-Age=0"),
+						);
+						let replacement: Session;
+						if (expiredPrimary && writer === "legacy") {
+							// The native after-hook overwrites the new primary cookie during expired-session cleanup.
+							expect(primary).toBeUndefined();
+							expect(clearedPrimary).toBe(true);
+							const { rows } = await database.query<Session>(
+								`SELECT id,token,"userId" FROM ${schema}.session WHERE "userId"=$1 AND NOT id=ANY($2::text[])`,
+								[eventUserId, priorSessions],
+							);
+							expect(rows).toHaveLength(1);
+							replacement = rows[0]!;
+						} else {
+							expect(primary).toBeTruthy();
+							expect(clearedPrimary).toBe(false);
+							const read = await send(
+								"legacy",
+								"/get-session",
+								undefined,
+								primary,
+							);
+							replacement = ((await read.json()) as { session: Session })
+								.session;
+						}
+						expect(replacement.userId).toBe(eventUserId);
+						expect(priorSessions).not.toContain(replacement.id);
+						priorSessions.push(replacement.id);
+						sessionIds.push(replacement.id);
+						return replacement;
+					}
+					const signedIn = await signIn();
+					const replacement = await readReplacement(signedIn);
+					const cookies = signedIn.headers.getSetCookie();
 					const previousCookieName = previous.deviceCookie.split("=", 1)[0];
 					const activeCookieName = active.deviceCookie.split("=", 1)[0];
 					expect(
@@ -3020,16 +3141,33 @@ describe.skipIf(!existsSync(fixture))(
 								cookie.startsWith(`${previousCookieName}=;`) &&
 								cookie.includes("Max-Age=0"),
 						),
-					).toBe(true);
+					).toBe(!expiredOwner);
 					expect(
 						cookies.some((cookie) => cookie.startsWith(`${activeCookieName}=`)),
 					).toBe(false);
+					const unrelatedCookieName = unrelatedDevice.deviceCookie.split(
+						"=",
+						1,
+					)[0];
+					expect(
+						cookies.some((cookie) =>
+							cookie.startsWith(`${unrelatedCookieName}=`),
+						),
+					).toBe(false);
+					const replacementIds = [replacement.id];
+					if (deviceState === "expired")
+						replacementIds.push((await readReplacement(await signIn())).id);
 					const { rows } = await database.query<{ id: string }>(
 						`SELECT id FROM ${schema}.session WHERE id=ANY($1::text[]) ORDER BY id`,
 						[sessionIds],
 					);
 					expect(rows.map(({ id }) => id)).toEqual(
-						[active.id, otherBrowser.id, replacement.id].sort(),
+						[
+							active.id,
+							otherBrowser.id,
+							...(expiredOther ? [] : [unrelatedDevice.id]),
+							...replacementIds,
+						].sort(),
 					);
 					expect(
 						(
@@ -3039,6 +3177,14 @@ describe.skipIf(!existsSync(fixture))(
 							)
 						).rows,
 					).toEqual([{ id: previous.id }]);
+					expect(
+						(
+							await database.query(
+								`SELECT revoked,"sessionId" FROM ${foreignSchema}."oauthRefreshToken" WHERE id=$1`,
+								[foreignGrant],
+							)
+						).rows,
+					).toEqual([{ revoked: null, sessionId: previous.id }]);
 					const grantState = await database.query<{
 						id: string;
 						revoked: boolean;
@@ -3049,11 +3195,11 @@ describe.skipIf(!existsSync(fixture))(
 						[clientId],
 					);
 					expect(grantState.rows).toHaveLength(grants.length);
-					for (const { kind, id } of grants)
+					for (const { id, revoked, remainingSessionId } of grants)
 						expect(grantState.rows.find((row) => row.id === id)).toEqual({
 							id,
-							revoked: kind === "access" || kind === "online",
-							sessionId: kind === "unrelated" ? otherBrowser.id : null,
+							revoked,
+							sessionId: remainingSessionId,
 						});
 					return await signedEvents(
 						subscription,
@@ -3064,19 +3210,28 @@ describe.skipIf(!existsSync(fixture))(
 							active.token,
 							previous.token,
 							otherBrowser.token,
+							unrelatedDevice.token,
 							replacement.token,
 							...grants.map(({ id }) => id),
 						],
-						new Map([[previous.id, "replaced-device"]]),
+						new Map([
+							[previous.id, "replaced-device"],
+							[unrelatedDevice.id, "expired-primary"],
+						]),
 					);
 				} finally {
 					await database.query(
 						`DELETE FROM ${foreignSchema}."user" WHERE id=$1`,
 						[foreignOwner],
 					);
+					for (const realm of [schema, foreignSchema])
+						await database.query(
+							`DELETE FROM ${realm}."oauthClient" WHERE id=$1`,
+							[clientId],
+						);
 					await database.query(
-						`DELETE FROM ${schema}."oauthClient" WHERE id=$1`,
-						[clientId],
+						`DELETE FROM ${schema}."rateLimit" WHERE "key"=$1`,
+						[`${ip}|${path}`],
 					);
 					await database.query(
 						`DELETE FROM ${schema}.session WHERE id=ANY($1::text[])`,
@@ -3098,18 +3253,36 @@ describe.skipIf(!existsSync(fixture))(
 				);
 			try {
 				const native = await exercise("legacy");
-				expect(native).toEqual([
+				const actorId = expiredOwner
+					? eventUserId
+					: primaryState === "active"
+						? userId
+						: undefined;
+				const expected = [
 					{
 						event: {
 							type: "session.deleted",
 							outcome: "success",
-							...(hasActiveCookie ? { actorId: userId } : {}),
+							...(actorId ? { actorId } : {}),
 							userId: eventUserId,
 							targetId: "replaced-device",
 							metadata: { path },
 						},
 					},
-				]);
+				];
+				if (expiredOther)
+					expected.push({
+						event: {
+							type: "session.deleted",
+							outcome: "success",
+							actorId: userId,
+							userId,
+							targetId: "expired-primary",
+							metadata: { path },
+						},
+					});
+				expect(native).toHaveLength(expected.length);
+				expect(native).toEqual(expect.arrayContaining(expected));
 				expect(await exercise("owned")).toEqual(native);
 			} finally {
 				if (identifier === "username")
@@ -3622,6 +3795,11 @@ describe.skipIf(!existsSync(fixture))(
 			["/revoke-sessions", "cookie"],
 			["/revoke-other-sessions", "cookie"],
 			["/revoke-session", "bearer"],
+			["/multi-session/revoke", "cookie"],
+			["/sdk/sessions", "cookie"],
+			["/sdk/sessions/revoke", "cookie"],
+			["/account/sessions", "cookie"],
+			["/account/sessions/revoke", "cookie"],
 		] as const)("cleans up an expired %s caller authenticated by %s", async (path, authority) => {
 			const realm = `"${alpha.schemaName}"`;
 			const shadow = `"${beta.schemaName}"`;
@@ -3631,9 +3809,17 @@ describe.skipIf(!existsSync(fixture))(
 					? "session.revoked"
 					: path === "/revoke-sessions"
 						? "session.revoked-all"
-						: "session.revoked-others";
+						: path === "/revoke-other-sessions"
+							? "session.revoked-others"
+							: null;
+			const deviceRevoke = path === "/multi-session/revoke";
+			let nativeDenial: unknown;
+			let nativeClears: boolean | undefined;
 			for (const [writer, dispatch] of [
-				["legacy", installed.handler],
+				[
+					"legacy",
+					path.startsWith("/sdk/") ? legacy.handler : installed.handler,
+				],
 				["owned", owned.dispatch],
 			] as const) {
 				const expired = await browserSession(eventEmail);
@@ -3646,7 +3832,7 @@ describe.skipIf(!existsSync(fixture))(
 				);
 				const subscription = await endpoint(
 					"legacy",
-					`nested-expiry-${operation.split(".")[1]}-${authority}-${writer}`,
+					`nested-expiry-${path.slice(1).replaceAll("/", "-")}-${authority}-${writer}`,
 					["session.*"],
 				);
 				try {
@@ -3691,11 +3877,14 @@ describe.skipIf(!existsSync(fixture))(
 						 VALUES ($1,$1,$2,$3,$4,now()+interval '1 day',now(),'["openid"]')`,
 						[foreignGrant, expired.id, shadowOwner, client],
 					);
-					const expiredRequest = (body: object) => {
+					const expiredRequest = (body?: object) => {
+						const cookies = deviceRevoke
+							? `${expired.cookie}; ${active.deviceCookie}`
+							: expired.cookie;
 						const incoming = request(
 							`${alpha.path}${path}`,
 							body,
-							authority === "cookie" ? expired.cookie : "",
+							authority === "cookie" ? cookies : "",
 						);
 						if (authority === "bearer") {
 							incoming.headers.delete("origin");
@@ -3745,7 +3934,15 @@ describe.skipIf(!existsSync(fixture))(
 						).toBe(1);
 					}
 					const body =
-						path === "/revoke-session" ? { token: active.token } : {};
+						path === "/revoke-session"
+							? { token: active.token }
+							: deviceRevoke
+								? { sessionToken: active.token }
+								: path.endsWith("/sessions/revoke")
+									? { id: active.id }
+									: path.endsWith("/sessions")
+										? undefined
+										: {};
 					if (
 						writer === "owned" &&
 						path === "/revoke-session" &&
@@ -3788,15 +3985,19 @@ describe.skipIf(!existsSync(fixture))(
 						await dispatch(expiredRequest(body)),
 						await dispatch(expiredRequest(body)),
 					]) {
-						expect(response.status).toBe(401);
-						expect(await response.json()).toEqual({
-							code: "UNAUTHORIZED",
-							message: "Unauthorized",
-						});
-						expect(response.headers.getSetCookie()).toEqual(
-							expect.arrayContaining([
-								expect.stringMatching(/\.session_token=;.*Max-Age=0/),
-							]),
+						expect(response.status, writer).toBe(401);
+						const content = await response.text();
+						const denial: unknown = content ? JSON.parse(content) : null;
+						if (nativeDenial === undefined && writer === "legacy")
+							nativeDenial = denial;
+						expect(denial, writer).toEqual(nativeDenial);
+						const clears = response.headers
+							.getSetCookie()
+							.some((value) => /\.session_token=;.*Max-Age=0/.test(value));
+						if (nativeClears === undefined && writer === "legacy")
+							nativeClears = clears;
+						expect(clears, `${writer} session cookie expiry`).toBe(
+							nativeClears,
 						);
 					}
 					const events = await audit();
@@ -3817,7 +4018,7 @@ describe.skipIf(!existsSync(fixture))(
 					expect(
 						events.filter(({ event }) => event.type === operation),
 					).toEqual(
-						Array.from({ length: 2 }, () => ({
+						Array.from({ length: operation ? 2 : 0 }, () => ({
 							event: {
 								type: operation,
 								outcome: "failure",
@@ -3881,6 +4082,8 @@ describe.skipIf(!existsSync(fixture))(
 		it.each([
 			"/get-session",
 			"/revoke-session",
+			"/sdk/sessions",
+			"/account/sessions",
 		] as const)("keeps a session whose concurrent renewal commits during expiration cleanup on %s", async (path) => {
 			const active = await browserSession(eventEmail);
 			const realm = `"${alpha.schemaName}"`;
@@ -3916,10 +4119,10 @@ describe.skipIf(!existsSync(fixture))(
 					path === "/revoke-session" ? { token: randomUUID() } : undefined,
 					active.cookie,
 				);
-				pending =
-					path === "/get-session"
-						? owned.readSession(incoming)
-						: owned.dispatch(incoming);
+				if (path === "/get-session") pending = owned.readSession(incoming);
+				else if (path === "/account/sessions")
+					pending = owned.listAccountSessions(incoming);
+				else pending = owned.dispatch(incoming);
 				void pending.catch(() => {});
 				await expect
 					.poll(
@@ -3937,11 +4140,12 @@ describe.skipIf(!existsSync(fixture))(
 				committed = true;
 				const result = await pending;
 				expect(result.status).toBe(200);
-				expect(await result.json()).toMatchObject(
-					path === "/get-session"
-						? { session: { id: active.id } }
-						: { status: true },
-				);
+				const value: unknown = await result.json();
+				if (path === "/get-session")
+					expect(value).toMatchObject({ session: { id: active.id } });
+				else if (path === "/revoke-session")
+					expect(value).toMatchObject({ status: true });
+				else expect(value).toMatchObject({ currentSessionId: active.id });
 				expect(result.headers.getSetCookie()).toEqual([]);
 				expect(
 					(

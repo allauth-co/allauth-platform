@@ -791,22 +791,63 @@ export function createOwnedProjectEngine(
 		const existing = multiSessionTokens(request.headers);
 		const owned = [];
 		if (!prior) {
+			const signedPrimary =
+				path === "/sign-in/email" || path === "/sign-in/username"
+					? tokenFrom(request.headers)
+					: null;
+			if (signedPrimary) {
+				const browser = await store.session(
+					signedPrimary,
+					refreshWindow,
+					client,
+					{ includeExpired: true },
+				);
+				if (browser?.expired) {
+					// Lock both kinds of signed session in one order when the primary belongs to another account.
+					await client.query(
+						`SELECT id FROM "session"
+						 WHERE (token=$1 AND "expiresAt"<=statement_timestamp())
+						    OR (token=ANY($2::text[]) AND "userId"=$3)
+						 ORDER BY id FOR UPDATE`,
+						[signedPrimary, existing.map(({ token }) => token), user.id],
+					);
+					// The installed anonymous after-hook cleans up the old primary before device replacement.
+					await cleanupExpiredSession(
+						client,
+						request,
+						signedPrimary,
+						eventMetadata.path,
+					);
+				}
+			}
 			for (const item of existing) {
-				const previous = await store.session(item.token, refreshWindow, client);
+				// Device replacement removes stored same-account sessions, including expired rows.
+				const previous = await store.session(
+					item.token,
+					refreshWindow,
+					client,
+					{ includeExpired: true },
+				);
 				if (previous?.user.id === user.id) owned.push(item);
 			}
 		}
 		if (owned.length) {
+			const enterpriseCallback =
+				eventMetadata.path === "/sso/callback/:providerId" ||
+				eventMetadata.path === "/sso/saml2/sp/acs/:providerId";
 			let actorId: string | null | undefined;
 			if (
 				path === "/two-factor/verify-totp" ||
-				path === "/two-factor/verify-backup-code"
+				path === "/two-factor/verify-backup-code" ||
+				(enterpriseCallback && policy.mfaMode !== "required")
 			) {
-				// Only pending MFA creates a new session without a prior session on these routes.
+				// Pending MFA and optional enterprise callbacks leave the browser actor unset.
 				actorId = null;
 			} else if (
+				enterpriseCallback ||
 				path === "/sign-in/email" ||
 				path === "/sign-in/username" ||
+				path === "/sign-in/social" ||
 				eventMetadata.path === "/callback/:id" ||
 				path === "/verify-email" ||
 				path === "/email-otp/verify-email" ||
@@ -814,7 +855,7 @@ export function createOwnedProjectEngine(
 				path === "/sign-in/email-otp" ||
 				path === "/passkey/verify-authentication"
 			) {
-				// The legacy anonymous-session hook reads the incoming browser session before multi-session cleanup.
+				// The legacy policy or anonymous hook reads the incoming browser session before cleanup.
 				const browserToken = tokenFrom(request.headers);
 				const browser = browserToken
 					? await store.session(browserToken, refreshWindow, client)
@@ -822,7 +863,7 @@ export function createOwnedProjectEngine(
 				actorId = browser?.user.id ?? null;
 			}
 			const removed = await store.revoke(
-				{ tokens: owned.map((item) => item.token) },
+				{ tokens: owned.map((item) => item.token), userId: user.id },
 				eventMetadata.path,
 				Boolean(backchannel),
 				client,
@@ -1575,6 +1616,27 @@ export function createOwnedProjectEngine(
 			: null;
 	}
 
+	async function readBrowserRouteSession(
+		client: PoolClient,
+		request: Request,
+		path: string,
+		headers: Headers,
+	) {
+		const token = tokenFrom(request.headers);
+		if (!token) return null;
+		const row = await store.session(token, refreshWindow, client, {
+			includeExpired: true,
+		});
+		const observed = row?.expired
+			? await cleanupExpiredSession(client, request, token, path)
+			: row;
+		if (!observed) {
+			clearSessionCookies(headers);
+			return null;
+		}
+		return { token, ...observed };
+	}
+
 	async function readSession(request: Request) {
 		if (!trustedRequest(request.headers, false)) return forbidden();
 		let headers = new Headers();
@@ -1736,8 +1798,8 @@ export function createOwnedProjectEngine(
 		const headers = new Headers();
 		const invalid = () =>
 			failure(401, "INVALID_SESSION_TOKEN", "Invalid session token", headers);
-		if (tokenFrom(request.headers, name) !== token) return invalid();
 		if (!revoke) {
+			if (tokenFrom(request.headers, name) !== token) return invalid();
 			const current = await eligibleSession(token);
 			if (!current) {
 				writeCookie(headers, name, "", 0);
@@ -1747,34 +1809,44 @@ export function createOwnedProjectEngine(
 			return json(publicDeviceSession(current), 200, headers);
 		}
 
-		const current = await currentSession(request.headers);
-		if (!current)
-			return failure(401, "UNAUTHORIZED", "Authentication required.");
-		const removed = await store.revoke(
-			{ tokens: [token] },
-			"/multi-session/revoke",
-			Boolean(backchannel),
-			undefined,
-			current.user.id,
-		);
-		if (!removed) return unsupported();
-		await backchannel?.(removed.targets);
-		writeCookie(headers, name, "", 0);
-		if (current.token === token) {
-			let replacement: string | undefined;
-			for (const candidate of multiSessionTokens(request.headers)) {
-				if (
-					candidate.token !== token &&
-					(await eligibleSession(candidate.token))
-				) {
-					replacement = candidate.token;
-					break;
+		const path = "/multi-session/revoke";
+		return store.transaction(async (client) => {
+			const observed = await readBrowserRouteSession(
+				client,
+				request,
+				path,
+				headers,
+			);
+			const current = ordinarySession(observed?.token ?? null, observed);
+			if (!current)
+				return failure(401, "UNAUTHORIZED", "Unauthorized", headers);
+			if (tokenFrom(request.headers, name) !== token) return invalid();
+			const removed = await store.revoke(
+				{ tokens: [token] },
+				path,
+				Boolean(backchannel),
+				client,
+				current.user.id,
+			);
+			if (!removed) return unsupported();
+			deliverLogoutAfterCommit(client, request, removed.targets);
+			writeCookie(headers, name, "", 0);
+			if (current.token === token) {
+				let replacement: string | undefined;
+				for (const candidate of multiSessionTokens(request.headers)) {
+					if (
+						candidate.token !== token &&
+						(await eligibleSession(candidate.token, client))
+					) {
+						replacement = candidate.token;
+						break;
+					}
 				}
+				if (replacement) setActiveDeviceCookie(headers, request, replacement);
+				else clearSessionCookies(headers);
 			}
-			if (replacement) setActiveDeviceCookie(headers, request, replacement);
-			else clearSessionCookies(headers);
-		}
-		return json({ status: true }, 200, headers);
+			return json({ status: true }, 200, headers);
+		});
 	}
 
 	function serverSessionBearer(headers: Headers) {
@@ -1963,7 +2035,13 @@ export function createOwnedProjectEngine(
 			pragma: "no-cache",
 		});
 		return store.transaction(async (client) => {
-			const observed = await currentSession(request.headers, client);
+			const browser = await readBrowserRouteSession(
+				client,
+				request,
+				path,
+				headers,
+			);
+			const observed = ordinarySession(browser?.token ?? null, browser);
 			if (
 				!observed ||
 				!(await store.lockUser(client, observed.user.id)) ||
@@ -2114,12 +2192,15 @@ export function createOwnedProjectEngine(
 			pragma: "no-cache",
 		});
 		const unauthorized = () => new Response(null, { status: 401, headers });
-		const token = tokenFrom(request.headers);
-		if (!token) return unauthorized();
+		if (!tokenFrom(request.headers)) return unauthorized();
 		return store.transaction(async (client) => {
-			const observed = await store.session(token, refreshWindow, client);
-			if (!observed || observed.user.directoryDisabled)
-				return unauthorized();
+			const observed = await readBrowserRouteSession(
+				client,
+				request,
+				"/sdk/sessions",
+				headers,
+			);
+			if (!observed || observed.user.directoryDisabled) return unauthorized();
 			const current = await confirmSessionListAuthority(
 				request,
 				client,
@@ -2145,7 +2226,13 @@ export function createOwnedProjectEngine(
 					headers,
 				);
 			if (!session.impersonatedBy)
-				await renewAuthorizedSession(request, { ...current, token }, client, headers, false);
+				await renewAuthorizedSession(
+					request,
+					{ ...current, token: observed.token },
+					client,
+					headers,
+					false,
+				);
 			const sessions = await store.list(user.id, client);
 			return json(
 				{
@@ -2164,44 +2251,65 @@ export function createOwnedProjectEngine(
 		});
 	}
 
-	async function listAccountSessions(headers: Headers) {
-		if (!trustedRequest(headers, false)) return forbidden();
-		const current = await currentSession(headers);
-		if (!current)
-			return failure(401, "UNAUTHORIZED", "Authentication required.");
-		if (!current.user.emailVerified) return forbidden();
-		return json({
-			sessions: await store.list(current.user.id),
-			currentSessionId: current.session.id,
+	async function listAccountSessions(request: Request) {
+		if (!trustedRequest(request.headers, false)) return forbidden();
+		const headers = new Headers({ "cache-control": "no-store" });
+		const response = await store.transaction(async (client) => {
+			const observed = await readBrowserRouteSession(
+				client,
+				request,
+				"/account/sessions",
+				headers,
+			);
+			const current = ordinarySession(observed?.token ?? null, observed);
+			if (!current) return new Response(null, { status: 401, headers });
+			if (!current.user.emailVerified) return forbidden();
+			return json({
+				sessions: await store.list(current.user.id, client),
+				currentSessionId: current.session.id,
+			});
 		});
+		await deliverCommittedLogout(request);
+		return response;
 	}
 
-	async function revokeAccountSession(headers: Headers, value: { id: string }) {
-		if (!trustedRequest(headers, true, revocationOrigins)) return forbidden();
+	async function revokeAccountSession(request: Request, value: { id: string }) {
+		if (!trustedRequest(request.headers, true, revocationOrigins))
+			return forbidden();
 		const body = sessionIdInput.safeParse(value);
 		if (!body.success)
 			return failure(400, "INVALID_BODY", "Supply a session ID.");
-		const current = await currentSession(headers);
-		if (!current)
-			return failure(401, "UNAUTHORIZED", "Authentication required.");
-		if (!current.user.emailVerified) return forbidden();
-		const removed = await store.revoke(
-			{
-				id: body.data.id,
-				userId: current.user.id,
-				currentToken: current.token,
-			},
-			"/account/sessions/revoke",
-			Boolean(backchannel),
-		);
-		if (!removed) return unsupported();
-		if (!removed.ids.length)
-			return failure(404, "NOT_FOUND", "This session no longer exists.");
-		await backchannel?.(removed.targets);
-		const responseHeaders = new Headers();
-		if (body.data.id === current.session.id)
-			clearSessionCookies(responseHeaders);
-		return json({ success: true }, 200, responseHeaders);
+		const path = "/account/sessions/revoke";
+		const headers = new Headers({ "cache-control": "no-store" });
+		const response = await store.transaction(async (client) => {
+			const observed = await readBrowserRouteSession(
+				client,
+				request,
+				path,
+				headers,
+			);
+			const current = ordinarySession(observed?.token ?? null, observed);
+			if (!current) return new Response(null, { status: 401, headers });
+			if (!current.user.emailVerified) return forbidden();
+			const removed = await store.revoke(
+				{
+					id: body.data.id,
+					userId: current.user.id,
+					currentToken: current.token,
+				},
+				path,
+				Boolean(backchannel),
+				client,
+			);
+			if (!removed) return unsupported();
+			if (!removed.ids.length)
+				return failure(404, "NOT_FOUND", "This session no longer exists.");
+			deliverLogoutAfterCommit(client, request, removed.targets);
+			if (body.data.id === current.session.id) clearSessionCookies(headers);
+			return json({ success: true }, 200, headers);
+		});
+		await deliverCommittedLogout(request);
+		return response;
 	}
 
 	const agentHosts =
@@ -3975,11 +4083,11 @@ export function createOwnedProjectEngine(
 		if (request.method === "POST" && path === "/multi-session/revoke")
 			return deviceSessionAction(request, true);
 		if (request.method === "GET" && path === "/account/sessions")
-			return listAccountSessions(request.headers);
+			return listAccountSessions(request);
 		if (request.method === "POST" && path === "/account/sessions/revoke") {
 			const body = sessionIdInput.safeParse(await requestBody(request));
 			return body.success
-				? revokeAccountSession(request.headers, body.data)
+				? revokeAccountSession(request, body.data)
 				: failure(400, "INVALID_BODY", "Supply a session ID.");
 		}
 		return unsupported();
