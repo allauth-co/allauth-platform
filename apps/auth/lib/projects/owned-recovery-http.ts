@@ -32,8 +32,15 @@ import { projectOrigin, projectSlug } from "./validation";
 const alphabet =
 	"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 const email = z.email().max(320);
-const callback = z.string().max(2048).optional();
+const maximumCallbackLength = 2048;
+const maximumHostedResetURLLength = 16_384;
+const maximumHostedResetBodyBytes = maximumHostedResetURLLength + 1024;
+const resetTokenLength = 24;
+const callback = z.string().max(maximumCallbackLength).optional();
 const resetRequest = z.object({ email, redirectTo: callback }).strict();
+const hostedResetRequest = resetRequest.extend({
+	redirectTo: z.string().max(maximumHostedResetURLLength).optional(),
+});
 const verifyRequest = z.object({ email, callbackURL: callback }).strict();
 const resetInput = z
 	.object({
@@ -124,10 +131,10 @@ function redirect(callbackURL: URL, name?: string, value?: string) {
 	});
 }
 
-function validURL(value: string) {
+function validURL(value: string, maximumLength = maximumCallbackLength) {
 	if (
 		!value ||
-		value.length > 2048 ||
+		value.length > maximumLength ||
 		value.startsWith("//") ||
 		/[\\\u0000-\u0020\u007f]/.test(value)
 	)
@@ -154,7 +161,10 @@ function configuredCallbacks(values: readonly string[], origins: Set<string>) {
 	});
 }
 
-async function boundedJson(request: Request): Promise<unknown> {
+async function boundedJson(
+	request: Request,
+	maximumBytes = 8192,
+): Promise<unknown> {
 	if (
 		request.headers
 			.get("content-type")
@@ -173,7 +183,7 @@ async function boundedJson(request: Request): Promise<unknown> {
 			const { value, done } = await reader.read();
 			if (done) return JSON.parse(source + decoder.decode());
 			length += value.byteLength;
-			if (length > 8192) {
+			if (length > maximumBytes) {
 				void reader.cancel().catch(() => {});
 				return undefined;
 			}
@@ -215,6 +225,10 @@ export function createOwnedRecoveryHttp(options: RecoveryHttpOptions) {
 		options.verificationCallbackURLs,
 		origins,
 	);
+	const hostedReset =
+		options.basePath === "/api/auth" &&
+		linkBase.origin === origin &&
+		Boolean(options.callbackPolicy);
 	const policy = authPolicySchema.parse(options.policy);
 	const store = createProjectEngineStore(
 		options.database,
@@ -238,18 +252,34 @@ export function createOwnedRecoveryHttp(options: RecoveryHttpOptions) {
 
 	function selectCallback(
 		value: string | undefined,
-		flow: Parameters<OwnedEmailCallbackPolicy>[1],
+		flow: "verification" | "password-reset",
 		phase: Parameters<OwnedEmailCallbackPolicy>[2],
 		caller = linkBase.origin,
 	): ReturnType<OwnedEmailCallbackPolicy> {
 		const approved = flow === "verification" ? verifyCallbacks : resetCallbacks;
 		if (value === undefined) return { url: new URL(approved[0]) };
-		if (!validURL(value)) return null;
+		const extended =
+			flow === "password-reset" &&
+			hostedReset &&
+			caller === origin &&
+			value.length > maximumCallbackLength;
+		if (!validURL(value, extended ? maximumHostedResetURLLength : undefined))
+			return null;
 		try {
 			const target = new URL(value, caller);
 			if (approved.includes(target.href)) return { url: target };
+			if (
+				extended &&
+				(target.origin !== origin ||
+					target.href.length > maximumHostedResetURLLength)
+			)
+				return null;
 			return origins.has(target.origin)
-				? (options.callbackPolicy?.(target, flow, phase) ?? null)
+				? (options.callbackPolicy?.(
+						target,
+						extended ? "hosted-password-reset" : flow,
+						phase,
+					) ?? null)
 				: null;
 		} catch {
 			return null;
@@ -274,7 +304,7 @@ export function createOwnedRecoveryHttp(options: RecoveryHttpOptions) {
 		destination: URL,
 	) {
 		const token = Array.from(
-			{ length: 24 },
+			{ length: resetTokenLength },
 			() => alphabet[randomInt(alphabet.length)],
 		).join("");
 		const user = await store.transaction(async (client) => {
@@ -366,11 +396,17 @@ export function createOwnedRecoveryHttp(options: RecoveryHttpOptions) {
 		operation: "request-password-reset" | "send-verification-email",
 	) {
 		const caller = request.headers.get("origin") ?? undefined;
-		const raw = await boundedJson(request);
 		const isReset = operation === "request-password-reset";
-		const body = isReset ? options.emailAliases?.normalizeInput(raw) ?? raw : raw;
+		const hosted = isReset && hostedReset && caller === origin;
+		const raw = await boundedJson(
+			request,
+			hosted ? maximumHostedResetBodyBytes : undefined,
+		);
+		const body = isReset
+			? (options.emailAliases?.normalizeInput(raw) ?? raw)
+			: raw;
 		const parsed = isReset
-			? resetRequest.safeParse(body)
+			? (hosted ? hostedResetRequest : resetRequest).safeParse(body)
 			: verifyRequest.safeParse(body);
 		if (!parsed.success)
 			return failure(400, "INVALID_BODY", "Supply a valid email address.");
@@ -387,6 +423,17 @@ export function createOwnedRecoveryHttp(options: RecoveryHttpOptions) {
 			caller,
 		);
 		if (!destination) return forbidden();
+		// Check the nested, encoded email URL before creating a reset token.
+		if (
+			hosted &&
+			value &&
+			value.length > maximumCallbackLength &&
+			emailURL(
+				`/reset-password/${"a".repeat(resetTokenLength)}`,
+				destination.url,
+			).length > maximumHostedResetURLLength
+		)
+			return forbidden();
 		const address = parsed.data.email.toLowerCase();
 		const identity = isReset && options.emailAliases
 			? await options.emailAliases.resolve(address)

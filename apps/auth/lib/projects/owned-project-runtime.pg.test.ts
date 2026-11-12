@@ -6409,6 +6409,84 @@ describe.skipIf(!existsSync(fixture))(
 			}
 		}, 60_000);
 
+		it("opens a long hosted recovery email through the signed edge after rollback", async () => {
+			const local: { container: string; DATABASE_URL: string } = JSON.parse(
+				readFileSync(fixture, "utf8"),
+			);
+			const base = new URL(local.DATABASE_URL);
+			if (
+				local.container !== "allauth-production-test-20261007" ||
+				base.hostname !== "127.0.0.1" ||
+				base.port !== "55445"
+			)
+				throw new Error("Hosted recovery requires the isolated PostgreSQL fixture.");
+			const admin = new Pool({ connectionString: base.href, max: 1 });
+			const name = `allauth_hosted_${randomUUID().replaceAll("-", "")}`;
+			const databaseURL = new URL(`/${name}`, base).href;
+			let created = false;
+			let service: Awaited<ReturnType<typeof openProcess>> | undefined;
+			try {
+				await admin.query(`CREATE DATABASE "${name}"`);
+				created = true;
+				const { alpha } = await seed(databaseURL);
+				const host = `${alpha.slug}-accounts.allauth.co`;
+				const origin = `https://${host}`;
+				const rollout = {
+					ALLAUTH_PROJECT_HOSTED_UI_PROJECT_IDS: alpha.id,
+					EMAIL_FROM: "recovery@runtime.fixture.example",
+				};
+				const state = `${"signed-synthetic-reset-return".repeat(295)}+one&two`;
+				const target = new URL("/reset-password", origin);
+				const continuation = `/oauth2/continue?${signProjectIssuerQuery(
+					fixtureAuthorizationQuery(state),
+					versionedSigningSecret,
+				)}`;
+				target.searchParams.set("returnTo", continuation);
+				const body = { email: credentials.project.email, redirectTo: target.href };
+				expect(Buffer.byteLength(JSON.stringify(body))).toBeGreaterThan(8192);
+				service = await openProcess(databaseURL, alpha, true, alpha.slug, undefined, undefined, rollout);
+				const response = await service.request("/api/auth/hosted-ui/request-password-reset", {
+					host,
+					accept: "application/json",
+					body,
+				});
+				expect(response.status, await response.clone().text()).toBe(200);
+				expect(await response.json()).toMatchObject({ status: true });
+				const link = await vi.waitFor(() => {
+					const mail = service!.mail.find(
+						({ to, subject }) => to === body.email && subject.startsWith("Reset your"),
+					);
+					const match = mail?.text.match(/https:\/\/[^\s<>\]]+\/reset-password\/[^\s<>\]]+/);
+					expect(match?.[0]).toBeTruthy();
+					return new URL(match![0]);
+				});
+				expect(link.origin).toBe(origin);
+				expect(link.searchParams.get("callbackURL")).toBe(target.href);
+				const path = link.pathname + link.search;
+				const owned = await service.request(path, { host });
+				expect(owned.status).toBe(302);
+				const opened = new URL(owned.headers.get("location")!);
+				expect(opened.searchParams.get("returnTo")).toBe(continuation);
+				expect(opened.searchParams.get("token")).toBeTruthy();
+				await service.stop();
+				service = undefined;
+				service = await openProcess(databaseURL, alpha, false, alpha.slug, undefined, undefined, rollout);
+				const legacy = await service.request(path, { host });
+				expect(legacy.status).toBe(302);
+				expect(legacy.headers.get("location")).toBe(opened.href);
+			} finally {
+				try {
+					await service?.stop();
+				} finally {
+					try {
+						if (created) await dropClosedFixtureDatabase(admin, name);
+					} finally {
+						await admin.end();
+					}
+				}
+			}
+		}, 60_000);
+
 		it("preserves signed custom SAML metadata at its exact verified accounts receiver across process restarts", async () => {
 			const local: { container: string; DATABASE_URL: string } = JSON.parse(
 				readFileSync(fixture, "utf8"),

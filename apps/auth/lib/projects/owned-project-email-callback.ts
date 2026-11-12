@@ -5,7 +5,11 @@ import {
 } from "./owned-project-issuer-authorization-query";
 import { projectOrigin } from "./validation";
 
-type CallbackFlow = "verification" | "password-reset" | "hosted-magic-link";
+type CallbackFlow =
+	| "verification"
+	| "password-reset"
+	| "hosted-magic-link"
+	| "hosted-password-reset";
 type CallbackPhase = "issue" | "consume";
 
 export type OwnedEmailCallbackPolicy = (
@@ -27,13 +31,13 @@ export function createOwnedProjectEmailCallbackPolicy(options: {
 	const authPath = new URL(options.publicLinkBaseURL).pathname;
 	const account = `${origin}/account`;
 
-	function local(target: URL, phase: CallbackPhase, hostedMagic = false) {
+	function local(target: URL, phase: CallbackPhase, extendedSigned = false) {
 		if (
 			target.origin !== origin ||
 			target.username ||
 			target.password ||
 			(target.href.length > 2048 &&
-				(!hostedMagic || target.pathname !== "/oauth2/continue")) ||
+				(!extendedSigned || target.pathname !== "/oauth2/continue")) ||
 			target.searchParams.has("token") ||
 			target.searchParams.has("error")
 		)
@@ -109,7 +113,9 @@ export function createOwnedProjectEmailCallbackPolicy(options: {
 				return null;
 			continuation = new URL(intent, origin);
 		}
-		const destination = local(continuation, phase);
+		const extended = flow === "hosted-password-reset";
+		if (extended && continuation.pathname !== "/oauth2/continue") return null;
+		const destination = local(continuation, phase, extended);
 		if (!destination) return null;
 		if (!destination.expiredContinuation) return { url: target };
 		const reset = new URL("/reset-password", origin);
