@@ -269,34 +269,32 @@ async function revokeLockedAgent(client: PoolClient, id: string) {
 	return json({ agent_id: id, status: "revoked" });
 }
 
-/** A live signed host may disconnect an explicitly selected agent on that host. */
-export async function revokeOwnedHostAgent(
+/** Lock a selected agent in the verified signed host's scope. */
+export async function lockHostOwnedAgent(
 	client: PoolClient,
 	hostId: string,
-	input: z.infer<typeof revokeInput>,
+	id: string,
 ) {
-	const id = input.agent_id;
-	if (!id) return missingRevocationTarget();
 	if (id.includes("\0")) return notFound();
-	const target = await client.query(
-		`SELECT 1 FROM "agent" WHERE id=$1 AND "hostId"=$2 FOR UPDATE`,
+	const {
+		rows: [agent],
+	} = await client.query<{ id: string; status: string }>(
+		`SELECT id,status FROM "agent" WHERE id=$1 AND "hostId"=$2 FOR UPDATE`,
 		[id, hostId],
 	);
-	if (target.rowCount) return revokeLockedAgent(client, id);
+	if (agent) return agent;
 	const existing = await client.query(`SELECT 1 FROM "agent" WHERE id=$1`, [
 		id,
 	]);
 	return existing.rowCount ? forbidden() : notFound();
 }
 
-/** Revoke the selected agent under its live browser or persisted host owner. */
-export async function revokeOwnedBrowserAgent(
+/** Lock an agent under its live browser owner or persisted host owner. */
+export async function lockBrowserOwnedAgent(
 	client: PoolClient,
 	userId: string,
-	input: z.infer<typeof revokeInput>,
+	id: string,
 ) {
-	const id = input.agent_id;
-	if (!id) return missingRevocationTarget();
 	if (id.includes("\0")) return notFound();
 	const {
 		rows: [target],
@@ -313,11 +311,37 @@ export async function revokeOwnedBrowserAgent(
 	);
 	const {
 		rows: [agent],
-	} = await client.query<{ userId: string | null }>(
-		`SELECT "userId" FROM "agent" WHERE id=$1 AND "hostId"=$2 FOR UPDATE`,
+	} = await client.query<{ id: string; status: string; userId: string | null }>(
+		`SELECT id,status,"userId" FROM "agent" WHERE id=$1 AND "hostId"=$2 FOR UPDATE`,
 		[id, target.hostId],
 	);
 	if (!agent) return notFound();
 	if (agent.userId !== userId && host?.userId !== userId) return forbidden();
-	return revokeLockedAgent(client, id);
+	return agent;
+}
+
+/** Revoke the selected agent under its live browser or persisted host owner. */
+export async function revokeOwnedBrowserAgent(
+	client: PoolClient,
+	userId: string,
+	input: z.infer<typeof revokeInput>,
+) {
+	if (!input.agent_id) return missingRevocationTarget();
+	const agent = await lockBrowserOwnedAgent(client, userId, input.agent_id);
+	return agent instanceof Response
+		? agent
+		: revokeLockedAgent(client, agent.id);
+}
+
+/** A live signed host may disconnect an explicitly selected agent on that host. */
+export async function revokeOwnedHostAgent(
+	client: PoolClient,
+	hostId: string,
+	input: z.infer<typeof revokeInput>,
+) {
+	if (!input.agent_id) return missingRevocationTarget();
+	const agent = await lockHostOwnedAgent(client, hostId, input.agent_id);
+	return agent instanceof Response
+		? agent
+		: revokeLockedAgent(client, agent.id);
 }

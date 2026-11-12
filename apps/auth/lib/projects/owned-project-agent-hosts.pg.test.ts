@@ -1875,6 +1875,205 @@ describe.skipIf(!existsSync(fixture))(
 			});
 		});
 
+		it.each([
+			"browser",
+			"host",
+		] as const)("revokes named grants with the native %s authority across writers", async (lane) => {
+			const path = "/agent/revoke-capability";
+			const schema = `"${alpha.schemaName}"`;
+			const seed = async (label: string) => {
+				const host = await nativeMachineHost(label, ownerCookie);
+				const [agentId, , , revokedAgent] = await seedDependents(host.hostId);
+				if (lane === "browser")
+					await database.query(
+						`UPDATE ${schema}."agent" SET "userId"=NULL WHERE id=$1`,
+						[agentId],
+					);
+				const [readActive, readPending] = [randomUUID(), randomUUID()].sort();
+				const writeConsumed = randomUUID();
+				const alreadyRevoked = randomUUID();
+				const untouched = randomUUID();
+				await database.query(
+					`INSERT INTO ${schema}."agentCapabilityGrant" (id,"agentId",capability,status,"createdAt","updatedAt") VALUES
+					($1,$6,'fixture.read.extra','active',now(),now()), ($2,$6,'fixture.read.extra','pending',now(),now()),
+					($3,$6,'fixture.write','consumed',now(),now()), ($4,$6,'fixture.read.extra','revoked',now(),now()),
+					($5,$6,'fixture.untouched','active',now(),now())`,
+					[
+						readActive,
+						readPending,
+						writeConsumed,
+						alreadyRevoked,
+						untouched,
+						agentId,
+					],
+				);
+				return {
+					host,
+					agentId,
+					revokedAgent,
+					changed: [writeConsumed, readActive, readPending],
+					alreadyRevoked,
+					untouched,
+				};
+			};
+			const nativeFixture = await seed(`Native ${lane} grant revoke`);
+			const ownedFixture = await seed(`Owned ${lane} grant revoke`);
+			const cookie = lane === "browser" ? ownerCookie : "";
+			const nativeBearer =
+				lane === "host"
+					? `Bearer ${await nativeClientHostProof(nativeFixture.host)}`
+					: undefined;
+			const ownedBearer =
+				lane === "host"
+					? `Bearer ${await nativeClientHostProof(ownedFixture.host)}`
+					: undefined;
+			const capabilities = [
+				"fixture.write",
+				"fixture.read.extra",
+				"fixture.read.extra",
+				"fixture.absent",
+			];
+			const data = (agent_id: string) => ({ agent_id, capabilities });
+			const state = (fixture: typeof ownedFixture) =>
+				database.query<{ id: string; status: string }>(
+					`SELECT id,status FROM ${schema}."agentCapabilityGrant" WHERE "agentId"=$1`,
+					[fixture.agentId],
+				);
+			const principal = () =>
+				database.query(
+					`SELECT status,"publicKey",kid,"hostId","userId" FROM ${schema}."agent" WHERE id=$1`,
+					[ownedFixture.agentId],
+				);
+			const before = (await principal()).rows;
+			await expectSame(
+				path,
+				cookie,
+				400,
+				{ agent_id: ownedFixture.agentId, capabilities: [] },
+				ownedBearer,
+			);
+			await expectSame(path, cookie, 404, data(randomUUID()), ownedBearer);
+			await expectSame(
+				path,
+				cookie,
+				403,
+				data(ownedFixture.revokedAgent),
+				ownedBearer,
+			);
+			if (lane === "host") {
+				await expectSame(
+					path,
+					ownerCookie,
+					403,
+					data(nativeFixture.agentId),
+					ownedBearer,
+				);
+				expect(
+					(
+						await outside.dispatch(
+							request(beta, path, "", data(ownedFixture.agentId), ownedBearer),
+						)
+					).status,
+				).toBe(401);
+			} else {
+				await expectSame(path, peerCookie, 403, data(ownedFixture.agentId));
+				await expectSame(path, "", 403, data(ownedFixture.agentId));
+				const stale = await signIn(owner.email);
+				const active = await legacy.handler(
+					request(alpha, "/get-session", stale),
+				);
+				const { session } = (await active.json()) as {
+					session: { id: string };
+				};
+				await database.query(
+					`UPDATE ${schema}."session" SET "createdAt"=now()-interval '6 minutes' WHERE id=$1`,
+					[session.id],
+				);
+				await expectSame(path, stale, 403, data(ownedFixture.agentId));
+			}
+			expect(
+				(
+					await disabled.dispatch(
+						request(
+							alpha,
+							path,
+							cookie,
+							data(ownedFixture.agentId),
+							ownedBearer,
+						),
+					)
+				).status,
+			).toBe(501);
+			const prior = await legacy.handler(
+				request(alpha, path, cookie, data(nativeFixture.agentId), nativeBearer),
+			);
+			const revoke = () =>
+				owned.dispatch(
+					request(alpha, path, cookie, data(ownedFixture.agentId), ownedBearer),
+				);
+			const next = await Promise.all([revoke(), revoke()]);
+			expect([prior.status, ...next.map(({ status }) => status)]).toEqual([
+				200, 200, 200,
+			]);
+			const expected = (fixture: typeof ownedFixture) => ({
+				agent_id: fixture.agentId,
+				revoked: ["fixture.write", "fixture.read.extra"],
+				grant_ids: fixture.changed,
+			});
+			expect(await prior.json()).toEqual(expected(nativeFixture));
+			const outputs = await Promise.all(
+				next.map((response) => response.json()),
+			);
+			expect(outputs).toEqual(
+				expect.arrayContaining([
+					expected(ownedFixture),
+					{ agent_id: ownedFixture.agentId, revoked: [], grant_ids: [] },
+				]),
+			);
+			const { rows } = await state(ownedFixture);
+			const statuses = new Map(rows.map(({ id, status }) => [id, status]));
+			for (const id of [...ownedFixture.changed, ownedFixture.alreadyRevoked])
+				expect(statuses.get(id)).toBe("revoked");
+			expect(statuses.get(ownedFixture.untouched)).toBe("active");
+			expect((await principal()).rows).toEqual(before);
+			const repeat = await owned.dispatch(
+				request(alpha, path, cookie, data(ownedFixture.agentId), ownedBearer),
+			);
+			expect(repeat.status).toBe(200);
+			expect(await repeat.json()).toEqual({
+				agent_id: ownedFixture.agentId,
+				revoked: [],
+				grant_ids: [],
+			});
+			legacy = await native(nativePool);
+			const resumed = await legacy.handler(
+				request(alpha, path, cookie, data(ownedFixture.agentId), ownedBearer),
+			);
+			expect(resumed.status).toBe(200);
+			expect(await resumed.json()).toEqual({
+				agent_id: ownedFixture.agentId,
+				revoked: [],
+				grant_ids: [],
+			});
+			const inspected = await legacy.handler(
+				request(
+					alpha,
+					`${statusPath}?agent_id=${ownedFixture.agentId}`,
+					"",
+					undefined,
+					`Bearer ${await nativeClientHostProof(ownedFixture.host)}`,
+				),
+			);
+			expect(inspected.status).toBe(200);
+			expect(await inspected.json()).toMatchObject({
+				status: "active",
+				agent_capability_grants: expect.arrayContaining([
+					{ capability: "fixture.read.extra", status: "revoked" },
+					{ capability: "fixture.untouched", status: "active" },
+				]),
+			});
+		});
+
 		it("updates the fresh browser owner's host and replaces its inline key under the stable ID across writers", async () => {
 			const path = "/host/update";
 			const host = await nativeMachineHost("Browser key update", ownerCookie);

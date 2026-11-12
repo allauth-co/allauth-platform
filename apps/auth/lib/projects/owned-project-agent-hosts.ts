@@ -8,6 +8,8 @@ import {
 } from "./owned-project-agent-approvals";
 import {
 	cleanupOwnedBrowserAgents,
+	lockBrowserOwnedAgent,
+	lockHostOwnedAgent,
 	ownedAgentRevokeInput,
 	ownedAgentUpdateInput,
 	ownedBrowserAgentQuery,
@@ -26,6 +28,11 @@ import {
 	invalidAgentBody,
 	updateOwnedAgentHost,
 } from "./owned-project-agent-enrollment";
+import {
+	agentGrantRevokePath,
+	ownedAgentGrantRevokeInput,
+	revokeOwnedAgentGrants,
+} from "./owned-project-agent-grant-revocation";
 import {
 	agentIntrospectionPath,
 	introspectOwnedProjectAgent,
@@ -57,6 +64,10 @@ const detailInput = z.object({ host_id: z.string() });
 const revokeInput = z.object({ host_id: z.string().optional() });
 const revokePath = "/host/revoke";
 const agentRevokePath = "/agent/revoke";
+type SignedHostRevocationPath =
+	| typeof revokePath
+	| typeof agentRevokePath
+	| typeof agentGrantRevokePath;
 
 type Host = {
 	id: string;
@@ -172,7 +183,7 @@ function hasSignedHostType(request: Request) {
 async function verifyRevokingHost(
 	client: PoolClient,
 	request: Request,
-	path: typeof revokePath | typeof agentRevokePath,
+	path: SignedHostRevocationPath,
 ) {
 	const url = new URL(request.url);
 	const decoded = decodeAgentMachineJWT(request);
@@ -221,11 +232,19 @@ async function verifyRevokingHost(
 async function signedHostRevoke(
 	client: PoolClient,
 	request: Request,
-	path: typeof revokePath | typeof agentRevokePath,
+	path: SignedHostRevocationPath,
 	body: unknown,
 ) {
 	const host = await verifyRevokingHost(client, request, path);
 	if (host instanceof Response) return host;
+	if (path === agentGrantRevokePath) {
+		const input = ownedAgentGrantRevokeInput(body);
+		if (input instanceof Response) return input;
+		const agent = await lockHostOwnedAgent(client, host.id, input.agent_id);
+		return agent instanceof Response
+			? agent
+			: revokeOwnedAgentGrants(client, agent, input.capabilities);
+	}
 	if (path === agentRevokePath) {
 		const input = ownedAgentRevokeInput(body);
 		return input instanceof Response
@@ -272,6 +291,8 @@ export function createOwnedProjectAgentHosts(options: BrowserHosts) {
 			request.method === "GET" &&
 			(path === "/agent/get" || path === "/agent/list");
 		const agentRevoke = request.method === "POST" && path === agentRevokePath;
+		const grantRevoke =
+			request.method === "POST" && path === agentGrantRevokePath;
 		const agentUpdate = request.method === "POST" && path === "/agent/update";
 		const agentCleanup = request.method === "POST" && path === "/agent/cleanup";
 		const browserAgentWrite = agentRevoke || agentUpdate || agentCleanup;
@@ -280,6 +301,7 @@ export function createOwnedProjectAgentHosts(options: BrowserHosts) {
 		const write =
 			decision ||
 			browserAgentWrite ||
+			grantRevoke ||
 			hostRevoke ||
 			hostUpdate ||
 			(request.method === "POST" && path === "/host/create");
@@ -310,6 +332,7 @@ export function createOwnedProjectAgentHosts(options: BrowserHosts) {
 							? 300
 							: agentRead ||
 									agentRevoke ||
+									grantRevoke ||
 									agentUpdate ||
 									catalog ||
 									introspect ||
@@ -345,13 +368,16 @@ export function createOwnedProjectAgentHosts(options: BrowserHosts) {
 			);
 		}
 		if (request.headers.has("authorization")) {
-			if ((hostRevoke || agentRevoke) && hasSignedHostType(request)) {
+			if (
+				(hostRevoke || agentRevoke || grantRevoke) &&
+				hasSignedHostType(request)
+			) {
 				const body = await options.readBody(request);
 				return options.store.transaction((client) =>
 					signedHostRevoke(client, request, path, body),
 				);
 			}
-			if (hostRevoke && request.headers.get("authorization"))
+			if ((hostRevoke || grantRevoke) && request.headers.get("authorization"))
 				return forbidden(
 					"Use your browser session or a valid signed host request.",
 				);
@@ -387,9 +413,13 @@ export function createOwnedProjectAgentHosts(options: BrowserHosts) {
 			: null;
 		const browserRevoke = agentRevoke ? ownedAgentRevokeInput(body) : null;
 		const browserUpdate = agentUpdate ? ownedAgentUpdateInput(body) : null;
+		const browserGrantRevoke = grantRevoke
+			? ownedAgentGrantRevokeInput(body)
+			: null;
 		if (browserQuery instanceof Response) return browserQuery;
 		if (browserRevoke instanceof Response) return browserRevoke;
 		if (browserUpdate instanceof Response) return browserUpdate;
+		if (browserGrantRevoke instanceof Response) return browserGrantRevoke;
 		return options.store.transaction(async (client) => {
 			const userId = await options.authorizeBrowser(
 				client,
@@ -414,6 +444,20 @@ export function createOwnedProjectAgentHosts(options: BrowserHosts) {
 				return revokeOwnedBrowserAgent(client, userId, browserRevoke);
 			if (browserUpdate)
 				return updateOwnedBrowserAgent(client, userId, browserUpdate);
+			if (browserGrantRevoke) {
+				const agent = await lockBrowserOwnedAgent(
+					client,
+					userId,
+					browserGrantRevoke.agent_id,
+				);
+				return agent instanceof Response
+					? agent
+					: revokeOwnedAgentGrants(
+							client,
+							agent,
+							browserGrantRevoke.capabilities,
+						);
+			}
 			if (agentCleanup) return cleanupOwnedBrowserAgents(client, userId, body);
 			if (decision) return decideOwnedAgentApproval(client, userId, body);
 			if (pending) return listOwnedAgentApprovals(client, userId);
