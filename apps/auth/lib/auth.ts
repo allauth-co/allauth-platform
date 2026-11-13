@@ -1235,6 +1235,18 @@ export function withAuthEngine<T>(
 		return callback(
 			{
 				...legacy,
+				listAccountSessions: (request) =>
+					withPlatformIssuerRuntime(env, ({ candidate }) =>
+						candidate
+							? candidate.accountSessions(request)
+							: legacy.listAccountSessions(request),
+					),
+				revokeAccountSession: (request, body) =>
+					withPlatformIssuerRuntime(env, ({ candidate }) =>
+						candidate
+							? candidate.accountSessions(request, body)
+							: legacy.revokeAccountSession(request, body),
+					),
 				dispatch: (request) => dispatchPlatformAuth(request, instance, env),
 			},
 			env,

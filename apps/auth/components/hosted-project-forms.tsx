@@ -20,7 +20,11 @@ import { useAllAuth, withAuthReturnTo } from "@/sdk/react";
 import { ApplicationBrandFooter } from "./application-brand";
 import { useHostedPasskeySignIn } from "./hosted-project-passkey";
 
-type FormContext = { destination: string; legacyPath: string };
+type FormContext = {
+	destination: string;
+	legacyPath?: string;
+	signInHref?: string;
+};
 type HostedOperation =
 	| "sign-in/email"
 	| "sign-in/username"
@@ -155,11 +159,13 @@ export function HostedProjectCard({
 	);
 }
 
-function FormFooter({ destination, legacyPath }: FormContext) {
+function FormFooter({ destination, legacyPath, signInHref }: FormContext) {
 	return (
 		<div className="flex flex-wrap justify-center gap-x-4 gap-y-2">
-			<a href={withAuthReturnTo("/sign-in", destination)}>Back to sign in</a>
-			<a href={legacyPath}>Open standard form</a>
+			<a href={signInHref ?? withAuthReturnTo("/sign-in", destination)}>
+				Back to sign in
+			</a>
+			{legacyPath && <a href={legacyPath}>Open standard form</a>}
 		</div>
 	);
 }
@@ -928,7 +934,12 @@ export function HostedProjectSso({
 }
 
 export function HostedProjectMfa(
-	context: FormContext & { inline?: boolean; methods?: string[] },
+	context: FormContext & {
+		inline?: boolean;
+		methods?: string[];
+		oauthQuery?: string;
+		onVerified?: (data: Record<string, unknown>) => Promise<void>;
+	},
 ) {
 	const { run, busy, error, clearError } = useHostedAction();
 	const { challengeMethods } = useAllAuth();
@@ -951,10 +962,15 @@ export function HostedProjectMfa(
 		void run(async (request) => {
 			const result = await request(
 				recovery ? "two-factor/verify-backup-code" : "two-factor/verify-totp",
-				{ code, trustDevice },
+				{
+					code,
+					trustDevice,
+					...(context.oauthQuery && { oauth_query: context.oauthQuery }),
+				},
 			);
 			if (!result.ok) throw result.data;
-			complete(result.data, context.destination);
+			if (context.onVerified) await context.onVerified(result.data);
+			else complete(result.data, context.destination);
 		});
 	}
 	return (

@@ -25,6 +25,7 @@ import { AllAuthAuth } from "./better-auth-ui/allauth-auth";
 import { HostedProjectAuth } from "./hosted-project-auth";
 import { HostedProjectIssuerNavigation } from "./hosted-project-auth-status";
 import { HostedProjectUnavailable } from "./hosted-project-unavailable";
+import { PlatformHostedAuth } from "./platform-hosted-auth";
 import { PlatformSignIn } from "./platform-sign-in";
 
 export type HostedProjectAuthPageProps = {
@@ -81,6 +82,12 @@ export async function HostedProjectAuthPage({
 	const requestHeaders = await headers();
 	if (!requestHeaders.has(portalHeader)) {
 		if (view === "signIn") return <PlatformSignIn />;
+		if (
+			view === "twoFactor" ||
+			view === "enterpriseSignIn" ||
+			view === "signOut"
+		)
+			return <PlatformHostedAuth view={view} />;
 		return standardForm;
 	}
 

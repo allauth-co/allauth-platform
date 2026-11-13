@@ -1,4 +1,5 @@
 import type { Pool, PoolClient } from "pg";
+import * as z from "zod";
 import { authPolicyRepository } from "./auth-policy/storage";
 import type { AuthEnvironment } from "./configuration";
 import {
@@ -28,6 +29,7 @@ import { createPlatformProviderSignIn } from "./platform-provider-sign-in";
 import { createPlatformSessionIssuer } from "./platform-session-issuance";
 import { readLegacyProjectKeyring } from "./projects/legacy-project-keyring";
 import { createOwnedPendingMfa } from "./projects/owned-mfa";
+import { recordOwnedProjectEvent } from "./projects/owned-project-engine-store";
 import { createOwnedProjectIssuerAuthorization } from "./projects/owned-project-issuer-authorization";
 import { createIssuerClientAuthenticator } from "./projects/owned-project-issuer-client";
 import { createOwnedProjectConsentManagement } from "./projects/owned-project-issuer-consent-management";
@@ -318,6 +320,27 @@ export function createPlatformIssuer(database: Pool, env: AuthEnvironment) {
 		return { kind: "response" as const, response };
 	}
 
+	function clearBrowserSession(headers: Headers, incoming: Request) {
+		const names = new Set(
+			["session_token", "session_data", "dont_remember"].map(
+				(name) => cookiePrefix + name,
+			),
+		);
+		for (const pair of (incoming.headers.get("cookie") ?? "").split(";")) {
+			const name = pair.split("=", 1)[0]?.trim();
+			if (
+				name?.startsWith(`${cookiePrefix}session_data.`) &&
+				/^\d+$/.test(name.slice(`${cookiePrefix}session_data.`.length))
+			)
+				names.add(name);
+		}
+		for (const name of names)
+			headers.append(
+				"set-cookie",
+				`${name}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${secure ? "; Secure" : ""}`,
+			);
+	}
+
 	async function logout(
 		path: "/oauth2/end-session" | "/oauth2/end-session/confirm",
 		request: Request,
@@ -329,33 +352,104 @@ export function createPlatformIssuer(database: Pool, env: AuthEnvironment) {
 			env,
 			requireMfa: current.mfaMode === "required",
 			readBody: readBrowserBody,
-			clearBrowserSession(headers, incoming) {
-				const names = new Set(
-					["session_token", "session_data", "dont_remember"].map(
-						(name) => cookiePrefix + name,
-					),
-				);
-				for (const pair of (incoming.headers.get("cookie") ?? "").split(";")) {
-					const name = pair.split("=", 1)[0]?.trim();
-					if (
-						name?.startsWith(`${cookiePrefix}session_data.`) &&
-						/^\d+$/.test(name.slice(`${cookiePrefix}session_data.`.length))
-					)
-						names.add(name);
-				}
-				for (const name of names)
-					headers.append(
-						"set-cookie",
-						`${name}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${secure ? "; Secure" : ""}`,
-					);
-			},
+			clearBrowserSession,
 		})(path, request);
+	}
+
+	async function signOut(request: Request) {
+		if (
+			request.headers.has("authorization") ||
+			request.headers.get("sec-fetch-site") === "cross-site" ||
+			!trustedOrigins(env).includes(request.headers.get("origin") ?? "")
+		)
+			return issuerJSON({ code: "FORBIDDEN" }, 403);
+		await store.transaction(async (client) => {
+			const current = await readSession(request.headers, client);
+			if (!current) return;
+			const deleted = await client.query(
+				'DELETE FROM public."session" WHERE id=$1 AND "userId"=$2',
+				[current.session.id, current.user.id],
+			);
+			if (!deleted.rowCount) return;
+			await recordOwnedProjectEvent(client, {
+				type: "session.signed-out",
+				outcome: "success",
+				actorId: current.user.id,
+				userId: current.user.id,
+				targetId: current.session.id,
+				metadata: { path: "/sign-out" },
+			});
+		});
+		const response = issuerJSON({ success: true });
+		clearBrowserSession(response.headers, request);
+		return response;
+	}
+
+	async function accountSessions(request: Request, input?: { id: string }) {
+		const write = input !== undefined;
+		if (
+			request.headers.has("authorization") ||
+			(write &&
+				(request.headers.get("origin") !== issuer ||
+					request.headers.get("sec-fetch-site") === "cross-site"))
+		)
+			return issuerJSON({ code: "FORBIDDEN" }, 403);
+		const body = write
+			? z.strictObject({ id: z.string().min(1).max(160) }).safeParse(input)
+			: undefined;
+		if (body && !body.success) return issuerJSON({ code: "INVALID_BODY" }, 400);
+		const { policy: configured } = await policy.read("platform");
+		return store.transaction(async (client) => {
+			const current = await readSession(request.headers, client);
+			if (!current) return issuerJSON({ code: "UNAUTHORIZED" }, 401);
+			if (
+				current.user.banned ||
+				current.user.directoryDisabled ||
+				!current.user.emailVerified ||
+				(configured.mfaMode === "required" &&
+					!current.session.impersonatedBy &&
+					!current.user.twoFactorEnabled)
+			)
+				return issuerJSON({ code: "FORBIDDEN" }, 403);
+			if (!body) {
+				const { rows } = await client.query(
+					`SELECT id, "createdAt", "expiresAt", "ipAddress", "userAgent" FROM public."session"
+					WHERE "userId"=$1 AND "expiresAt">clock_timestamp() ORDER BY "createdAt" DESC, id LIMIT 100`,
+					[current.user.id],
+				);
+				return issuerJSON({
+					sessions: rows,
+					currentSessionId: current.session.id,
+				});
+			}
+			const deleted = await client.query(
+				'DELETE FROM public."session" WHERE id=$1 AND "userId"=$2',
+				[body.data.id, current.user.id],
+			);
+			if (!deleted.rowCount) return issuerJSON({ code: "NOT_FOUND" }, 404);
+			const response = issuerJSON({ success: true });
+			if (body.data.id === current.session.id)
+				clearBrowserSession(response.headers, request);
+			return response;
+		});
 	}
 
 	async function dispatch(request: Request): Promise<Response | undefined> {
 		const url = new URL(request.url);
 		if (url.origin !== issuer || !url.pathname.startsWith("/api/auth/")) return;
 		const path = url.pathname.slice("/api/auth".length);
+		if (path === "/sign-out" && request.method === "POST")
+			return signOut(request);
+		if (path === "/account/sessions" && request.method === "GET")
+			return accountSessions(request);
+		if (path === "/account/sessions/revoke" && request.method === "POST") {
+			const input = z
+				.strictObject({ id: z.string().min(1).max(160) })
+				.safeParse(await readBrowserBody(request));
+			return input.success
+				? accountSessions(request, input.data)
+				: issuerJSON({ code: "INVALID_BODY" }, 400);
+		}
 		if (
 			path === "/broker-two-factor/browser-handoff" &&
 			request.method === "GET"
@@ -442,6 +536,7 @@ export function createPlatformIssuer(database: Pool, env: AuthEnvironment) {
 	});
 
 	return {
+		accountSessions,
 		brokerMfa,
 		dispatch,
 		dispatchDevice,

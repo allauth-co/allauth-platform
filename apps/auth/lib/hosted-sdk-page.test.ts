@@ -3,11 +3,13 @@ import { beforeEach, expect, it, vi } from "vitest";
 import OrganizationSSOPage from "@/app/organizations/[id]/sso/page";
 import { AllAuthAuth } from "@/components/better-auth-ui/allauth-auth";
 import { HostedProjectAuth } from "@/components/hosted-project-auth";
+import type { HostedProjectAuthPageProps } from "@/components/hosted-project-auth-page";
 import { HostedProjectAuthPage } from "@/components/hosted-project-auth-page";
 import { HostedProjectIssuerNavigation } from "@/components/hosted-project-auth-status";
 import { HostedProjectUnavailable } from "@/components/hosted-project-unavailable";
 import { SSOManagement } from "@/components/management/sso";
-import type { HostedProjectAuthPageProps } from "@/components/hosted-project-auth-page";
+import { PlatformHostedAuth } from "@/components/platform-hosted-auth";
+import { PlatformSignIn } from "@/components/platform-sign-in";
 import { portalHeader } from "./domains/edge";
 import { projectWriterUnavailable } from "./projects/project-engine-unavailable";
 import { platformWorkspaceId } from "./workspaces/types";
@@ -48,13 +50,15 @@ vi.mock("@/components/management/sso", () => ({
 
 function engineConfiguration(configuration: Record<string, unknown>) {
 	return {
-		dispatch: vi.fn(async (_request: Request) => Response.json({
-			emailPassword: true,
-			google: false,
-			organizations: true,
-			twoFactor: true,
-			...configuration,
-		})),
+		dispatch: vi.fn(async (_request: Request) =>
+			Response.json({
+				emailPassword: true,
+				google: false,
+				organizations: true,
+				twoFactor: true,
+				...configuration,
+			}),
+		),
 		readOAuthContext: vi.fn(
 			async (_request: Request): Promise<Response> =>
 				new Response(null, { status: 400 }),
@@ -85,8 +89,8 @@ it("preserves exact sign-out destinations, verifies a direct OAuth query, and de
 	const read = (searchParams: HostedProjectAuthPageProps["searchParams"]) =>
 		HostedProjectAuthPage({ view: "signOut", searchParams });
 	const platform = await read(Promise.resolve({}));
-	expect(platform.type).toBe(AllAuthAuth);
-	expect(platform.props).toEqual({ path: "sign-out" });
+	expect(platform.type).toBe(PlatformHostedAuth);
+	expect(platform.props).toEqual({ view: "signOut" });
 	expect(runtime.withPortalHeadersEngine).not.toHaveBeenCalled();
 
 	runtime.headers.mockResolvedValue(
@@ -150,28 +154,52 @@ it("shows supported callback results with verified local destinations and keeps 
 		searchParams: Promise.resolve({}),
 	});
 	expect(bare.type).toBe(HostedProjectAuth);
-	expect(bare.props).toMatchObject({ view: "authCallback", destination: "/sign-in" });
+	expect(bare.props).toMatchObject({
+		view: "authCallback",
+		destination: "/sign-in",
+	});
 	for (const [searchParams, status, destination] of [
-		[{ result: "email_verified", returnTo: "/account?tab=profile#email" }, "emailVerified", "/account?tab=profile#email"],
-		[{ status: "success", source: "link account" }, "accountLinked", "/account/security"],
-		[{ result: "password_reset", returnTo: "/account" }, "passwordReset", "/sign-in"],
+		[
+			{ result: "email_verified", returnTo: "/account?tab=profile#email" },
+			"emailVerified",
+			"/account?tab=profile#email",
+		],
+		[
+			{ status: "success", source: "link account" },
+			"accountLinked",
+			"/account/security",
+		],
+		[
+			{ result: "password_reset", returnTo: "/account" },
+			"passwordReset",
+			"/sign-in",
+		],
 		[{ result: "signed-up" }, "signupComplete", "/sign-in"],
 	] as const) {
 		const result = await HostedProjectAuthPage({
-			view: "authCallback", searchParams: Promise.resolve(searchParams),
+			view: "authCallback",
+			searchParams: Promise.resolve(searchParams),
 		});
 		expect(result.type).toBe(HostedProjectAuth);
 		expect(result.props).toMatchObject({ callbackStatus: status, destination });
 	}
 	for (const [view, query] of [
-		["authCallback", { result: "email_verified", returnTo: "//other.example/path" }],
-		["authCallback", { result: "email_verified", returnTo: "/api/auth/callback" }],
+		[
+			"authCallback",
+			{ result: "email_verified", returnTo: "//other.example/path" },
+		],
+		[
+			"authCallback",
+			{ result: "email_verified", returnTo: "/api/auth/callback" },
+		],
 		["authCallback", { result: "email_verified", code: "opaque" }],
 	] as const) {
-		await expect(HostedProjectAuthPage({
-			view,
-			searchParams: Promise.resolve(query),
-		})).rejects.toThrow("redirect:/auth-error");
+		await expect(
+			HostedProjectAuthPage({
+				view,
+				searchParams: Promise.resolve(query),
+			}),
+		).rejects.toThrow("redirect:/auth-error");
 	}
 	expect(runtime.portalSession).not.toHaveBeenCalled();
 	const redirect = () =>
@@ -267,15 +295,17 @@ it("verifies a signed redirect continuation and carries it through signed-out lo
 	await expect(read(params)).rejects.toThrow(`redirect:${path}`);
 
 	runtime.portalSession.mockClear();
-	await expect(read({ redirectTo: path })).rejects.toThrow("redirect:/auth-error");
+	await expect(read({ redirectTo: path })).rejects.toThrow(
+		"redirect:/auth-error",
+	);
 	expect(runtime.portalSession).not.toHaveBeenCalled();
 });
 
 it("keeps explicit legacy fallback and refuses unsafe or ambiguous auth redirects", async () => {
 	const { engine, read } = redirectFixture();
-	expect((await read({ interface: "legacy", redirectTo: "/account" })).type).toBe(
-		AllAuthAuth,
-	);
+	expect(
+		(await read({ interface: "legacy", redirectTo: "/account" })).type,
+	).toBe(AllAuthAuth);
 	for (const params of [
 		{ interface: "other", redirectTo: "/account" },
 		{ interface: ["legacy", "legacy"], redirectTo: "/account" },
@@ -299,7 +329,7 @@ it("uses the standard page for an unverified account hostname without looking up
 		view: "signIn",
 		searchParams: Promise.resolve({}),
 	});
-	expect(result.type).toBe(AllAuthAuth);
+	expect(result.type).toBe(PlatformSignIn);
 	expect(runtime.getAuthEnvironment).not.toHaveBeenCalled();
 	expect(runtime.withPortalHeadersEngine).not.toHaveBeenCalled();
 });
@@ -310,12 +340,18 @@ it("rejects an unsigned project OAuth query without loading a legacy form", asyn
 	);
 	const engine = engineConfiguration({ emailPassword: true });
 	runtime.withPortalHeadersEngine.mockImplementation(async (_headers, select) =>
-		select(engine, new Headers(), { kind: "accounts", project, hostname: accountsHostname }),
+		select(engine, new Headers(), {
+			kind: "accounts",
+			project,
+			hostname: accountsHostname,
+		}),
 	);
-	await expect(HostedProjectAuthPage({
-		view: "signIn",
-		searchParams: Promise.resolve({ client_id: "fixture" }),
-	})).rejects.toThrow("redirect:/auth-error");
+	await expect(
+		HostedProjectAuthPage({
+			view: "signIn",
+			searchParams: Promise.resolve({ client_id: "fixture" }),
+		}),
+	).rejects.toThrow("redirect:/auth-error");
 	expect(runtime.withPortalHeadersEngine).toHaveBeenCalledOnce();
 	expect(engine.dispatch).not.toHaveBeenCalled();
 });
@@ -365,10 +401,12 @@ it("renders verified signed OAuth sign-in and MFA with the exact continuation", 
 	engine.readOAuthContext.mockResolvedValue(
 		new Response(null, { status: 400 }),
 	);
-	await expect(HostedProjectAuthPage({
-		view: "signIn",
-		searchParams: Promise.resolve(signed),
-	})).rejects.toThrow("redirect:/auth-error");
+	await expect(
+		HostedProjectAuthPage({
+			view: "signIn",
+			searchParams: Promise.resolve(signed),
+		}),
+	).rejects.toThrow("redirect:/auth-error");
 });
 
 it("uses the first-party page for an allowlisted development accounts realm with an exact callback", async () => {
@@ -526,7 +564,9 @@ it("keeps production on the standard page even when the immutable ID appears in 
 });
 
 it("checks the verified portal writer before rendering a legacy fallback on a stale deployment", async () => {
-	runtime.headers.mockResolvedValue(new Headers({ [portalHeader]: "fixture-proof" }));
+	runtime.headers.mockResolvedValue(
+		new Headers({ [portalHeader]: "fixture-proof" }),
+	);
 	runtime.getAuthEnvironment.mockResolvedValue({});
 	runtime.withPortalHeadersEngine.mockRejectedValue(projectWriterUnavailable());
 
@@ -539,7 +579,9 @@ it("checks the verified portal writer before rendering a legacy fallback on a st
 });
 
 it("switches registered production sign-in by the current writer and requires its exact preparation revision", async () => {
-	runtime.headers.mockResolvedValue(new Headers({ [portalHeader]: "fixture-proof" }));
+	runtime.headers.mockResolvedValue(
+		new Headers({ [portalHeader]: "fixture-proof" }),
+	);
 	const production = {
 		...project,
 		environment: "production",
@@ -549,13 +591,25 @@ it("switches registered production sign-in by the current writer and requires it
 	};
 	const engine = engineConfiguration({ emailPassword: true });
 	runtime.withPortalHeadersEngine.mockImplementation(async (_headers, select) =>
-		select(engine, new Headers(), { kind: "accounts", project: production, hostname: accountsHostname }),
+		select(engine, new Headers(), {
+			kind: "accounts",
+			project: production,
+			hostname: accountsHostname,
+		}),
 	);
-	const read = (params: Awaited<HostedProjectAuthPageProps["searchParams"]> = {}) =>
-		HostedProjectAuthPage({ view: "signIn", searchParams: Promise.resolve(params) });
-	const prepare = (revision: number) => runtime.getAuthEnvironment.mockResolvedValue({
-		ALLAUTH_PROJECT_ENGINE_PRODUCTION_REVISIONS: JSON.stringify({ [production.id]: revision }),
-	});
+	const read = (
+		params: Awaited<HostedProjectAuthPageProps["searchParams"]> = {},
+	) =>
+		HostedProjectAuthPage({
+			view: "signIn",
+			searchParams: Promise.resolve(params),
+		});
+	const prepare = (revision: number) =>
+		runtime.getAuthEnvironment.mockResolvedValue({
+			ALLAUTH_PROJECT_ENGINE_PRODUCTION_REVISIONS: JSON.stringify({
+				[production.id]: revision,
+			}),
+		});
 	prepare(0);
 	runtime.readWriter.mockResolvedValue({ writer: "legacy", revision: 0 });
 	expect((await read()).type).toBe(AllAuthAuth);
@@ -563,7 +617,9 @@ it("switches registered production sign-in by the current writer and requires it
 	expect((await read()).type).toBe(HostedProjectAuth);
 	const expired = { client_id: "fixture", sig: "fixture", exp: "1" };
 	await expect(read(expired)).rejects.toThrow("redirect:/auth-error");
-	expect((await read({ ...expired, interface: "legacy" })).type).toBe(AllAuthAuth);
+	expect((await read({ ...expired, interface: "legacy" })).type).toBe(
+		AllAuthAuth,
+	);
 	runtime.readWriter.mockResolvedValue({ writer: "legacy", revision: 2 });
 	expect((await read()).type).toBe(AllAuthAuth);
 	expect((await read(expired)).type).toBe(AllAuthAuth);
@@ -587,7 +643,9 @@ it("selects the SSO client with the destination page's verified project writer",
 	const requestHeaders = new Headers({ [portalHeader]: "fixture-proof" });
 	const bound = new Headers({ cookie: "fixture-session=opaque" });
 	const engine = {
-		dispatch: vi.fn(async (_request: Request) => Response.json({ role: "owner" })),
+		dispatch: vi.fn(async (_request: Request) =>
+			Response.json({ role: "owner" }),
+		),
 	};
 	runtime.headers.mockResolvedValue(requestHeaders);
 	runtime.portalSession.mockResolvedValue({
@@ -825,16 +883,17 @@ it("selects project MFA for a local callback and keeps unbound broker MFA on the
 		view: "twoFactor",
 		destination: "/account/security",
 	});
-	const signed = () => HostedProjectAuthPage({
-		view: "twoFactor",
-		searchParams: Promise.resolve({
-			allauth_mfa: "app-v1",
-			client_id: "broker",
-		}),
-	});
+	const signed = () =>
+		HostedProjectAuthPage({
+			view: "twoFactor",
+			searchParams: Promise.resolve({
+				allauth_mfa: "app-v1",
+				client_id: "broker",
+			}),
+		});
 	await expect(signed()).rejects.toThrow("redirect:/auth-error");
 	runtime.headers.mockResolvedValue(new Headers());
-	expect((await signed()).type).toBe(AllAuthAuth);
+	expect((await signed()).type).toBe(PlatformHostedAuth);
 });
 
 it("selects email status views only for an enabled hosted project without a bearer in the page query", async () => {
@@ -886,13 +945,15 @@ it("selects email status views only for an enabled hosted project without a bear
 	}
 
 	runtime.withPortalHeadersEngine.mockClear();
-	await expect(HostedProjectAuthPage({
-		view: "verifyEmail",
-		searchParams: Promise.resolve({
-			callbackUrl: destination,
-			token: "fixture",
+	await expect(
+		HostedProjectAuthPage({
+			view: "verifyEmail",
+			searchParams: Promise.resolve({
+				callbackUrl: destination,
+				token: "fixture",
+			}),
 		}),
-	})).rejects.toThrow("redirect:/auth-error");
+	).rejects.toThrow("redirect:/auth-error");
 	expect(runtime.withPortalHeadersEngine).toHaveBeenCalledOnce();
 
 	runtime.getAuthEnvironment.mockResolvedValue({});

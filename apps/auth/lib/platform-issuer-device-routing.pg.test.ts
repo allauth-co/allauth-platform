@@ -187,6 +187,85 @@ describe.skipIf(!existsSync(fixture))(
 			return row;
 		}
 
+		it("lists and revokes sessions from an existing platform browser cookie", async () => {
+			const target = randomUUID();
+			const otherUser = randomUUID();
+			const foreignSession = randomUUID();
+			await database.query(
+				'INSERT INTO public."user" (id,name,email,"emailVerified") VALUES ($1,$2,$3,true)',
+				[otherUser, "Other account", `${otherUser}@fixture.example`],
+			);
+			await database.query(
+				`INSERT INTO public."session" (id, token, "userId", "expiresAt", "updatedAt")
+				VALUES ($1,$2,$3,now()+interval '1 hour',now()), ($4,$5,$6,now()+interval '1 hour',now())`,
+				[target, randomUUID(), user, foreignSession, randomUUID(), otherUser],
+			);
+			const listed = await platform.dispatch(
+				request("/account/sessions", undefined, cookie),
+			);
+			expect(listed?.status).toBe(200);
+			const list = (await listed!.json()) as {
+				sessions: Record<string, unknown>[];
+				currentSessionId: string;
+			};
+			expect(list.sessions.map((item) => item.id)).toContain(target);
+			expect(list.sessions.map((item) => item.id)).not.toContain(
+				foreignSession,
+			);
+			expect(list.sessions.every((item) => !Object.hasOwn(item, "token"))).toBe(
+				true,
+			);
+			const rejected = await platform.dispatch(
+				request("/account/sessions/revoke", { id: foreignSession }, cookie),
+			);
+			expect(rejected?.status).toBe(404);
+			const revoked = await platform.dispatch(
+				request("/account/sessions/revoke", { id: target }, cookie),
+			);
+			expect(revoked?.status).toBe(200);
+			expect(
+				await native.api.getSession({ headers: new Headers({ cookie }) }),
+			).toMatchObject({ user: { id: user } });
+			const { rows } = await database.query(
+				'SELECT id FROM public."session" WHERE id=ANY($1::text[])',
+				[[target, foreignSession]],
+			);
+			expect(rows).toEqual([{ id: foreignSession }]);
+		});
+
+		it("signs out a session issued by the previous engine", async () => {
+			const token = randomUUID();
+			const signature = createHmac("sha256", secret)
+				.update(token)
+				.digest("base64");
+			const prior = `${cookieName}=${encodeURIComponent(token + "." + signature)}`;
+			await database.query(
+				`INSERT INTO public."session" (id, token, "userId", "expiresAt", "updatedAt")
+				VALUES ($1,$2,$3,now()+interval '1 hour',now())`,
+				[randomUUID(), token, user],
+			);
+			expect(
+				await native.api.getSession({
+					headers: new Headers({ cookie: prior }),
+				}),
+			).toMatchObject({ user: { id: user } });
+			const response = await platform.dispatch(request("/sign-out", {}, prior));
+			expect(await response?.json()).toEqual({ success: true });
+			expect(response?.headers.getSetCookie()).toEqual(
+				expect.arrayContaining([
+					expect.stringMatching(/session_token=;.*Max-Age=0/),
+				]),
+			);
+			expect(
+				await native.api.getSession({
+					headers: new Headers({ cookie: prior }),
+				}),
+			).toBeNull();
+			expect(
+				await native.api.getSession({ headers: new Headers({ cookie }) }),
+			).toMatchObject({ user: { id: user } });
+		});
+
 		it("reuses a linked Google account and issues a native-readable platform session", async () => {
 			const account = randomUUID();
 			const subject = "previously-linked-google-account";
