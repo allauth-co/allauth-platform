@@ -14,6 +14,7 @@ import { ssoProfileRejected } from "./owned-project-sso-admission";
 import { checkedProjectSchema } from "./validation";
 
 const stateAge = 600;
+
 export { ssoProviderId };
 export const ssoReferenceSchema = z.object({
 	providerId: ssoProviderId,
@@ -193,7 +194,8 @@ export function createProjectSsoStore(
 	keys: LegacyMfaKeys,
 	emailAliases?: Pick<OwnedProjectEmailAliases, "reserved">,
 ) {
-	const schema = checkedProjectSchema(schemaName);
+	const schema =
+		schemaName === "public" ? "public" : checkedProjectSchema(schemaName);
 	const engine = createProjectEngineStore(database, schema);
 	const columns =
 		'id, "providerId", issuer, domain, "domainVerified", "organizationId", "oidcConfig", "samlConfig"';

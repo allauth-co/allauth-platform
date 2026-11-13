@@ -15,6 +15,7 @@ export const legacyProjectPlatformAuthority: ProjectPlatformAuthority = {
 				platformOrigin,
 				factor,
 				(input) => dispatchPlatformAuth(input, root, env),
+				env,
 			),
 		);
 	},

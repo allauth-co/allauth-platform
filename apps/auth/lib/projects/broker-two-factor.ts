@@ -2,6 +2,9 @@ import { runWithAdapter } from "@better-auth/core/context";
 import { APIError } from "better-auth";
 import type { AuthInstance } from "../api";
 import { verifyBrokerTwoFactor } from "../broker-two-factor";
+import type { AuthEnvironment } from "../configuration";
+import { ConsoleRequestError } from "../console/request-error";
+import { withPlatformIssuerRuntime } from "../platform-issuer-runtime";
 import type { ProjectBrokerFactor } from "./owned-project-broker-mfa";
 import { projectBrokerTwoFactorBody } from "./owned-project-broker-mfa";
 import type { Project } from "./registry";
@@ -16,6 +19,7 @@ export async function projectBrokerTwoFactor(
 	platformOrigin: string,
 	parsedBody?: ProjectBrokerFactor,
 	dispatchFactor?: (request: Request) => Promise<Response>,
+	env?: AuthEnvironment,
 ): Promise<Response> {
 	const origin = request.headers.get("allauth-proxy-origin");
 	if (
@@ -44,22 +48,42 @@ export async function projectBrokerTwoFactor(
 	const body = projectBrokerTwoFactorBody.parse(
 		parsedBody ?? (await request.json()),
 	);
-	// A project endpoint runs inside its own adapter context. Never let that
-	// ambient context select the application DB for central challenge records.
-	const result = await runWithAdapter((await platform.$context).adapter, () =>
-		verifyBrokerTwoFactor(
-			platform,
-			platformOrigin,
-			{ clientId: project.brokerClientId, slug: project.slug, origin },
-			{
-				...body,
-				ticket: read("broker_mfa_ticket"),
-				binding: read("broker_mfa_binding"),
-			},
-			request.headers,
-			dispatchFactor,
-		),
-	);
+	const identity = {
+		clientId: project.brokerClientId,
+		slug: project.slug,
+		origin,
+	};
+	const input = {
+		...body,
+		ticket: read("broker_mfa_ticket"),
+		binding: read("broker_mfa_binding"),
+	};
+	const legacy = async () =>
+		runWithAdapter((await platform.$context).adapter, () =>
+			verifyBrokerTwoFactor(
+				platform,
+				platformOrigin,
+				identity,
+				input,
+				request.headers,
+				dispatchFactor,
+			),
+		);
+	const result = env
+		? await withPlatformIssuerRuntime(env, ({ candidate }) =>
+				candidate
+					? candidate.brokerMfa
+							.verify(identity, input, request.headers)
+							.catch((error: unknown) => {
+								if (!(error instanceof ConsoleRequestError)) throw error;
+								throw APIError.fromStatus(
+									error.statusCode,
+									error.message ? { message: error.message } : undefined,
+								);
+							})
+					: legacy(),
+			)
+		: await legacy();
 	return Response.json(result, {
 		headers: { "cache-control": "no-store", "referrer-policy": "no-referrer" },
 	});

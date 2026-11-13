@@ -77,7 +77,7 @@ function samlFormResponse(body: string) {
 	return { SAMLResponse: responses[0], RelayState: states[0] };
 }
 
-async function samlPostResponse(request: Request) {
+export async function samlPostResponse(request: Request) {
 	const media = request.headers
 		.get("content-type")
 		?.split(";", 1)[0]

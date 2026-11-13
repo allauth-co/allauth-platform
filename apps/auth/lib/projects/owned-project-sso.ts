@@ -183,7 +183,9 @@ function json(body: unknown, status: number, headers = new Headers()) {
 /** Configured project enterprise sign-in against the realm’s existing provider and account records. */
 export function createOwnedProjectSso(options: OwnedProjectSsoOptions) {
 	const origin = projectOrigin.parse(options.baseURL);
-	const slug = projectSlug.parse(options.project.slug);
+	const platform = options.project.schemaName === "public";
+	const slug = platform ? "platform" : projectSlug.parse(options.project.slug);
+	const cookiePrefix = platform ? "better-auth" : `allauth_project_${slug}`;
 	const origins = new Set([
 		origin,
 		...options.trustedOrigins.map((item) => projectOrigin.parse(item)),
@@ -196,7 +198,7 @@ export function createOwnedProjectSso(options: OwnedProjectSsoOptions) {
 	)
 		throw new Error("Invalid project SSO configuration.");
 	const secure = origin.startsWith("https:");
-	const cookie = `${secure ? "__Secure-" : ""}allauth_project_${slug}.state`;
+	const cookie = `${secure ? "__Secure-" : ""}${cookiePrefix}.state`;
 	const attributes = `Path=/; HttpOnly; SameSite=Lax${secure ? "; Secure" : ""}`;
 	const store = createProjectSsoStore(
 		options.database,
@@ -209,7 +211,7 @@ export function createOwnedProjectSso(options: OwnedProjectSsoOptions) {
 		createOwnedProjectSaml({
 			origin,
 			basePath: options.basePath,
-			cookieName: `${secure ? "__Secure-" : ""}allauth_project_${slug}.relay_state`,
+			cookieName: `${secure ? "__Secure-" : ""}${cookiePrefix}.relay_state`,
 			cookieAttributes: attributes,
 			signingSecret: options.signingSecret,
 			signUpEnabled: options.signUpEnabled,
