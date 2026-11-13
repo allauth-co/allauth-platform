@@ -10,7 +10,11 @@ import {
 	afterOwnedProjectCommit,
 	recordOwnedProjectEvent,
 } from "./projects/owned-project-engine-store";
-import { readSignedProjectIssuerQuery } from "./projects/owned-project-issuer-authorization-query";
+import {
+	readProviderProjectIssuerQuery,
+	readSignedProjectIssuerQuery,
+	signProjectIssuerQuery,
+} from "./projects/owned-project-issuer-authorization-query";
 import { issuerJSON } from "./projects/owned-project-issuer-http";
 import { admitOwnedProjectNativeRoute } from "./projects/owned-project-native-admission";
 import {
@@ -134,15 +138,19 @@ export function createPlatformGoogle(options: {
 						if (!challenge) return issuerJSON({ code: "FORBIDDEN" }, 403);
 						const target = new URL("/two-factor", issuer);
 						const continuation = new URL(destination);
-						if (
+						const signed =
 							continuation.origin === issuer &&
-							continuation.pathname === "/oauth2/continue" &&
-							readSignedProjectIssuerQuery(
-								continuation.searchParams.toString(),
+							continuation.pathname === "/oauth2/continue"
+								? readProviderProjectIssuerQuery(
+										continuation.searchParams.toString(),
+										signingSecret,
+									)
+								: null;
+						if (signed) {
+							target.search = signProjectIssuerQuery(
+								signed.params,
 								signingSecret,
-							)
-						) {
-							target.search = continuation.search;
+							).toString();
 						} else if (
 							continuation.origin === issuer &&
 							/^\/(account|organizations|accept-invitation|device|console|admin\/workspaces)(\/|$)/.test(
@@ -287,7 +295,7 @@ export function createPlatformGoogle(options: {
 			const target = new URL(destination);
 			if (target.origin !== issuer || target.pathname !== "/oauth2/continue")
 				return response;
-			const signed = readSignedProjectIssuerQuery(
+			const signed = readProviderProjectIssuerQuery(
 				target.searchParams.toString(),
 				signingSecret,
 			);
@@ -338,7 +346,22 @@ export function createPlatformGoogle(options: {
 		)
 			return issuerJSON({ error: "invalid_signature" }, 400);
 		if (typeof oauth_query === "string") {
+			// Keep the installed browser-to-app MFA handoff until its callback can move with it.
+			if (new URLSearchParams(oauth_query).get("allauth_mfa") === "app-v1")
+				return;
 			input.callbackURL = `${issuer}/oauth2/continue?${oauth_query}`;
+		}
+		for (const raw of [input.callbackURL, input.newUserCallbackURL]) {
+			if (typeof raw !== "string" || !URL.canParse(raw, issuer)) continue;
+			const target = new URL(raw, issuer);
+			if (target.origin !== issuer || target.pathname !== "/oauth2/continue")
+				continue;
+			const query = target.searchParams.toString();
+			if (
+				!readSignedProjectIssuerQuery(query, signingSecret) ||
+				target.searchParams.get("allauth_mfa") === "app-v1"
+			)
+				return;
 		}
 		let parsed = ownedProjectOAuthStartInput.safeParse(input);
 		if (!parsed.success) {

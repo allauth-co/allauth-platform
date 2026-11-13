@@ -276,6 +276,8 @@ describe.skipIf(!existsSync(fixture))(
 					callbacks,
 				);
 				providerCallback.headers.set("sec-fetch-mode", "navigate");
+				const returnTime = Date.now() + 75_000;
+				vi.spyOn(Date, "now").mockReturnValue(returnTime);
 				const returned = await platform.dispatch(providerCallback);
 				expect(returned?.status).toBe(302);
 				const location = new URL(returned!.headers.get("location")!, issuer);
@@ -304,6 +306,7 @@ describe.skipIf(!existsSync(fixture))(
 				expect(rows).toEqual([{ id: account, accountId: subject }]);
 			} finally {
 				vi.unstubAllGlobals();
+				vi.restoreAllMocks();
 			}
 		});
 

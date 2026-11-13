@@ -182,6 +182,21 @@ export function readSignedProjectIssuerQuery(
 	return readSignedQueryAt(serialized, signingSecret, Date.now());
 }
 
+/** Provider state carries the original signed authorization through the provider round trip. */
+export function readProviderProjectIssuerQuery(
+	serialized: string,
+	signingSecret: string,
+) {
+	if (!serialized || serialized.length > maximumProjectAuthorizationQueryLength)
+		return null;
+	const now = Date.now();
+	const expires = Number(new URLSearchParams(serialized).get("exp")) * 1000;
+	const query = readSignedQueryAt(serialized, signingSecret, now - 10 * 60_000);
+	return query && expires >= query.issuedAt && !query.consentSessionId
+		? query
+		: null;
+}
+
 /** Recognize only a recently expired email callback. This result carries no authorization state. */
 export function isAuthenticExpiredProjectIssuerEmailContinuation(
 	serialized: string,
