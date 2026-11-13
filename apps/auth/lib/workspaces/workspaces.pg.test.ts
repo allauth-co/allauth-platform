@@ -1176,9 +1176,13 @@ describe.skipIf(!existsSync(fixturePath))(
 				clientSecret: "fixture-broker-secret",
 			};
 			// @ts-expect-error Untyped callers must not bypass mandatory workspace authority.
-			await expect(
-				provisionProject(input, broker, global.principal.user.id, env),
-			).rejects.toMatchObject({ statusCode: 400 });
+			const unscoped = provisionProject(
+				input,
+				broker,
+				global.principal.user.id,
+				env,
+			);
+			await expect(unscoped).rejects.toMatchObject({ statusCode: 400 });
 			await expect(
 				provisionProject(
 					{ ...input, workspaceId: bobWorkspace },
