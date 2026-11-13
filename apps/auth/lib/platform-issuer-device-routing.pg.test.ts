@@ -173,7 +173,10 @@ describe.skipIf(!existsSync(fixture))(
 			]);
 			const code = await dispatch(request("/device/code", form), "native");
 			expect(code.status).toBe(200);
-			const issued = await code.json();
+			const issued = (await code.json()) as {
+				device_code: string;
+				user_code: string;
+			};
 			expect(issued).toMatchObject({
 				verification_uri: `${issuer}/device`,
 				expires_in: 600,
@@ -225,7 +228,10 @@ describe.skipIf(!existsSync(fixture))(
 				"oauth",
 			);
 			expect(code.status).toBe(200);
-			const issued = await code.json();
+			const issued = (await code.json()) as {
+				device_code: string;
+				user_code: string;
+			};
 			expect(issued).toMatchObject({
 				verification_uri: `${issuer}/device`,
 				expires_in: 600,
@@ -313,7 +319,10 @@ describe.skipIf(!existsSync(fixture))(
 				"oauth",
 			);
 			expect(code.status).toBe(200);
-			const issued = await code.json();
+			const issued = (await code.json()) as {
+				device_code: string;
+				user_code: string;
+			};
 			expect(await deviceRow(issued.device_code)).toMatchObject({
 				oauthClientId: MCP_DEVICE_CLIENT_ID,
 				status: "pending",
