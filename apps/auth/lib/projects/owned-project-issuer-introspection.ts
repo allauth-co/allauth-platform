@@ -1,6 +1,7 @@
 import { createLocalJWKSet, jwtVerify } from "jose";
 import type { Pool, PoolClient } from "pg";
 import * as z from "zod";
+import type { createPlatformIssuerStore } from "../platform-issuer-store";
 import type { LegacyMfaKeys } from "./legacy-mfa-record";
 import { createProjectEngineStore } from "./owned-project-engine-store";
 import type {
@@ -187,18 +188,40 @@ function emptyRevocation() {
 	});
 }
 
+export type IssuerTransactionOptions =
+	| { database: Pool; schemaName: string }
+	| {
+			store: Pick<ReturnType<typeof createPlatformIssuerStore>, "transaction">;
+	  };
+
+export type IssuerKeyStorageOptions =
+	| { database: Pool; schemaName: string; keys: LegacyMfaKeys }
+	| {
+			store: Pick<ReturnType<typeof createPlatformIssuerStore>, "transaction">;
+			keyring: Pick<
+				ReturnType<typeof createOwnedProjectIssuerKeys>,
+				"existingPublicKeys"
+			>;
+	  };
+
 /** Introspection and revocation over the project's existing OAuth grant rows and signing keys. */
-export function createOwnedProjectIssuerIntrospection(options: {
-	database: Pool;
-	schemaName: string;
-	issuer: string;
-	keys: LegacyMfaKeys;
-	authenticateClient?: IssuerClientAuthenticator;
-}) {
-	const store = createProjectEngineStore(options.database, options.schemaName);
-	const keyring = createOwnedProjectIssuerKeys(options);
+export function createOwnedProjectIssuerIntrospection(
+	options: IssuerKeyStorageOptions & {
+		issuer: string;
+		endpointBase?: string;
+		authenticateClient?: IssuerClientAuthenticator;
+	},
+) {
+	const { store, keyring } =
+		"store" in options
+			? options
+			: {
+					store: createProjectEngineStore(options.database, options.schemaName),
+					keyring: createOwnedProjectIssuerKeys(options),
+				};
 	const origin = new URL(options.issuer).origin;
-	const userinfo = `${options.issuer}/oauth2/userinfo`;
+	const endpointBase = options.endpointBase ?? options.issuer;
+	const userinfo = `${endpointBase}/oauth2/userinfo`;
 	const authenticateClient =
 		options.authenticateClient ??
 		createIssuerClientAuthenticator(options.issuer);
@@ -486,7 +509,7 @@ export function createOwnedProjectIssuerIntrospection(options: {
 		const url = new URL(request.url);
 		if (
 			request.method !== "POST" ||
-			url.origin + url.pathname !== `${options.issuer}/oauth2/${operation}`
+			url.origin + url.pathname !== `${endpointBase}/oauth2/${operation}`
 		)
 			return new ProjectOAuthError(
 				"invalid_request",

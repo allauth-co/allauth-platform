@@ -1,13 +1,13 @@
 import { createHmac } from "node:crypto";
 import { compactVerify, createLocalJWKSet, decodeJwt } from "jose";
-import type { Pool, PoolClient } from "pg";
+import type { PoolClient } from "pg";
 import * as z from "zod";
-import type { LegacyMfaKeys } from "./legacy-mfa-record";
 import { readLegacySessionCookie } from "./legacy-session-cookie";
 import { createProjectEngineStore } from "./owned-project-engine-store";
 import type { ProjectIssuerClient } from "./owned-project-issuer-client";
 import { readIssuerClient } from "./owned-project-issuer-client";
 import { issuerForm, ProjectOAuthError } from "./owned-project-issuer-http";
+import type { IssuerKeyStorageOptions } from "./owned-project-issuer-introspection";
 import { createOwnedProjectIssuerKeys } from "./owned-project-issuer-keys";
 
 const confirmLifetime = 300;
@@ -34,11 +34,9 @@ interface LogoutSession {
 	token: string;
 }
 
-export interface OwnedProjectIssuerLogoutOptions {
-	database: Pool;
-	schemaName: string;
+export type OwnedProjectIssuerLogoutOptions = IssuerKeyStorageOptions & {
 	issuer: string;
-	keys: LegacyMfaKeys;
+	endpointBase?: string;
 	signingSecret: string;
 	sessionCookie: string;
 	requireMfa: boolean;
@@ -51,7 +49,7 @@ export interface OwnedProjectIssuerLogoutOptions {
 		actorId: string | null,
 	): Promise<void>;
 	clearBrowserSession(headers: Headers): void;
-}
+};
 
 function isNavigation(request: Request) {
 	const accept = request.headers.get("accept") ?? "";
@@ -117,10 +115,16 @@ function logoutRedirect(
 export function createOwnedProjectIssuerLogout(
 	options: OwnedProjectIssuerLogoutOptions,
 ) {
-	const store = createProjectEngineStore(options.database, options.schemaName);
-	const keys = createOwnedProjectIssuerKeys(options);
-	const endpoint = `${options.issuer}${endSessionPath}`;
-	const confirmEndpoint = `${options.issuer}${confirmSessionPath}`;
+	const { store, keyring } =
+		"store" in options
+			? options
+			: {
+					store: createProjectEngineStore(options.database, options.schemaName),
+					keyring: createOwnedProjectIssuerKeys(options),
+				};
+	const endpointBase = options.endpointBase ?? options.issuer;
+	const endpoint = `${endpointBase}${endSessionPath}`;
+	const confirmEndpoint = `${endpointBase}${confirmSessionPath}`;
 	const confirmPath = new URL(confirmEndpoint).pathname;
 	const origin = new URL(options.issuer).origin;
 	const cookieName = `${options.sessionCookie}.oauth_logout_confirmation`;
@@ -171,7 +175,7 @@ export function createOwnedProjectIssuerLogout(
 		try {
 			const { payload, protectedHeader } = await compactVerify(
 				token,
-				createLocalJWKSet(await keys.existingPublicKeys(database)),
+				createLocalJWKSet(await keyring.existingPublicKeys(database)),
 			);
 			if (protectedHeader.typ === "at+jwt") return;
 			const claims = JSON.parse(

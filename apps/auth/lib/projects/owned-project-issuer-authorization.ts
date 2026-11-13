@@ -3,6 +3,7 @@ import type { Pool, PoolClient } from "pg";
 import * as z from "zod";
 import { hostedOAuthBrowserActionRequests } from "../domains/hosted-oauth-requests";
 import { oauthBrowserQuery } from "../oauth-browser";
+import type { createPlatformIssuerStore } from "../platform-issuer-store";
 import { createProjectEngineStore } from "./owned-project-engine-store";
 import {
 	filteredProjectIssuerClaims,
@@ -70,6 +71,10 @@ export interface OwnedProjectIssuerAuthorizationOptions {
 	database: Pool;
 	schemaName: string;
 	issuer: string;
+	endpointBase?: string;
+	loginPage?: string;
+	allowImpersonatedSession?: boolean;
+	store?: Pick<ReturnType<typeof createPlatformIssuerStore>, "transaction">;
 	signingSecret: string;
 	errorURL?: string;
 	readBody(request: Request): Promise<unknown>;
@@ -155,8 +160,10 @@ function covers(
 export function createOwnedProjectIssuerAuthorization(
 	options: OwnedProjectIssuerAuthorizationOptions,
 ) {
-	const base = new URL(options.issuer);
-	const store = createProjectEngineStore(options.database, options.schemaName);
+	const base = new URL(options.endpointBase ?? options.issuer);
+	const store =
+		options.store ??
+		createProjectEngineStore(options.database, options.schemaName);
 	const errorURL = new URL(options.errorURL ?? "/auth-error", base.origin);
 	if (
 		base.username ||
@@ -253,7 +260,7 @@ export function createOwnedProjectIssuerAuthorization(
 				registration,
 				query.resources,
 				query.scopes,
-				`${options.issuer}/oauth2/userinfo`,
+				`${options.endpointBase ?? options.issuer}/oauth2/userinfo`,
 			);
 	}
 
@@ -264,11 +271,15 @@ export function createOwnedProjectIssuerAuthorization(
 	) {
 		const session =
 			authorizationHeaders && options.readAuthorizationSession
-				? await options.readAuthorizationSession(request, client, authorizationHeaders)
+				? await options.readAuthorizationSession(
+						request,
+						client,
+						authorizationHeaders,
+					)
 				: await options.readSession(request, client);
 		return session?.user.id &&
 			session.user.id === session.session.userId &&
-			!session.session.impersonatedBy &&
+			(!session.session.impersonatedBy || options.allowImpersonatedSession) &&
 			Number.isFinite(authTime(session))
 			? session
 			: null;
@@ -477,7 +488,11 @@ export function createOwnedProjectIssuerAuthorization(
 						asJSON,
 					);
 				await assertResources(client, registration, query);
-				const ordinary = await liveSession(request, client, authorizationHeaders);
+				const ordinary = await liveSession(
+					request,
+					client,
+					authorizationHeaders,
+				);
 				const consoleSession =
 					!ordinary &&
 					!signed &&
@@ -514,7 +529,12 @@ export function createOwnedProjectIssuerAuthorization(
 							"login_required",
 							"authentication required",
 						);
-					return browserPrompt(request, "/sign-in", query, asJSON);
+					return browserPrompt(
+						request,
+						options.loginPage ?? "/sign-in",
+						query,
+						asJSON,
+					);
 				}
 				if (
 					query.prompt.has("login") ||
@@ -812,14 +832,18 @@ export function createOwnedProjectIssuerAuthorization(
 				return readSignedProjectIssuerQuery(query, options.signingSecret);
 			}
 			if (path === "/oauth2/consent") {
-				const body = (extended ? hostedConsentBody : consentBody).safeParse(input);
+				const body = (extended ? hostedConsentBody : consentBody).safeParse(
+					input,
+				);
 				if (!body.success) throw invalid("Invalid consent request.");
 				const signed = signedQuery(body.data.oauth_query);
 				if (!signed)
 					throw invalid("The authorization request is invalid or expired.");
 				return await consent(request, body.data, signed);
 			}
-			const body = (extended ? hostedContinueBody : continueBody).safeParse(input);
+			const body = (extended ? hostedContinueBody : continueBody).safeParse(
+				input,
+			);
 			if (
 				!body.success ||
 				[body.data.selected, body.data.created, body.data.postLogin].filter(

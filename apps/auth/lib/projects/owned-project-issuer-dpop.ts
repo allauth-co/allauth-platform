@@ -5,15 +5,9 @@ import {
 	jwtVerify,
 } from "jose";
 import type { PoolClient } from "pg";
+import { issuerDpopAlgorithms } from "../issuer-algorithms";
 import { issuerDigest, ProjectOAuthError } from "./owned-project-issuer-http";
 
-export const issuerDpopAlgorithms = [
-	"EdDSA",
-	"ES256",
-	"ES512",
-	"PS256",
-	"RS256",
-];
 const privateJwkFields = ["d", "p", "q", "dp", "dq", "qi", "oth", "k"];
 const proofLifetime = 300;
 

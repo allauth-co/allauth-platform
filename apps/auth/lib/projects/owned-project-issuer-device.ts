@@ -2,6 +2,7 @@ import { randomInt, randomUUID } from "node:crypto";
 import type { PoolClient } from "pg";
 import * as z from "zod";
 import { freshFeatureSession } from "../features/helpers";
+import type { createPlatformIssuerStore } from "../platform-issuer-store";
 import { createProjectEngineStore } from "./owned-project-engine-store";
 import type { OwnedProjectIssuerAuthorizationOptions } from "./owned-project-issuer-authorization";
 import type {
@@ -71,7 +72,12 @@ export interface OwnedProjectIssuerDeviceOptions
 		"database" | "schemaName" | "issuer" | "readBody" | "readSession"
 	> {
 	platformOrigin: string;
-	projectSlug: string;
+	projectSlug?: string;
+	endpointBase?: string;
+	store?: Pick<
+		ReturnType<typeof createPlatformIssuerStore>,
+		"transaction" | "lockUser"
+	>;
 	trustedOrigins?: readonly string[];
 	trustedIP(request: Request): string | null;
 	authenticateClient?: IssuerClientAuthenticator;
@@ -166,7 +172,10 @@ export async function consumeDeviceGrant<T>(
 	_request: Request,
 	form: URLSearchParams,
 	authClient: ProjectIssuerClient,
-	options: { issuer: string; issue(grant: ProjectDeviceGrant): Promise<T> },
+	options: {
+		endpointBase: string;
+		issue(grant: ProjectDeviceGrant): Promise<T>;
+	},
 ): Promise<T> {
 	const raw = form.get("device_code");
 	if (!raw)
@@ -235,7 +244,7 @@ export async function consumeDeviceGrant<T>(
 		authClient,
 		resources,
 		scopes,
-		`${options.issuer}/oauth2/userinfo`,
+		`${options.endpointBase}/oauth2/userinfo`,
 	);
 	const result = await options.issue({
 		userId: row.userId,
@@ -258,17 +267,23 @@ export async function consumeDeviceGrant<T>(
 export function createOwnedProjectIssuerDevice(
 	options: OwnedProjectIssuerDeviceOptions,
 ) {
-	const store = createProjectEngineStore(options.database, options.schemaName);
+	const store =
+		options.store ??
+		createProjectEngineStore(options.database, options.schemaName);
 	const platform = projectOrigin.parse(options.platformOrigin);
-	const slug = projectSlug.parse(options.projectSlug);
 	const origin = new URL(options.issuer).origin;
+	const endpointBase = options.endpointBase ?? options.issuer;
 	const browserOrigins = new Set([
 		origin,
 		...(options.trustedOrigins?.map((value) => projectOrigin.parse(value)) ??
 			[]),
 	]);
 	const verificationURL = new URL("/device", platform);
-	verificationURL.searchParams.set("project", slug);
+	if (options.projectSlug !== undefined || options.endpointBase === undefined)
+		verificationURL.searchParams.set(
+			"project",
+			projectSlug.parse(options.projectSlug),
+		);
 	const authenticateClient =
 		options.authenticateClient ??
 		createIssuerClientAuthenticator(options.issuer, browserOrigins);
@@ -366,7 +381,7 @@ export function createOwnedProjectIssuerDevice(
 					client,
 					resources,
 					scopes,
-					`${options.issuer}/oauth2/userinfo`,
+					`${endpointBase}/oauth2/userinfo`,
 				);
 				const userId = form.get("user_id") || null;
 				if (userId && userId.length > 256)
@@ -540,7 +555,7 @@ export function createOwnedProjectIssuerDevice(
 			return;
 		const url = new URL(request.url);
 		if (
-			url.origin + url.pathname !== `${options.issuer}${path}` ||
+			url.origin + url.pathname !== `${endpointBase}${path}` ||
 			request.method !== (path === "/device" ? "GET" : "POST")
 		)
 			return new ProjectOAuthError(
