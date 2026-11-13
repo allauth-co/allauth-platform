@@ -1,4 +1,4 @@
-import { createHmac, randomUUID } from "node:crypto";
+import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { symmetricDecrypt, symmetricEncrypt } from "better-auth/crypto";
 import { exportJWK, generateKeyPair, SignJWT } from "jose";
@@ -22,6 +22,12 @@ import {
 import { maximumIssuerFormBytes } from "./projects/owned-project-issuer-http";
 import { dropClosedFixtureDatabase } from "./testing/postgres-fixture";
 import { virtualCredential } from "./testing/virtual-passkey";
+
+const enterpriseNetwork = vi.hoisted(() => vi.fn());
+vi.mock("./projects/owned-project-sso-network", async (load) => ({
+	...(await load<typeof import("./projects/owned-project-sso-network")>()),
+	fetchPublicSsoEndpoint: enterpriseNetwork,
+}));
 
 const fixture = new URL(
 	"../../../.secrets/local-postgres.json",
@@ -340,6 +346,109 @@ describe.skipIf(!existsSync(fixture))(
 			).toBe("access_denied");
 		});
 
+		it("completes platform OIDC for an existing enterprise account", async () => {
+			const provider = "platform-enterprise-fixture";
+			const upstream = "https://enterprise-idp.fixture.example";
+			const client = "fixture-enterprise-client";
+			const subject = "existing-enterprise-subject";
+			const account = randomUUID();
+			const callback = `${endpointBase}/sso/callback/${provider}`;
+			const target = `${issuer}/account?from=enterprise`;
+			await database.query(
+				`INSERT INTO public."ssoProvider" (id,"providerId",issuer,"oidcConfig","userId",domain,"domainVerified")
+				VALUES ($1,$2,$3,$4,$5,'fixture.example',true)`,
+				[
+					randomUUID(),
+					provider,
+					upstream,
+					JSON.stringify({
+						issuer: upstream,
+						clientId: client,
+						clientSecret: "synthetic-enterprise-secret",
+						authorizationEndpoint: upstream + "/authorize",
+						tokenEndpoint: upstream + "/token",
+						jwksEndpoint: upstream + "/jwks",
+						tokenEndpointAuthentication: "client_secret_post",
+						pkce: true,
+					}),
+					user,
+				],
+			);
+			await database.query(
+				'INSERT INTO public."account" (id,"accountId","providerId","userId","updatedAt") VALUES ($1,$2,$3,$4,now())',
+				[account, subject, provider, user],
+			);
+			const input = request("/sign-in/sso", {
+				providerId: provider,
+				providerType: "oidc",
+				callbackURL: target,
+			});
+			input.headers.set("origin", issuer);
+			const started = await platform.dispatch(input);
+			expect(started?.status).toBe(200);
+			const { url } = (await started!.json()) as { url: string };
+			const authorization = new URL(url);
+			expect(authorization.searchParams.get("redirect_uri")).toBe(callback);
+			const keys = await generateKeyPair("RS256");
+			const kid = "enterprise-fixture";
+			const jwk = { ...(await exportJWK(keys.publicKey)), kid, alg: "RS256" };
+			const token = await new SignJWT({
+				email: `${user}@fixture.example`,
+				email_verified: true,
+				name: "Enterprise Fixture",
+				nonce: authorization.searchParams.get("nonce"),
+			})
+				.setProtectedHeader({ alg: "RS256", kid })
+				.setSubject(subject)
+				.setIssuer(upstream)
+				.setAudience(client)
+				.setIssuedAt()
+				.setExpirationTime("5m")
+				.sign(keys.privateKey);
+			enterpriseNetwork.mockImplementation(
+				async (input: RequestInfo | URL, init?: RequestInit) => {
+					const outgoing = new Request(input, init);
+					if (outgoing.url === upstream + "/jwks")
+						return Response.json({ keys: [jwk] });
+					expect(outgoing.url).toBe(upstream + "/token");
+					return Response.json({
+						access_token: "fixture-enterprise-access",
+						token_type: "Bearer",
+						id_token: token,
+					});
+				},
+			);
+			try {
+				const query = new URLSearchParams({
+					state: authorization.searchParams.get("state")!,
+					code: "fixture-oidc-code",
+				});
+				const challenge = started!.headers
+					.getSetCookie()
+					.map((value) => value.split(";")[0])
+					.join("; ");
+				const response = await platform.dispatch(
+					request(`/sso/callback/${provider}?${query}`, undefined, challenge),
+				);
+				expect(response?.headers.get("location")).toBe(target);
+				const session = response?.headers
+					.getSetCookie()
+					.find((value) => value.startsWith(cookieName + "="));
+				expect(
+					await native.api.getSession({
+						headers: new Headers({ cookie: session!.split(";")[0]! }),
+					}),
+				).toMatchObject({ user: { id: user } });
+				const { rows } = await database.query(
+					'SELECT id FROM public."account" WHERE "providerId"=$1 AND "accountId"=$2',
+					[provider, subject],
+				);
+				expect(rows).toEqual([{ id: account }]);
+			} finally {
+				enterpriseNetwork.mockReset();
+			}
+		});
+
 		it("redeems a legacy standalone MCP code through AllAuth and preserves the native session handoff", async () => {
 			const form = new URLSearchParams([
 				["client_id", ""],
@@ -559,6 +668,120 @@ describe.skipIf(!existsSync(fixture))(
 			);
 			expect(denied?.status).toBe(401);
 			expect(denied?.headers.getSetCookie()).toEqual([]);
+		});
+
+		it.each([
+			"legacy",
+			"allauth",
+		] as const)("resumes a connected app after a %s in-app MFA handoff", async (writer) => {
+			const actor = randomUUID();
+			const clientId = randomUUID();
+			const app = "https://app.fixture.example";
+			const redirect = `${app}/api/allauth/callback/allauth`;
+			const slug = "fixture-app";
+			const challenge = "2fa-" + randomBytes(15).toString("base64url");
+			const signature = createHmac("sha256", secret)
+				.update(challenge)
+				.digest("base64");
+			const challengeCookie = `__Secure-better-auth.two_factor=${encodeURIComponent(challenge + "." + signature)}`;
+			const recoveryCode = "synthetic-app-recovery-code";
+			const binding = randomBytes(32).toString("hex");
+			await database.query(
+				'INSERT INTO public."user" (id,name,email,"emailVerified","twoFactorEnabled") VALUES ($1,$2,$3,true,true)',
+				[actor, "Broker MFA Fixture", `${actor}@fixture.example`],
+			);
+			await database.query(
+				'INSERT INTO public."twoFactor" (id,secret,"backupCodes","userId",verified) VALUES ($1,$2,$3,$4,true)',
+				[
+					randomUUID(),
+					await symmetricEncrypt({
+						key: secret,
+						data: "synthetic-app-totp-fixture",
+					}),
+					await symmetricEncrypt({
+						key: secret,
+						data: JSON.stringify([recoveryCode]),
+					}),
+					actor,
+				],
+			);
+			await database.query(
+				`INSERT INTO public."verification" (id,identifier,value,"expiresAt")
+				VALUES ($1,$2,$3,now()+interval '5 minutes'), ($4,$5,'0',now()+interval '5 minutes')`,
+				[
+					randomUUID(),
+					challenge,
+					actor,
+					randomUUID(),
+					`2fa-attempts-${challenge}`,
+				],
+			);
+			await database.query(
+				`INSERT INTO public."oauthClient" (id,"clientId","redirectUris","grantTypes","responseTypes","skipConsent","tokenEndpointAuthMethod",scopes,"applicationType",metadata)
+				VALUES ($1,$2,$3,'["authorization_code"]','["code"]',true,'none','["openid"]','web',$4)`,
+				[
+					randomUUID(),
+					clientId,
+					JSON.stringify([redirect]),
+					JSON.stringify({
+						allauthProjectBroker: slug,
+						allauthWorkspaceId: randomUUID(),
+					}),
+				],
+			);
+			const query = signProjectIssuerQuery(
+				new URLSearchParams({
+					client_id: clientId,
+					redirect_uri: redirect,
+					response_type: "code",
+					scope: "openid",
+					state: "fixture-app-state",
+					code_challenge: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+					code_challenge_method: "S256",
+					allauth_mfa: "app-v1",
+					allauth_mfa_binding: createHash("sha256")
+						.update(binding)
+						.digest("hex"),
+				}),
+				secret,
+			);
+			const headers = new Headers({
+				cookie: challengeCookie,
+				"x-real-ip": "192.0.2.114",
+			});
+			const handoff =
+				writer === "allauth"
+					? await platform.brokerMfa.browserHandoff(headers, query.toString())
+					: await native.api.brokerTwoFactorBrowserHandoff({
+							headers,
+							query: { oauth_query: query.toString() },
+						});
+			expect(handoff.url).toBeTruthy();
+			const ticket = new URL(handoff.url!).searchParams.get("ticket")!;
+			const result = await platform.brokerMfa.verify(
+				{ clientId, slug, origin: app },
+				{ ticket, binding, code: recoveryCode, method: "backup" },
+				headers,
+			);
+			const completed = await platform.brokerMfa.complete(
+				new Request(result.url, { headers }),
+			);
+			expect(completed.status).toBe(302);
+			const destination = new URL(completed.headers.get("location")!);
+			expect(destination.origin + destination.pathname).toBe(redirect);
+			expect(destination.searchParams.get("state")).toBe("fixture-app-state");
+			expect(destination.searchParams.get("code")).toBeTruthy();
+			const session = completed.headers
+				.getSetCookie()
+				.find((value) => value.startsWith(cookieName + "="));
+			expect(
+				await native.api.getSession({
+					headers: new Headers({ cookie: session!.split(";")[0]! }),
+				}),
+			).toMatchObject({ user: { id: actor } });
+			await expect(
+				platform.brokerMfa.complete(new Request(result.url, { headers })),
+			).rejects.toMatchObject({ statusCode: 401 });
 		});
 
 		it("enrolls platform MFA through AllAuth and rotates the installed session", async () => {

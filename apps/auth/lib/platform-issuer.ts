@@ -9,7 +9,7 @@ import {
 } from "./configuration";
 import { authenticationEmail } from "./email/authentication";
 import { emailConfigured, sendAuthEmail } from "./email/send";
-import { createPlatformGoogle } from "./platform-google";
+import { createPlatformBrokerMfa } from "./platform-broker-mfa";
 import {
 	platformIssuerDevicePath,
 	routePlatformIssuerDevice,
@@ -24,6 +24,7 @@ import { createPlatformMfaEnrollment } from "./platform-mfa-enrollment";
 import { createPlatformPasskeys } from "./platform-passkeys";
 import { createPlatformPasswordSignIn } from "./platform-password-sign-in";
 import { createPlatformPendingMfa } from "./platform-pending-mfa";
+import { createPlatformProviderSignIn } from "./platform-provider-sign-in";
 import { createPlatformSessionIssuer } from "./platform-session-issuance";
 import { readLegacyProjectKeyring } from "./projects/legacy-project-keyring";
 import { createOwnedPendingMfa } from "./projects/owned-mfa";
@@ -244,7 +245,7 @@ export function createPlatformIssuer(database: Pool, env: AuthEnvironment) {
 		secureCookies: secure,
 		keys: encryptionKeys,
 	});
-	const google = createPlatformGoogle({
+	const providerSignIn = createPlatformProviderSignIn({
 		...credentialOptions,
 		database,
 		keys: encryptionKeys,
@@ -355,7 +356,18 @@ export function createPlatformIssuer(database: Pool, env: AuthEnvironment) {
 		const url = new URL(request.url);
 		if (url.origin !== issuer || !url.pathname.startsWith("/api/auth/")) return;
 		const path = url.pathname.slice("/api/auth".length);
-		const social = await google(path, request);
+		if (
+			path === "/broker-two-factor/browser-handoff" &&
+			request.method === "GET"
+		) {
+			const queries = url.searchParams.getAll("oauth_query");
+			const handoff =
+				queries.length === 1
+					? await brokerMfa.browserHandoff(request.headers, queries[0]!)
+					: { url: null };
+			return issuerJSON(handoff, queries.length === 1 ? 200 : 400);
+		}
+		const social = await providerSignIn(path, request);
 		if (social) return social;
 		const passkey = await passkeys(path, request);
 		if (passkey) return passkey;
@@ -421,7 +433,16 @@ export function createPlatformIssuer(database: Pool, env: AuthEnvironment) {
 		}
 	}
 
+	const brokerMfa = createPlatformBrokerMfa({
+		database,
+		issuer,
+		signingSecret,
+		keys: encryptionKeys,
+		dispatch,
+	});
+
 	return {
+		brokerMfa,
 		dispatch,
 		dispatchDevice,
 		continueAuthenticated: authorization.continueAuthenticated,

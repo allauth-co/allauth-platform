@@ -1,10 +1,15 @@
 import type { AuthInstance } from "../api";
-import { apiResponse, apiRoute, json, requireSameOrigin } from "../api";
+import { apiResponse, json, requireSameOrigin } from "../api";
+import { getAuthEnvironment } from "../auth";
 import { readApplicationBranding } from "../branding/repository";
 import type { AuthEnvironment } from "../configuration";
 import { authOrigin, setting } from "../configuration";
+import type { ControlDatabase } from "../control/types";
+import { postgresDatabase } from "../postgres-database";
 import type { Project } from "../projects/registry";
+import { projectRegistryPool } from "../projects/registry";
 import { withProjectOrganizationConsole } from "../projects/runtime";
+import { requirePlatformDirectoryAdmin } from "../workspaces/authorization";
 import {
 	consoleBody,
 	consoleDatabase,
@@ -25,13 +30,12 @@ export function consoleOrganizationRoute(
 ) {
 	const slug = new URL(request.url).searchParams.get("project");
 	const readBody = () => consoleBody(request);
-	async function legacy(
-		instance: AuthInstance,
+	async function execute(
 		env: AuthEnvironment,
+		database: ControlDatabase,
+		actorId: string,
 		project?: Project,
 	) {
-		if (request.method !== "GET") requireSameOrigin(request, env);
-		const actor = await requireConsoleAdministrator(instance, request.headers);
 		const delivery: ConsoleOrganizationInvitationDelivery | undefined =
 			resource === "invitations" && request.method === "POST"
 				? {
@@ -54,7 +58,7 @@ export function consoleOrganizationRoute(
 					}
 				: undefined;
 		const result = await executeConsoleOrganization(
-			await consoleDatabase(instance),
+			database,
 			request,
 			async () => {
 				const body = await readBody();
@@ -62,7 +66,7 @@ export function consoleOrganizationRoute(
 					requireConsoleInvitationDelivery(body, delivery);
 				return body;
 			},
-			actor.user.id,
+			actorId,
 			organizationId,
 			"native",
 			resource,
@@ -75,7 +79,32 @@ export function consoleOrganizationRoute(
 			: result;
 		return json(response.body, response.status);
 	}
-	if (!slug) return apiRoute(request, legacy);
+	async function legacy(
+		instance: AuthInstance,
+		env: AuthEnvironment,
+		project: Project,
+	) {
+		if (request.method !== "GET") requireSameOrigin(request, env);
+		const actor = await requireConsoleAdministrator(instance, request.headers);
+		return execute(
+			env,
+			await consoleDatabase(instance),
+			actor.user.id,
+			project,
+		);
+	}
+	if (!slug) {
+		return apiResponse(async () => {
+			const env = await getAuthEnvironment();
+			if (request.method !== "GET") requireSameOrigin(request, env);
+			const actor = await requirePlatformDirectoryAdmin(request.headers, env);
+			return execute(
+				env,
+				postgresDatabase(projectRegistryPool(env)).db,
+				actor.user.id,
+			);
+		});
+	}
 	return apiResponse((selectWorkspace) =>
 		withProjectOrganizationConsole(
 			slug,

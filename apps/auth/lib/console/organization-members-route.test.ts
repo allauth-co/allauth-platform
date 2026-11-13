@@ -11,6 +11,13 @@ const handlers = vi.hoisted(() => ({
 	projectConsole: vi.fn(),
 	selectWorkspace: vi.fn(),
 }));
+vi.mock("@/lib/auth", () => ({ getAuthEnvironment: async () => ({}) }));
+vi.mock("@/lib/workspaces/authorization", () => ({
+	requirePlatformDirectoryAdmin: handlers.authorize,
+}));
+vi.mock("@/lib/projects/registry", () => ({
+	projectRegistryPool: handlers.connect,
+}));
 vi.mock("@/lib/api", () => ({
 	apiRoute: (
 		_request: Request,

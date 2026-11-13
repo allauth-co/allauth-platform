@@ -398,6 +398,7 @@ async function build(
 								authOrigin(environment),
 								body,
 								(input) => dispatchPlatformAuth(input, platform, rootEnv),
+								rootEnv,
 							),
 						);
 					},
