@@ -16,20 +16,32 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
-import { authClient } from "@/lib/auth-client";
 import { useConfiguration } from "@/lib/configuration-client";
+import { hostedSsoManagementClient } from "@/lib/domains/hosted-sso-management-client";
 import { requireHTTPSURL } from "./sso-utils";
 import { SCIMManagement } from "./scim";
 
-const origin = "https://allauth.co";
-
-type SSOProvider = NonNullable<
-	Awaited<ReturnType<typeof authClient.sso.providers>>["data"]
+type HostedProvider = NonNullable<
+	Awaited<ReturnType<typeof hostedSsoManagementClient.providers>>["data"]
 >["providers"][number];
+type SSOProvider = Omit<HostedProvider, "type"> & { type: string };
 
-export function SSOManagement({ organizationId }: { organizationId: string }) {
+export function SSOManagement({
+	organizationId,
+	origin,
+	hosted,
+}: {
+	organizationId: string;
+	origin: string;
+	hosted: boolean;
+}) {
 	const queryClient = useQueryClient();
 	const configuration = useConfiguration();
+	async function ssoClient() {
+		if (hosted) return hostedSsoManagementClient;
+		return (await import("@/lib/auth-client")).authClient.sso;
+	}
+	const queryKey = ["sso", hosted ? "hosted" : "legacy", organizationId];
 	const [providerId, setProviderId] = useState("");
 	const [type, setType] = useState<"oidc" | "saml">("oidc");
 	const [issuer, setIssuer] = useState("");
@@ -47,10 +59,10 @@ export function SSOManagement({ organizationId }: { organizationId: string }) {
 		token: string;
 	} | null>(null);
 	const providers = useQuery({
-		queryKey: ["sso", organizationId],
+		queryKey,
 		enabled: configuration.data?.enterpriseSSO === true,
 		queryFn: async () => {
-			const result = await authClient.sso.providers();
+			const result = await (await ssoClient()).providers();
 			if (result.error)
 				throw new Error(
 					result.error.message ?? "Unable to load identity providers.",
@@ -86,7 +98,7 @@ export function SSOManagement({ organizationId }: { organizationId: string }) {
 		try {
 			await operation();
 			await queryClient.invalidateQueries({
-				queryKey: ["sso", organizationId],
+				queryKey,
 			});
 		} catch (error) {
 			toast.error(
@@ -111,7 +123,7 @@ export function SSOManagement({ organizationId }: { organizationId: string }) {
 					"Use letters, numbers, and hyphens for the provider ID.",
 				);
 			if (editing) {
-				const result = await authClient.sso.updateProvider({
+				const result = await (await ssoClient()).updateProvider({
 					...common,
 					...(type === "oidc" && (clientId.trim() || clientSecret)
 						? {
@@ -141,7 +153,7 @@ export function SSOManagement({ organizationId }: { organizationId: string }) {
 					"Identity provider updated. Verify the domains again if its identity or domain changed.",
 				);
 			} else {
-				const result = await authClient.sso.register({
+				const result = await (await ssoClient()).register({
 					...common,
 					organizationId,
 					...(type === "oidc"
@@ -185,7 +197,7 @@ export function SSOManagement({ organizationId }: { organizationId: string }) {
 	}
 	async function requestVerification(provider: SSOProvider) {
 		await perform(async () => {
-			const result = await authClient.sso.requestDomainVerification({
+			const result = await (await ssoClient()).requestDomainVerification({
 				providerId: provider.providerId,
 			});
 			if (result.error)
@@ -301,7 +313,7 @@ export function SSOManagement({ organizationId }: { organizationId: string }) {
 												disabled={busy}
 												onClick={() =>
 													perform(async () => {
-														const result = await authClient.sso.verifyDomain({
+														const result = await (await ssoClient()).verifyDomain({
 															providerId: provider.providerId,
 														});
 														if (result.error)
@@ -331,10 +343,9 @@ export function SSOManagement({ organizationId }: { organizationId: string }) {
 													disabled={busy}
 													onClick={() =>
 														perform(async () => {
-															const result =
-																await authClient.sso.deleteProvider({
-																	providerId: provider.providerId,
-																});
+													const result = await (await ssoClient()).deleteProvider({
+																providerId: provider.providerId,
+															});
 															if (result.error)
 																throw new Error(
 																	result.error.message ??
@@ -580,6 +591,7 @@ export function SSOManagement({ organizationId }: { organizationId: string }) {
 				<SCIMManagement
 					organizationId={organizationId}
 					providers={providers.data ?? []}
+					hosted={hosted}
 				/>
 			)}
 		</div>

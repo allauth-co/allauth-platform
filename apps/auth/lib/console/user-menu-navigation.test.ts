@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { localNavigation } from "@/components/better-auth-ui/lib/navigation";
+import { localNavigation } from "@/lib/auth-navigation";
 import {
 	accountNavigationHref,
 	consoleReturnFromSearch,

@@ -3,15 +3,36 @@ import type { SCIMScope } from "@better-auth/scim";
 import { APIError } from "better-auth";
 import * as z from "zod";
 import type { AuthInstance } from "./api";
-import { json, requireDirectoryAdministrator, requireSameOrigin } from "./api";
+import { apiResponse, apiRoute, json, requireDirectoryAdministrator, requireSameOrigin } from "./api";
 import type { AuthEnvironment } from "./configuration";
 import { authOrigin } from "./configuration";
 import type { DirectoryBinding } from "./enterprise";
 import { provisioningDomain, recordAudit } from "./enterprise";
+import type { OwnedProjectSCIMConsoleRoute } from "./projects/owned-project-scim-console";
+import { withProjectSCIMConsole } from "./projects/runtime";
 
 const scopes = ["scim.users.read", "scim.users.write", "scim.groups.read", "scim.groups.write"] as const satisfies readonly SCIMScope[];
 const expiry = () => new Date(Date.now() + 90 * 24 * 60 * 60 * 1000);
 const baseURL = (env: AuthEnvironment) => `${authOrigin(env)}/api/auth/scim/v2`;
+
+export function scimConsoleRoute(request: Request, route: OwnedProjectSCIMConsoleRoute) {
+	const { organizationId } = route;
+	const legacy = (instance: AuthInstance, env: AuthEnvironment) => {
+		if ("connectionId" in route)
+			return mutateDirectory(instance, request, env, organizationId, route.connectionId, route.operation);
+		return route.operation === "list"
+			? listDirectories(instance, request, env, organizationId)
+			: createDirectory(instance, request, env, organizationId);
+	};
+	const slug = new URL(request.url).searchParams.get("project");
+	if (!slug) return apiRoute(request, legacy);
+	return apiResponse((selectWorkspace) =>
+		withProjectSCIMConsole(slug, (manage, readLegacy, env, project) => {
+			selectWorkspace(project.workspaceId);
+			return manage ? manage(request, route) : legacy(readLegacy(), env);
+		}),
+	);
+}
 
 export async function listDirectories(instance: AuthInstance, request: Request, env: AuthEnvironment, organizationId: string) {
 	await requireDirectoryAdministrator(instance, request.headers, organizationId);

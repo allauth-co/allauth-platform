@@ -3,6 +3,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { portalHeader } from "../domains/edge";
 import { publicBranding } from "../../sdk/branding";
+import { defaultPasswordPolicy } from "../auth-policy/password";
 
 const mocks = vi.hoisted(() => ({
 	read: vi.fn(),
@@ -11,8 +12,12 @@ const mocks = vi.hoisted(() => ({
 	environment: { BETTER_AUTH_URL: "https://allauth.co" },
 	context: { ready: true, error: "", realmName: "Legacy Realm", branding: null as unknown },
 }));
-vi.mock("../auth", () => ({ getAuthEnvironment: async () => mocks.environment }));
-vi.mock("../domains/hosting", () => ({ withPortalHeaders: mocks.withHeaders, withPortalRequest: mocks.withRequest }));
+vi.mock("../auth", () => ({
+	getAuthEnvironment: async () => mocks.environment,
+	withAuth: async (callback: (instance: { options: object }) => Promise<unknown>) =>
+		callback({ options: {} }),
+}));
+vi.mock("../domains/hosting", () => ({ withPortalHeadersEngine: mocks.withHeaders, withPortalAuthEngine: mocks.withRequest }));
 vi.mock("./repository", () => ({ readApplicationBranding: mocks.read }));
 vi.mock("@/components/better-auth-ui/lib/allauth-context", () => ({ useAllAuthUI: () => mocks.context }));
 vi.mock("@/components/better-auth-ui/lib/use-auth", () => ({ useAuth: () => ({ plugins: [], Link: "a" }) }));
@@ -28,13 +33,27 @@ import { portalBranding } from "./portal";
 
 const asset = "https://assets.allauth.co/branding/00000000-0000-0000-0000-000000000001/00000000-0000-0000-0000-000000000002/00000000-0000-0000-0000-000000000003.png";
 const brand = publicBranding({ name: "Application Alpha", logoUrl: asset, logoDarkUrl: asset.replace(".png", ".webp"), faviconUrl: asset, supportEmail: "support@alpha.example", primaryColor: "#ffffff", darkPrimaryColor: "#315bff", showPoweredBy: true })!;
-const binding = { project: { id: "verified-alpha", name: "Old realm name" } };
+const binding = { hostname: "alpha.example", project: { id: "verified-alpha", name: "Old realm name", slug: "alpha" } };
 const bound = new Headers();
+const engine = {
+	dispatch: vi.fn(async () =>
+		Response.json({
+			apple: false,
+			microsoft: false,
+			googleProvider: null,
+			emailPassword: true,
+			signUpEnabled: true,
+			emailVerificationRequired: true,
+			passwordPolicy: defaultPasswordPolicy,
+		}),
+	),
+};
 
 beforeEach(() => {
 	mocks.read.mockReset().mockResolvedValue(brand);
 	mocks.withHeaders.mockReset().mockImplementation((_headers: Headers, callback: (instance: object, headers: Headers, selected: typeof binding) => Promise<unknown>) => callback({}, bound, binding));
-	mocks.withRequest.mockReset().mockImplementation((_request: Request, callback: (instance: object, environment: typeof mocks.environment, request: Request, selected: typeof binding | null) => Promise<unknown>) => callback({ options: { plugins: [] } }, mocks.environment, _request, binding));
+	engine.dispatch.mockClear();
+	mocks.withRequest.mockReset().mockImplementation((_request: Request, callback: (instance: object, environment: typeof mocks.environment, request: Request, selected: typeof binding | null) => Promise<unknown>) => callback(engine, mocks.environment, _request, binding));
 	mocks.context = { ready: true, error: "", realmName: "Legacy Realm", branding: brand };
 });
 
@@ -43,6 +62,7 @@ describe("hosted application branding boundary", () => {
 		const request = new Request("https://origin.example/api/config?project=other-project", { headers: { host: "other.example" } });
 		const response = await configurationGET(request);
 		expect(mocks.withRequest).toHaveBeenCalledWith(request, expect.any(Function));
+		expect(engine.dispatch).toHaveBeenCalledWith(expect.objectContaining({ url: "https://alpha.example/api/auth/sdk/config" }));
 		expect(mocks.read).toHaveBeenCalledWith("verified-alpha", mocks.environment);
 		expect(await response.json()).toMatchObject({ broker: true, realmName: brand.name, branding: brand, platformOrigin: "https://allauth.co" });
 		mocks.read.mockResolvedValueOnce({ ...brand, name: "Renamed Application" });
@@ -50,11 +70,34 @@ describe("hosted application branding boundary", () => {
 		expect(response.headers.get("cache-control")).toBe("no-store");
 	});
 
+	it("uses explicit engine capabilities while preserving the legacy defaults", async () => {
+		const request = new Request("https://origin.example/api/config");
+		expect(await (await configurationGET(request)).json()).toMatchObject({
+			apiKeys: true, enterpriseSSO: true, scim: false,
+		});
+		engine.dispatch.mockResolvedValueOnce(Response.json({
+			apple: false,
+			microsoft: false,
+			googleProvider: null,
+			emailPassword: true,
+			signUpEnabled: false,
+			emailVerificationRequired: true,
+			passwordPolicy: defaultPasswordPolicy,
+			apiKeys: false,
+			enterpriseSSO: false,
+			scim: true,
+		}));
+		expect(await (await configurationGET(request)).json()).toMatchObject({
+			apiKeys: false, enterpriseSSO: false, scim: true, signUpEnabled: false,
+		});
+	});
+
 	it("keeps apex configuration and metadata generic without reading another application's branding", async () => {
 		mocks.withRequest.mockImplementation((_request: Request, callback: (instance: object, environment: typeof mocks.environment, request: Request, selected: null) => Promise<unknown>) => callback({ options: { plugins: [] } }, mocks.environment, _request, null));
 		const configuration = await (await configurationGET(new Request("https://allauth.co/api/config?project=verified-alpha"))).json();
 		expect(configuration).not.toHaveProperty("branding");
 		expect(configuration).not.toHaveProperty("broker");
+		expect(engine.dispatch).not.toHaveBeenCalled();
 		expect(await portalBranding(new Headers({ host: "alpha.example" }))).toBeNull();
 		expect(mocks.withHeaders).not.toHaveBeenCalled();
 		expect(mocks.read).not.toHaveBeenCalled();

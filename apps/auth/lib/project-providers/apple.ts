@@ -1,11 +1,8 @@
 import { createHash } from "node:crypto";
-import { importPKCS8, SignJWT } from "jose";
-import { APIError } from "better-auth";
-import type { BetterAuthPlugin } from "better-auth";
-import { verifyProviderIdToken } from "@better-auth/core/oauth2";
 import * as z from "zod";
 import { setting } from "../configuration";
 import type { AuthEnvironment } from "../configuration";
+export { generateAppleClientSecret } from "./apple-client-secret";
 
 const identifier = z.string().trim().min(3).max(255).regex(/^[A-Za-z0-9][A-Za-z0-9.-]+$/);
 const credentialsSchema = z.object({
@@ -41,45 +38,4 @@ export function appleCallbackURL(realm: { primaryOrigin: string; publicOrigin?: 
 	const parsed = new URL(origin);
 	if (parsed.protocol !== "https:" || parsed.origin !== origin || parsed.username || parsed.password) throw new Error("Apple sign-in requires an exact HTTPS application origin.");
 	return `${origin}${realm.publicOrigin ? realm.basePath : "/api/allauth"}/callback/apple`;
-}
-
-/** Mint a short-lived Apple client secret from a server-only ES256 signing key. */
-export async function generateAppleClientSecret(provider: ProjectAppleProvider): Promise<string> {
-	const key = await importPKCS8(provider.privateKey, "ES256");
-	const issuedAt = Math.floor(Date.now() / 1000);
-	return new SignJWT({}).setProtectedHeader({ alg: "ES256", kid: provider.keyId }).setIssuer(provider.teamId)
-		.setSubject(provider.clientId).setAudience("https://appleid.apple.com").setIssuedAt(issuedAt)
-		.setExpirationTime(issuedAt + 7 * 24 * 60 * 60).sign(key);
-}
-
-/** Add nonce binding around the existing native Apple provider without bypassing its token verifier. */
-export function appleIntegrity(): BetterAuthPlugin {
-	return { id: "allauth-apple-integrity", init(ctx) {
-		const provider = ctx.socialProviders.find(value => value.id === "apple");
-		if (!provider) return;
-		provider.requiresIdTokenNonce = true;
-		const nativeAuthorization = provider.createAuthorizationURL;
-		provider.createAuthorizationURL = async input => {
-			if (!input.idTokenNonce) throw new APIError("BAD_REQUEST", { message: "Apple sign-in requires a fresh authorization attempt." });
-			const url = await nativeAuthorization(input);
-			// Apply the server-generated nonce after native reserved-parameter filtering.
-			url.searchParams.set("nonce", input.idTokenNonce);
-			return url;
-		};
-		const nativeUserInfo = provider.getUserInfo;
-		provider.getUserInfo = async tokens => {
-			// Native Apple profile parsing decodes the token. Verify its signature,
-			// audience, issuer and state-bound nonce before that parsing can run.
-			if (!tokens.idToken || !await verifyProviderIdToken(provider, tokens.idToken, tokens.expectedIdTokenNonce)) return null;
-			const result = await nativeUserInfo(tokens);
-			if (!result?.user || result.user.email) return result;
-			// Apple may omit email after first consent. Recover it only through the
-			// cryptographically verified stable subject in this realm's adapter.
-			const subject = await provider.accountSubject({ tokens, profile: result.data });
-			if (typeof subject !== "string" || !subject.trim() || subject.length > 512) return null;
-			const existing = await ctx.internalAdapter.findAccountOwnerByKey({ providerId: provider.id, accountId: subject });
-			if (!existing || existing.kind !== "owned") return result;
-			return { ...result, user: { ...result.user, email: existing.user.email, emailVerified: existing.user.emailVerified, name: result.user.name || existing.user.name } };
-		};
-	} };
 }

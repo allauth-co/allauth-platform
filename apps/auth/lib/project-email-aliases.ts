@@ -5,29 +5,23 @@ import { createAuthMiddleware } from "better-auth/api";
 import { generateRandomString } from "better-auth/crypto";
 import * as z from "zod";
 
-const email = z.email().max(320).refine((value) => value === value.trim().toLowerCase());
-const aliasesSchema = z.record(email, z.string().regex(/^[A-Za-z0-9_-]{1,160}$/));
+import type { ProjectEmailAliasMap } from "./project-email-alias-config";
+import { parseProjectEmailAliases, projectEmailAliasVariable } from "./project-email-alias-config";
+
+export { projectEmailAliasVariable } from "./project-email-alias-config";
+
 const rewritePaths = new Set(["/sign-in/email", "/sign-in/email-otp", "/sign-in/magic-link", "/request-password-reset", "/email-otp/request-password-reset", "/email-otp/reset-password"]);
 const typedCodePaths = new Set(["/email-otp/send-verification-otp", "/email-otp/check-verification-otp"]);
-
-/** A separate server variable keeps each realm's verified migration aliases private and isolated. */
-export function projectEmailAliasVariable(project: string): string {
-	if (!/^[a-z][a-z0-9-]{1,47}$/.test(project)) throw new Error("An exact project is required for email aliases.");
-	return `ALLAUTH_PROJECT_${project.replaceAll("-", "_").toUpperCase()}_EMAIL_ALIASES`;
-}
 
 /** Map only reviewed verified aliases to a stable native ID, never to an email or caller-supplied ID. */
 export function projectEmailAliases(options: { project: string; readConfiguration: () => string }): BetterAuthPlugin {
 	projectEmailAliasVariable(options.project);
-	let previous: string | undefined, selected: Record<string, string> = {};
+	let previous: string | undefined, selected: ProjectEmailAliasMap = {};
 	const aliases = () => {
 		const raw = options.readConfiguration();
 		if (raw === previous) return selected;
 		try {
-			if (raw.length > 32768) throw new Error();
-			const parsed = raw.trim() ? aliasesSchema.parse(JSON.parse(raw)) : {};
-			if (Object.keys(parsed).length > 100) throw new Error();
-			selected = parsed; previous = raw; return selected;
+			selected = parseProjectEmailAliases(raw); previous = raw; return selected;
 		} catch { throw new APIError("SERVICE_UNAVAILABLE", { message: "Account sign-in is temporarily unavailable." }); }
 	};
 	return {

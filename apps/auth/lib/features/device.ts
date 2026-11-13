@@ -11,11 +11,15 @@ export function deviceProject(
 }
 
 /** Keep a local, explicit review link; visiting it alone never approves a code. */
-export function deviceReviewPath(code: string, project?: string): string {
+export function deviceReviewPath(
+	code: string,
+	project?: string,
+	path: "/device" | "/account/device" = "/device",
+): string {
 	const query = new URLSearchParams();
 	if (code) query.set("user_code", code);
 	if (project) query.set("project", projectSlug.parse(project));
-	return `/device${query.size ? `?${query}` : ""}`;
+	return `${path}${query.size ? `?${query}` : ""}`;
 }
 
 /** Distinguish session admission failures from authoritative device-code errors. */

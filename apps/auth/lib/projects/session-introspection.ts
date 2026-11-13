@@ -1,9 +1,8 @@
 import { createHash } from "node:crypto";
 import { APIError } from "better-auth";
-import { getSessionCookie } from "better-auth/cookies";
 import type { AuthEnvironment } from "../configuration";
-import { verifyLegacySessionCookie } from "./legacy-session-cookie";
-import { verifiedProjectRequest } from "./proxy";
+import { readProjectSessionAdmissionCookie } from "./legacy-session-cookie";
+import { verifiedProjectRequest, withoutProjectProxyAssertions } from "./proxy";
 import type { Project } from "./registry";
 import type { SessionCheckCoordinator } from "./session-check-coordinator";
 import { createSessionCheckCoordinator } from "./session-check-coordinator";
@@ -35,6 +34,7 @@ interface IntrospectionDependencies {
 	coordinator?: SessionCheckCoordinator;
 	diagnostic?: (event: SessionCheckDiagnostic) => void;
 }
+type SessionSigningKey = string | (() => string);
 const coordinator = createSessionCheckCoordinator();
 const scopes = new WeakMap<object, number>();
 let nextScope = 0;
@@ -47,7 +47,7 @@ function scopeId(scope: object): number {
 	return id;
 }
 function diagnostic(
-	dependencies: IntrospectionDependencies,
+	observe: IntrospectionDependencies["diagnostic"],
 	project: Project,
 	outcome: SessionCheckDiagnostic["outcome"],
 	code: string,
@@ -62,31 +62,54 @@ function diagnostic(
 		status,
 	};
 	try {
-		(
-			dependencies.diagnostic ??
-			((value) => console.info(JSON.stringify(value)))
-		)(event);
+		(observe ?? ((value) => console.info(JSON.stringify(value))))(event);
 	} catch {
 		/* Observability cannot change authentication. */
 	}
 }
 
-/** A valid cookie selects a rate bucket; it never establishes live authority. */
-function authenticSessionCookie(
+/** Verify the app proxy against the exact registry row before admitting engine work. */
+export async function prepareProjectAuthentication(
 	request: Request,
 	project: Project,
-	secret: string,
-): string | null {
-	try {
-		const serialized = getSessionCookie(request, {
-			cookiePrefix: `allauth_project_${project.slug}`,
-		});
-		if (!serialized || serialized.length > 1024) return null;
-		const value = decodeURIComponent(serialized);
-		return verifyLegacySessionCookie(value, secret) ? value : null;
-	} catch {
-		return null;
+	environment: AuthEnvironment,
+	options: {
+		consumeBody?: boolean;
+		diagnostic?: IntrospectionDependencies["diagnostic"];
+	} = {},
+) {
+	const signed = Boolean(request.headers.get("allauth-proxy-signature"));
+	let verified = signed ? request : withoutProjectProxyAssertions(request);
+	if (signed) {
+		try {
+			verified = await verifiedProjectRequest(request, project, environment, {
+				consumeBody: options.consumeBody,
+			});
+		} catch (error) {
+			diagnostic(
+				options.diagnostic,
+				project,
+				error instanceof APIError ? "verification_failed" : "service_failure",
+				"ALLAUTH_PROXY_VERIFICATION_FAILED",
+				error instanceof APIError ? error.statusCode : 503,
+			);
+			throw error;
+		}
 	}
+	return {
+		signed,
+		dispatch: (
+			sessionKey: SessionSigningKey,
+			dependencies: IntrospectionDependencies,
+		) =>
+			dispatchProjectAuthentication(
+				verified,
+				project,
+				signed,
+				sessionKey,
+				dependencies,
+			),
+	};
 }
 
 /** Signed server introspection retains live native authority and independently meters every caller. */
@@ -97,28 +120,35 @@ export async function handleProjectAuthentication(
 	sessionSecret: string,
 	dependencies: IntrospectionDependencies,
 ): Promise<Response> {
-	const signed = Boolean(request.headers.get("allauth-proxy-signature"));
-	let verified: Request;
-	try {
-		verified = await verifiedProjectRequest(request, project, environment);
-	} catch (error) {
-		diagnostic(
-			dependencies,
-			project,
-			error instanceof APIError ? "verification_failed" : "service_failure",
-			"ALLAUTH_PROXY_VERIFICATION_FAILED",
-			error instanceof APIError ? error.statusCode : 503,
-		);
-		throw error;
-	}
+	const authentication = await prepareProjectAuthentication(
+		request,
+		project,
+		environment,
+		{ diagnostic: dependencies.diagnostic },
+	);
+	return authentication.dispatch(sessionSecret, dependencies);
+}
+
+async function dispatchProjectAuthentication(
+	verified: Request,
+	project: Project,
+	signed: boolean,
+	sessionKey: SessionSigningKey,
+	dependencies: IntrospectionDependencies,
+): Promise<Response> {
 	const url = new URL(verified.url);
 	const introspection =
 		signed &&
 		verified.method === "GET" &&
 		url.pathname === `/api/projects/${project.slug}/auth/get-session`;
-	const cookie = introspection
-		? authenticSessionCookie(verified, project, sessionSecret)
-		: null;
+	if (!introspection) return dependencies.fallback(verified);
+	const sessionSecret =
+		typeof sessionKey === "function" ? sessionKey() : sessionKey;
+	const cookie = readProjectSessionAdmissionCookie(
+		verified.headers,
+		`allauth_project_${project.slug}`,
+		sessionSecret,
+	);
 	if (!cookie) return dependencies.fallback(verified);
 	const digest = createHash("sha256")
 		.update(JSON.stringify([project.id, cookie]))
@@ -159,7 +189,7 @@ export async function handleProjectAuthentication(
 	);
 	if (result.status === 429)
 		diagnostic(
-			dependencies,
+			dependencies.diagnostic,
 			project,
 			"rate_limited",
 			"ALLAUTH_SESSION_CHECK_RATE_LIMITED",
@@ -167,7 +197,7 @@ export async function handleProjectAuthentication(
 		);
 	else if (result.status >= 500)
 		diagnostic(
-			dependencies,
+			dependencies.diagnostic,
 			project,
 			"service_failure",
 			"ALLAUTH_SESSION_CHECK_UNAVAILABLE",
@@ -175,7 +205,7 @@ export async function handleProjectAuthentication(
 		);
 	else if (result.status === 401 || result.status === 403)
 		diagnostic(
-			dependencies,
+			dependencies.diagnostic,
 			project,
 			"verification_failed",
 			"ALLAUTH_SESSION_CHECK_REJECTED",
@@ -183,7 +213,7 @@ export async function handleProjectAuthentication(
 		);
 	else if (result.status === 200 && (await result.clone().text()) === "null")
 		diagnostic(
-			dependencies,
+			dependencies.diagnostic,
 			project,
 			"invalid_session",
 			"ALLAUTH_SESSION_INVALID",

@@ -2,6 +2,8 @@ import { APIError } from "better-auth";
 import { randomUUID } from "node:crypto";
 import type { Pool } from "pg";
 import type { AuthEnvironment } from "../configuration";
+import { storedProjectWebhookSelectors } from "../projects/owned-project-webhook-admission";
+import type { ProjectEngineWriter } from "../projects/project-engine-writer-lease";
 import { projectRegistryPool } from "../projects/registry";
 import { checkedProjectSchema } from "../projects/validation";
 import { authPolicySchema, defaultStoredAuthPolicy } from "./policy";
@@ -16,8 +18,13 @@ export function authPolicyRepository(pool: Pick<Pool, "query">) {
 			const result = await pool.query<PolicyRow>('SELECT version,policy,"updatedAt" FROM public."allauthAuthConfiguration" WHERE id=$1', [scopeId]);
 			return publicPolicy(result.rows[0]);
 		},
-		async update(scopeId: string, expectedVersion: number, policy: AuthPolicy, actorId: string, auditSchema?: string): Promise<StoredAuthPolicy> {
+		async update(scopeId: string, expectedVersion: number, policy: AuthPolicy, actorId: string, auditSchema?: string, writer?: ProjectEngineWriter): Promise<StoredAuthPolicy> {
 			const validated = authPolicySchema.parse(policy);
+			if (writer === "allauth") {
+				const configuration = await storedProjectWebhookSelectors(pool, auditSchema ?? "", validated);
+				if (configuration?.unsupported !== false)
+					throw new APIError("CONFLICT", { message: "Switch this project to the legacy writer before saving a policy that its configured webhooks cannot support." });
+			}
 			let statement = expectedVersion === 0
 				? 'INSERT INTO public."allauthAuthConfiguration" (id,policy,version,"updatedBy") VALUES ($1,$2,1,$3) ON CONFLICT (id) DO NOTHING RETURNING version,policy,"updatedAt"'
 				: 'UPDATE public."allauthAuthConfiguration" SET policy=$2,version=version+1,"updatedBy"=$3,"updatedAt"=NOW() WHERE id=$1 AND version=$4 RETURNING version,policy,"updatedAt"';

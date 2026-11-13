@@ -2,11 +2,14 @@ import { createHash, randomUUID } from "node:crypto";
 import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import { APIError } from "better-auth";
-import { symmetricDecrypt, symmetricEncrypt } from "better-auth/crypto";
 import { Pool } from "pg";
 import type { AuthEnvironment } from "../configuration";
 import { authOrigin, setting } from "../configuration";
 import type { ControlPrincipal } from "../control/types";
+import {
+	openLegacyUnversionedRecord,
+	sealLegacyUnversionedRecord,
+} from "../legacy-encrypted-record";
 import {
 	requireWorkspaceActor,
 	storedWorkspacePrincipal,
@@ -26,6 +29,7 @@ export interface Project {
 	applicationId: string;
 	environment: "development" | "production";
 	workspaceId: string;
+	projectEngineFenced?: boolean;
 	brokerClientId: string;
 	brokerSecret: string;
 	proxyVersion: string;
@@ -110,10 +114,10 @@ export async function projectBrokerSecret(
 	project: Project,
 	env: AuthEnvironment,
 ) {
-	return symmetricDecrypt({
-		key: setting(env, "BETTER_AUTH_SECRET"),
-		data: project.brokerSecret,
-	});
+	return openLegacyUnversionedRecord(
+		project.brokerSecret,
+		setting(env, "BETTER_AUTH_SECRET"),
+	);
 }
 
 /** Creates a namespace inside an explicitly authorized workspace; failure leaves no partial tenant. */
@@ -148,10 +152,10 @@ export async function provisionProject(
 			message:
 				"Choose your app's origin rather than the AllAuth platform origin.",
 		});
-	const secret = await symmetricEncrypt({
-		key: setting(env, "BETTER_AUTH_SECRET"),
-		data: broker.clientSecret,
-	});
+	const secret = sealLegacyUnversionedRecord(
+		broker.clientSecret,
+		setting(env, "BETTER_AUTH_SECRET"),
+	);
 	const client = await projectRegistryPool(env).connect();
 	try {
 		await client.query("BEGIN");

@@ -1,0 +1,1810 @@
+import { createHmac } from "node:crypto";
+import type { JWTPayload } from "jose";
+import {
+	createRemoteJWKSet,
+	decodeJwt,
+	customFetch as joseFetch,
+	jwtVerify,
+} from "jose";
+import * as oauth from "oauth4webapi";
+import type { Pool, PoolClient } from "pg";
+import * as z from "zod";
+import { validAvatarPath } from "../avatars/protocol";
+import type { ControlEventInput } from "../control/types";
+import { hostedSocialSignInRequests } from "../domains/hosted-oauth-requests";
+import { reservedProjectEmailError } from "../project-email-alias-config";
+import type { LegacyMfaKeys } from "./legacy-mfa-record";
+import { sealLegacyMfaRecord } from "./legacy-mfa-record";
+import { readLegacySessionCookie } from "./legacy-session-cookie";
+import {
+	linkedProviderProfile,
+	readLinkedOAuthToken,
+} from "./owned-project-account-info";
+import {
+	projectAdditionalAuthorizationParams,
+	setProjectAdditionalAuthorizationParams,
+} from "./owned-project-authorization-params";
+import {
+	markOwnedCallbackFailure,
+	ownedCallbackFailureCode,
+} from "./owned-project-callback-failure";
+import type {
+	AuthorizeLinkedAccounts,
+	LinkedAccountGrant,
+	OwnedProjectOAuthUnlink,
+} from "./owned-project-linked-accounts";
+import {
+	createOwnedProjectLinkedAccounts,
+	linkedAccessTokenNearExpiry,
+	linkedAccountScopes,
+} from "./owned-project-linked-accounts";
+
+export { ownedProjectOAuthUnlinkInput } from "./owned-project-linked-accounts";
+
+import type { ProjectUser } from "./owned-project-engine-store";
+import {
+	isAuthenticExpiredProjectIssuerEmailContinuation,
+	readSignedProjectIssuerQuery,
+} from "./owned-project-issuer-authorization-query";
+import type {
+	ProjectOAuthIdentity,
+	ProjectOAuthProvider,
+	ProjectOAuthState,
+} from "./owned-project-oauth-store";
+import {
+	createProjectOAuthStore,
+	maximumProjectOAuthReturnLength,
+	oauthStateAge,
+	projectOAuthProvider,
+	standardProjectOAuthReturnLength,
+} from "./owned-project-oauth-store";
+import {
+	appleCallbackForm,
+	appleClientProfile,
+	appleDisplayName,
+	appleMetadata,
+	appleNonce,
+	appleProfileName,
+	appleTokenAudience,
+	microsoftEmailVerified,
+	microsoftIssuer,
+	microsoftMetadata,
+} from "./owned-project-provider-tokens";
+import {
+	projectSecurityBlockedCode,
+	projectSecurityBlockedMessage,
+} from "./owned-project-security";
+
+export { projectOAuthProvider } from "./owned-project-oauth-store";
+
+import type { Project } from "./registry";
+import { projectOrigin, projectSlug } from "./validation";
+
+const statePattern = /^[A-Za-z0-9_-]{32,128}$/;
+const trustedSigningAlgorithms = [
+	"RS256",
+	"PS256",
+	"ES256",
+	"EdDSA",
+	"Ed25519",
+];
+
+async function isStoredAccountPolicyDenial(response: Response) {
+	if (response.status !== 429) return false;
+	const payload: unknown = await response
+		.clone()
+		.json()
+		.catch(() => null);
+	return Boolean(
+		payload &&
+			typeof payload === "object" &&
+			"code" in payload &&
+			payload.code === projectSecurityBlockedCode,
+	);
+}
+const originControls = /[\\\u0000-\u0020\u007f]/;
+const googleMetadata: oauth.AuthorizationServer = {
+	issuer: "https://accounts.google.com",
+	authorization_endpoint: "https://accounts.google.com/o/oauth2/v2/auth",
+	token_endpoint: "https://oauth2.googleapis.com/token",
+	jwks_uri: "https://www.googleapis.com/oauth2/v3/certs",
+	id_token_signing_alg_values_supported: ["RS256"],
+};
+
+export const ownedProjectOAuthStartInput = z.strictObject({
+	provider: projectOAuthProvider,
+	callbackURL: z.string().max(standardProjectOAuthReturnLength).optional(),
+	newUserCallbackURL: z.string().max(standardProjectOAuthReturnLength).optional(),
+	errorCallbackURL: z.string().max(standardProjectOAuthReturnLength).optional(),
+	disableRedirect: z.boolean().optional(),
+	requestSignUp: z.boolean().optional(),
+	loginHint: z.string().max(320).optional(),
+	idToken: z
+		.object({
+			token: z.string().min(1).max(32768),
+			nonce: z.string().max(512).optional(),
+			accessToken: z.string().max(32768).optional(),
+			refreshToken: z.string().max(32768).optional(),
+			expiresAt: z.number().optional(),
+			user: appleClientProfile.optional(),
+		})
+		.optional(),
+	additionalData: z.record(z.string(), z.unknown()).optional(),
+	additionalParams: projectAdditionalAuthorizationParams,
+	scopes: z
+		.array(
+			z
+				.string()
+				.min(1)
+				.max(256)
+				.regex(/^[\x21\x23-\x5b\x5d-\x7e]+$/),
+		)
+		.max(24)
+		.optional(),
+});
+
+const hostedContinuation = z.string().max(maximumProjectOAuthReturnLength);
+export const ownedProjectHostedSocialContinuationInput = z
+	.strictObject({
+		provider: projectOAuthProvider,
+		callbackURL: hostedContinuation,
+		newUserCallbackURL: hostedContinuation.optional(),
+		disableRedirect: z.boolean().optional(),
+	})
+	.refine(
+		({ callbackURL, newUserCallbackURL }) =>
+			callbackURL.length > standardProjectOAuthReturnLength &&
+			(newUserCallbackURL === undefined || newUserCallbackURL === callbackURL),
+	);
+export const maximumHostedSocialContinuationBodyBytes =
+	maximumProjectOAuthReturnLength * 2 + 1024;
+
+export type OwnedProjectOAuthStart = z.infer<
+	typeof ownedProjectOAuthStartInput
+>;
+
+type ProjectOAuthFetch = (
+	input: URL | RequestInfo,
+	init?: RequestInit,
+) => Promise<Response>;
+
+type Credentials = {
+	clientId: string;
+	clientSecret: string;
+	redirectURI: string;
+};
+type AppleCredentials = Omit<Credentials, "clientSecret"> & {
+	appBundleIdentifier?: string;
+	clientSecret(clientId: string): Promise<string>;
+};
+
+export interface OwnedProjectOAuthOptions {
+	database: Pool;
+	project: Pick<Project, "schemaName" | "slug">;
+	baseURL: string;
+	basePath: string;
+	trustedOrigins: readonly string[];
+	signingSecret: string;
+	tokenKeys?: LegacyMfaKeys;
+	signUpEnabled: boolean;
+	requireEmailVerification: boolean;
+	reservedEmail?(email: string): boolean;
+	defaultErrorURL: string;
+	broker: Credentials & {
+		issuer: string;
+		discoveryURL: string;
+		hintGoogle?: boolean;
+	};
+	google?: Credentials;
+	microsoft?: Credentials & { tenantId: string };
+	apple?: AppleCredentials;
+	/** Bind a live guest from this project to an authoritative OAuth state record. */
+	readGuestUserId?(request: Request): Promise<string | undefined>;
+	/** Apply project rules after verifying a provider profile. */
+	denyProviderProfile?(
+		client: PoolClient,
+		request: Request,
+		email: string,
+	): Promise<boolean>;
+	/** Commit signup admission even when provisional account writes are discarded. */
+	prepareProviderSignup?(
+		client: PoolClient,
+		request: Request,
+		email: string,
+	): Promise<(() => Promise<void>) | null>;
+	/** Inject a scoped session/MFA operation. Its response is released only after the account transaction commits. */
+	complete(
+		client: PoolClient,
+		details: {
+			request: Request;
+			user: ProjectUser;
+			provider: ProjectOAuthProvider;
+			destination: string;
+			verificationDestination?: string;
+			anonymousUserId?: string;
+			registered: boolean;
+			transport: "browser" | "id-token";
+		},
+	): Promise<Response>;
+	authorizeLinkedAccounts?: AuthorizeLinkedAccounts;
+	missingBrowserSessionHeaders?(
+		request: Request,
+		path: "/list-accounts" | "/account-info",
+	): Promise<Headers | null>;
+	auditContext?(
+		request: Request,
+	): Pick<ControlEventInput, "ipAddress" | "userAgent">;
+	passwordSignIn?: boolean;
+	passkeySignIn?: boolean;
+	otherLinkedSignIn?(client: PoolClient, user: ProjectUser): Promise<boolean>;
+	fetch?: ProjectOAuthFetch;
+}
+
+function safeURL(value: string, base: string, origins: ReadonlySet<string>) {
+	if (
+		value.startsWith("//") ||
+		originControls.test(value) ||
+		!(value.startsWith("/") || /^https?:\/\//i.test(value))
+	)
+		return null;
+	try {
+		const url = new URL(value, base);
+		return !url.username && !url.password && origins.has(url.origin)
+			? url
+			: null;
+	} catch {
+		return null;
+	}
+}
+
+function publicJSON(body: unknown, status: number, headers = new Headers()) {
+	headers.set("cache-control", "no-store");
+	return Response.json(body, { status, headers });
+}
+
+function publicFailure(code: string, message: string, status: number) {
+	return publicJSON({ code, message }, status);
+}
+
+function rejectedResponse(result: {
+	code: string;
+	message: string;
+	httpStatus: number;
+}) {
+	return publicFailure(result.code, result.message, result.httpStatus);
+}
+
+function boundedExpiry(seconds: unknown) {
+	return typeof seconds === "number" &&
+		Number.isFinite(seconds) &&
+		seconds > 0 &&
+		seconds <= 315_576_000
+		? new Date(Date.now() + seconds * 1000)
+		: undefined;
+}
+
+function navigation(response: Response, stateCookie: string) {
+	const headers = new Headers(response.headers);
+	headers.append("set-cookie", stateCookie);
+	headers.set("cache-control", "no-store");
+	headers.set("referrer-policy", "no-referrer");
+	const result = new Response(response.body, {
+		status: response.status,
+		headers,
+	});
+	const failureCode = ownedCallbackFailureCode(response);
+	return failureCode ? markOwnedCallbackFailure(result, failureCode) : result;
+}
+
+function publicRedirect(url: string) {
+	return new Response(null, { status: 302, headers: { location: url } });
+}
+
+/** A project OAuth client for the shared AllAuth broker and an explicitly configured Google client. */
+export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
+	const origin = projectOrigin.parse(options.baseURL);
+	const slug = projectSlug.parse(options.project.slug);
+	const origins = new Set([
+		origin,
+		...options.trustedOrigins.map((value) => projectOrigin.parse(value)),
+	]);
+	if (
+		!["/api/auth", `/api/projects/${slug}/auth`].includes(options.basePath) ||
+		options.signingSecret.length < 32
+	)
+		throw new Error("Invalid project OAuth configuration.");
+	const defaultError = safeURL(options.defaultErrorURL, origin, origins);
+	if (!defaultError) throw new Error("Invalid project OAuth error URL.");
+	const tokenKeys = options.tokenKeys ?? { secret: options.signingSecret };
+	const store = createProjectOAuthStore(
+		options.database,
+		options.project.schemaName,
+		tokenKeys,
+		options.reservedEmail,
+	);
+	const linked = createOwnedProjectLinkedAccounts(
+		options.database,
+		options.project.schemaName,
+		options.authorizeLinkedAccounts,
+		{
+			socialProviders: projectOAuthProvider.options.filter((provider) =>
+				credentials(provider),
+			),
+			passwordSignIn: options.passwordSignIn !== false,
+			passkeySignIn: options.passkeySignIn === true,
+			otherSignIn: options.otherLinkedSignIn,
+		},
+	);
+	const secure = origin.startsWith("https:");
+	const stateCookie = `${secure ? "__Secure-" : ""}allauth_project_${slug}.state`;
+	const sessionCookie = `${secure ? "__Secure-" : ""}allauth_project_${slug}.session_token`;
+	const attributes = `Path=/; HttpOnly; SameSite=${options.apple ? "None" : "Lax"}${secure ? "; Secure" : ""}`;
+	const expireState = `${stateCookie}=; Max-Age=0; ${attributes}`;
+	const network: ProjectOAuthFetch = (input, init) =>
+		(options.fetch ?? globalThis.fetch)(input, init);
+	const providerNetwork: ProjectOAuthFetch = (input, init) =>
+		network(input, { ...init, redirect: "error" });
+	const appleKeys =
+		options.apple &&
+		createRemoteJWKSet(new URL(appleMetadata.jwks_uri!), {
+			[joseFetch]: providerNetwork,
+			timeoutDuration: 7000,
+		});
+	const appleBindingFailures = {
+		SOCIAL_ACCOUNT_ALREADY_LINKED: ["Social account already linked", 409],
+		LINKING_NOT_ALLOWED: ["Account not linked - linking not allowed", 401],
+		LINKING_DIFFERENT_EMAILS_NOT_ALLOWED: [
+			"Account not linked - different emails not allowed",
+			401,
+		],
+		USER_EMAIL_NOT_FOUND: ["User email not found", 401],
+		[reservedProjectEmailError.code]: [
+			reservedProjectEmailError.message,
+			reservedProjectEmailError.status,
+		],
+		SIGN_UP_DISABLED: [
+			"New account registration is disabled for this application.",
+			403,
+		],
+	} as const;
+	const issuer = new URL(options.broker.issuer);
+	const discoveryURL = new URL(options.broker.discoveryURL);
+	if (
+		issuer.protocol !== "https:" ||
+		issuer.username ||
+		issuer.password ||
+		issuer.search ||
+		issuer.hash ||
+		discoveryURL.origin !== issuer.origin ||
+		discoveryURL.username ||
+		discoveryURL.password ||
+		discoveryURL.hash
+	)
+		throw new Error("Invalid project broker issuer.");
+
+	function checkCredentials(
+		provider: ProjectOAuthProvider,
+		config: Credentials | AppleCredentials,
+	) {
+		const url = safeURL(config.redirectURI, origin, origins);
+		const path = url?.pathname;
+		if (
+			!config.clientId ||
+			!config.clientSecret ||
+			!url ||
+			(provider === "apple" && (!secure || url.protocol !== "https:")) ||
+			url.search ||
+			url.hash ||
+			![
+				`/api/auth/callback/${provider}`,
+				`/api/allauth/callback/${provider}`,
+			].includes(path ?? "")
+		)
+			throw new Error("Invalid project OAuth provider configuration.");
+	}
+	checkCredentials("allauth", options.broker);
+	if (options.google) checkCredentials("google", options.google);
+	if (options.apple) checkCredentials("apple", options.apple);
+	if (options.microsoft) checkCredentials("microsoft", options.microsoft);
+	const microsoftServer =
+		options.microsoft && microsoftMetadata(options.microsoft.tenantId);
+
+	let brokerDiscovery:
+		| { expires: number; pending: Promise<oauth.AuthorizationServer> }
+		| undefined;
+	const resolvers = new Map<string, ReturnType<typeof createRemoteJWKSet>>();
+
+	async function discoverBroker() {
+		const response = await network(discoveryURL, {
+			headers: { accept: "application/json" },
+			redirect: "error",
+			signal: AbortSignal.timeout(7000),
+		});
+		const metadata = await oauth.processDiscoveryResponse(issuer, response);
+		for (const value of [
+			metadata.authorization_endpoint,
+			metadata.token_endpoint,
+			metadata.jwks_uri,
+			...(metadata.userinfo_endpoint ? [metadata.userinfo_endpoint] : []),
+		]) {
+			const url = value && new URL(value);
+			if (
+				!url ||
+				url.origin !== issuer.origin ||
+				url.username ||
+				url.password ||
+				url.hash
+			)
+				throw new Error("Invalid project broker metadata.");
+		}
+		return metadata;
+	}
+
+	function metadata(provider: ProjectOAuthProvider) {
+		if (provider === "google") return Promise.resolve(googleMetadata);
+		if (provider === "apple") return Promise.resolve(appleMetadata);
+		if (provider === "microsoft") {
+			if (!microsoftServer)
+				throw new Error("Microsoft is unavailable in this project.");
+			return Promise.resolve(microsoftServer);
+		}
+		if (!brokerDiscovery || brokerDiscovery.expires <= Date.now()) {
+			const pending = discoverBroker();
+			brokerDiscovery = { expires: Date.now() + 300_000, pending };
+			void pending.catch(() => {
+				if (brokerDiscovery?.pending === pending) brokerDiscovery = undefined;
+			});
+		}
+		return brokerDiscovery.pending;
+	}
+
+	function credentials(provider: ProjectOAuthProvider) {
+		return provider === "allauth" ? options.broker : options[provider];
+	}
+
+	function route(request: Request, path: string) {
+		const url = new URL(request.url);
+		return url.origin === origin &&
+			url.pathname === `${options.basePath}/${path}`
+			? url
+			: null;
+	}
+
+	function browserRequest(
+		request: Request,
+		path: string,
+		method: "GET" | "POST",
+		ignoreAuthorization = false,
+	) {
+		const caller = request.headers.get("origin");
+		return (
+			request.method === method &&
+			route(request, path) &&
+			(ignoreAuthorization || !request.headers.has("authorization")) &&
+			request.headers.get("sec-fetch-site") !== "cross-site" &&
+			(caller === null ? method === "GET" : origins.has(caller))
+		);
+	}
+
+	function browserToken(request: Request) {
+		return readLegacySessionCookie(
+			request.headers,
+			sessionCookie,
+			options.signingSecret,
+		);
+	}
+
+	function signedHostedContinuation(target: URL, allowExpired: boolean) {
+		if (
+			options.basePath !== "/api/auth" ||
+			target.href.length > maximumProjectOAuthReturnLength ||
+			target.origin !== origin ||
+			target.pathname !== "/oauth2/continue" ||
+			target.hash ||
+			target.searchParams.has("token") ||
+			target.searchParams.has("error") ||
+			target.searchParams.getAll("client_id").length !== 1
+		)
+			return false;
+		const query = target.searchParams.toString();
+		const signed = readSignedProjectIssuerQuery(query, options.signingSecret);
+		if (signed) return !signed.consentSessionId;
+		// A completed provider round trip may outlast the issuer's continuation.
+		// Preserve its exact redirect to the issuer's existing expiry handling.
+		return (
+			allowExpired &&
+			isAuthenticExpiredProjectIssuerEmailContinuation(query, options.signingSecret)
+		);
+	}
+
+	function errorRedirect(
+		code: string,
+		state?: ProjectOAuthState,
+		clearState = false,
+		description?: string,
+	) {
+		const target =
+			(state?.errorURL && safeURL(state.errorURL, origin, origins)) ||
+			new URL(defaultError!.href);
+		target.searchParams.set("error", code);
+		if (description) target.searchParams.set("error_description", description);
+		const result = publicRedirect(target.href);
+		if (clearState)
+			return markOwnedCallbackFailure(navigation(result, expireState), code);
+		result.headers.set("cache-control", "no-store");
+		result.headers.set("referrer-policy", "no-referrer");
+		return markOwnedCallbackFailure(result, code);
+	}
+
+	async function redirectStart(
+		request: Request,
+		input: OwnedProjectOAuthStart,
+		linking: boolean,
+	) {
+		const requestOrigin = request.headers.get("origin");
+		if (
+			!requestOrigin ||
+			!browserRequest(
+				request,
+				linking ? "link-social" : "sign-in/social",
+				"POST",
+			)
+		)
+			return publicFailure(
+				"FORBIDDEN",
+				"This authentication request is not permitted.",
+				403,
+			);
+		const linkToken = linking ? browserToken(request) : null;
+		if (linking && !linkToken)
+			return publicFailure("UNAUTHORIZED", "Unauthorized", 401);
+		const regular = ownedProjectOAuthStartInput.safeParse(input);
+		const hosted =
+			!linking &&
+			requestOrigin === origin &&
+			hostedSocialSignInRequests.has(request);
+		const parsed =
+			!regular.success && hosted
+				? ownedProjectHostedSocialContinuationInput.safeParse(input)
+				: regular;
+		if (!parsed.success)
+			return publicJSON(
+				{ code: "INVALID_BODY", message: "Invalid provider sign-in request." },
+				400,
+			);
+		const body: OwnedProjectOAuthStart = parsed.data;
+		const client = credentials(body.provider);
+		if (!client)
+			return publicJSON(
+				{ code: "PROVIDER_NOT_FOUND", message: "Provider not found" },
+				404,
+			);
+		const destination = safeURL(
+			body.callbackURL ?? origin,
+			requestOrigin,
+			origins,
+		);
+		const newUser =
+			body.newUserCallbackURL === undefined
+				? undefined
+				: safeURL(body.newUserCallbackURL, requestOrigin, origins);
+		const error =
+			body.errorCallbackURL === undefined
+				? undefined
+				: safeURL(body.errorCallbackURL, requestOrigin, origins);
+		if (
+			!destination ||
+			newUser === null ||
+			error === null ||
+			(!regular.success && !signedHostedContinuation(destination, false))
+		)
+			return publicJSON(
+				{
+					code: "FORBIDDEN",
+					message: "This authentication destination is not permitted.",
+				},
+				403,
+			);
+		const state = oauth.generateRandomState();
+		const codeVerifier = oauth.generateRandomCodeVerifier();
+		const nonce = oauth.generateRandomNonce();
+		let authorization: URL;
+		try {
+			const provider = await metadata(body.provider);
+			authorization = new URL(provider.authorization_endpoint!);
+			authorization.searchParams.set("client_id", client.clientId);
+			authorization.searchParams.set("redirect_uri", client.redirectURI);
+			const apple = body.provider === "apple";
+			authorization.searchParams.set(
+				"response_type",
+				apple ? "code id_token" : "code",
+			);
+			if (apple) authorization.searchParams.set("response_mode", "form_post");
+			const scopes = apple ? ["email", "name"] : ["openid", "profile", "email"];
+			authorization.searchParams.set(
+				"scope",
+				[...new Set([...scopes, ...(body.scopes ?? [])])].join(" "),
+			);
+			authorization.searchParams.set("state", state);
+			authorization.searchParams.set(
+				"code_challenge",
+				await oauth.calculatePKCECodeChallenge(codeVerifier),
+			);
+			authorization.searchParams.set("code_challenge_method", "S256");
+			authorization.searchParams.set("nonce", nonce);
+			if (body.loginHint && !apple)
+				authorization.searchParams.set("login_hint", body.loginHint);
+			if (body.provider === "google")
+				authorization.searchParams.set("include_granted_scopes", "true");
+			if (body.provider === "allauth" && options.broker.hintGoogle)
+				authorization.searchParams.set("idp_hint", "google");
+			setProjectAdditionalAuthorizationParams(
+				authorization,
+				body.additionalParams,
+			);
+			const flow: ProjectOAuthState = {
+				...body.additionalData,
+				link: undefined,
+				callbackURL: destination.href,
+				newUserURL: newUser?.href,
+				errorURL: error?.href,
+				codeVerifier,
+				expiresAt: Date.now() + oauthStateAge * 1000,
+				oauthState: state,
+				idTokenNonce: nonce,
+				requestSignUp: body.requestSignUp,
+				serverContext: {
+					ownedProjectProvider: body.provider,
+					anonymousUserId: linking
+						? undefined
+						: await options.readGuestUserId?.(request),
+				},
+			};
+			if (!linking) await store.issue(state, flow);
+			else {
+				const result = await store.transaction(async (client) => {
+					const authority = await linked.lockAuthority(
+						client,
+						request,
+						linkToken,
+						"link",
+					);
+					if (authority.status === "rejected") return authority;
+					await store.issue(
+						state,
+						{
+							...flow,
+							link: { userId: authority.user.id, email: authority.user.email },
+							serverContext: {
+								ownedProjectProvider: body.provider,
+								linkedSessionId: authority.session.id,
+							},
+						},
+						client,
+					);
+					await linked.record(
+						client,
+						"account.link-started",
+						"success",
+						"/link-social",
+						authority.user.id,
+					);
+					return authority;
+				});
+				if (result.status === "rejected") return rejectedResponse(result);
+			}
+		} catch {
+			return publicJSON(
+				{
+					code: "PROVIDER_UNAVAILABLE",
+					message: "Provider sign-in is temporarily unavailable.",
+				},
+				503,
+			);
+		}
+		const signature = createHmac("sha256", options.signingSecret)
+			.update(state)
+			.digest("base64");
+		const headers = new Headers({
+			"set-cookie": `${stateCookie}=${encodeURIComponent(`${state}.${signature}`)}; Max-Age=${oauthStateAge}; ${attributes}`,
+		});
+		const redirect = !body.disableRedirect;
+		if (redirect) headers.set("location", authorization.href);
+		return publicJSON({ url: authorization.href, redirect }, 200, headers);
+	}
+
+	function start(request: Request, input: OwnedProjectOAuthStart) {
+		return input.idToken
+			? directApple(request, input, input.idToken, false)
+			: redirectStart(request, input, false);
+	}
+
+	function startLink(request: Request, input: OwnedProjectOAuthStart) {
+		return input.idToken
+			? directApple(request, input, input.idToken, true)
+			: redirectStart(request, input, true);
+	}
+
+	async function verifyAppleToken(
+		token: string,
+		config: AppleCredentials,
+		nonce?: string,
+	) {
+		if (!appleKeys) throw new Error("Apple sign-in is unavailable.");
+		const { payload } = await jwtVerify(token, appleKeys, {
+			issuer: appleMetadata.issuer,
+			audience: config.appBundleIdentifier
+				? [config.clientId, config.appBundleIdentifier]
+				: config.clientId,
+			algorithms: ["RS256"],
+			requiredClaims: ["sub", "iat", "exp"],
+			maxTokenAge: "1h",
+		});
+		const clientId = appleTokenAudience(payload.aud, config);
+		const subject = payload.sub;
+		if (
+			!clientId ||
+			!subject ||
+			subject.length > 512 ||
+			originControls.test(subject) ||
+			(nonce && payload.nonce !== appleNonce(nonce, payload.nonce))
+		)
+			throw new Error("Apple identity is invalid.");
+		return { clientId, subject, payload };
+	}
+
+	async function verifiedAppleRefresh(
+		config: AppleCredentials,
+		subject: string,
+		clientId: string,
+		refreshToken: string,
+	) {
+		const client = { client_id: clientId };
+		const response = await oauth.refreshTokenGrantRequest(
+			appleMetadata,
+			client,
+			oauth.ClientSecretPost(await config.clientSecret(clientId)),
+			refreshToken,
+			{ [oauth.customFetch]: network, signal: AbortSignal.timeout(7000) },
+		);
+		const tokens = await oauth.processRefreshTokenResponse(
+			appleMetadata,
+			client,
+			response,
+		);
+		if (!tokens.id_token)
+			throw new Error("Apple did not return a grant identity.");
+		const proof = await verifyAppleToken(tokens.id_token, config);
+		if (proof.subject !== subject || proof.clientId !== clientId)
+			throw new Error("Apple grant does not match the verified identity.");
+		return {
+			accessToken: tokens.access_token,
+			idToken: tokens.id_token,
+			refreshToken,
+			accessTokenExpiresAt: boundedExpiry(tokens.expires_in),
+		};
+	}
+
+	const rejectedSignupProfile = Symbol("project OAuth signup profile rejected");
+
+	function profileAdmission(client: PoolClient, request: Request) {
+		const state: {
+			denied?: "existing" | "signup";
+			rollback?: () => Promise<void>;
+		} = {};
+		return {
+			state,
+			async denyProfile(email: string, action: "existing" | "signup") {
+				if (action === "signup" && options.prepareProviderSignup) {
+					const rollback = await options.prepareProviderSignup(
+						client,
+						request,
+						email,
+					);
+					if (!rollback) state.denied = action;
+					else state.rollback = rollback;
+					return !rollback;
+				}
+				if (!(await options.denyProviderProfile?.(client, request, email)))
+					return false;
+				// Native signup discards profile audit events when its provisional identity is refused.
+				if (action === "signup") throw rejectedSignupProfile;
+				state.denied = action;
+				return true;
+			},
+		};
+	}
+
+	async function directApple(
+		request: Request,
+		input: OwnedProjectOAuthStart,
+		token: NonNullable<OwnedProjectOAuthStart["idToken"]>,
+		linking: boolean,
+	) {
+		const operation = linking ? "link-social" : "sign-in/social";
+		if (!browserRequest(request, operation, "POST"))
+			return publicFailure(
+				"FORBIDDEN",
+				"This authentication request is not permitted.",
+				403,
+			);
+		if (!credentials(input.provider))
+			return publicFailure("PROVIDER_NOT_FOUND", "Provider not found", 404);
+		const config = options.apple;
+		if (input.provider !== "apple" || !config)
+			return publicFailure(
+				"ID_TOKEN_NOT_SUPPORTED",
+				"id_token not supported",
+				404,
+			);
+		const requestOrigin = request.headers.get("origin")!;
+		const destination = safeURL(
+			input.callbackURL ?? "/",
+			requestOrigin,
+			origins,
+		);
+		if (
+			!destination ||
+			[input.newUserCallbackURL, input.errorCallbackURL].some(
+				(value) =>
+					value !== undefined && !safeURL(value, requestOrigin, origins),
+			)
+		)
+			return publicFailure(
+				"FORBIDDEN",
+				"This authentication destination is not permitted.",
+				403,
+			);
+
+		const sessionToken = linking ? browserToken(request) : null;
+		if (linking && !sessionToken)
+			return publicFailure("UNAUTHORIZED", "Unauthorized", 401);
+		const authority = sessionToken
+			? await store.transaction((client) =>
+					linked.lockAuthority(client, request, sessionToken, "link"),
+				)
+			: null;
+		if (authority?.status === "rejected") return rejectedResponse(authority);
+
+		let identity: ProjectOAuthIdentity;
+		try {
+			const { clientId, subject, payload } = await verifyAppleToken(
+				token.token,
+				config,
+				token.nonce,
+			);
+			const email =
+				payload.email === undefined || payload.email === ""
+					? undefined
+					: z.email().max(320).parse(payload.email).toLowerCase();
+			identity = {
+				provider: "apple",
+				subject,
+				email,
+				idToken: token.token,
+				emailVerified:
+					payload.email_verified === true || payload.email_verified === "true",
+				name:
+					appleProfileName(token.user) ??
+					(typeof payload.name === "string" ? payload.name.slice(0, 256) : ""),
+				accessToken: token.accessToken,
+			};
+			if (linking && token.refreshToken)
+				Object.assign(
+					identity,
+					await verifiedAppleRefresh(
+						config,
+						subject,
+						clientId,
+						token.refreshToken,
+					),
+				);
+		} catch {
+			return publicFailure("INVALID_TOKEN", "Invalid token", 401);
+		}
+
+		const link =
+			sessionToken && authority?.status === "authorized"
+				? {
+						userId: authority.user.id,
+						email: authority.user.email,
+						sessionToken,
+					}
+				: undefined;
+		const profileFailure = () =>
+			publicFailure("validation_failed", "User validation failed", 403);
+		const directFailure = (error: unknown) =>
+			error === rejectedSignupProfile
+				? profileFailure()
+				: error instanceof Response
+					? error
+					: publicFailure(
+							"PROVIDER_UNAVAILABLE",
+							"Provider sign-in is temporarily unavailable.",
+							503,
+						);
+		try {
+			return await store.transaction(async (client) => {
+				const { state, denyProfile } = profileAdmission(client, request);
+				try {
+					const account = await store.bind(
+						client,
+						identity,
+						{
+							signUpEnabled: options.signUpEnabled,
+							requireEmailVerification: false,
+							denyProfile: linking ? undefined : denyProfile,
+						},
+						link,
+						`/${operation}`,
+					);
+					if (state.denied) return profileFailure();
+					if (!account)
+						throw publicFailure("OAUTH_LINK_ERROR", "Account not linked", 401);
+					if ("error" in account) {
+						const [message, status] = appleBindingFailures[account.error];
+						throw publicFailure(
+							account.error === "SIGN_UP_DISABLED"
+								? "FORBIDDEN"
+								: account.error,
+							message,
+							status,
+						);
+					}
+					if (link) {
+						if (
+							options.authorizeLinkedAccounts &&
+							!(await options.authorizeLinkedAccounts(client, {
+								request,
+								user: account.user,
+								operation: "link-callback",
+							}))
+						)
+							throw publicFailure(
+								"FORBIDDEN",
+								"This authentication request is not permitted.",
+								403,
+							);
+						return publicJSON({ url: "", status: true, redirect: false }, 200);
+					}
+					const response = await options.complete(client, {
+						request,
+						user: account.user,
+						provider: "apple",
+						destination: destination.href,
+						registered: account.registered,
+						transport: "id-token",
+					});
+					if (response.status >= 400) throw response;
+					return response;
+				} catch (error) {
+					if (!state.rollback) throw error;
+					await state.rollback();
+					return directFailure(error);
+				}
+			});
+		} catch (error) {
+			return directFailure(error);
+		}
+	}
+
+	async function listAccounts(request: Request) {
+		if (!browserRequest(request, "list-accounts", "GET"))
+			return publicFailure(
+				"FORBIDDEN",
+				"This authentication request is not permitted.",
+				403,
+			);
+		const headers = await options.missingBrowserSessionHeaders?.(
+			request,
+			"/list-accounts",
+		);
+		if (headers)
+			return publicJSON(
+				{ code: "UNAUTHORIZED", message: "Unauthorized" },
+				401,
+				headers,
+			);
+		const result = await linked.list(request, browserToken(request));
+		return result.status === "rejected"
+			? rejectedResponse(result)
+			: publicJSON(result.accounts, 200);
+	}
+
+	async function unlinkAccount(
+		request: Request,
+		input: OwnedProjectOAuthUnlink,
+	) {
+		if (!browserRequest(request, "unlink-account", "POST"))
+			return publicFailure(
+				"FORBIDDEN",
+				"This authentication request is not permitted.",
+				403,
+			);
+		const result = await linked.unlink(
+			request,
+			browserToken(request),
+			input,
+			options.auditContext?.(request),
+		);
+		return result.status === "rejected"
+			? rejectedResponse(result)
+			: publicJSON({ status: true }, 200);
+	}
+
+	function providerTokenServer(
+		provider: ProjectOAuthProvider,
+		as: oauth.AuthorizationServer,
+		claims: JWTPayload,
+	) {
+		// Google publishes two issuer spellings. The network endpoints and keys remain pinned.
+		if (provider === "google" && claims.iss === "accounts.google.com")
+			return { ...as, issuer: "accounts.google.com" };
+		if (provider === "microsoft")
+			return {
+				...as,
+				issuer: microsoftIssuer(options.microsoft!.tenantId, claims),
+			};
+		return as;
+	}
+
+	async function verifyProviderToken(
+		provider: ProjectOAuthProvider,
+		as: oauth.AuthorizationServer,
+		tokenServer: oauth.AuthorizationServer,
+		token: string,
+		clientId: string,
+		currentDate?: Date,
+	) {
+		const jwks = as.jwks_uri!;
+		const resolverKey = provider === "microsoft" ? tokenServer.issuer : jwks;
+		let resolver = resolvers.get(resolverKey);
+		if (!resolver) {
+			if (resolvers.size >= 32) resolvers.clear();
+			resolver = createRemoteJWKSet(new URL(jwks), {
+				[joseFetch]:
+					provider === "microsoft"
+						? async (input, init) => {
+								const keys = await providerNetwork(input, init);
+								if (!keys.ok) return keys;
+								const data = z
+									.object({
+										keys: z
+											.array(z.looseObject({ issuer: z.string().optional() }))
+											.max(64),
+									})
+									.parse(await keys.json());
+								return Response.json({
+									keys: data.keys.filter(
+										({ issuer }) =>
+											issuer === undefined ||
+											issuer === tokenServer.issuer ||
+											issuer ===
+												"https://login.microsoftonline.com/{tenantid}/v2.0",
+									),
+								});
+							}
+						: providerNetwork,
+				timeoutDuration: 7000,
+			});
+			resolvers.set(resolverKey, resolver);
+		}
+		const algorithms =
+			as.id_token_signing_alg_values_supported?.filter((value) =>
+				trustedSigningAlgorithms.includes(value),
+			) ?? trustedSigningAlgorithms;
+		const { payload } = await jwtVerify(token, resolver, {
+			issuer: tokenServer.issuer,
+			audience: clientId,
+			algorithms,
+			requiredClaims: ["sub", "iat", "exp"],
+			...(currentDate
+				? { currentDate }
+				: provider !== "allauth"
+					? { maxTokenAge: 3600 }
+					: {}),
+		});
+		return payload;
+	}
+
+	function savedProviderToken(token: string) {
+		if (token.length > 32768) throw new Error("Invalid provider ID token.");
+		return decodeJwt(token);
+	}
+
+	function linkedClientId(
+		provider: ProjectOAuthProvider,
+		config: Credentials | AppleCredentials,
+		claims?: JWTPayload,
+	) {
+		if (provider !== "apple" || !claims) return config.clientId;
+		const audience = appleTokenAudience(claims.aud, config);
+		if (!audience) throw new Error("Invalid linked Apple audience.");
+		return audience;
+	}
+
+	async function linkedIdentityToken(
+		provider: ProjectOAuthProvider,
+		as: oauth.AuthorizationServer,
+		token: string,
+		clientId: string,
+		historic: boolean,
+	) {
+		const claims = savedProviderToken(token);
+		let signedAt: Date | undefined;
+		if (historic) {
+			if (
+				!Number.isSafeInteger(claims.iat) ||
+				!claims.iat ||
+				claims.iat < 0 ||
+				claims.iat > Date.now() / 1000 + 60
+			)
+				throw new Error("Invalid stored provider ID token time.");
+			// A stored claim is verified at issuance for account display only. It is never reused to sign in.
+			signedAt = new Date(claims.iat * 1000);
+		}
+		return verifyProviderToken(
+			provider,
+			as,
+			providerTokenServer(provider, as, claims),
+			token,
+			clientId,
+			signedAt,
+		);
+	}
+
+	async function refreshLinkedAccount(
+		provider: ProjectOAuthProvider,
+		config: Credentials | AppleCredentials,
+		as: oauth.AuthorizationServer,
+		account: LinkedAccountGrant,
+	) {
+		const refreshToken = readLinkedOAuthToken(account.refreshToken, tokenKeys);
+		if (!refreshToken) throw new Error("Missing stored refresh grant.");
+		const savedClaims =
+			provider === "apple" && account.idToken
+				? savedProviderToken(account.idToken)
+				: undefined;
+		const clientId = linkedClientId(provider, config, savedClaims);
+		const client: oauth.Client = { client_id: clientId };
+		const secret =
+			typeof config.clientSecret === "string"
+				? config.clientSecret
+				: await config.clientSecret(clientId);
+		const authenticate =
+			provider === "allauth"
+				? oauth.ClientSecretBasic(secret)
+				: oauth.ClientSecretPost(secret);
+		const response = await oauth.refreshTokenGrantRequest(
+			as,
+			client,
+			authenticate,
+			refreshToken,
+			{
+				[oauth.customFetch]: providerNetwork,
+				signal: AbortSignal.timeout(7000),
+				...(provider === "microsoft" && {
+					additionalParameters: { scope: "openid profile email" },
+				}),
+			},
+		);
+		let tokenServer = as;
+		if (response.ok && (provider === "google" || provider === "microsoft")) {
+			const raw: unknown = await response.clone().json();
+			if (
+				raw &&
+				typeof raw === "object" &&
+				"id_token" in raw &&
+				typeof raw.id_token === "string"
+			)
+				tokenServer = providerTokenServer(
+					provider,
+					as,
+					savedProviderToken(raw.id_token),
+				);
+		}
+		const tokens = await oauth.processRefreshTokenResponse(
+			tokenServer,
+			client,
+			response,
+		);
+		if (
+			tokens.token_type !== "bearer" ||
+			tokens.access_token.length > 32768 ||
+			(tokens.refresh_token?.length ?? 0) > 32768
+		)
+			throw new Error("Invalid linked provider token response.");
+		let idToken = account.idToken;
+		if (tokens.id_token) {
+			// A temporary signing-key failure must not lose a refresh grant the provider has already rotated.
+			const identity = await linkedIdentityToken(
+				provider,
+				as,
+				tokens.id_token,
+				clientId,
+				false,
+			).catch(() => undefined);
+			if (identity) {
+				linkedProviderProfile(account, provider, identity);
+				idToken = tokens.id_token;
+			}
+		}
+		return {
+			accessToken: sealLegacyMfaRecord(tokens.access_token, tokenKeys),
+			accessTokenExpiresAt: boundedExpiry(tokens.expires_in) ?? null,
+			refreshToken: tokens.refresh_token
+				? sealLegacyMfaRecord(tokens.refresh_token, tokenKeys)
+				: account.refreshToken,
+			refreshTokenExpiresAt:
+				boundedExpiry(tokens.refresh_token_expires_in) ??
+				account.refreshTokenExpiresAt,
+			idToken,
+		};
+	}
+
+	const providerTokenSelection = z.union([
+		z.strictObject({
+			accountId: z.string(),
+			userId: z.string().optional(),
+		}),
+		z.strictObject({
+			useAccountCookie: z.literal(true),
+			userId: z.string().optional(),
+		}),
+	]);
+	function configuredLinkedProvider(account: LinkedAccountGrant) {
+		const provider = projectOAuthProvider.safeParse(account.providerId);
+		if (!provider.success) return;
+		const config = credentials(provider.data);
+		if (config) return { provider: provider.data, config };
+	}
+
+	function accessTokenFailure() {
+		return publicFailure(
+			"FAILED_TO_GET_ACCESS_TOKEN",
+			"Failed to get a valid access token",
+			400,
+		);
+	}
+
+	async function providerToken(
+		request: Request,
+		readBody: () => Promise<unknown>,
+		path: "/get-access-token" | "/refresh-token",
+		bearer: string | null,
+	): Promise<Response> {
+		// Browser authority comes from the owning session cookie. The direct bearer has its own origin check.
+		const routeName = path.slice(1);
+		if (
+			!browserRequest(request, routeName, "POST", true) &&
+			!(bearer && request.method === "POST" && route(request, routeName))
+		)
+			return publicFailure(
+				"FORBIDDEN",
+				"This authentication request is not permitted.",
+				403,
+			);
+		const selection = providerTokenSelection.safeParse(await readBody());
+		if (!selection.success)
+			return publicFailure("VALIDATION_ERROR", "[body] Invalid input", 400);
+		// This PostgreSQL realm uses the owning live session and local row ID. Its
+		// native engine did not enable the stateless provider account cookie.
+		const accountId =
+			"accountId" in selection.data ? selection.data.accountId : null;
+		const forceRefresh = path === "/refresh-token";
+		function tokenFailure() {
+			return forceRefresh
+				? publicFailure(
+						"FAILED_TO_REFRESH_ACCESS_TOKEN",
+						"Failed to refresh access token",
+						400,
+					)
+				: accessTokenFailure();
+		}
+		let issuedExpiry: Date | undefined;
+		let refreshFailed = false;
+		const loaded = await linked.info(
+			request,
+			bearer ?? browserToken(request),
+			accountId,
+			{
+				operation: "provider-token",
+				forceRefresh,
+				async refresh(account) {
+					const configured = configuredLinkedProvider(account);
+					if (!configured || !account.refreshToken) return;
+					try {
+						const { provider, config } = configured;
+						const rotated = await refreshLinkedAccount(
+							provider,
+							config,
+							await metadata(provider),
+							account,
+						);
+						issuedExpiry = rotated.accessTokenExpiresAt ?? undefined;
+						return {
+							...rotated,
+							accessTokenExpiresAt:
+								issuedExpiry ?? account.accessTokenExpiresAt,
+						};
+					} catch {
+						refreshFailed = true;
+					}
+				},
+			},
+		);
+		if (loaded.status === "rejected") return rejectedResponse(loaded);
+		if (refreshFailed) return tokenFailure();
+		const { account } = loaded;
+		if (!configuredLinkedProvider(account))
+			return publicFailure(
+				"PROVIDER_NOT_SUPPORTED",
+				`Provider ${account.providerId} is not supported.`,
+				400,
+			);
+		if (forceRefresh && !account.refreshToken)
+			return publicFailure(
+				"REFRESH_TOKEN_NOT_FOUND",
+				"Refresh token not found",
+				400,
+			);
+		try {
+			const accessToken =
+				readLinkedOAuthToken(account.accessToken, tokenKeys) ?? "";
+			const headers = new Headers({ "referrer-policy": "no-referrer" });
+			if (forceRefresh)
+				return publicJSON(
+					{
+						accessToken,
+						refreshToken: readLinkedOAuthToken(account.refreshToken, tokenKeys),
+						accessTokenExpiresAt: issuedExpiry,
+						refreshTokenExpiresAt: account.refreshTokenExpiresAt,
+						scope: account.scope,
+						idToken: account.idToken,
+						providerId: account.providerId,
+						accountId: account.id,
+					},
+					200,
+					headers,
+				);
+			return publicJSON(
+				{
+					accessToken,
+					accessTokenExpiresAt: account.accessTokenExpiresAt ?? undefined,
+					scopes: linkedAccountScopes(account.scope),
+					idToken: account.idToken ?? undefined,
+				},
+				200,
+				headers,
+			);
+		} catch {
+			return tokenFailure();
+		}
+	}
+
+	async function accountInfo(request: Request) {
+		if (!browserRequest(request, "account-info", "GET"))
+			return publicFailure(
+				"FORBIDDEN",
+				"This authentication request is not permitted.",
+				403,
+			);
+		const query = new URL(request.url).searchParams;
+		const accountId = query.get("accountId");
+		if (
+			!accountId ||
+			accountId.length > 512 ||
+			query.getAll("accountId").length !== 1 ||
+			query.getAll("userId").length > 1 ||
+			[...query.keys()].some(
+				(name) => name !== "accountId" && name !== "userId",
+			)
+		)
+			return publicFailure("INVALID_QUERY", "Select a linked account.", 400);
+		const headers = await options.missingBrowserSessionHeaders?.(
+			request,
+			"/account-info",
+		);
+		if (headers) return new Response(null, { status: 401, headers });
+		const token = browserToken(request);
+		const loaded = await linked.info(request, token, accountId);
+		if (loaded.status === "rejected") return rejectedResponse(loaded);
+		let { account } = loaded;
+		const provider = projectOAuthProvider.safeParse(account.providerId);
+		const config = provider.success ? credentials(provider.data) : undefined;
+		if (!provider.success || !config)
+			return publicFailure(
+				"PROVIDER_NOT_CONFIGURED",
+				"Account is not associated with a configured social provider.",
+				400,
+			);
+		let as: oauth.AuthorizationServer;
+		let accessToken: string | undefined;
+		try {
+			as = await metadata(provider.data);
+			if (linkedAccessTokenNearExpiry(account)) {
+				const refreshed = await linked.info(request, token, accountId, {
+					refresh(current) {
+						if (
+							current.providerId !== account.providerId ||
+							current.accountId !== account.accountId
+						)
+							throw new Error("Linked provider account changed.");
+						return refreshLinkedAccount(provider.data, config, as, current);
+					},
+				});
+				if (refreshed.status === "rejected") return rejectedResponse(refreshed);
+				account = refreshed.account;
+			}
+			accessToken = readLinkedOAuthToken(account.accessToken, tokenKeys);
+		} catch {
+			return accessTokenFailure();
+		}
+		if (!accessToken)
+			return publicFailure(
+				"ACCESS_TOKEN_NOT_FOUND",
+				"Access token not found",
+				400,
+			);
+		try {
+			const claims = account.idToken
+				? savedProviderToken(account.idToken)
+				: undefined;
+			const clientId = linkedClientId(provider.data, config, claims);
+			let profile = account.idToken
+				? await linkedIdentityToken(
+						provider.data,
+						as,
+						account.idToken,
+						clientId,
+						provider.data !== "allauth",
+					)
+				: undefined;
+			if (
+				provider.data === "allauth" &&
+				!profile?.email &&
+				as.userinfo_endpoint
+			) {
+				const client: oauth.Client = { client_id: clientId };
+				profile = await oauth.processUserInfoResponse(
+					as,
+					client,
+					account.accountId,
+					await oauth.userInfoRequest(as, client, accessToken, {
+						[oauth.customFetch]: providerNetwork,
+						signal: AbortSignal.any([
+							request.signal,
+							AbortSignal.timeout(7000),
+						]),
+					}),
+				);
+			}
+			if (!profile) throw new Error("Missing linked provider profile.");
+			const value = linkedProviderProfile(account, provider.data, profile);
+			const current = await linked.info(request, token, accountId);
+			if (current.status === "rejected") return rejectedResponse(current);
+			if (
+				current.account.providerId !== account.providerId ||
+				current.account.accountId !== account.accountId
+			)
+				return publicFailure("ACCOUNT_NOT_FOUND", "Account not found", 400);
+			return publicJSON(
+				value,
+				200,
+				new Headers({ "referrer-policy": "no-referrer" }),
+			);
+		} catch {
+			return publicFailure(
+				"FAILED_TO_GET_USER_INFO",
+				"Failed to get user info",
+				401,
+			);
+		}
+	}
+
+	async function getIdentity(
+		provider: ProjectOAuthProvider,
+		config: Credentials | AppleCredentials,
+		url: URL,
+		state: string,
+		flow: ProjectOAuthState,
+	) {
+		const as = await metadata(provider);
+		const client: oauth.Client = { client_id: config.clientId };
+		const query = oauth.validateAuthResponse(as, client, url, state);
+		if (provider !== "google" && !flow.idTokenNonce)
+			throw new Error("Project provider nonce is missing.");
+		const secret =
+			typeof config.clientSecret === "string"
+				? config.clientSecret
+				: await config.clientSecret(config.clientId);
+		const auth =
+			provider === "allauth"
+				? oauth.ClientSecretBasic(secret)
+				: oauth.ClientSecretPost(secret);
+		const response = await oauth.authorizationCodeGrantRequest(
+			as,
+			client,
+			auth,
+			query,
+			config.redirectURI,
+			flow.codeVerifier,
+			{
+				[oauth.customFetch]: network,
+				signal: AbortSignal.timeout(7000),
+			},
+		);
+		let tokenServer = as;
+		let expectedNonce = flow.idTokenNonce;
+		if (provider !== "allauth" && response.ok) {
+			const body: unknown = await response.clone().json();
+			if (
+				body &&
+				typeof body === "object" &&
+				"id_token" in body &&
+				typeof body.id_token === "string" &&
+				body.id_token.length <= 32768
+			) {
+				const claims = decodeJwt(body.id_token);
+				tokenServer = providerTokenServer(provider, as, claims);
+				if (provider === "apple" && expectedNonce)
+					expectedNonce = appleNonce(expectedNonce, claims.nonce);
+			}
+		}
+		const tokens = await oauth.processAuthorizationCodeResponse(
+			tokenServer,
+			client,
+			response,
+			{
+				expectedNonce: expectedNonce ?? oauth.expectNoNonce,
+				requireIdToken: true,
+			},
+		);
+		if (!tokens.id_token || tokens.token_type !== "bearer")
+			throw new Error("Invalid provider token response.");
+		const payload = await verifyProviderToken(
+			provider,
+			as,
+			tokenServer,
+			tokens.id_token,
+			config.clientId,
+		);
+		const subject = provider === "microsoft" ? payload.oid : payload.sub;
+		if (
+			typeof subject !== "string" ||
+			!subject ||
+			subject.length > 512 ||
+			originControls.test(subject)
+		)
+			throw new Error("Provider identity is incomplete.");
+		if (provider === "microsoft")
+			microsoftIssuer(options.microsoft!.tenantId, payload);
+		const profile =
+			!payload.email && as.userinfo_endpoint
+				? await oauth.processUserInfoResponse(
+						as,
+						client,
+						payload.sub!,
+						await oauth.userInfoRequest(as, client, tokens.access_token, {
+							[oauth.customFetch]: network,
+							signal: AbortSignal.timeout(7000),
+						}),
+					)
+				: payload;
+		const missingAppleEmail =
+			provider === "apple" &&
+			(profile.email === undefined || profile.email === "");
+		const email = missingAppleEmail
+			? undefined
+			: z.email().max(320).parse(profile.email).toLowerCase();
+		const emailVerified =
+			provider === "microsoft"
+				? microsoftEmailVerified(profile)
+				: profile.email_verified === true ||
+					(provider === "apple" && profile.email_verified === "true");
+		const displayName =
+			(provider === "apple"
+				? appleDisplayName(url.searchParams.get("user"))
+				: undefined) ??
+			(typeof profile.name === "string" ? profile.name.slice(0, 256) : "");
+		let image: string | undefined;
+		if (typeof profile.picture === "string" && profile.picture.length <= 2048) {
+			try {
+				const url = new URL(profile.picture);
+				if (
+					url.protocol === "https:" &&
+					!url.username &&
+					!url.password &&
+					!validAvatarPath(url.pathname)
+				)
+					image = url.href;
+			} catch {
+				/* An invalid optional profile image does not prevent authentication. */
+			}
+		}
+		return {
+			provider,
+			subject,
+			email,
+			emailVerified,
+			name: displayName,
+			image,
+			accessToken: tokens.access_token,
+			refreshToken: tokens.refresh_token,
+			idToken: tokens.id_token,
+			accessTokenExpiresAt: boundedExpiry(tokens.expires_in),
+			refreshTokenExpiresAt: boundedExpiry(tokens.refresh_token_expires_in),
+			scope: tokens.scope?.split(/\s+/).filter(Boolean).join(","),
+		};
+	}
+
+	async function callback(request: Request, provider: ProjectOAuthProvider) {
+		const url = route(request, `callback/${provider}`);
+		const config = credentials(provider);
+		if (!url || !config || request.headers.has("authorization"))
+			return errorRedirect("invalid_callback_request");
+		if (request.method === "POST" && provider === "apple") {
+			const caller = request.headers.get("origin");
+			if (!caller || (caller !== appleMetadata.issuer && !origins.has(caller)))
+				return errorRedirect("invalid_callback_request");
+			const continuation = await appleCallbackForm(request, url);
+			if (!continuation) return errorRedirect("invalid_callback_request");
+			const response = publicRedirect(continuation.href);
+			response.headers.set("cache-control", "no-store");
+			response.headers.set("referrer-policy", "no-referrer");
+			return response;
+		}
+		if (request.method !== "GET")
+			return errorRedirect("invalid_callback_request");
+		const states = url.searchParams.getAll("state");
+		const state = states.length === 1 ? states[0] : undefined;
+		if (!state || !statePattern.test(state))
+			return errorRedirect("state_not_found");
+		if (
+			readLegacySessionCookie(
+				request.headers,
+				stateCookie,
+				options.signingSecret,
+			) !== state
+		)
+			return errorRedirect("state_mismatch");
+		let flow: ProjectOAuthState | null = null;
+		const rejected = Symbol("project OAuth session rejected");
+		const profileFailure = (clearState = false) =>
+			errorRedirect(
+				"validation_failed",
+				flow ?? undefined,
+				clearState,
+				"User validation failed",
+			);
+		const callbackFailure = (error: unknown) =>
+			error === rejectedSignupProfile
+				? profileFailure(true)
+				: errorRedirect(
+						error === rejected ? "account_not_linked" : "internal_server_error",
+						flow ?? undefined,
+						true,
+					);
+		try {
+			const linkSession = browserToken(request);
+			flow = await store.consume(state, provider, linkSession, (value) => {
+				const target = safeURL(value, origin, origins);
+				return target !== null && signedHostedContinuation(target, true);
+			});
+			if (!flow) return errorRedirect("state_mismatch", undefined, true);
+			const destination = safeURL(flow.callbackURL, origin, origins);
+			const newUser =
+				flow.newUserURL === undefined
+					? undefined
+					: safeURL(flow.newUserURL, origin, origins);
+			if (!destination || newUser === null)
+				return errorRedirect("invalid_callback_request", flow, true);
+			let identity: Awaited<ReturnType<typeof getIdentity>>;
+			try {
+				identity = await getIdentity(provider, config, url, state, flow);
+			} catch {
+				return errorRedirect("invalid_code", flow, true);
+			}
+			const link =
+				flow.link && linkSession
+					? { ...flow.link, sessionToken: linkSession }
+					: undefined;
+			const anonymousUserId = flow.serverContext?.anonymousUserId;
+			const response = await store.transaction(async (client) => {
+				const { state: admission, denyProfile } = profileAdmission(
+					client,
+					request,
+				);
+				try {
+					const account = await store.bind(
+						client,
+						identity,
+						{
+							signUpEnabled: options.signUpEnabled,
+							requireEmailVerification:
+								options.requireEmailVerification &&
+								provider !== "microsoft" &&
+								provider !== "apple",
+							denyProfile,
+						},
+						link,
+					);
+					if (admission.denied)
+						return profileFailure(admission.denied === "signup");
+					if (
+						account &&
+						"error" in account &&
+						account.error === reservedProjectEmailError.code
+					) {
+						await admission.rollback?.();
+						return errorRedirect(
+							account.error,
+							flow ?? undefined,
+							true,
+							reservedProjectEmailError.message,
+						);
+					}
+					if (!account || "error" in account) throw rejected;
+					if (link) {
+						if (
+							options.authorizeLinkedAccounts &&
+							!(await options.authorizeLinkedAccounts(client, {
+								request,
+								user: account.user,
+								operation: "link-callback",
+							}))
+						)
+							throw rejected;
+						return publicRedirect(destination.href);
+					}
+					const response = await options.complete(client, {
+						request,
+						user: account.user,
+						provider,
+						destination: ((account.registered && newUser) || destination).href,
+						verificationDestination: destination.href,
+						anonymousUserId,
+						registered: account.registered,
+						transport: "browser",
+					});
+					if (response.status >= 400) {
+						// The native session gate follows token rotation for a verified, already-linked profile.
+						if (
+							options.denyProviderProfile &&
+							account.existingBinding &&
+							identity.email &&
+							identity.email.toLowerCase() !==
+								account.user.email.toLowerCase() &&
+							(await isStoredAccountPolicyDenial(response))
+						)
+							return errorRedirect(
+								projectSecurityBlockedCode,
+								flow ?? undefined,
+								false,
+								projectSecurityBlockedMessage,
+							);
+						throw rejected;
+					}
+					return response;
+				} catch (error) {
+					if (!admission.rollback) throw error;
+					await admission.rollback();
+					return callbackFailure(error);
+				}
+			});
+			return navigation(response, expireState);
+		} catch (error) {
+			return callbackFailure(error);
+		}
+	}
+
+	return {
+		start,
+		startLink,
+		listAccounts,
+		accountInfo,
+		providerToken,
+		unlinkAccount,
+		callback,
+	};
+}

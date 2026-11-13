@@ -1,4 +1,6 @@
-import { AllAuthAuth } from "@/components/better-auth-ui/allauth-auth";
-export default function Page() {
-	return <AllAuthAuth view="signIn" />;
+import { HostedProjectAuthPage } from "@/components/hosted-project-auth-page";
+import type { HostedProjectAuthPageProps } from "@/components/hosted-project-auth-page";
+
+export default function Page(props: HostedProjectAuthPageProps) {
+	return <HostedProjectAuthPage view="signIn" {...props} />;
 }

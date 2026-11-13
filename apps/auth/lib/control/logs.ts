@@ -5,7 +5,7 @@ import { createAuthEndpoint } from "better-auth/api";
 import { sql } from "kysely";
 import * as z from "zod";
 import { rolesInclude } from "../configuration";
-import { publicControlEvent } from "./events";
+import { publicControlEvent } from "./event-contract";
 import { canonicalIP } from "./security";
 import type { ControlDatabase, ControlEventFilters, ControlEventsResponse, ControlPrincipal } from "./types";
 
@@ -19,13 +19,13 @@ const shape = {
 };
 const interval = (value: { from?: string; to?: string }) => !value.from || !value.to || new Date(value.from) <= new Date(value.to);
 export const controlLogsQuery = z.object({ ...shape, limit: z.coerce.number().int().min(1).max(100).default(25), offset: z.coerce.number().int().min(0).max(100000).default(0) }).strict().refine(interval, { message: "The start date must precede the end date." }).prefault({});
-const detailQuery = z.object({ ...shape, id: identifier }).strict().refine(interval);
+export const controlLogDetailQuery = z.object({ ...shape, id: identifier }).strict().refine(interval);
 export interface ControlLogFilters extends ControlEventFilters { id?: string; ipAddress?: string; actorId?: string; targetId?: string; clientId?: string; sessionId?: string }
 const fields = ["id", "type", "outcome", "actorId", "userId", "organizationId", "clientId", "targetId", "ipAddress", "userAgent", "createdAt", "metadata"];
 const escapedLike = (value: string) => `%${value.replaceAll("\\", "\\\\").replaceAll("%", "\\%").replaceAll("_", "\\_")}%`;
 
 /** Search scope is authorized before this parameterized, retention-bounded query executes. */
-export async function queryControlLogs(adapter: Pick<DBAdapter, "findMany" | "count">, database: ControlDatabase | undefined, filters: ControlLogFilters, retentionDays: number): Promise<ControlEventsResponse> {
+export async function queryControlLogs(adapter: Pick<DBAdapter, "findMany" | "count"> | undefined, database: ControlDatabase | undefined, filters: ControlLogFilters, retentionDays: number): Promise<ControlEventsResponse> {
 	const oldest = new Date(Date.now() - retentionDays * 86400_000); const from = filters.from ? new Date(filters.from) : oldest;
 	const where: Where[] = [{ field: "createdAt", operator: "gte", value: from < oldest ? oldest : from }];
 	if (filters.to) where.push({ field: "createdAt", operator: "lte", value: new Date(filters.to) });
@@ -42,6 +42,7 @@ export async function queryControlLogs(adapter: Pick<DBAdapter, "findMany" | "co
 		]);
 		rows = records.rows; total = Number(count.rows[0]?.total || 0);
 	} else {
+		if (!adapter) throw new Error("Log database is unavailable.");
 		if (filters.q || filters.sessionId) throw new APIError("BAD_REQUEST", { message: "Text and session log search require the PostgreSQL dashboard adapter." });
 		[rows,total] = await Promise.all([adapter.findMany<Record<string, unknown>>({ model: "allauthEvent", where, select: fields, limit: filters.limit, offset: filters.offset, sortBy: { field: "createdAt", direction: "desc" } }), adapter.count({ model: "allauthEvent", where })]);
 	}
@@ -67,6 +68,6 @@ export function createControlLogs(options: LogOptions) {
 	}
 	return { endpoints: {
 		controlLogs: createAuthEndpoint("/control/logs", { method: "GET", requireHeaders: true, query: controlLogsQuery }, async (ctx) => { const filters = { ...ctx.query }; await authorize(ctx,filters); return ctx.json(await queryControlLogs(ctx.context.adapter,options.database,filters,await options.retentionDays())); }),
-		controlLogDetail: createAuthEndpoint("/control/logs/detail", { method: "GET", requireHeaders: true, query: detailQuery }, async (ctx) => { const filters = { ...ctx.query,limit: 1,offset: 0 }; await authorize(ctx,filters); const result = await queryControlLogs(ctx.context.adapter,options.database,filters,await options.retentionDays()); if (!result.events[0]) throw new APIError("NOT_FOUND", { message: "This log entry is unavailable in this scope or outside retention." }); return ctx.json({ event: result.events[0] }); }),
+		controlLogDetail: createAuthEndpoint("/control/logs/detail", { method: "GET", requireHeaders: true, query: controlLogDetailQuery }, async (ctx) => { const filters = { ...ctx.query,limit: 1,offset: 0 }; await authorize(ctx,filters); const result = await queryControlLogs(ctx.context.adapter,options.database,filters,await options.retentionDays()); if (!result.events[0]) throw new APIError("NOT_FOUND", { message: "This log entry is unavailable in this scope or outside retention." }); return ctx.json({ event: result.events[0] }); }),
 	} };
 }

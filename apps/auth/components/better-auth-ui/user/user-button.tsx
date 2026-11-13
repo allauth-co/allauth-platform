@@ -27,7 +27,7 @@ import {
 import { cn } from "cn";
 import { UserAvatar } from "./user-avatar";
 import { UserView } from "./user-view";
-import "./user-button.css";
+import "@/components/user-menu.css";
 
 /** Auth states a `UserButton` link can be visible in. */
 export type UserButtonLinkVisibility =

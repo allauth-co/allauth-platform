@@ -1,63 +1,43 @@
 "use client";
 
-import type { Organization } from "better-auth/plugins";
 import { useRouter } from "next/navigation";
-import { toast } from "sonner";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Button } from "@/components/ui/button";
-import { authClient } from "@/lib/auth-client";
+import { useOAuthPicker } from "@/lib/oauth-picker-browser";
+import type { OAuthOrganizationChoice } from "@/lib/oauth-picker-portal";
 
-export function SelectOrganizationBtn({
-	organization,
+export function OrganizationChoices({
+	organizations,
+	query,
 }: {
-	organization: Partial<Organization>;
+	organizations: OAuthOrganizationChoice[];
+	query: string;
 }) {
+	const { choose, pending } = useOAuthPicker(query);
 	return (
-		<Button
-			className="w-full gap-2 h-12"
-			variant="outline"
-			onClick={async () => {
-				try {
-					if (!organization.id) {
-						toast.error("No organization");
-						return;
+		<div aria-busy={pending}>
+			{organizations.map((organization) => (
+				<Button
+					key={organization.id}
+					type="button"
+					className="w-full gap-2 h-12"
+					variant="outline"
+					disabled={pending}
+					onClick={() =>
+						void choose({ kind: "organization", id: organization.id })
 					}
-					const { data: active, error: activeError } =
-						await authClient.organization.setActive({
-							organizationId: organization.id,
-						});
-					if (activeError || !active) {
-						toast.error(
-							activeError?.message ?? "Failed to set active organization",
-						);
-						return;
-					}
-					const { data, error } = await authClient.oauth2.continue({
-						postLogin: true,
-					});
-					if (error || !data?.redirect || !data.url) {
-						toast.error(error?.message ?? "Failed to continue");
-						return;
-					}
-					window.location.href = data.url;
-				} catch (error) {
-					toast.error(String(error));
-				}
-			}}
-		>
-			<Avatar className="mr-2 h-5 w-5">
-				<AvatarImage
-					src={organization.logo || undefined}
-					alt={organization?.name}
-				/>
-				<AvatarFallback>{organization?.name?.charAt(0)}</AvatarFallback>
-			</Avatar>
-			<div className="flex text-start w-full">
-				<div>
-					<p>{organization?.name}</p>
-				</div>
-			</div>
-		</Button>
+				>
+					<Avatar className="mr-2 h-5 w-5">
+						<AvatarImage
+							src={organization.logo || undefined}
+							alt={organization.name}
+						/>
+						<AvatarFallback>{organization.name.charAt(0)}</AvatarFallback>
+					</Avatar>
+					<span className="text-start w-full">{organization.name}</span>
+				</Button>
+			))}
+		</div>
 	);
 }
 
@@ -65,6 +45,7 @@ export function GoBackBtn() {
 	const router = useRouter();
 	return (
 		<Button
+			type="button"
 			className="w-full gap-2 h-12"
 			variant="outline"
 			onClick={() => router.back()}

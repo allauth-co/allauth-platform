@@ -8,8 +8,9 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import type { AuthInstance } from "../api";
 import type { AuthEnvironment } from "../configuration";
 import type { ControlPrincipal } from "../control/types";
+import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
 import { requireWorkspacePrincipal } from "../workspaces/authorization";
-import { createProjectDomains, deleteProjectDomains, listProjectDomains, lookupActiveHostname, verifyProjectDomains } from "./repository";
+import { createProjectDomains, deleteProjectDomains, listProjectDomains, listStoredActiveProjectHostnames, lookupActiveHostname, verifyProjectDomains } from "./repository";
 import type { DomainDns, HostnameProvider, ProviderHostname, StoredCustomHostname } from "./types";
 
 const fixturePath = new URL("../../../../.secrets/local-postgres.json", import.meta.url);
@@ -69,7 +70,14 @@ describe.skipIf(!existsSync(fixturePath))("actual PostgreSQL domain ownership an
 		const first = await project(alice, "alice-domains"); aliceProject = first.id; aliceWorkspace = first.workspace; bobProject = (await project(bob, "bob-domains")).id;
 	}, 30000);
 	beforeEach(async () => { await pool.query('TRUNCATE public."allauthDomainPair" CASCADE'); registered.clear(); createCalls = 0; removeCalls = 0; findCalls = 0; quotaUsed = 0; failCreate = false; uncertainCreate = false; failRemove = false; partialDelete = false; proofMissing = false; routingWrong = false; sslPending = false; providerMismatch = false; });
-	afterAll(async () => { if (database) await database.destroy(); if (pool) await pool.end(); if (operator) { await operator.query(`DROP DATABASE IF EXISTS "${databaseName}" WITH (FORCE)`); await operator.end(); } });
+	afterAll(async () => {
+		try {
+			await Promise.all([database?.destroy(), pool?.end()]);
+			if (operator) await dropClosedFixtureDatabase(operator, databaseName);
+		} finally {
+			await operator?.end();
+		}
+	});
 	it("reserves both globally unique hostnames atomically and returns the same pair on retry", async () => {
 		const first = await create(); const again = await create(); expect(again.domain.id).toBe(first.domain.id); expect(first.domain.hostnames.map((host) => host.hostname)).toEqual(["accounts.acme-customer.com", "frontend-api.acme-customer.com"]);
 		await expect(createProjectDomains(bob, bobProject, { domain: "acme-customer.com" }, env, deps())).rejects.toMatchObject({ statusCode: 409 });
@@ -111,6 +119,33 @@ describe.skipIf(!existsSync(fixturePath))("actual PostgreSQL domain ownership an
 		sslPending = false; routingWrong = true; await verifyProjectDomains(alice, aliceProject, value.domain.id, env, deps()); expect(await lookupActiveHostname("accounts.acme-customer.com", env, pool)).toBeNull();
 		routingWrong = false; await verifyProjectDomains(alice, aliceProject, value.domain.id, env, deps()); expect(await lookupActiveHostname("accounts.acme-customer.com", env, pool)).toBeTruthy();
 		proofMissing = true; await verifyProjectDomains(alice, aliceProject, value.domain.id, env, deps()); expect(await lookupActiveHostname("accounts.acme-customer.com", env, pool)).toBeNull();
+	});
+	it("lists both kinds of complete active custom hostname pairs for the exact project", async () => {
+		const active = await create();
+		const pending = await create("pending-customer.com");
+		const deleting = await create("deleting-customer.com");
+		const other = await createProjectDomains(bob, bobProject, { domain: "other-customer.com" }, env, deps());
+		await verifyProjectDomains(alice, aliceProject, active.domain.id, env, deps());
+		await verifyProjectDomains(alice, aliceProject, deleting.domain.id, env, deps());
+		await verifyProjectDomains(bob, bobProject, other.domain.id, env, deps());
+		sslPending = true;
+		await verifyProjectDomains(alice, aliceProject, pending.domain.id, env, deps());
+		failRemove = true;
+		await deleteProjectDomains(alice, aliceProject, deleting.domain.id, env, deps());
+
+		await expect(listStoredActiveProjectHostnames(aliceProject, pool)).resolves.toEqual([
+			{ kind: "accounts", hostname: "accounts.acme-customer.com" },
+			{ kind: "frontend-api", hostname: "frontend-api.acme-customer.com" },
+		]);
+		await expect(listStoredActiveProjectHostnames(bobProject, pool)).resolves.toEqual([
+			{ kind: "accounts", hostname: "accounts.other-customer.com" },
+			{ kind: "frontend-api", hostname: "frontend-api.other-customer.com" },
+		]);
+		await expect(listStoredActiveProjectHostnames(randomUUID(), pool)).resolves.toEqual([]);
+		await expect(lookupActiveHostname("frontend-api.acme-customer.com", env, pool)).resolves.toMatchObject({
+			kind: "frontend-api", project: { id: aliceProject },
+		});
+		await expect(lookupActiveHostname("frontend-api.acme-customer.com", { ...env, CLOUDFLARE_SAAS_READY: "false" }, pool)).resolves.toBeNull();
 	});
 	it("disables routing before cleanup, retains failed cleanup reservations, and confirms provider deletion", async () => {
 		const value = await create(); await verifyProjectDomains(alice, aliceProject, value.domain.id, env, deps()); failRemove = true;

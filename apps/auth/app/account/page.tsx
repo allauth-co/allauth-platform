@@ -3,6 +3,7 @@ import { redirect } from "next/navigation";
 import { portalSession } from "@/lib/domains/hosting";
 import { Settings } from "@/components/better-auth-ui/settings/settings";
 import { ApiKeys } from "@/components/api-keys";
+import { HostedAccountProfile } from "@/components/hosted-account-profile";
 import { PageHeading } from "@/components/console/common";
 export default async function Page() {
 	const requestHeaders = await headers();
@@ -14,7 +15,9 @@ export default async function Page() {
 				title="Your account"
 				description="Manage your profile, sign-in methods and account security."
 			/>
-			<Settings view="account" className="account-settings" />
+			<HostedAccountProfile>
+				<Settings view="account" className="account-settings" />
+			</HostedAccountProfile>
 			<ApiKeys />
 		</div>
 	);

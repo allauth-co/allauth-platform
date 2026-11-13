@@ -38,6 +38,7 @@ import {
 	revokeUserGrants,
 } from "../enterprise";
 import { legacyAuthEngine } from "../legacy-auth-engine";
+import { projectEmailAliasVariable } from "../project-email-alias-config";
 import {
 	nativePasskeyCapability,
 	selectedNativePasskeys,
@@ -61,11 +62,31 @@ import {
 	requireWorkspacePrincipal,
 } from "../workspaces/authorization";
 import { backendCredentialRepository } from "./backend-credentials";
-import { createBoundedProjectCache } from "./cache";
-import { projectManagement } from "./management-plugin";
 import { projectBrokerTwoFactor } from "./broker-two-factor";
+import { createBoundedProjectCache } from "./cache";
+import { observeProjectEngine, projectEngineMetricsSelected } from "./engine-metrics";
+import { projectManagement } from "./management-plugin";
 import { projectOriginFingerprint } from "./origins";
+import type { OwnedProjectSCIMConsole } from "./owned-project-scim-console";
+import { projectSamlApprovalValue } from "./project-engine-binding";
+import {
+	projectAgentReplayApprovalValue,
+	projectAgentReplayApproved,
+	projectAgentReplayBridgeSelected,
+	projectEnginePreparationRevision,
+	projectEngineSelected,
+	selectProjectEngine,
+} from "./project-engine-internal-selection";
+import { projectWriterLease } from "./project-engine-internal-writer";
+import { selectRehearsalProjectEngine } from "./project-engine-rehearsal-selection";
+import { projectWriterUnavailable } from "./project-engine-unavailable";
+import {
+	projectEngineWriterConnectionOptions,
+	type ProjectEngineWriterState,
+} from "./project-engine-writer-lease";
+import { localizeProjectErrors } from "./project-error-localization";
 import { verifiedProjectRequest } from "./proxy";
+import { projectSecret } from "./project-secret";
 import type { Project } from "./registry";
 import {
 	getProject,
@@ -73,19 +94,90 @@ import {
 	projectRegistryPool,
 } from "./registry";
 import { consumeProxySessionCheck } from "./session-introspection-admission";
+import { readProjectSessionPrincipal } from "./session-principal";
+import { observeProjectSessions, projectSessionShadowSelected } from "./session-shadow";
 import { checkedProjectSchema } from "./validation";
 
 type Instance = ReturnType<typeof createAuth>;
-interface Entry {
-	auth: Instance;
+interface EntryBase {
+	engine: AuthEngine;
 	env: AuthEnvironment;
 	project: Project;
 	pool: Pool;
 }
-const entries = createBoundedProjectCache<Entry>(8, (entry) =>
-	entry.pool.end(),
-);
-const instances = new WeakMap<Instance, Entry>();
+interface LegacyEntry extends EntryBase {
+	kind: "legacy";
+	auth: Instance;
+	shadowPool?: Pool;
+}
+type Entry = LegacyEntry | (EntryBase & { kind: "owned" });
+const entries = createBoundedProjectCache<Entry>(8, async (entry) => {
+	await Promise.all([
+		entry.pool.end(),
+		entry.kind === "legacy" ? entry.shadowPool?.end() : undefined,
+	]);
+});
+const instances = new WeakMap<Instance, LegacyEntry>();
+
+/** Assemble a realm's selected engine with the same authority as the legacy runtime. */
+export type ProjectEngineBuilder = (input: {
+	database: Pool;
+	project: Project;
+	policy: AuthPolicy;
+	baseURL: string;
+	basePath: string;
+	signingSecret: string;
+	credentialHashSecret: string;
+}) => AuthEngine | Promise<AuthEngine>;
+
+interface IsolatedProjectEngineFixture {
+	projectId: string;
+	schemaName: string;
+	databaseURL: string;
+	build: ProjectEngineBuilder;
+}
+
+let fixture: Readonly<IsolatedProjectEngineFixture> | undefined;
+let projectRuntimeStarted = false;
+
+/** Install once, before any project is used, in a disposable local test process. */
+export function installIsolatedProjectEngineFixture(
+	selection: IsolatedProjectEngineFixture,
+) {
+	const url = new URL(selection.databaseURL);
+	if (
+		process.env.NODE_ENV !== "test" ||
+		fixture ||
+		projectRuntimeStarted ||
+		!/^postgres(?:ql)?:$/.test(url.protocol) ||
+		url.hostname !== "127.0.0.1" ||
+		url.port !== "55445" ||
+		!/^\/allauth_hosted_[a-f0-9]{32}$/.test(url.pathname) ||
+		!/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(selection.projectId) ||
+		selection.schemaName !== `allauth_project_${selection.projectId.replaceAll("-", "")}`
+	)
+		throw new Error("The owned project engine fixture requires a new isolated development realm.");
+	fixture = Object.freeze({ ...selection, databaseURL: url.href });
+}
+
+function fixtureFor(project: Project, env: AuthEnvironment) {
+	if (!fixture || fixture.projectId !== project.id) return;
+	if (
+		project.environment !== "development" ||
+		project.schemaName !== fixture.schemaName ||
+		new URL(setting(env, "DATABASE_URL")).href !== fixture.databaseURL
+	)
+		throw new APIError("SERVICE_UNAVAILABLE", { message: "The selected project fixture is unavailable." });
+	return fixture;
+}
+
+function legacyInstance(entry: Entry) {
+	if (entry.kind !== "legacy")
+		throw new APIError("SERVICE_UNAVAILABLE", {
+			message: "This operation is unavailable in the selected authentication realm.",
+		});
+	return entry.auth;
+}
 
 /** Platform authority is read afresh from the platform DB, never copied from a project role. */
 export async function platformProjectAdministrator(
@@ -117,11 +209,24 @@ export async function selectedProjectAdministrator(
 	}
 }
 
-/** Distinct keys isolate signed cookies, encrypted credentials, and security counters. */
-export function projectSecret(env: AuthEnvironment, projectId: string): string {
-	return createHmac("sha256", setting(env, "BETTER_AUTH_SECRET"))
-		.update(`allauth:project:${projectId}`)
-		.digest("hex");
+export { projectSecret } from "./project-secret";
+
+function bindOwnedDirectTransport(engine: AuthEngine, origin: string): AuthEngine {
+	function bind(request: Request) {
+		const incoming = new URL(request.url);
+		if (incoming.origin === origin) return request;
+		// Standalone Next may use the listener address in Request.url. The project
+		// route already selects the realm and verifies signed requests before dispatch.
+		const url = new URL(origin);
+		url.pathname = incoming.pathname;
+		url.search = incoming.search;
+		return new Request(url, request);
+	}
+	return {
+		...engine,
+		dispatch: (request) => engine.dispatch(bind(request)),
+		readSession: (request) => engine.readSession(bind(request)),
+	};
 }
 
 async function build(
@@ -130,6 +235,8 @@ async function build(
 	policy: AuthPolicy,
 	googleProvider: StoredGoogleProvider,
 	publicOrigin?: string,
+	owned?: ProjectEngineBuilder,
+	writer?: ProjectEngineWriterState,
 ): Promise<Entry> {
 	const schema = checkedProjectSchema(project.schemaName);
 	const pool = new Pool({
@@ -138,11 +245,14 @@ async function build(
 		connectionTimeoutMillis: 10000,
 		idleTimeoutMillis: 10000,
 		allowExitOnIdle: true,
-		options: `-c search_path=${schema}`,
+		options: writer
+			? `-c search_path=${schema} ${projectEngineWriterConnectionOptions(project.id, writer)}`
+			: `-c search_path=${schema}`,
 	});
 	pool.on("error", () =>
 		console.error("AllAuth project database connection error."),
 	);
+	let shadowPool: Pool | undefined;
 	const secret = projectSecret(environment, project.id);
 	const env = {
 		...environment,
@@ -159,6 +269,36 @@ async function build(
 		const basePath = publicOrigin
 			? "/api/auth"
 			: `/api/projects/${project.slug}/auth`;
+		const metricsEnabled = projectEngineMetricsSelected(environment, project.id);
+		const observe = (engine: AuthEngine, writer: "legacy" | "allauth") =>
+			metricsEnabled ? observeProjectEngine(engine, {
+				projectId: project.id,
+				writer,
+				transport: publicOrigin ? "hosted" : "project",
+				basePath,
+			}) : engine;
+		if (owned) {
+			const baseURL = publicOrigin ?? authOrigin(environment);
+			const engine = await owned({
+				database: pool,
+				project,
+				policy,
+				baseURL,
+				basePath,
+				signingSecret: secret,
+				credentialHashSecret: env.SCIM_CREDENTIAL_HASH_SECRET,
+			});
+			const boundEngine = publicOrigin
+				? engine
+				: bindOwnedDirectTransport(engine, baseURL);
+			return {
+				kind: "owned",
+				engine: observe(localizeProjectErrors(boundEngine), "allauth"),
+				env,
+				project,
+				pool,
+			};
+		}
 		const requirePlatformAdmin = async (ctx: GenericEndpointContext) => {
 			const currentProject = await getProject(project.slug, environment);
 			const principal = await selectedProjectAdministrator(
@@ -195,6 +335,9 @@ async function build(
 			postgresDatabase(pool),
 			env,
 			{
+				...(projectAgentReplayBridgeSelected(project, environment)
+					? { agentReplayBridge: { projectId: project.id, database: pool } }
+					: {}),
 				...(google ? { google } : {}),
 				...(apple ? { apple } : {}),
 				...(microsoft ? { microsoft } : {}),
@@ -353,17 +496,116 @@ async function build(
 			(userId) =>
 				eraseOwnedAvatarsBeforeDelete(userId, avatarScope, pool, environment),
 		);
-		const entry = { auth: instance, env, project, pool };
+		const legacy = legacyAuthEngine(instance);
+		let engine = legacy;
+		if (projectSessionShadowSelected(environment, project)) {
+			const context = await instance.$context;
+			const shadow = new Pool({
+				connectionString: setting(environment, "DATABASE_URL"),
+				max: 1,
+				connectionTimeoutMillis: 150,
+				idleTimeoutMillis: 5000,
+				statement_timeout: 100,
+				allowExitOnIdle: true,
+				options: "-c default_transaction_read_only=on",
+			});
+			shadow.on("error", () => console.error("AllAuth project session comparison connection error."));
+			shadowPool = shadow;
+			engine = observeProjectSessions(legacy, {
+				projectId: project.id,
+				basePath,
+				read: (headers) => readProjectSessionPrincipal(shadow, project, headers, {
+					signingSecret: context.secret,
+					secureCookies: context.authCookies.sessionToken.attributes.secure === true,
+				}),
+			});
+		}
+		const entry: LegacyEntry = { kind: "legacy", auth: instance, engine: observe(engine, "legacy"), env, project, pool, shadowPool };
 		instances.set(instance, entry);
 		return entry;
 	} catch (error) {
-		await pool.end();
+		await Promise.all([pool.end(), shadowPool?.end()]);
 		throw error;
 	}
 }
 
 /** Cache and connection counts remain bounded, including when many different projects are requested. */
-export async function withProjectAuth<T>(
+async function withProjectEntry<T>(
+	project: Project,
+	env: AuthEnvironment,
+	publicOrigin: string | undefined,
+	callback: (entry: Entry, project: Project) => Promise<T>,
+): Promise<T> {
+	projectRuntimeStarted = true;
+	const rehearsal =
+		fixtureFor(project, env)?.build ??
+		(await selectRehearsalProjectEngine(project, env));
+	if (rehearsal)
+		return withConfiguredProjectEntry(project, env, publicOrigin, callback, rehearsal);
+	const lease = projectWriterLease(project, env);
+	if (!lease) return withConfiguredProjectEntry(project, env, publicOrigin, callback);
+	return lease.withCurrent(({ writer, revision }) => {
+		const candidate = writer === "allauth"
+			? selectProjectEngine(project, env, { revision, preparing: false })
+			: undefined;
+		if (writer === "allauth" && !candidate)
+			throw projectWriterUnavailable();
+		return withConfiguredProjectEntry(
+			project, env, publicOrigin, callback, candidate, { writer, revision },
+		);
+	});
+}
+
+async function withConfiguredProjectEntry<T>(
+	project: Project,
+	env: AuthEnvironment,
+	publicOrigin: string | undefined,
+	callback: (entry: Entry, project: Project) => Promise<T>,
+	owned?: ProjectEngineBuilder,
+	writer?: ProjectEngineWriterState,
+	preparing = false,
+) {
+	const [configured, googleProvider] = await Promise.all([
+		readAuthPolicy(project.id, env),
+		readGoogleProvider(project.id, env),
+	]);
+	const apple = readProjectAppleProvider(env, project.slug);
+	const microsoft = readProjectMicrosoftProvider(env, project.slug);
+	const aliasConfiguration = owned && setting(env, projectEmailAliasVariable(project.slug));
+	const aliasVersion = aliasConfiguration
+		? createHmac("sha256", setting(env, "ALLAUTH_AUTH_SECRET"))
+				.update(aliasConfiguration)
+				.digest("hex")
+		: "";
+	const samlApproval = owned && writer && projectSamlApprovalValue(project, env);
+	const samlApprovalVersion = samlApproval
+		? createHmac("sha256", setting(env, "ALLAUTH_AUTH_SECRET")).update(samlApproval).digest("hex")
+		: "";
+	const agentApproval = owned && writer && projectAgentReplayApprovalValue(project, env);
+	const agentApprovalVersion = agentApproval
+		? createHmac("sha256", setting(env, "ALLAUTH_AUTH_SECRET")).update(agentApproval).digest("hex")
+		: "";
+	const agentBridge = projectAgentReplayBridgeSelected(project, env);
+	// Transport secrets can rotate while the native auth instance remains cached.
+	// Verification must receive the registry row read for this request.
+	return entries.use(
+		`${project.id}:${configured.version}:engine:${preparing ? "preflight:" : ""}${writer ? `${writer.writer}:${writer.revision}` : owned ? "owned-fixture" : "legacy"}:metrics:${projectEngineMetricsSelected(env, project.id)}:shadow:${projectSessionShadowSelected(env, project)}:origins:${projectOriginFingerprint(project)}:owned-avatars:${ownedAvatarSelected(env, project.id)}:native-passkeys:${selectedNativePasskeys(env, project, publicOrigin).version}:google:${googleProvider.version}:microsoft:${microsoftConfigurationVersion(microsoft)}:apple:${appleConfigurationVersion(apple)}:${apple ? Math.floor(Date.now() / 86400000) : 0}:aliases:${aliasVersion}:saml:${samlApprovalVersion}:agent:${agentBridge}:${agentApprovalVersion}:${publicOrigin ?? ""}`,
+		() => build(project, env, configured.policy, googleProvider, publicOrigin, owned, writer),
+		(entry) => callback(entry, project),
+	);
+}
+
+async function withDirectProjectEntry<T>(
+	slug: string,
+	callback: (entry: Entry, project: Project) => Promise<T>,
+	environment?: AuthEnvironment,
+) {
+	const env = environment || (await getAuthEnvironment());
+	const project = await getProject(slug, env);
+	return withProjectEntry(project, env, undefined, callback);
+}
+
+export function withProjectAuth<T>(
 	slug: string,
 	callback: (
 		instance: Instance,
@@ -372,20 +614,78 @@ export async function withProjectAuth<T>(
 	) => Promise<T>,
 	environment?: AuthEnvironment,
 ): Promise<T> {
-	const env = environment || (await getAuthEnvironment());
-	const project = await getProject(slug, env);
-	const [configured, googleProvider] = await Promise.all([
-		readAuthPolicy(project.id, env),
-		readGoogleProvider(project.id, env),
-	]);
-	const apple = readProjectAppleProvider(env, project.slug);
-	const microsoft = readProjectMicrosoftProvider(env, project.slug);
-	// Transport secrets can rotate while the native auth instance remains cached.
-	// Verification must receive the registry row read for this request.
-	return entries.use(
-		`${project.id}:${configured.version}:origins:${projectOriginFingerprint(project)}:owned-avatars:${ownedAvatarSelected(env, project.id)}:native-passkeys:${selectedNativePasskeys(env, project).version}:google:${googleProvider.version}:microsoft:${microsoftConfigurationVersion(microsoft)}:apple:${appleConfigurationVersion(apple)}:${apple ? Math.floor(Date.now() / 86400000) : 0}`,
-		() => build(project, env, configured.policy, googleProvider),
-		(entry) => callback(entry.auth, entry.env, project),
+	return withDirectProjectEntry(
+		slug,
+		(entry, project) => callback(legacyInstance(entry), entry.env, project),
+		environment,
+	);
+}
+
+/** Use the selected writer for the existing directory console API. */
+export function withProjectSCIMConsole(
+	slug: string,
+	callback: (
+		manage: OwnedProjectSCIMConsole | undefined,
+		readLegacy: () => Instance,
+		env: AuthEnvironment,
+		project: Project,
+	) => Promise<Response>,
+) {
+	return withDirectProjectEntry(slug, (entry, project) =>
+		callback(
+			entry.engine.manageSCIMConsole,
+			() => legacyInstance(entry),
+			entry.env,
+			project,
+		),
+	);
+}
+
+/** The console uses the selected project engine and only opens a native instance in a legacy realm. */
+export function withProjectOrganizationConsole(
+	slug: string,
+	callback: (
+		manage: AuthEngine["manageOrganizationConsole"],
+		readLegacy: () => Instance,
+		env: AuthEnvironment,
+		project: Project,
+	) => Promise<Response>,
+) {
+	return withDirectProjectEntry(slug, (entry, project) =>
+		callback(
+			entry.engine.manageOrganizationConsole,
+			() => legacyInstance(entry),
+			entry.env,
+			project,
+		),
+	);
+}
+
+export function withProjectUserConsole(
+	slug: string,
+	callback: (
+		manage: AuthEngine["manageUserConsole"],
+		readLegacy: () => Instance,
+		env: AuthEnvironment,
+		project: Project,
+	) => Promise<Response>,
+) {
+	return withDirectProjectEntry(slug, (entry, project) =>
+		callback(entry.engine.manageUserConsole, () => legacyInstance(entry), entry.env, project),
+	);
+}
+
+export function withProjectApplicationConsole(
+	slug: string,
+	callback: (
+		manage: AuthEngine["manageApplicationConsole"],
+		readLegacy: () => Instance,
+		env: AuthEnvironment,
+		project: Project,
+	) => Promise<Response>,
+) {
+	return withDirectProjectEntry(slug, (entry, project) =>
+		callback(entry.engine.manageApplicationConsole, () => legacyInstance(entry), entry.env, project),
 	);
 }
 
@@ -394,7 +694,7 @@ export async function closeProjectInstances() {
 }
 
 /** Pair dispatch and admission with the same checked PostgreSQL project schema. */
-export function withProjectAuthEngine<T>(
+export async function withProjectAuthEngine<T>(
 	slug: string,
 	callback: (
 		scope: ProjectAuthScope,
@@ -403,26 +703,34 @@ export function withProjectAuthEngine<T>(
 	) => Promise<T>,
 	environment?: AuthEnvironment,
 ): Promise<T> {
-	return withProjectAuth(
-		slug,
-		(instance, env, project) => {
-			const entry = instances.get(instance);
-			if (!entry) throw new Error("Project instance is unavailable.");
-			return callback(
-				{
-					engine: legacyAuthEngine(instance),
-					consumeAdmission: (key) => consumeProxySessionCheck(entry.pool, key),
-				},
-				env,
-				project,
-			);
-		},
-		environment,
+	const env = environment || (await getAuthEnvironment());
+	return withResolvedProjectAuthEngine(await getProject(slug, env), callback, env);
+}
+
+/** Admit the same immutable registry binding used to verify the app proxy. */
+export function withResolvedProjectAuthEngine<T>(
+	project: Project,
+	callback: (
+		scope: ProjectAuthScope,
+		env: AuthEnvironment,
+		project: Project,
+	) => Promise<T>,
+	environment: AuthEnvironment,
+): Promise<T> {
+	return withProjectEntry(project, environment, undefined, (entry, current) =>
+		callback(
+			{
+				engine: entry.engine,
+				consumeAdmission: (key) => consumeProxySessionCheck(entry.pool, key),
+			},
+			entry.env,
+			current,
+		),
 	);
 }
 
 /** Callers must supply a hostname from the verified gateway/domain lookup, never a request Host alone. */
-export async function withHostedProjectAuth<T>(
+export function withHostedProjectAuth<T>(
 	project: Project,
 	hostname: string,
 	callback: (
@@ -432,19 +740,49 @@ export async function withHostedProjectAuth<T>(
 	) => Promise<T>,
 	environment: AuthEnvironment,
 ): Promise<T> {
-	const [configured, googleProvider] = await Promise.all([
-		readAuthPolicy(project.id, environment),
-		readGoogleProvider(project.id, environment),
-	]);
-	const apple = readProjectAppleProvider(environment, project.slug);
-	const microsoft = readProjectMicrosoftProvider(environment, project.slug);
-	const origin = `https://${hostname}`;
-	return entries.use(
-		`${project.id}:${configured.version}:origins:${projectOriginFingerprint(project)}:owned-avatars:${ownedAvatarSelected(environment, project.id)}:native-passkeys:${selectedNativePasskeys(environment, project, origin).version}:google:${googleProvider.version}:microsoft:${microsoftConfigurationVersion(microsoft)}:apple:${appleConfigurationVersion(apple)}:${apple ? Math.floor(Date.now() / 86400000) : 0}:${origin}`,
-		() =>
-			build(project, environment, configured.policy, googleProvider, origin),
-		(entry) => callback(entry.auth, entry.env, project),
+	return withProjectEntry(
+		project,
+		environment,
+		`https://${hostname}`,
+		(entry, current) => callback(legacyInstance(entry), entry.env, current),
 	);
+}
+
+/** Check the active writer and prepare a selected candidate without dispatching a request. */
+export function confirmProjectEngine(
+	project: Project,
+	env: AuthEnvironment,
+	hostname?: string,
+) {
+	const lease = projectWriterLease(project, env);
+	if (!projectEngineSelected(env, project) || !lease)
+		throw new Error("The project selection changed.");
+	const origin = hostname ? `https://${hostname}` : undefined;
+	return lease.withCurrent(async ({ writer, revision }) => {
+		// Keep preflight separate from live cache entries. Legacy can
+		// still change configuration until the database commits the switch.
+		const preparing = writer === "legacy" && revision === projectEnginePreparationRevision(env, project);
+		if (preparing)
+			projectAgentReplayApproved(project, env, { revision, preparing });
+		const useCandidate = preparing || writer === "allauth";
+		const candidate = useCandidate ? selectProjectEngine(project, env, { revision, preparing }) : undefined;
+		if (useCandidate && !candidate)
+			throw new Error("The project writer is unavailable.");
+		await withConfiguredProjectEntry(
+			project,
+			env,
+			origin,
+			async (entry) => {
+				const expected = useCandidate ? "owned" : "legacy";
+				if (entry.kind !== expected || !projectEngineSelected(env, entry.project))
+					throw new Error("The project writer is unavailable.");
+				if (entry.kind === "owned") await entry.engine.verifySamlReadiness?.();
+			},
+			candidate,
+			preparing ? { writer: "allauth", revision: revision + 1 } : { writer, revision },
+			preparing,
+		);
+	});
 }
 
 /** Use the same verified custom hostname binding and project pool as hosted auth. */
@@ -454,10 +792,10 @@ export function withHostedProjectAuthEngine<T>(
 	callback: (engine: AuthEngine, env: AuthEnvironment) => Promise<T>,
 	environment: AuthEnvironment,
 ): Promise<T> {
-	return withHostedProjectAuth(
+	return withProjectEntry(
 		project,
-		hostname,
-		(instance, env) => callback(legacyAuthEngine(instance), env),
 		environment,
+		`https://${hostname}`,
+		(entry) => callback(entry.engine, entry.env),
 	);
 }

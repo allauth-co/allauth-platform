@@ -1,4 +1,4 @@
-import {describe,expect,it} from "vitest";
+import {describe,expect,it,vi} from "vitest";
 import {boundedEdgeBody,edgeHeaders,portalHeader,portalPathAllowed,signEdgeRequest,signPortalBinding,strippedEdgeHeaders,verifyEdgeRequest,verifyPortalBinding} from "./edge";
 const secret="fixture-gateway-secret-at-least-thirty-two-characters";
 const now=1791350000000;
@@ -15,4 +15,31 @@ describe("authentication gateway envelope",()=>{
 	it.each(["/admin/users","/api/admin/users","/api/workspaces","/api/projects/other/auth/get-session","/api/organizations/other/scim"])("does not expose platform management path %s on customer hosts",(path)=>{expect(portalPathAllowed(path,"accounts")).toBe(false);expect(portalPathAllowed(path,"frontend-api")).toBe(false);});
 	it("allows only the exact console entry on customer account hosts",()=>{expect(portalPathAllowed("/console","accounts")).toBe(true);expect(portalPathAllowed("/console","frontend-api")).toBe(false);expect(portalPathAllowed("/console/child","accounts")).toBe(false);expect(portalPathAllowed("/console/child","frontend-api")).toBe(false);});
 	it.each(["/sign-in","/magic-link","/magic-link-sent","/email-otp","/reset-link-sent","/account/security","/api/auth/get-session","/api/account/sessions","/.well-known/openid-configuration"])("allows the realm's authentication path %s",(path)=>{expect(portalPathAllowed(path,"accounts")).toBe(true);});
+	it.each([
+		"/api/auth/scim/v2/Users",
+		"/api/auth/sso/saml2/sp/acs/fixture-provider",
+	])("bounds hosted protocol body reads for %s before binding", async (path) => {
+		const url = `https://accounts.customer.com${path}`;
+		const signed = await signEdgeRequest(
+			new Request(url, { method: "POST", body: "fixture" }),
+			secret,
+			"accounts.customer.com",
+			"192.0.2.5",
+			now,
+		);
+		vi.useFakeTimers();
+		try {
+			const stalled = new Request(url, {
+				method: "POST",
+				headers: signed,
+				body: new ReadableStream<Uint8Array>(),
+				duplex: "half",
+			} as RequestInit);
+			const verification = verifyEdgeRequest(stalled, secret, now);
+			await vi.advanceTimersByTimeAsync(5000);
+			await expect(verification).resolves.toBeNull();
+		} finally {
+			vi.useRealTimers();
+		}
+	});
 });

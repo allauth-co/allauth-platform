@@ -1,9 +1,12 @@
 import { createHmac, randomUUID } from "node:crypto";
 import { APIError } from "better-auth";
-import { symmetricDecrypt, symmetricEncrypt } from "better-auth/crypto";
 import type { Pool } from "pg";
 import { setting } from "../configuration";
 import type { AuthEnvironment } from "../configuration";
+import {
+	openLegacyUnversionedRecord,
+	sealLegacyUnversionedRecord,
+} from "../legacy-encrypted-record";
 import { projectRegistryPool } from "../projects/registry";
 import type { Project } from "../projects/registry";
 import { checkedProjectSchema } from "../projects/validation";
@@ -20,8 +23,21 @@ function providerKey(projectId: string, env: AuthEnvironment) {
 	return createHmac("sha256", secret).update(`allauth:project-google:${projectId}`).digest("hex");
 }
 /** Credentials are encrypted with a project-bound key and never enter a public settings response. */
-export const encryptGoogleSecret = (value: string, projectId: string, env: AuthEnvironment) => symmetricEncrypt({ key: providerKey(projectId, env), data: value });
-export const decryptGoogleSecret = (value: string, projectId: string, env: AuthEnvironment) => symmetricDecrypt({ key: providerKey(projectId, env), data: value });
+export async function encryptGoogleSecret(
+	value: string,
+	projectId: string,
+	env: AuthEnvironment,
+): Promise<string> {
+	return sealLegacyUnversionedRecord(value, providerKey(projectId, env));
+}
+
+export async function decryptGoogleSecret(
+	value: string,
+	projectId: string,
+	env: AuthEnvironment,
+): Promise<string> {
+	return openLegacyUnversionedRecord(value, providerKey(projectId, env));
+}
 
 export function googleProviderRepository(pool: Pick<Pool, "query">, env: AuthEnvironment) {
 	const read = async (projectId: string): Promise<StoredGoogleProvider> => publicStored((await pool.query<ProviderRow>('SELECT version,enabled,"clientId","encryptedClientSecret","updatedAt" FROM public."allauthProjectGoogleProvider" WHERE "projectId"=$1', [projectId])).rows[0]);

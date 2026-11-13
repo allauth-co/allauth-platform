@@ -11,6 +11,8 @@ import { emailConfigured } from "../email/send";
 import { readProjectAppleProvider } from "../project-providers/apple";
 import { readProjectMicrosoftProvider } from "../project-providers/microsoft";
 import { googleProviderRepository } from "../project-providers/repository";
+import { projectWriterLease } from "../projects/project-engine-internal-writer";
+import type { ProjectEngineWriter } from "../projects/project-engine-writer-lease";
 import { getProject, projectRegistryPool } from "../projects/registry";
 import { checkedProjectSchema } from "../projects/validation";
 import {
@@ -32,6 +34,7 @@ export async function authConfigurationRoute(
 			const pool = projectRegistryPool(env);
 			const dependencies = (
 				database: Pick<Pool, "query">,
+				writer?: ProjectEngineWriter,
 			): ConfigurationDependencies => {
 				const repository = authPolicyRepository(database);
 				return {
@@ -70,7 +73,7 @@ export async function authConfigurationRoute(
 					},
 					read: repository.read,
 					update: (id, version, policy, actorId, scope) =>
-						repository.update(id, version, policy, actorId, scope.schemaName),
+						repository.update(id, version, policy, actorId, scope.schemaName, writer),
 					providers: async (scope) => {
 						const available = authConfiguration(env);
 						const direct =
@@ -130,16 +133,20 @@ export async function authConfigurationRoute(
 					serializeWrite: async (scope, actor, work) => {
 						if (scope.type !== "project") return work(dependencies(database));
 						const project = await getProject(scope.slug!, env);
-						return withProjectSettingsWrite(
+						if (scope.id !== project.id || scope.schemaName !== project.schemaName)
+							throw new APIError("NOT_FOUND");
+						const save = (activeWriter?: ProjectEngineWriter) => withProjectSettingsWrite(
 							pool,
 							project.id,
 							async (transaction) => {
 								await requireWorkspaceActor(actor, project.workspaceId, env, {
 									database: transaction,
 								});
-								return work(dependencies(transaction));
+								return work(dependencies(transaction, activeWriter));
 							},
 						);
+						const lease = projectWriterLease(project, env);
+						return lease ? lease.withCurrent(({ writer }) => save(writer)) : save();
 					},
 				};
 			};

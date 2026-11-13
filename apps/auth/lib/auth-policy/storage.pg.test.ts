@@ -9,9 +9,11 @@ import { allauthControl } from "../control";
 import { queryControlLogs } from "../control/logs";
 import { authPolicyRepository } from "./storage";
 import { defaultAuthPolicy } from "./policy";
+import { withProjectSettingsWrite } from "./serialization";
 const fixturePath = new URL("../../../../.secrets/local-postgres.json",import.meta.url);
 describe.skipIf(!existsSync(fixturePath))("PostgreSQL configuration races and scoped log predicates",() => {
 	const schema = `allauth_project_${randomUUID().replaceAll("-","")}`; const scopeId = `fixture-policy-${randomUUID()}`; const otherScopeId = `fixture-policy-${randomUUID()}`;
+	const webhookScopeId = `fixture-policy-${randomUUID()}`;
 	let pool: Pool; let database: Kysely<Record<string,Record<string,unknown>>>;
 	const makeInstance = () => getTestInstance({ database: { db: database,type: "postgres",transaction: true },logger: { disabled: true },plugins: [admin(),organization(),allauthControl({ database })] },{ disableTestUser: true });
 	let instance: Awaited<ReturnType<typeof makeInstance>>;
@@ -20,11 +22,11 @@ describe.skipIf(!existsSync(fixturePath))("PostgreSQL configuration races and sc
 		if (fixture.container !== "allauth-production-test-20261007" || url.hostname !== "127.0.0.1" || url.port !== "55445") throw new Error("Policy tests require the retained isolated local AllAuth fixture.");
 		pool = new Pool({ connectionString: fixture.DATABASE_URL,max: 6,options: `-c search_path=${schema},public` }); database = new Kysely({ dialect: new PostgresDialect({ pool }) });
 		await sql`CREATE SCHEMA ${sql.id(schema)}`.execute(database);
-		for (const filename of ["001-initial-auth.sql","002-control-plane.sql","005-free-plugins.sql","006-analytics.sql","007-auth-configuration.sql"]) await sql.raw(readFileSync(new URL(`../../migrations/${filename}`,import.meta.url),"utf8")).execute(database);
+		for (const filename of ["001-initial-auth.sql","002-control-plane.sql","004-webhooks.sql","005-free-plugins.sql","006-analytics.sql","007-auth-configuration.sql"]) await sql.raw(readFileSync(new URL(`../../migrations/${filename}`,import.meta.url),"utf8")).execute(database);
 		await pool.query('CREATE TABLE IF NOT EXISTS public."allauthAuthConfiguration" (id TEXT PRIMARY KEY,policy JSONB NOT NULL,version INTEGER NOT NULL CHECK(version>0),"updatedBy" TEXT NOT NULL,"updatedAt" TIMESTAMPTZ NOT NULL DEFAULT NOW())');
 		instance = await makeInstance();
 	});
-	afterAll(async () => { if (database) { await pool.query('DELETE FROM public."allauthAuthConfiguration" WHERE id=ANY($1::text[])',[[scopeId,otherScopeId]]); await sql`DROP SCHEMA IF EXISTS ${sql.id(schema)} CASCADE`.execute(database); await database.destroy(); } });
+	afterAll(async () => { if (database) { await pool.query('DELETE FROM public."allauthAuthConfiguration" WHERE id=ANY($1::text[])',[[scopeId,otherScopeId,webhookScopeId]]); await sql`DROP SCHEMA IF EXISTS ${sql.id(schema)} CASCADE`.execute(database); await database.destroy(); } });
 	it("atomically admits one concurrent version-zero write and one audit, then rejects stale updates",async () => {
 		const repository = authPolicyRepository(pool); expect((await repository.read(scopeId)).version).toBe(0);
 		const writes = await Promise.allSettled(Array.from({ length: 6 },() => repository.update(scopeId,0,{ ...defaultAuthPolicy,signUpEnabled: false },"fixture-admin",schema)));
@@ -39,6 +41,24 @@ describe.skipIf(!existsSync(fixturePath))("PostgreSQL configuration races and sc
 	it("rolls back settings if scoped audit persistence fails",async () => {
 		const repository = authPolicyRepository(pool); const missing = `allauth_project_${randomUUID().replaceAll("-","")}`;
 		await expect(repository.update(otherScopeId,0,defaultAuthPolicy,"fixture-admin",missing)).rejects.toThrow(); expect((await repository.read(otherScopeId)).version).toBe(0);
+	});
+	it("keeps a configured owned webhook realm available when an incompatible policy is submitted", async () => {
+		const compatible = { ...defaultAuthPolicy, mfaMode: "optional" as const, requireEmailVerification: false };
+		const update = (version: number, policy: typeof defaultAuthPolicy, writer: "legacy" | "allauth") =>
+			withProjectSettingsWrite(pool, webhookScopeId, (client) =>
+				authPolicyRepository(client).update(webhookScopeId, version, policy, "fixture-admin", schema, writer),
+			);
+		await expect(update(0, compatible, "allauth")).resolves.toMatchObject({ version: 1 });
+		await pool.query(`INSERT INTO "${schema}"."allauthWebhookEndpoint" (id,url,"eventTypes","encryptedSecret") VALUES ('fixture-mfa','https://webhook.fixture.example/events','["mfa.*"]','fixture-encrypted-secret')`);
+		const incompatible = { ...compatible, requireEmailVerification: true };
+		await expect(update(1, incompatible, "allauth")).rejects.toMatchObject({ statusCode: 409 });
+		await expect(authPolicyRepository(pool).read(webhookScopeId)).resolves.toMatchObject({ version: 1, policy: compatible });
+		const count = await pool.query<{ total: number }>(`SELECT count(*)::integer AS total FROM "${schema}"."allauthEvent" WHERE type='configuration.updated' AND "targetId"=$1`, [webhookScopeId]);
+		expect(count.rows).toEqual([{ total: 1 }]);
+		await expect(update(1, incompatible, "legacy")).resolves.toMatchObject({ version: 2, policy: incompatible });
+		await pool.query(`UPDATE "${schema}"."allauthWebhookEndpoint" SET "eventTypes"='["api-key.*"]' WHERE id='fixture-mfa'`);
+		const required = { ...incompatible, mfaMode: "required" as const, signUpEnabled: false };
+		await expect(update(2, required, "allauth")).resolves.toMatchObject({ version: 3, policy: required });
 	});
 	it("binds every PG log filter and search literally, including metadata/session-target fallback",async () => {
 		const context = await instance.auth.$context;

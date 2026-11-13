@@ -3,14 +3,13 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import type { ReactNode } from "react";
-import Header from "@/components/header";
-import { isAuthenticationPath } from "@/components/better-auth-ui/lib/navigation";
+import { isAuthenticationPath } from "@/lib/hosted-portal-paths";
 import "./account-shell.css";
 import { useConfiguration } from "@/lib/configuration-client";
 import { applicationBrandStyle } from "@/lib/branding/presentation";
 import { ApplicationBrandFooter } from "@/components/application-brand";
 
-export function AccountShell({ children }: { children: ReactNode }) {
+export function AccountShell({ children, header }: { children: ReactNode; header: ReactNode }) {
 	const pathname = usePathname();
 	const configuration = useConfiguration();
 	const branding = (configuration.data?.realmName || configuration.data?.broker) ? configuration.data.branding : null;
@@ -27,7 +26,7 @@ export function AccountShell({ children }: { children: ReactNode }) {
 			<a className="account-skip-link" href="#main-content">
 				Skip to content
 			</a>
-			<Header />
+			{header}
 			<main
 				id="main-content"
 				className={`account-main ${hosted ? "account-main-hosted" : ""}`}

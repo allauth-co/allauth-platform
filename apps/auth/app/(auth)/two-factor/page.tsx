@@ -1,7 +1,8 @@
-import { AllAuthAuth } from "@/components/better-auth-ui/allauth-auth";
+import { HostedProjectAuthPage } from "@/components/hosted-project-auth-page";
 import { headers } from "next/headers";
 import { redirect } from "next/navigation";
-import { withPortalHeaders } from "@/lib/domains/hosting";
+import { withAuth } from "@/lib/auth";
+import { withPortalHeadersEngine } from "@/lib/domains/hosting";
 
 export default async function Page({
 	searchParams,
@@ -16,17 +17,19 @@ export default async function Page({
 			else if (Array.isArray(value))
 				for (const part of value) query.append(name, part);
 		}
-		const handoff = await withPortalHeaders(
+		const handoff = await withPortalHeadersEngine(
 			new Headers(await headers()),
-			async (instance, bound, binding) =>
+			async (_engine, bound, binding) =>
 				binding
 					? null
-					: instance.api.brokerTwoFactorBrowserHandoff({
-							headers: bound,
-							query: { oauth_query: query.toString() },
-						}),
+					: withAuth((instance) =>
+							instance.api.brokerTwoFactorBrowserHandoff({
+								headers: bound,
+								query: { oauth_query: query.toString() },
+							}),
+						),
 		);
 		if (handoff?.url) redirect(handoff.url);
 	}
-	return <AllAuthAuth view="twoFactor" />;
+	return <HostedProjectAuthPage view="twoFactor" searchParams={searchParams} />;
 }

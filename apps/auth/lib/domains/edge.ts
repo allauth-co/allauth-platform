@@ -1,3 +1,8 @@
+import {
+	projectProtocolBody,
+	timedProjectProtocolStream,
+} from "../projects/project-protocol-body";
+
 /** The gateway and origin share a short-lived, body-bound request envelope. No hostname header alone grants routing. */
 export const edgeHeaders = ["x-allauth-edge-host", "x-allauth-edge-ip", "x-allauth-edge-time", "x-allauth-edge-signature"] as const;
 export const portalHeader = "x-allauth-portal-binding";
@@ -6,12 +11,39 @@ const encoder = new TextEncoder();
 const hex = (value: ArrayBuffer) => Array.from(new Uint8Array(value), (byte) => byte.toString(16).padStart(2,"0")).join("");
 const bytes = (value: string) => new Uint8Array(value.match(/.{2}/g)!.map((pair) => parseInt(pair,16)));
 async function key(secret: string) { if (secret.length < 32) throw new Error("Gateway secret is not configured."); return crypto.subtle.importKey("raw",encoder.encode(secret),{name:"HMAC",hash:"SHA-256"},false,["sign","verify"]); }
-export async function boundedEdgeBody(request: Request): Promise<Uint8Array<ArrayBuffer>> {
-	const reader = request.clone().body?.getReader(); if (!reader) return new Uint8Array();
-	const chunks: Uint8Array[] = []; let length=0;
-	try { for (;;) { const next=await reader.read(); if(next.done) break; length+=next.value.length; if(length>maxEdgeBody) { void reader.cancel().catch(()=>{}); throw new Error("Request body exceeds gateway limit."); } chunks.push(next.value); } }
-	finally { reader.releaseLock(); }
-	const body=new Uint8Array(length); let offset=0; for(const chunk of chunks) {body.set(chunk,offset);offset+=chunk.length;} return body;
+export async function boundedEdgeBody(
+	request: Request,
+): Promise<Uint8Array<ArrayBuffer>> {
+	const stream = request.clone().body;
+	if (!stream) return new Uint8Array();
+	const reader = (
+		projectProtocolBody(request, "/api/auth")
+			? timedProjectProtocolStream(stream).stream
+			: stream
+	).getReader();
+	const chunks: Uint8Array[] = [];
+	let length = 0;
+	try {
+		for (;;) {
+			const next = await reader.read();
+			if (next.done) break;
+			length += next.value.length;
+			if (length > maxEdgeBody) {
+				void reader.cancel().catch(() => {});
+				throw new Error("Request body exceeds gateway limit.");
+			}
+			chunks.push(next.value);
+		}
+	} finally {
+		reader.releaseLock();
+	}
+	const body = new Uint8Array(length);
+	let offset = 0;
+	for (const chunk of chunks) {
+		body.set(chunk, offset);
+		offset += chunk.length;
+	}
+	return body;
 }
 async function message(request: Request, hostname: string, ip: string, timestamp: string) {
 	const url=new URL(request.url); const body=await boundedEdgeBody(request);

@@ -1,8 +1,9 @@
 import { APIError } from "better-auth";
+import * as z from "zod";
 import { getAuthEnvironment, withAuth, withAuthEngine } from "../auth";
 import type { AuthInstance } from "../api";
 import type { AuthEngine } from "../auth-engine";
-import { setting } from "../configuration";
+import { authOrigin, setting } from "../configuration";
 import type { AuthEnvironment } from "../configuration";
 import { getProject } from "../projects/registry";
 import type { Project } from "../projects/registry";
@@ -39,13 +40,40 @@ export async function requestHostedBinding(request: Request, env: AuthEnvironmen
 	const binding=await resolveHostedBinding(edge.hostname,env); if(!binding) throw new APIError("NOT_FOUND",{message:"Authentication hostname is not active."});
 	return {binding,headers:hostedHeaders(request.headers,binding,edge.ip)};
 }
-async function bindPortalRequest(request: Request) {
+const confidentialOAuthPaths = new Set([
+	"/api/auth/oauth2/token",
+	"/api/auth/oauth2/introspect",
+	"/api/auth/oauth2/revoke",
+	"/api/auth/device/code",
+]);
+
+function hostedProtocolAuthorization(request: Request) {
+	const authorization = request.headers.get("authorization");
+	if (!authorization) return null;
+	const path = new URL(request.url).pathname;
+	if (request.method === "POST" && confidentialOAuthPaths.has(path))
+		return /^Basic [A-Za-z0-9+/]+=*$/i.test(authorization) ? authorization : null;
+	if (path === "/api/auth/oauth2/userinfo" && ["GET", "POST"].includes(request.method))
+		return /^(?:Bearer|DPoP) [A-Za-z0-9._~+/-]+=*$/i.test(authorization) ? authorization : null;
+	if ((path === "/api/auth/scim/v2" || path.startsWith("/api/auth/scim/v2/")) &&
+		["GET", "POST", "PUT", "PATCH", "DELETE"].includes(request.method))
+		return /^Bearer [A-Za-z0-9._~+/-]+=*$/i.test(authorization) ? authorization : null;
+	return null;
+}
+
+async function bindPortalRequest(request: Request, permitProtocolAuthorization = false) {
 	const env = await getAuthEnvironment();
 	const hosted = await requestHostedBinding(request, env);
 	if (!hosted) return { env, request, binding: null };
-	const url = new URL(request.url);
-	url.protocol = "https:";
-	url.host = hosted.binding.hostname;
+	const incoming = new URL(request.url);
+	// Assigning URL.host would keep the standalone listener port.
+	const url = new URL(`https://${hosted.binding.hostname}`);
+	url.pathname = incoming.pathname;
+	url.search = incoming.search;
+	// The signed gateway proves the realm. The protocol endpoint independently
+	// authenticates the client credential against that realm.
+	const authorization = permitProtocolAuthorization && hostedProtocolAuthorization(request);
+	if (authorization) hosted.headers.set("authorization", authorization);
 	const bound = new Request(url, {
 		method: request.method,
 		headers: hosted.headers,
@@ -71,7 +99,7 @@ export async function withPortalAuthEngine<T>(
 		binding: HostedBinding | null,
 	) => Promise<T>,
 ): Promise<T> {
-	const { env, request: bound, binding } = await bindPortalRequest(request);
+	const { env, request: bound, binding } = await bindPortalRequest(request, true);
 	if (!binding) {
 		return withAuthEngine((engine, environment) =>
 			callback(engine, environment, bound, null),
@@ -84,13 +112,99 @@ export async function withPortalAuthEngine<T>(
 		env,
 	);
 }
-/** Server-rendered pages receive only proxy-minted proofs and re-resolve the active mapping on each read. */
-export async function withPortalHeaders<T>(headers:Headers,callback:(instance:AuthInstance,headers:Headers,binding:HostedBinding|null)=>Promise<T>):Promise<T> {
-	const proof=headers.get(portalHeader);
-	if(!proof) { if(edgeHeaders.some(name=>headers.has(name))) throw new APIError("FORBIDDEN"); return withAuth((instance)=>callback(instance,headers,null)); }
-	const env=await getAuthEnvironment();const hostname=await verifyPortalBinding(proof,setting(env,"ALLAUTH_EDGE_SECRET"));
-	const binding=hostname ? await resolveHostedBinding(hostname,env) : null;
-	if(!binding) throw new APIError("FORBIDDEN");
-	return withHostedProjectAuth(binding.project,binding.hostname,(instance)=>callback(instance,hostedHeaders(headers,binding),binding),env);
+/** Server-rendered pages reverify the gateway proof and the active mapping on each read. */
+async function bindPortalHeaders(headers: Headers) {
+	const proof = headers.get(portalHeader);
+	if (!proof) {
+		if (edgeHeaders.some((name) => headers.has(name))) throw new APIError("FORBIDDEN");
+		return null;
+	}
+	const env = await getAuthEnvironment();
+	const hostname = await verifyPortalBinding(proof, setting(env, "ALLAUTH_EDGE_SECRET"));
+	const binding = hostname ? await resolveHostedBinding(hostname, env) : null;
+	if (!binding) throw new APIError("FORBIDDEN");
+	return { binding, env, headers: hostedHeaders(headers, binding) };
 }
-export function portalSession(headers:Headers) {return withPortalHeaders(headers,(instance,bound)=>instance.api.getSession({headers:bound,query:{disableCookieCache:true}}));}
+
+export async function withPortalHeaders<T>(
+	headers: Headers,
+	callback: (instance: AuthInstance, headers: Headers, binding: HostedBinding | null) => Promise<T>,
+): Promise<T> {
+	const bound = await bindPortalHeaders(headers);
+	if (!bound) return withAuth((instance) => callback(instance, headers, null));
+	const { binding, env } = bound;
+	return withHostedProjectAuth(binding.project, binding.hostname,
+		(instance) => callback(instance, bound.headers, binding), env);
+}
+
+export async function withPortalHeadersEngine<T>(
+	headers: Headers,
+	callback: (
+		engine: AuthEngine,
+		headers: Headers,
+		binding: HostedBinding | null,
+		env: AuthEnvironment,
+	) => Promise<T>,
+): Promise<T> {
+	const bound = await bindPortalHeaders(headers);
+	if (!bound)
+		return withAuthEngine((engine, env) => callback(engine, headers, null, env));
+	const { binding, env } = bound;
+	return withHostedProjectAuthEngine(
+		binding.project,
+		binding.hostname,
+		(engine, env) => callback(engine, bound.headers, binding, env),
+		env,
+	);
+}
+
+const portalIdentity = z.object({
+	user: z.object({
+		id: z.string().min(1),
+		name: z.string(),
+		email: z.string(),
+		emailVerified: z.boolean(),
+		banned: z.boolean().nullish(),
+		isAnonymous: z.boolean().nullish(),
+	}),
+	session: z.object({
+		id: z.string().min(1),
+		userId: z.string().min(1),
+		impersonatedBy: z.string().nullish(),
+	}),
+}).nullable();
+
+/** Read the live portal identity from the engine selected by the verified realm. */
+export function portalSessionContext(headers: Headers) {
+	return withPortalHeadersEngine(headers, async (engine, bound, binding, env) => {
+		const origin = binding ? `https://${binding.hostname}` : authOrigin(env);
+		// A browser may navigate here from another site. The server reads only
+		// the cookies already admitted for this realm and session device context.
+		const sessionHeaders = new Headers({ accept: "application/json" });
+		for (const name of ["cookie", "user-agent", "x-real-ip", "cf-connecting-ip"]) {
+			const value = bound.get(name);
+			if (value) sessionHeaders.set(name, value);
+		}
+		const response = await engine.readSession(
+			new Request(`${origin}/api/auth/get-session?disableCookieCache=true`, {
+				headers: sessionHeaders,
+			}),
+		);
+		if (response.status === 401) return { binding, session: null };
+		if (!response.ok) throw new Error("Unable to read the portal session.");
+		const identity = portalIdentity.safeParse(
+			await response.json().catch(() => undefined),
+		);
+		if (
+			!identity.success ||
+			(identity.data && identity.data.session.userId !== identity.data.user.id)
+		)
+			throw new Error("Invalid portal session response.");
+		return { binding, session: identity.data };
+	});
+}
+
+/** Read the current identity for an account or authorization page. */
+export async function portalSession(headers: Headers) {
+	return (await portalSessionContext(headers)).session;
+}

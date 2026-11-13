@@ -1,7 +1,7 @@
 import type { DBAdapter, Where } from "@better-auth/core/db/adapter";
 import { APIError } from "better-auth";
 import { sql } from "kysely";
-import { publicControlEvent } from "./events";
+import { publicControlEvent } from "./event-contract";
 import type { ControlDatabase, ControlEventFilters, ControlEventsResponse, ControlOverview, ControlSession, ControlSessionsResponse } from "./types";
 
 export const DEFAULT_RETENTION_DAYS = 90;
@@ -26,7 +26,7 @@ function eventWhere(filters: ControlEventFilters, retentionDays: number): Where[
 const escapedLike = (value: string) => `%${value.replaceAll("\\", "\\\\").replaceAll("%", "\\%").replaceAll("_", "\\_")}%`;
 
 /** Parameterized, date-bounded events; scope authorization must precede this function. */
-export async function queryControlEvents(adapter: Pick<DBAdapter, "findMany" | "count">, database: ControlDatabase | undefined, filters: ControlEventFilters, retentionDays: number): Promise<ControlEventsResponse> {
+export async function queryControlEvents(adapter: Pick<DBAdapter, "findMany" | "count"> | undefined, database: ControlDatabase | undefined, filters: ControlEventFilters, retentionDays: number): Promise<ControlEventsResponse> {
 	const where = eventWhere(filters, retentionDays);
 	let rows: Record<string, unknown>[];
 	let total: number;
@@ -43,6 +43,7 @@ export async function queryControlEvents(adapter: Pick<DBAdapter, "findMany" | "
 		]);
 		rows = records.rows; total = Number(count.rows[0]?.total || 0);
 	} else {
+		if (!adapter) throw new Error("Audit database is unavailable.");
 		if (filters.q) throw new APIError("BAD_REQUEST", { message: "Audit search requires the PostgreSQL dashboard adapter." });
 		[rows, total] = await Promise.all([
 			adapter.findMany<Record<string, unknown>>({ model: "allauthEvent", where, select: eventFields, limit: filters.limit, offset: filters.offset, sortBy: { field: "createdAt", direction: "desc" } }),
@@ -53,14 +54,33 @@ export async function queryControlEvents(adapter: Pick<DBAdapter, "findMany" | "
 }
 
 /** Aggregate seven complete UTC calendar buckets without reading event payloads into memory. */
-export async function queryControlOverview(adapter: Pick<DBAdapter, "findMany" | "count">, database: ControlDatabase | undefined, retentionDays: number): Promise<ControlOverview> {
+export async function queryControlOverview(adapter: Pick<DBAdapter, "findMany" | "count"> | undefined, database: ControlDatabase | undefined, retentionDays: number): Promise<ControlOverview> {
 	const today = new Date(); today.setUTCHours(0, 0, 0, 0);
 	const start = new Date(today.getTime() - 6 * day);
-	const totalsPromise = Promise.all([
-		adapter.count({ model: "user" }), adapter.count({ model: "organization" }), adapter.count({ model: "oauthClient" }),
-		adapter.count({ model: "session", where: [{ field: "expiresAt", operator: "gt", value: new Date() }] }),
-		adapter.count({ model: "user", where: [{ field: "twoFactorEnabled", value: true }] }),
-	]);
+	const now = new Date();
+	const totalsPromise = (async () => {
+		if (!database) {
+			if (!adapter) throw new Error("Overview database is unavailable.");
+			return Promise.all([
+				adapter.count({ model: "user" }),
+				adapter.count({ model: "organization" }),
+				adapter.count({ model: "oauthClient" }),
+				adapter.count({ model: "session", where: [{ field: "expiresAt", operator: "gt", value: now }] }),
+				adapter.count({ model: "user", where: [{ field: "twoFactorEnabled", value: true }] }),
+			]);
+		}
+		const { rows: [totals] } = await sql<{ users: string; organizations: string; applications: string; activeSessions: string; mfaUsers: string }>`
+			SELECT (SELECT count(*) FROM "user")::text AS users,
+			       (SELECT count(*) FROM organization)::text AS organizations,
+			       (SELECT count(*) FROM "oauthClient")::text AS applications,
+			       (SELECT count(*) FROM session WHERE "expiresAt" > ${now})::text AS "activeSessions",
+			       (SELECT count(*) FROM "user" WHERE "twoFactorEnabled" = true)::text AS "mfaUsers"
+		`.execute(database);
+		return [
+			Number(totals.users), Number(totals.organizations), Number(totals.applications),
+			Number(totals.activeSessions), Number(totals.mfaUsers),
+		];
+	})();
 	const recentPromise = queryControlEvents(adapter, database, { scope: "admin", limit: 8, offset: 0 }, retentionDays);
 	const series: ControlOverview["series"] = [];
 	let blockedRequests = 0;
@@ -79,6 +99,7 @@ export async function queryControlOverview(adapter: Pick<DBAdapter, "findMany" |
 			if (index === 6) blockedRequests = Number(row?.blockedRequests || 0);
 		}
 	} else {
+		if (!adapter) throw new Error("Overview database is unavailable.");
 		const buckets = await Promise.all(Array.from({ length: 7 }, async (_value, index) => {
 			const from = new Date(start.getTime() + index * day);
 			const where: Where[] = [{ field: "createdAt", operator: "gte", value: from }, { field: "createdAt", operator: "lt", value: new Date(from.getTime() + day) }];
@@ -104,7 +125,7 @@ function publicSession(row: Record<string, unknown>): ControlSession {
 }
 
 /** Read only active sessions, projecting safe fields before the SQL result reaches the caller. */
-export async function queryControlSessions(adapter: Pick<DBAdapter, "findMany" | "findOne" | "count">, database: ControlDatabase | undefined, filters: { userId?: string; q?: string; limit: number; offset: number }): Promise<ControlSessionsResponse> {
+export async function queryControlSessions(adapter: Pick<DBAdapter, "findMany" | "findOne" | "count"> | undefined, database: ControlDatabase | undefined, filters: { userId?: string; q?: string; limit: number; offset: number }): Promise<ControlSessionsResponse> {
 	let rows: Record<string, unknown>[];
 	let total: number;
 	if (database) {
@@ -118,6 +139,7 @@ export async function queryControlSessions(adapter: Pick<DBAdapter, "findMany" |
 		]);
 		rows = records.rows; total = Number(count.rows[0]?.total || 0);
 	} else {
+		if (!adapter) throw new Error("Session database is unavailable.");
 		if (filters.q) throw new APIError("BAD_REQUEST", { message: "Session search requires the PostgreSQL dashboard adapter." });
 		const where: Where[] = [{ field: "expiresAt", operator: "gt", value: new Date() }, ...(filters.userId ? [{ field: "userId", value: filters.userId }] : [])];
 		const [records, count] = await Promise.all([

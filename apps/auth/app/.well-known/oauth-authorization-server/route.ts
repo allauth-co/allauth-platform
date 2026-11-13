@@ -1,7 +1,7 @@
-import { NextResponse } from "next/server";
-import { withPortalRequest } from "@/lib/domains/hosting";
-import { discoveryDocument, discoveryHeaders } from "@/lib/discovery";
+import { withPortalAuthEngine } from "@/lib/domains/hosting";
 
-export async function GET(request:Request): Promise<NextResponse> {
-	return withPortalRequest(request,async (auth)=>{const config=await auth.api.getOAuthServerConfig();return NextResponse.json(discoveryDocument(config),{headers:discoveryHeaders});});
+export function GET(request: Request) {
+	return withPortalAuthEngine(request, (engine) =>
+		engine.readIssuerMetadata("oauth"),
+	);
 }

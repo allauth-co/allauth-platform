@@ -19,6 +19,7 @@ import {
 import type { AvatarScope } from "./lifecycle";
 import worker from "../../workers/brand-assets";
 import type { AuthEnvironment } from "../configuration";
+import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
 const fixturePath = new URL(
 	"../../../../.secrets/local-postgres.json",
 	import.meta.url,
@@ -164,10 +165,11 @@ describe.skipIf(!existsSync(fixturePath))(
 			vi.unstubAllGlobals();
 			if (pool) await pool.end();
 			if (admin) {
-				await admin.query(
-					`DROP DATABASE IF EXISTS "${databaseName}" WITH (FORCE)`,
-				);
-				await admin.end();
+				try {
+					await dropClosedFixtureDatabase(admin, databaseName);
+				} finally {
+					await admin.end();
+				}
 			}
 		});
 

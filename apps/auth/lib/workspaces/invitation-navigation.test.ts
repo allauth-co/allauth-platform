@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { workspaceInvitationHref, workspaceInvitationSignInHref, workspaceInvitationConsoleHref } from "./invitation-navigation";
 import { getCallbackURL } from "../shared";
-import { localNavigation } from "../../components/better-auth-ui/lib/navigation";
+import { localNavigation } from "../auth-navigation";
 
 /** @see https://allauth.co/admin/workspaces?tab=team */
 describe("workspace invitation email continuation", () => {

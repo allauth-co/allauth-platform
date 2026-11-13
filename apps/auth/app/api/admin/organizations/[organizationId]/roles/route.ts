@@ -1,12 +1,12 @@
-import { apiRoute, json, requireSameOrigin } from "@/lib/api";
-import { consoleBody, consoleDatabase, requireConsoleAdministrator } from "@/lib/console/database";
-import { changeConsoleRole, listConsoleOrganizationRoles } from "@/lib/console/organizations";
-export const POST = (request: Request, context: { params: Promise<{ organizationId: string }> }) => apiRoute(request, async (instance, env) => {
-	requireSameOrigin(request, env); const actor = await requireConsoleAdministrator(instance, request.headers);
-	return json(await changeConsoleRole(await consoleDatabase(instance), (await context.params).organizationId, await consoleBody(request), actor.user.id));
-});
+import { consoleOrganizationRoute } from "@/lib/console/organization-route";
 
-export const GET = (request: Request, context: { params: Promise<{ organizationId: string }> }) => apiRoute(request, async (instance) => {
-	await requireConsoleAdministrator(instance, request.headers);
-	return json(await listConsoleOrganizationRoles(await consoleDatabase(instance), (await context.params).organizationId, Object.fromEntries(new URL(request.url).searchParams)));
-});
+type Context = { params: Promise<{ organizationId: string }> };
+
+export const GET = async (request: Request, context: Context) =>
+	consoleOrganizationRoute(
+		request,
+		(await context.params).organizationId,
+		"roles",
+	);
+
+export const POST = GET;

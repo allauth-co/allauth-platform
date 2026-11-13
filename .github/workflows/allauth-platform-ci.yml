@@ -24,7 +24,8 @@ jobs:
           POSTGRES_USER: allauth
           POSTGRES_DB: allauth
           POSTGRES_PASSWORD: allauth-ci-only
-        ports: ["55445:5432"]
+        ports: ["55445:5432", "55447:5432"]
+        # cspell:ignore isready
         options: >-
           --health-cmd "pg_isready -U allauth -d allauth"
           --health-interval 5s --health-timeout 5s --health-retries 20
@@ -55,17 +56,90 @@ jobs:
         run: |
           node --input-type=module <<'JS'
           import { mkdirSync, writeFileSync } from 'node:fs';
+          import { createRequire } from 'node:module';
+          const { Client } = createRequire(process.cwd() + '/apps/auth/package.json')('pg');
+          const databaseURL = 'postgresql://allauth:allauth-ci-only@127.0.0.1:55445/allauth';
+          const database = new Client({ connectionString: databaseURL });
+          await database.connect();
+          try {
+            await database.query('CREATE DATABASE security_fixture');
+          } finally {
+            await database.end();
+          }
           mkdirSync('.secrets', { recursive: true });
-          // Historical marker used by the tests' isolated-fixture allowlist.
-          writeFileSync('.secrets/local-postgres.json', JSON.stringify({ container: 'allauth-production-test-20261007', DATABASE_URL: 'postgresql://allauth:allauth-ci-only@127.0.0.1:55445/allauth' }), { mode: 0o600 });
+          // These historical markers require the disposable CI databases and their exact ports.
+          writeFileSync('.secrets/local-postgres.json', JSON.stringify({ container: 'allauth-production-test-20261007', DATABASE_URL: databaseURL }), { mode: 0o600 });
+          writeFileSync('.secrets/security-test-database.json', JSON.stringify({ fixture: 'allauth-security-test-20261007', url: 'postgresql://allauth:allauth-ci-only@127.0.0.1:55447/security_fixture' }), { mode: 0o600 });
           JS
       - name: Test authentication and existing SDK compatibility
         run: >-
           pnpm exec vitest run --root apps/auth --config vitest.config.ts
-          lib/configuration-aliases.test.ts lib/clerk-password.test.ts lib/mfa.test.ts sdk/next.test.ts
-          lib/domains/hosting.pg.test.ts lib/projects/runtime.test.ts
+          lib/configuration-aliases.test.ts lib/project-email-aliases.test.ts lib/clerk-password.test.ts lib/mfa.test.ts sdk/next.test.ts
+          lib/broker-login.test.ts lib/projects/broker-two-factor.test.ts
+          lib/domains/hosting.pg.test.ts lib/domains/domains.pg.test.ts lib/domains/edge.test.ts lib/domains/gateway.test.ts lib/projects/runtime.test.ts
           lib/projects/session-introspection.test.ts lib/projects/session-introspection.legacy.test.ts
           lib/projects/service-directory-transport.test.ts lib/projects/sdk-version-observation.test.ts
+          lib/projects/proxy-boundary.test.ts lib/projects/owned-project-runtime-factory.test.ts
+          lib/projects/project-engine-rollout-selection.test.ts
+      - name: Test first-party project engine compatibility
+        run: >-
+          pnpm exec vitest run --root apps/auth --config vitest.config.ts
+          lib/domains/hosted-sdk.test.ts lib/hosted-sdk-page.test.ts lib/hosted-sdk-ui-render.test.ts
+          lib/hosted-project-passkey-render.test.ts
+          lib/domains/hosted-organization-preview.test.ts lib/hosted-organization-ui-render.test.ts
+          lib/domains/hosted-header-render.test.ts lib/domains/hosted-account-profile-render.test.ts
+          lib/domains/hosted-account-security-render.test.ts
+          lib/features/device-render.test.ts lib/features/project-device-page.test.ts
+          lib/domains/hosted-auth-error.test.ts lib/hosted-provider-render.test.ts lib/projects/oauth-return-window.test.ts lib/hosted-reset-continuation.test.ts lib/hosted-invitation-route-render.test.ts
+          lib/projects/owned-project-agent-hosts.pg.test.ts lib/projects/engine-metrics.test.ts
+          lib/projects/engine-metrics-comparison.test.ts
+          lib/console/organization-members-route.test.ts lib/projects/project-error-localization.test.ts
+          lib/branding/portal.test.ts lib/shared.test.ts lib/oauth-consent-render.test.ts
+          lib/domains/portal-session.test.ts lib/app-entry.test.ts lib/console-entry.test.ts
+          lib/oauth-picker-portal.test.ts lib/oauth-picker-render.test.ts
+          lib/projects/legacy-mfa-record.test.ts lib/projects/session-shadow.test.ts
+          lib/projects/legacy-project-keyring.test.ts
+          lib/projects/owned-project-engine.pg.test.ts lib/projects/owned-project-rollback.pg.test.ts
+          lib/projects/owned-project-openapi.test.ts
+          lib/projects/owned-project-password-safety.test.ts
+          lib/projects/owned-project-bulk-session.pg.test.ts lib/projects/owned-project-email-callback.test.ts
+          lib/projects/owned-project-personal-keys.pg.test.ts
+          lib/project-providers/apple.test.ts lib/project-providers/apple-flow.test.ts lib/project-providers/apple-deletion.test.ts
+          lib/project-providers/google.test.ts lib/project-providers/microsoft.test.ts
+          lib/projects/owned-project-issuer-authorization.pg.test.ts lib/projects/owned-project-issuer-introspection.pg.test.ts
+          lib/projects/owned-project-issuer-device.pg.test.ts
+          lib/projects/owned-project-account-links.pg.test.ts lib/projects/owned-project-broker-mfa.test.ts
+          lib/projects/owned-project-admin-deletion.pg.test.ts lib/projects/owned-project-clerk-import.pg.test.ts
+          lib/projects/owned-project-invitation-import.pg.test.ts lib/projects/owned-project-webhook-management.pg.test.ts
+          lib/projects/owned-password-reset.pg.test.ts
+          lib/projects/owned-project-password-change.pg.test.ts lib/auth-policy/password.test.ts
+          lib/auth-policy/api.test.ts lib/auth-policy/storage.pg.test.ts lib/auth-policy/serialization.test.ts
+          lib/projects/owned-mfa.pg.test.ts lib/projects/owned-mfa-enrollment.pg.test.ts
+          lib/projects/owned-recovery-http.pg.test.ts lib/projects/owned-sign-up.pg.test.ts
+          lib/projects/owned-project-email-sign-in.pg.test.ts lib/projects/owned-project-oauth.pg.test.ts
+          lib/projects/owned-project-email-otp-recovery.pg.test.ts lib/projects/owned-project-wallet.pg.test.ts
+          lib/projects/owned-project-callback-security.pg.test.ts
+          lib/projects/owned-project-organization.pg.test.ts lib/projects/owned-project-organization-roles.pg.test.ts
+          lib/control/security.test.ts lib/control/webhooks.test.ts lib/control/jobs.test.ts
+          lib/projects/owned-project-enterprise-catalog.pg.test.ts
+          lib/projects/owned-project-scim.pg.test.ts lib/projects/owned-project-scim-resources.pg.test.ts
+          lib/projects/owned-project-scim-user-writes.pg.test.ts lib/projects/owned-project-scim-group-writes.pg.test.ts
+          lib/projects/owned-project-scim-management.pg.test.ts lib/projects/owned-project-scim-decommission.pg.test.ts
+          lib/projects/owned-project-scim-console.pg.test.ts
+          lib/projects/owned-project-sso.pg.test.ts lib/projects/owned-project-sso-saml.pg.test.ts
+          lib/projects/owned-project-sso-management.pg.test.ts
+          lib/projects/owned-project-https.test.ts lib/avatars/profile.test.ts
+          lib/avatars/lifecycle.pg.test.ts lib/branding/validation.test.ts
+          lib/projects/owned-project-support.pg.test.ts lib/projects/support-plugin.test.ts
+          lib/projects/management-plugin.test.ts lib/projects/service-directory.test.ts
+          lib/projects/passkey-store.pg.test.ts
+      - name: Rehearse project writer restarts and rollback
+        run: >-
+          pnpm exec vitest run --root apps/auth --config vitest.config.ts
+          lib/projects/owned-project-runtime.pg.test.ts
+          lib/projects/project-engine-writer-lease.pg.test.ts
+          lib/projects/project-engine-production-fence.pg.test.ts
+          lib/projects/project-engine-production-operator.pg.test.ts
       - name: Test billing, platform administration, self-hosting and public pages
         run: >-
           pnpm exec vitest run --root apps/auth --config vitest.config.ts

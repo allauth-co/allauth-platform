@@ -1,9 +1,15 @@
 "use client";
 import { useQuery } from "@tanstack/react-query";
-import { useState } from "react";
+import { useSearchParams } from "next/navigation";
+import { useRef, useState } from "react";
 import { toast } from "sonner";
-import { authClient } from "@/lib/auth-client";
+import * as z from "zod";
+import {
+	oauthBrowserQuery,
+	submitOAuthBrowserAction,
+} from "@/lib/oauth-browser";
 import { errorMessage } from "@/lib/shared";
+import { Button } from "./ui/button";
 import {
 	Card,
 	CardContent,
@@ -11,12 +17,16 @@ import {
 	CardHeader,
 	CardTitle,
 } from "./ui/card";
-import { Button } from "./ui/button";
-interface Context {
-	client: { client_id: string; client_name: string };
-	scopes: string[];
-	continueURL: string;
-}
+
+const consentContext = z.object({
+	client: z.object({
+		client_id: z.string(),
+		client_name: z.string().nullish(),
+	}),
+	scopes: z.array(z.string()),
+	continueURL: z.string(),
+});
+const invalidRequest = "This authorization request is invalid or has expired";
 const labels: Record<string, string> = {
 	openid: "Confirm your identity",
 	profile: "Read your name and profile",
@@ -25,32 +35,62 @@ const labels: Record<string, string> = {
 	"organization:read": "Read the selected organization",
 };
 export function OAuthConsent({ name, email }: { name: string; email: string }) {
+	const params = oauthBrowserQuery(useSearchParams());
+	const signed = params?.toString();
+	const submitting = useRef(false);
 	const [busy, setBusy] = useState(false);
 	const context = useQuery({
-		queryKey: ["oauth-context"],
-		queryFn: async (): Promise<Context> => {
-			const response = await fetch(
-				`/api/oauth/context${window.location.search}`,
-				{ cache: "no-store" },
+		queryKey: ["oauth-context", signed],
+		queryFn: async ({ signal }) => {
+			if (!signed) throw new Error(invalidRequest);
+			const response = await fetch(`/api/oauth/context?${signed}`, {
+				cache: "no-store",
+				signal,
+			});
+			if (!response.ok) throw new Error(invalidRequest);
+			const verified = consentContext.safeParse(
+				await response.json().catch(() => null),
 			);
-			if (!response.ok)
-				throw new Error("This authorization request is invalid or has expired");
-			return response.json();
+			if (
+				!verified.success ||
+				verified.data.continueURL !== `/oauth2/continue?${signed}` ||
+				verified.data.client.client_id !== params?.get("client_id")
+			)
+				throw new Error(invalidRequest);
+			return verified.data;
 		},
+		enabled: Boolean(signed),
+		staleTime: 0,
+		gcTime: 0,
 		retry: false,
 	});
+	const verified =
+		context.isSuccess && context.fetchStatus === "idle" ? context.data : null;
+	const failure = !signed
+		? invalidRequest
+		: context.error
+			? errorMessage(context.error)
+			: null;
+	const clientName =
+		typeof verified?.client.client_name === "string"
+			? verified.client.client_name
+			: null;
 	const consent = async (accept: boolean) => {
+		if (!verified || !signed || submitting.current) return;
+		if (
+			oauthBrowserQuery(
+				new URLSearchParams(window.location.search),
+			)?.toString() !== signed
+		)
+			return;
+		submitting.current = true;
 		setBusy(true);
 		try {
-			const { data, error } = await authClient.oauth2.consent({ accept });
-			if (error) throw new Error(error.message);
-			if (!data?.redirect || !data.url)
-				throw new Error("Unable to complete authorization");
-			// The native redirect plugin already follows this one-use result.
-			// Do not start a second callback request after consent succeeds.
+			await submitOAuthBrowserAction("consent", signed, { accept });
 		} catch (e) {
 			toast.error(errorMessage(e));
 		} finally {
+			submitting.current = false;
 			setBusy(false);
 		}
 	};
@@ -58,28 +98,30 @@ export function OAuthConsent({ name, email }: { name: string; email: string }) {
 		<Card className="max-w-lg mx-auto my-8">
 			<CardHeader>
 				<CardTitle>Authorize application</CardTitle>
-				<CardDescription>
-					{context.data
-						? `${context.data.client.client_name || context.data.client.client_id} wants to access your AllAuth account.`
-						: "Checking authorization request…"}
-				</CardDescription>
+				{!failure && (
+					<CardDescription>
+						{verified
+							? `${clientName || verified.client.client_id} wants to access your AllAuth account.`
+							: "Checking authorization request…"}
+					</CardDescription>
+				)}
 			</CardHeader>
 			<CardContent className="space-y-6">
 				<div className="bg-muted p-4 rounded-md">
 					<p className="font-medium text-sm">{name}</p>
 					<p className="text-sm text-muted-foreground">{email}</p>
 				</div>
-				{context.error && (
+				{failure && (
 					<p className="text-sm text-destructive" role="alert">
-						{errorMessage(context.error)}
+						{failure}
 					</p>
 				)}
-				{context.data && (
+				{verified && (
 					<>
 						<div>
 							<p className="text-sm font-medium mb-3">Requested permissions</p>
 							<ul className="space-y-3 text-sm">
-								{context.data.scopes.map((scope) => (
+								{verified.scopes.map((scope) => (
 									<li key={scope}>{labels[scope] || scope}</li>
 								))}
 							</ul>

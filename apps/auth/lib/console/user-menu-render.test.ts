@@ -1,9 +1,10 @@
 import type { ComponentProps, ReactNode } from "react";
 import { createElement } from "react";
-import { renderToStaticMarkup } from "react-dom/server";
+import { renderToReadableStream, renderToStaticMarkup } from "react-dom/server";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { AllAuthUserMenu } from "@/components/allauth-user-menu";
-import Header from "@/components/header";
+import { SiteFrame } from "@/components/console/site-frame";
+import { LegacyAccountHeader } from "@/components/legacy-auth-ui";
 
 const state = vi.hoisted(() => ({
 	session: {
@@ -83,6 +84,16 @@ function render(consoleHref?: string) {
 	return renderToStaticMarkup(createElement(AllAuthUserMenu, { consoleHref }));
 }
 
+async function renderAccountShell() {
+	const stream = await renderToReadableStream(
+		createElement(SiteFrame, {
+			header: createElement(LegacyAccountHeader),
+			children: "Fixture account page",
+		}),
+	);
+	return new Response(stream).text();
+}
+
 beforeEach(() => {
 	state.session.user.emailVerified = true;
 	state.session.session.impersonatedBy = null;
@@ -148,20 +159,20 @@ describe("shared AllAuth user menu", () => {
 		expect(state.navigate).toHaveBeenCalledWith({ to: "/admin/workspaces" });
 	});
 
-	it("uses the same avatar and console return destination in the account header without a personal workspace selector", () => {
+	it("uses the same avatar and console return destination in the account header without a personal workspace selector", async () => {
 		const destination = "/admin/users?workspace=workspace-a&project=app-development";
 		state.search = new URLSearchParams({ consoleReturnTo: destination }).toString();
-		const html = renderToStaticMarkup(createElement(Header));
+		const html = await renderAccountShell();
 		expect(html).toContain('href="/admin/users?workspace=workspace-a&amp;project=app-development"');
 		expect(html).toContain(`href="/organizations?consoleReturnTo=${encodeURIComponent(destination)}"`);
 		expect(html.match(/class="[^"]*allauth-user-trigger/g)).toHaveLength(1);
 		expect(html).not.toContain("Portal organization selector");
 	});
 
-	it("keeps a labelled organization selector on hosted account portals and hides console return links", () => {
+	it("keeps a labelled organization selector on hosted account portals and hides console return links", async () => {
 		state.configuration = { broker: true };
 		state.search = new URLSearchParams({ consoleReturnTo: "/admin/users?workspace=workspace-a" }).toString();
-		const html = renderToStaticMarkup(createElement(Header));
+		const html = await renderAccountShell();
 		expect(html).toContain("Portal organization selector");
 		expect(html).toContain("Organization</span>");
 		expect(html).not.toContain("Console");

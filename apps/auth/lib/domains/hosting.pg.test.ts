@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { runWithEndpointContext } from "@better-auth/core/context";
@@ -16,6 +16,8 @@ import type { AuthEnvironment } from "../configuration";
 import type { ControlDatabase } from "../control/types";
 import { defaultSecurityPolicy } from "../control/security";
 import { projectProxySecret } from "../projects/proxy";
+import { openLegacyMfaRecord } from "../projects/legacy-mfa-record";
+import { consumeProjectRecoveryCode } from "../projects/recovery-code-store";
 import { projectRegistryPool, provisionProject } from "../projects/registry";
 import type { Project } from "../projects/registry";
 import { closeProjectInstances, projectSecret, withHostedProjectAuth, withProjectAuth, withProjectAuthEngine } from "../projects/runtime";
@@ -26,10 +28,14 @@ import { createWorkspace } from "../workspaces/repository";
 import { proxy } from "../../proxy";
 import { GET as configGET } from "../../app/api/config/route";
 import { GET as nativeGET, POST as nativePOST } from "../../app/api/auth/[...all]/route";
+import { GET as hostedSdkGET, POST as hostedSdkPOST } from "../../app/api/auth/hosted-ui/[...all]/route";
 import { GET as sessionsGET } from "../../app/api/account/sessions/route";
 import { POST as revokePOST } from "../../app/api/account/sessions/revoke/route";
 import { GET as projectGET, POST as projectPOST } from "../../app/api/projects/[slug]/auth/[...all]/route";
 import { GET as discoveryGET } from "../../app/.well-known/openid-configuration/route";
+import { GET as authorizationDiscoveryGET } from "../../app/.well-known/oauth-authorization-server/route";
+import { discoveryDocument } from "../discovery";
+import { ownedProjectIssuerMetadata } from "../projects/owned-project-issuer-metadata";
 import { createAllAuthClient } from "../../sdk/client";
 import { createAllAuthProxy } from "../../sdk/next";
 import { edgeHeaders, portalHeader, signEdgeRequest, signPortalBinding, verifyPortalBinding } from "./edge";
@@ -226,6 +232,66 @@ describe.skipIf(!existsSync(fixturePath))("real PostgreSQL hosted authentication
 		const other = await discoveryGET(await signedRequest(host(beta), "/.well-known/openid-configuration")); expect((await other.json() as { issuer: string }).issuer).toBe(`https://${host(beta)}/api/auth`);
 	});
 
+	it("forwards hosted protocol credentials only to the signed project and OAuth endpoint", async () => {
+		const clientId = randomUUID();
+		const clientSecret = "hosted-fixture-confidential-secret";
+		const accessToken = "hosted-fixture-opaque-token";
+		const digest = (value: string) => createHash("sha256").update(value).digest("base64url");
+		const database = projectRegistryPool(env);
+		await database.query(
+			`INSERT INTO "${alpha.schemaName}"."oauthClient" (id,"clientId","clientSecret","redirectUris","tokenEndpointAuthMethod")
+			 VALUES ($1,$2,$3,'[]','client_secret_basic')`,
+			[randomUUID(), clientId, digest(clientSecret)],
+		);
+		await database.query(
+			`INSERT INTO "${alpha.schemaName}"."oauthAccessToken" (id,token,"clientId","userId","expiresAt","createdAt",scopes)
+			 VALUES ($1,$2,$3,$4,statement_timestamp()+interval '5 minutes',statement_timestamp(),'["openid","profile","email"]')`,
+			[randomUUID(), digest(accessToken), clientId, alphaUserId],
+		);
+
+		const basic = `Basic ${Buffer.from(`${clientId}:${clientSecret}`).toString("base64")}`;
+		const call = async (hostname: string) => nativePOST(await signedRequest(hostname, "/api/auth/oauth2/introspect", {
+			method: "POST",
+			headers: { authorization: basic, "content-type": "application/x-www-form-urlencoded" },
+			body: new URLSearchParams({ token: accessToken }).toString(),
+		}));
+		const introspection = await call(host(alpha));
+		expect(introspection.status).toBe(200);
+		expect(await introspection.json()).toMatchObject({ active: true, sub: alphaUserId, client_id: clientId });
+		expect((await call(host(beta))).status).toBe(401);
+
+		const userinfo = await nativeGET(await signedRequest(host(alpha), "/api/auth/oauth2/userinfo", {
+			headers: { authorization: `Bearer ${accessToken}` },
+		}));
+		expect(userinfo.status).toBe(200);
+		expect(await userinfo.json()).toMatchObject({ sub: alphaUserId });
+		const ordinary = await nativeGET(await signedRequest(host(alpha), "/api/auth/get-session", {
+			headers: { authorization: `Bearer ${accessToken}` },
+		}));
+		expect(await ordinary.json()).toBeNull();
+	});
+
+	it("publishes the same project OAuth and OpenID capabilities for verified hosted and slug issuers", async () => {
+		const hostname = host(alpha);
+		const hostedDocument = ownedProjectIssuerMetadata({
+			origin: `https://${hostname}`, basePath: "/api/auth", slug: alpha.slug,
+		});
+		for (const [path, discovery] of [
+			["/.well-known/openid-configuration", discoveryGET],
+			["/.well-known/oauth-authorization-server", authorizationDiscoveryGET],
+		] as const) {
+			const response = await discovery(await signedRequest(hostname, path));
+			expect(response.status).toBe(200);
+			expect(await response.json()).toEqual(hostedDocument);
+		}
+		await withProjectAuth(alpha.slug, async (instance) => {
+			const basePath = `/api/projects/${alpha.slug}/auth`;
+			const candidate = ownedProjectIssuerMetadata({ origin: platformOrigin, basePath, slug: alpha.slug });
+			expect(candidate).toEqual(discoveryDocument(await instance.api.getOpenIdConfig()));
+			expect(candidate).toEqual(discoveryDocument(await instance.api.getOAuthServerConfig()));
+		}, env);
+	});
+
 	it("selects fresh shared application branding only from its signed hosted realm", async () => {
 		const pool = projectRegistryPool(env);
 		const alphaBrand = { ...defaultApplicationBranding("Alpha shared application"), faviconUrl: `https://assets.allauth.co/branding/${alpha.workspaceId}/${alpha.applicationId}/${randomUUID()}.png` };
@@ -303,6 +369,225 @@ describe.skipIf(!existsSync(fixturePath))("real PostgreSQL hosted authentication
 		for (const session of body.sessions) for (const key of Object.keys(session)) expect(["id", "createdAt", "expiresAt", "ipAddress", "userAgent"]).toContain(key);
 		expect(JSON.stringify(body)).not.toContain(rootUserId); expect(JSON.stringify(body)).not.toContain(betaUserId);
 		expect((await sessionsGET(await signedRequest(host(alpha), "/api/account/sessions", { headers: { cookie: rootCookie } }))).status).toBe(401);
+	});
+
+	it("compares selected development sessions and preserves hosted organization invitation authority", async () => {
+		const workspacePrincipal = await requireWorkspacePrincipal(native.auth as unknown as AuthInstance, new Headers({ cookie: rootCookie }));
+		const project = await provisionProject({
+			name: "Session shadow fixture",
+			slug: "session-shadow-development",
+			primaryOrigin: "https://session-shadow.fixture.example",
+			origins: [],
+			environment: "development",
+		}, { clientId: "local-shadow-broker", clientSecret: "local-shadow-broker-secret" }, rootUserId, env, { workspaceId: alpha.workspaceId, principal: workspacePrincipal });
+		const previousShadow = process.env.ALLAUTH_PROJECT_SESSION_SHADOW_IDS;
+		const previousUI = process.env.ALLAUTH_PROJECT_HOSTED_UI_PROJECT_IDS;
+		process.env.ALLAUTH_PROJECT_SESSION_SHADOW_IDS = [project.id, alpha.id].join(",");
+		process.env.ALLAUTH_PROJECT_HOSTED_UI_PROJECT_IDS = [project.id, alpha.id].join(",");
+		const info = vi.spyOn(console, "info").mockImplementation(() => {});
+		const previousFetch = globalThis.fetch;
+		try {
+			const userId = await withHostedProjectAuth(project, host(project), (instance) => seed(instance, project.name), env);
+			const hostedLogin = await nativePOST(await signedRequest(host(project), "/api/auth/sign-in/email", {
+				method: "POST", body: JSON.stringify({ email: sharedEmail, password }),
+			}));
+			expect(hostedLogin.status).toBe(200);
+			const hostedCookie = cookies(hostedLogin);
+			const session = await nativeGET(await signedRequest(host(project), "/api/auth/get-session", { headers: { cookie: hostedCookie } }));
+			expect(await session.json()).toMatchObject({ user: { id: userId } });
+			const foreign = await nativeGET(await signedRequest(host(project), "/api/auth/get-session", { headers: { cookie: rootCookie } }));
+			expect(await foreign.json()).toBeNull();
+
+			const base = `${platformOrigin}/api/projects/${project.slug}/auth`;
+			const directLogin = await withProjectAuth(project.slug, (instance) => instance.handler(new Request(`${base}/sign-in/email`, {
+				method: "POST", headers: { "content-type": "application/json", origin: platformOrigin, "x-real-ip": "203.0.113.39" },
+				body: JSON.stringify({ email: sharedEmail, password }),
+			})), env);
+			expect(directLogin.status).toBe(200);
+			const proxyCookie = cookies(directLogin);
+			const appProxy = createAllAuthProxy({
+				appOrigin: project.primaryOrigin, allauthURL: platformOrigin,
+				project: project.slug, proxySecret: projectProxySecret(project, env),
+				getClientIP: () => "203.0.113.39",
+			});
+			vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+				const request = input instanceof Request ? input : new Request(input, init);
+				if (request.url === `${base}/get-session`) {
+					return projectGET(request, { params: Promise.resolve({ slug: project.slug }) });
+				}
+				return previousFetch(input, init);
+			});
+			const direct = await appProxy(new Request(`${project.primaryOrigin}/api/allauth/get-session`, {
+				headers: { cookie: proxyCookie },
+			}), { params: Promise.resolve({ all: ["get-session"] }) });
+			expect(await direct.json()).toMatchObject({ user: { id: userId } });
+
+			const productionLogin = await login(alpha);
+			const previous = await nativeGET(await signedRequest(host(alpha), "/api/auth/get-session", { headers: { cookie: productionLogin.cookie } }));
+			expect(await previous.json()).toMatchObject({ user: { id: alphaUserId } });
+			const newUI = await hostedSdkPOST(await signedRequest(host(project), "/api/auth/hosted-ui/sign-in/email", {
+				method: "POST", ip: "192.0.2.156", headers: { accept: "application/json" },
+				body: JSON.stringify({ email: sharedEmail, password }),
+			}));
+			expect(newUI.status).toBe(200);
+			const uiSignIn = await newUI.json();
+			expect(uiSignIn).toMatchObject({ user: { id: userId } });
+			expect(uiSignIn).not.toHaveProperty("token");
+			const uiSession = await hostedSdkGET(await signedRequest(host(project), "/api/auth/hosted-ui/get-session", {
+				headers: { accept: "application/json", cookie: cookies(newUI) },
+			}));
+			expect(await uiSession.json()).toMatchObject({ user: { id: userId } });
+			expect((await hostedSdkGET(await signedRequest(host(alpha), "/api/auth/hosted-ui/get-session", {
+				headers: { accept: "application/json", cookie: productionLogin.cookie },
+			}))).status).toBe(404);
+
+			const comparisons = info.mock.calls
+				.map(([message]) => message)
+				.filter((message): message is string => typeof message === "string" && message.includes("allauth.project_session_shadow"))
+				.map((message) => JSON.parse(message) as unknown);
+			expect(comparisons).toEqual(Array.from({ length: 4 }, () => ({
+				event: "allauth.project_session_shadow", projectId: project.id, outcome: "match",
+			})));
+
+			const organizationUI = async (endpoint: string, cookie: string, body?: Record<string, unknown>) => {
+				const request = await signedRequest(host(project), `/api/auth/hosted-ui/organization/${endpoint}`, {
+					method: body ? "POST" : "GET",
+					headers: { accept: "application/json", cookie },
+					...(body ? { body: JSON.stringify(body) } : {}),
+				});
+				return body ? hostedSdkPOST(request) : hostedSdkGET(request);
+			};
+			const created = await organizationUI("create", cookies(newUI), {
+				name: "Hosted organization fixture", slug: "hosted-organization-fixture",
+			});
+			expect(created.status, await created.clone().text()).toBe(200);
+			const organization = await created.json() as { id: string; name: string };
+			expect(await (await organizationUI("list", cookies(newUI))).json()).toMatchObject([{ id: organization.id }]);
+
+			const recipientEmail = "hosted-invitation-recipient@fixture.example";
+			const recipient = await withHostedProjectAuth(project, host(project), (instance) =>
+				seed(instance, "Invitation recipient", recipientEmail), env,
+			);
+			const recipientLogin = await nativePOST(await signedRequest(host(project), "/api/auth/sign-in/email", {
+				method: "POST", body: JSON.stringify({ email: recipientEmail, password }),
+			}));
+			expect(recipientLogin.status).toBe(200);
+			const recipientCookie = cookies(recipientLogin);
+			const inviteId = randomUUID();
+			await projectRegistryPool(env).query(
+				`INSERT INTO "${project.schemaName}".invitation (id,"organizationId",email,role,status,"expiresAt","inviterId") VALUES ($1,$2,$3,'member','pending',now()+interval '1 hour',$4)`,
+				[inviteId, organization.id, recipientEmail, userId],
+			);
+			expect((await organizationUI("get-invitation?id=" + inviteId, rootCookie)).status).toBe(401);
+			expect((await organizationUI("get-invitation?id=" + inviteId, cookies(newUI))).status).toBe(403);
+			expect(await (await organizationUI("get-invitation?id=" + inviteId, recipientCookie)).json()).toMatchObject({
+				id: inviteId, organizationName: organization.name, email: recipientEmail, role: "member",
+			});
+			expect(await (await organizationUI("list-user-invitations", recipientCookie)).json()).toMatchObject([{ id: inviteId, role: "member" }]);
+			expect((await organizationUI("list-user-invitations?email=" + encodeURIComponent(recipientEmail), cookies(newUI))).status).toBe(400);
+			const accepted = await organizationUI("accept-invitation", recipientCookie, { invitationId: inviteId });
+			expect(accepted.status, await accepted.clone().text()).toBe(200);
+			expect(await accepted.json()).toMatchObject({
+				invitation: { id: inviteId, status: "accepted" },
+				member: { userId: recipient, organizationId: organization.id, role: "member" },
+			});
+			expect(await (await organizationUI("list-user-invitations", recipientCookie)).json()).toEqual([]);
+			expect(await (await organizationUI("list", recipientCookie)).json()).toMatchObject([{ id: organization.id }]);
+			expect(await (await organizationUI("set-active", recipientCookie, { organizationId: null })).json()).toBeNull();
+			expect(await (await organizationUI("set-active", recipientCookie, { organizationId: organization.id })).json()).toMatchObject({ id: organization.id });
+
+			const organizationQuery = `organizationId=${organization.id}`;
+			const details = await organizationUI(`get-full-organization?${organizationQuery}&membersLimit=1`, recipientCookie);
+			expect(details.status).toBe(200);
+			expect(await details.json()).toMatchObject({ id: organization.id, name: organization.name });
+			const members = await organizationUI(`list-members?${organizationQuery}&filterField=userId&filterValue=${recipient}`, recipientCookie);
+			expect(members.status).toBe(200);
+			expect(await members.json()).toMatchObject({ total: 1, members: [{ userId: recipient, role: "member" }] });
+			const team = await organizationUI("create-team", cookies(newUI), { organizationId: organization.id, name: "Hosted operations" });
+			expect(team.status).toBe(200);
+			const { id: teamId } = await team.json() as { id: string };
+			const added = await organizationUI("add-team-member", cookies(newUI), { organizationId: organization.id, teamId, userId: recipient });
+			expect(added.status).toBe(200);
+			const roster = await organizationUI(`list-team-members?teamId=${teamId}`, recipientCookie);
+			expect(roster.status).toBe(200);
+			expect(await roster.json()).toMatchObject([{ teamId, userId: recipient }]);
+			expect((await organizationUI(`list-team-members?teamId=${teamId}`, rootCookie)).status).toBe(401);
+		} finally {
+			info.mockRestore();
+			vi.stubGlobal("fetch", previousFetch);
+			if (previousShadow === undefined) delete process.env.ALLAUTH_PROJECT_SESSION_SHADOW_IDS;
+			else process.env.ALLAUTH_PROJECT_SESSION_SHADOW_IDS = previousShadow;
+			if (previousUI === undefined) delete process.env.ALLAUTH_PROJECT_HOSTED_UI_PROJECT_IDS;
+			else process.env.ALLAUTH_PROJECT_HOSTED_UI_PROJECT_IDS = previousUI;
+		}
+	});
+
+	it("consumes a recovery code from an existing enrolment and lets the legacy engine use the remaining codes", async () => {
+		const email = "recovery-compatibility@hosted.fixture.example";
+		const jar = new Map<string, string>();
+		const request = async (path: string, body: unknown) => {
+			const response = await nativePOST(await signedRequest(host(alpha), `/api/auth${path}`, {
+				method: "POST", ip: "192.0.2.133",
+				headers: { cookie: [...jar.values()].join("; ") },
+				body: JSON.stringify(body),
+			}));
+			for (const value of response.headers.getSetCookie()) {
+				const pair = value.split(";", 1)[0]!;
+				const name = pair.slice(0, pair.indexOf("="));
+				if (/;\s*Max-Age=0(?:;|$)/i.test(value)) jar.delete(name);
+				else jar.set(name, pair);
+			}
+			return response;
+		};
+		const userId = await withHostedProjectAuth(alpha, host(alpha), (instance) => seed(instance, "Recovery fixture", email), env);
+		expect((await request("/sign-in/email", { email, password })).status).toBe(200);
+		const enrollment = await request("/two-factor/enable", { password });
+		expect(enrollment.status).toBe(200);
+		const { backupCodes } = await enrollment.json() as { backupCodes: string[] };
+		expect(backupCodes.length).toBeGreaterThan(2);
+		const pool = projectRegistryPool(env);
+		const factor = (await pool.query<{ secret: string }>(
+			`SELECT secret FROM "${alpha.schemaName}"."twoFactor" WHERE "userId" = $1`,
+			[userId],
+		)).rows[0]!;
+		const { keys, code } = await withHostedProjectAuth(alpha, host(alpha), async (instance) => {
+			const { secretConfig } = await instance.$context;
+			const keys = typeof secretConfig === "string" ? { secret: secretConfig } : secretConfig;
+			const secret = openLegacyMfaRecord(factor.secret, keys);
+			const { code } = await instance.api.generateTOTP({ body: { secret } });
+			return { keys, code };
+		}, env);
+		expect((await request("/two-factor/verify-totp", { code })).status).toBe(200);
+		const transactions = new Pool({ connectionString: String(env.DATABASE_URL), max: 2 });
+		const consume = async (schemaName: string) => {
+			const client = await transactions.connect();
+			try {
+				await client.query("BEGIN");
+				const result = await consumeProjectRecoveryCode(client, {
+					schemaName, userId, code: backupCodes[0]!, keys,
+				});
+				await client.query("COMMIT");
+				return result;
+			} catch (error) {
+				await client.query("ROLLBACK");
+				throw error;
+			} finally {
+				client.release();
+			}
+		};
+		try {
+			expect(await consume(beta.schemaName)).toBe("invalid");
+			const concurrent = await Promise.all([consume(alpha.schemaName), consume(alpha.schemaName)]);
+			expect(concurrent.sort()).toEqual(["consumed", "invalid"]);
+			expect(await consume(alpha.schemaName)).toBe("invalid");
+		} finally {
+			await transactions.end();
+		}
+
+		const rejected = await request("/two-factor/verify-backup-code", { code: backupCodes[0], disableSession: true });
+		expect(rejected.status).toBe(401);
+		const accepted = await request("/two-factor/verify-backup-code", { code: backupCodes[1], disableSession: true });
+		expect(accepted.status).toBe(200);
 	});
 
 	it("re-resolves custom mappings for API and SSR so disabled routing invalidates already minted proofs", async () => {
@@ -395,7 +680,11 @@ describe.skipIf(!existsSync(fixturePath))("real PostgreSQL hosted authentication
 		expect((await registry.query(`SELECT id FROM "${beta.schemaName}"."rateLimit" WHERE "key"=$1`, [key])).rowCount).toBe(0);
 
 		await withProjectAuthEngine(alpha.slug, async ({ engine }) => {
-			const revoked = await engine.revokeAccountSession(headers, { id });
+			const revoke = new Request(`${base}/account/sessions/revoke`, {
+				method: "POST",
+				headers,
+			});
+			const revoked = await engine.revokeAccountSession(revoke, { id });
 			expect(await revoked.json()).toEqual({ success: true });
 			expect(await engine.readPrincipal(headers)).toBeNull();
 			expect(await probe(alpha, headers)).toBeNull();

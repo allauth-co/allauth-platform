@@ -1,12 +1,25 @@
 import { runWithAdapter } from "@better-auth/core/context";
+import { verifyOAuthQueryParams } from "@better-auth/oauth-provider";
+import { APIError } from "better-auth";
 import type { AuthInstance } from "./api";
 import type { AuthEngine } from "./auth-engine";
+import { discoveryDocument, discoveryHeaders } from "./discovery";
+import { isServerTokenRequest } from "./features/helpers";
 
 type LegacyInstance = Pick<AuthInstance, "$context" | "handler"> & {
 	api: Pick<
 		AuthInstance["api"],
-		"getSession" | "accountSessions" | "accountRevokeSession"
-	>;
+		| "getSession"
+		| "accountSessions"
+		| "accountRevokeSession"
+		| "getOpenIdConfig"
+		| "getOAuthServerConfig"
+		| "getOAuthClientPublicPrelogin"
+		| "generateOneTimeToken"
+	> &
+		Partial<
+			Pick<AuthInstance["api"], "verifyApiKey" | "deleteAllExpiredApiKeys">
+		>;
 };
 
 const engines = new WeakMap<LegacyInstance, AuthEngine>();
@@ -20,8 +33,92 @@ export function legacyAuthEngine(instance: LegacyInstance): AuthEngine {
 		return runWithAdapter((await instance.$context).adapter, operation);
 	}
 
+	async function privateResponse(operation: () => Promise<Response>) {
+		const response = await withAdapter(operation);
+		response.headers.set("cache-control", "no-store");
+		return response;
+	}
+
+	const verifyApiKey = instance.api?.verifyApiKey;
+	const deleteAllExpiredApiKeys = instance.api?.deleteAllExpiredApiKeys;
 	const engine: AuthEngine = {
 		dispatch: (request) => instance.handler(request),
+		verifyApiKey:
+			verifyApiKey &&
+			((body) =>
+				privateResponse(() => verifyApiKey({ body, asResponse: true }))),
+		deleteAllExpiredApiKeys:
+			deleteAllExpiredApiKeys &&
+			(() =>
+				privateResponse(() => deleteAllExpiredApiKeys({ asResponse: true }))),
+		issueOneTimeToken: (headers) =>
+			isServerTokenRequest(headers)
+				? withAdapter(async () => {
+						const result = await instance.api.generateOneTimeToken({
+							headers,
+							asResponse: true,
+						});
+						result.headers.set("cache-control", "no-store");
+						return result;
+					})
+				: Promise.resolve(
+						Response.json(
+							{
+								message:
+									"One-time session tokens are reserved for server integrations.",
+							},
+							{ status: 403, headers: { "cache-control": "no-store" } },
+						),
+					),
+		readIssuerMetadata: (kind) =>
+			withAdapter(async () => {
+				const document =
+					kind === "openid"
+						? await instance.api.getOpenIdConfig()
+						: await instance.api.getOAuthServerConfig();
+				return Response.json(discoveryDocument(document), {
+					headers: discoveryHeaders,
+				});
+			}),
+		readOAuthContext: (request) =>
+			withAdapter(async () => {
+				const query = new URL(request.url).searchParams;
+				const serialized = query.toString();
+				if (
+					!(await verifyOAuthQueryParams(
+						serialized,
+						(
+							await instance.$context
+						).secret,
+					))
+				)
+					throw new APIError("BAD_REQUEST", {
+						message: "The authorization request is invalid or expired.",
+					});
+				const clientId = query.get("client_id");
+				if (!clientId) throw new APIError("BAD_REQUEST");
+				const client = await instance.api.getOAuthClientPublicPrelogin({
+					headers: request.headers,
+					body: { client_id: clientId, oauth_query: serialized },
+				});
+				return Response.json(
+					{
+						client: {
+							client_id: client.client_id,
+							client_name: client.client_name,
+						},
+						scopes: (query.get("scope") || "").split(" ").filter(Boolean),
+						continueURL: `/oauth2/continue?${serialized}`,
+					},
+					{
+						headers: {
+							"cache-control": "no-store",
+							pragma: "no-cache",
+							"x-content-type-options": "nosniff",
+						},
+					},
+				);
+			}),
 		readPrincipal: (headers) =>
 			withAdapter(async () => {
 				const current = await instance.api.getSession({
@@ -51,14 +148,20 @@ export function legacyAuthEngine(instance: LegacyInstance): AuthEngine {
 				instance.api.getSession({
 					headers: request.headers,
 					request,
-					query: { disableCookieCache: true },
+					query: {
+						disableCookieCache: true,
+						...(new URL(request.url).searchParams.get("disableRefresh") ===
+						"true"
+							? { disableRefresh: true }
+							: {}),
+					},
 					asResponse: true,
 				}),
 			),
-		listAccountSessions: (headers) =>
-			instance.api.accountSessions({ headers, asResponse: true }),
-		revokeAccountSession: (headers, body) =>
-			instance.api.accountRevokeSession({ headers, body, asResponse: true }),
+		listAccountSessions: (request) =>
+			instance.api.accountSessions({ headers: request.headers, asResponse: true }),
+		revokeAccountSession: (request, body) =>
+			instance.api.accountRevokeSession({ headers: request.headers, body, asResponse: true }),
 		readDirectory: (operation, headers, query) =>
 			withAdapter(async () => {
 				const endpoint: unknown = Reflect.get(instance.api, operation);

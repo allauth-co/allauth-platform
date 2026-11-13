@@ -355,6 +355,40 @@ describe("signed BFF session checks retain live authority without a shared IP bo
 			"fixture-session-token",
 		);
 	});
+	it("keeps the signed proxy bucket for legacy cookie precedence and wire formats", async () => {
+		const current = cookie();
+		const alternate = cookie("other-fixture-session");
+		const [name, value] = current.split("=");
+		const previous = current.replace(".session_token=", "-session_token=");
+		const accepted = [
+			current,
+			`${alternate};__Secure-${current}`,
+			`${alternate};${current}`,
+			`unrelated=value; ${name}\t=\t"${value}"`,
+			`${name}=${encodeURIComponent(value)}`,
+			`${current};${name}=""invalid""`,
+		];
+		const deps = dependencies();
+		for (const header of accepted) {
+			await handleProjectAuthentication(request(header), project, environment, secret, deps);
+		}
+		expect(deps.fallback).not.toHaveBeenCalled();
+		expect(deps.session).toHaveBeenCalledTimes(accepted.length);
+		expect(new Set(deps.consume.mock.calls.map(([key]) => key)).size).toBe(1);
+
+		const rejected = [
+			previous,
+			`__Secure-${name}=;${alternate};${previous}`,
+			`${current};__Secure-${name}=invalid%ZZ`,
+			`${current};${name}=unsigned`,
+			`${current};${cookie("a".repeat(1024))}`,
+		];
+		for (const header of rejected) {
+			await handleProjectAuthentication(request(header), project, environment, secret, deps);
+		}
+		expect(deps.fallback).toHaveBeenCalledTimes(rejected.length);
+		expect(deps.consume).toHaveBeenCalledTimes(accepted.length);
+	});
 	it("keeps unsigned, missing, forged, wrong-project and tampered cookies on the ordinary client limiter", async () => {
 		for (const candidate of [
 			request(cookie(), false),
@@ -400,19 +434,44 @@ describe("signed BFF session checks retain live authority without a shared IP bo
 			expect(ordinary.session).not.toHaveBeenCalled();
 		}
 	});
-	it("does not treat an empty or whitespace signature header as authenticated transport", async () => {
-		for (const signature of ["", "   "]) {
-			const candidate = request(cookie(), false);
-			candidate.headers.set("allauth-proxy-signature", signature);
+	it("removes unverified app-proxy metadata before ordinary dispatch", async () => {
+		for (const [signature, body] of [
+			[undefined, '{"fixture":"ordinary request"}'],
+			["", undefined],
+			["   ", undefined],
+		] as const) {
+			const candidate = new Request(request(cookie(), false), {
+				method: body ? "POST" : "GET",
+				body,
+			});
+			if (signature !== undefined)
+				candidate.headers.set("allauth-proxy-signature", signature);
+			candidate.headers.set(
+				"allauth-proxy-origin",
+				"https://app.fixture.example",
+			);
+			candidate.headers.set("allauth-proxy-ip", "192.0.2.17");
+			candidate.headers.set("allauth-proxy-timestamp", "1234567890");
 			const deps = dependencies();
+			const fallback = vi.fn(async (_verified: Request) =>
+				Response.json({ ordinaryHandler: true }),
+			);
 			await handleProjectAuthentication(
 				candidate,
 				project,
 				environment,
 				secret,
-				deps,
+				{ ...deps, fallback },
 			);
-			expect(deps.fallback).toHaveBeenCalledTimes(1);
+			expect(fallback).toHaveBeenCalledTimes(1);
+			const forwarded = fallback.mock.calls[0]![0];
+			expect(
+				[...forwarded.headers].filter(([name]) =>
+					name.startsWith("allauth-proxy-"),
+				),
+			).toEqual([]);
+			expect(forwarded.headers.get("x-real-ip")).toBe("192.0.2.1");
+			expect(await forwarded.text()).toBe(body ?? "");
 			expect(deps.session).not.toHaveBeenCalled();
 			expect(deps.consume).not.toHaveBeenCalled();
 		}

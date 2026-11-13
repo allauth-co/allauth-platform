@@ -3,6 +3,16 @@ import { readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import { Pool } from "pg";
 import { setting } from "@/lib/configuration";
+import {
+	developmentProjectEngineRevisions,
+	internalProjectEngineIdSetting,
+	productionProjectEngineRevisions,
+} from "@/lib/projects/project-engine-internal-selection";
+import {
+	developmentAgentReplayBridgeIdsSetting,
+	productionAgentReplayBridgeIdsSetting,
+	readProjectAgentReplayBridgeIds,
+} from "@/scripts/project-agent-replay-evidence.mjs";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -45,6 +55,47 @@ export async function GET() {
 		);
 		if (migration.rows[0]?.checksum !== checksum)
 			throw new Error("Schema migration is pending or mismatched");
+		const bridgeSettings = [
+			["production", productionAgentReplayBridgeIdsSetting],
+			["development", developmentAgentReplayBridgeIdsSetting],
+		] as const;
+		for (const [scope, name] of bridgeSettings) {
+			const bridges = readProjectAgentReplayBridgeIds(
+				setting({}, name),
+				scope,
+			);
+			if (!bridges.size) continue;
+			const registered = await pool.query(
+				`SELECT id FROM public."allauthProject" p
+				 WHERE p.id = ANY($1::text[]) AND p.environment=$2 AND p."projectEngineFenced"
+				   AND public.allauth_project_engine_binding_allowed(p.id,p."schemaName")`,
+				[[...bridges], scope],
+			);
+			if (registered.rowCount !== bridges.size)
+				throw new Error(`A ${scope} project Agent bridge is unregistered.`);
+		}
+		const internal = setting({}, internalProjectEngineIdSetting).trim();
+		const production = productionProjectEngineRevisions({});
+		const development = developmentProjectEngineRevisions({});
+		const selected = [...production.keys(), ...development.keys()];
+		if (internal) selected.unshift(internal);
+		if (new Set(selected).size !== selected.length)
+			throw new Error("A project can belong to only one rollout selection.");
+		const unmatchedWriter = await pool.query(
+			`SELECT 1 FROM public."allauthProjectEngineWriter"
+			 WHERE writer='allauth' AND NOT ("projectId" = ANY($1::text[])) LIMIT 1`,
+			[selected],
+		);
+		if (unmatchedWriter.rowCount)
+			throw new Error(
+				"An active project writer is missing from this deployment.",
+			);
+		if (selected.length) {
+			const { verifyProjectEngineReadiness } = await import(
+				"@/lib/projects/project-engine-internal-readiness"
+			);
+			await verifyProjectEngineReadiness(pool, {}, selected);
+		}
 		return Response.json({ status: "ok" }, { headers });
 	} catch {
 		return Response.json({ status: "unavailable" }, { status: 503, headers });

@@ -1,5 +1,6 @@
 import { agentAuth } from "@better-auth/agent-auth";
 import type { BetterAuthPlugin } from "@better-auth/core";
+import { tryGetCurrentAuthEndpointContext } from "@better-auth/core/context";
 import { i18n, locales } from "@better-auth/i18n";
 import { oauthDeviceAuthorization } from "@better-auth/oauth-provider";
 import { APIError } from "better-auth";
@@ -23,6 +24,9 @@ import { verifyMessage } from "viem";
 import { parseSiweMessage } from "viem/siwe";
 import type { AuthEnvironment } from "../configuration";
 import { isPlatformAdmin, setting } from "../configuration";
+import type { NativeProjectAgentReplayBridge } from "../projects/owned-project-agent-native-replay";
+import { nativeProjectAgentKeyRotation, nativeProjectAgentReplayStorage } from "../projects/owned-project-agent-native-replay";
+import { retainLegacyProjectBackgroundWork } from "../projects/project-engine-writer-lease";
 import {
 	agentProtocolPath,
 	cookieOnlyFeaturePath,
@@ -44,6 +48,7 @@ function serverBearer() {
 				matcher: (ctx: Parameters<typeof hook.matcher>[0]) =>
 					!cookieOnlyFeaturePath(ctx.path || "") &&
 					!agentProtocolPath(ctx.path || "") &&
+					!(ctx.request?.headers || ctx.headers)?.has("allauth-proxy-signature") &&
 					isServerTokenRequest(ctx.request?.headers || ctx.headers) &&
 					hook.matcher(ctx),
 			})),
@@ -83,10 +88,52 @@ function projectAnonymous() {
 
 // Better Auth merges endpoint maps by their API key. Agent Auth's deviceCode
 // would otherwise replace the native /device/code endpoint despite a different URL.
-function allauthAgentAuth(options: Parameters<typeof agentAuth>[0]) {
-	const plugin = agentAuth(options);
+function allauthAgentAuth({
+	replayBridge,
+	...options
+}: NonNullable<Parameters<typeof agentAuth>[0]> & {
+	replayBridge?: NativeProjectAgentReplayBridge;
+}) {
+	const plugin = agentAuth(
+		replayBridge
+			? { ...options, jtiCacheStorage: "secondary-storage" }
+			: options,
+	);
 	const { deviceCode: agentDeviceCode, ...endpoints } = plugin.endpoints;
-	return { ...plugin, endpoints: { ...endpoints, agentDeviceCode } };
+	return {
+		...plugin,
+		init: replayBridge
+			? (context: Parameters<typeof plugin.init>[0]) => {
+					plugin.init({
+						...context,
+						secondaryStorage: nativeProjectAgentReplayStorage(
+							replayBridge.database,
+						),
+					});
+					const nativeBackground = context.runInBackground;
+					return {
+						context: {
+							runInBackground(work: Promise<unknown>) {
+								const path = tryGetCurrentAuthEndpointContext()?.path ?? "";
+								if (agentProtocolPath(path))
+									retainLegacyProjectBackgroundWork(
+										replayBridge.projectId,
+										work,
+									);
+								nativeBackground(work);
+							},
+						},
+					};
+				}
+			: plugin.init,
+		endpoints: {
+			...endpoints,
+			agentDeviceCode,
+			...(replayBridge
+				? { rotateKey: nativeProjectAgentKeyRotation(replayBridge.database) }
+				: {}),
+		},
+	};
 }
 
 /** Guards the additional native endpoints without replacing their protocol checks. */
@@ -237,7 +284,12 @@ export function featureBoundaries() {
 /** Compatible, free native plugins. Billing and challenge providers remain unconfigured. */
 export function extraServerPlugins(
 	env: AuthEnvironment,
-	options: { project: boolean; origin: string; projectSlug?: string },
+	options: {
+		project: boolean;
+		origin: string;
+		projectSlug?: string;
+		agentReplayBridge?: NativeProjectAgentReplayBridge;
+	},
 ) {
 	const origin = new URL(options.origin).origin;
 	const googleId = setting(env, "GOOGLE_CLIENT_ID");
@@ -297,6 +349,7 @@ export function extraServerPlugins(
 			},
 		}),
 		allauthAgentAuth({
+			replayBridge: options.agentReplayBridge,
 			providerName: "AllAuth",
 			modes: ["delegated"],
 			capabilities: [],

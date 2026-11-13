@@ -1,69 +1,57 @@
 "use client";
 
 import Link from "next/link";
-import { useSearchParams } from "next/navigation";
-import { toast } from "sonner";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Button } from "@/components/ui/button";
-import type { DeviceSession } from "@/lib/auth";
-import { authClient } from "@/lib/auth-client";
+import { useOAuthPicker } from "@/lib/oauth-picker-browser";
+import type { OAuthAccountChoice } from "@/lib/oauth-picker-portal";
 
-export function SelectAccountBtn({ session }: { session: DeviceSession }) {
+export function AccountChoices({
+	accounts,
+	query,
+}: {
+	accounts: OAuthAccountChoice[];
+	query: string;
+}) {
+	const { choose, pending } = useOAuthPicker(query);
 	return (
-		<Button
-			className="w-full gap-2 h-12"
-			variant="outline"
-			onClick={async () => {
-				try {
-					if (!session.session?.token) {
-						toast.error("No session");
-						return;
+		<div aria-busy={pending}>
+			{accounts.map((account) => (
+				<Button
+					key={account.id}
+					type="button"
+					className="w-full gap-2 h-12"
+					variant="outline"
+					disabled={pending}
+					onClick={() =>
+						void choose({
+							kind: "account",
+							id: account.id,
+							sessionToken: account.sessionToken,
+						})
 					}
-					const { data: active, error: activeError } =
-						await authClient.multiSession.setActive({
-							sessionToken: session.session.token,
-						});
-					if (activeError || !active?.session) {
-						toast.error(activeError?.message ?? "Failed to set active session");
-						return;
-					}
-					const { data, error } = await authClient.oauth2.continue({
-						selected: true,
-					});
-					if (error || !active?.session || !data?.redirect || !data.url) {
-						toast.error(error?.message ?? "Failed to continue");
-						return;
-					}
-					window.location.href = data.url;
-				} catch (error) {
-					toast.error(String(error));
-				}
-			}}
-		>
-			<Avatar className="mr-2 h-5 w-5">
-				<AvatarImage
-					src={session.user?.image || undefined}
-					alt={session.user?.name}
-				/>
-				<AvatarFallback>{session.user?.name?.charAt(0)}</AvatarFallback>
-			</Avatar>
-			<div className="flex text-start w-full">
-				<div>
-					<p>{session.user?.name}</p>
-					<p className="text-xs">{session.user?.email}</p>
-				</div>
-			</div>
-		</Button>
-	);
-}
-
-export function AnotherAccountBtn() {
-	const params = useSearchParams();
-	return (
-		<Link href={`/sign-in${params ? `?${params.toString()}` : ""}`}>
-			<Button className="w-full gap-2 h-12" variant="outline">
-				Another Account
+				>
+					<Avatar className="mr-2 h-5 w-5">
+						<AvatarImage src={account.image || undefined} alt={account.name} />
+						<AvatarFallback>{account.name.charAt(0)}</AvatarFallback>
+					</Avatar>
+					<span className="flex flex-col text-start w-full">
+						<span>{account.name}</span>
+						<span className="text-xs">{account.email}</span>
+					</span>
+				</Button>
+			))}
+			<Button asChild className="w-full gap-2 h-12" variant="outline">
+				<Link
+					href={query ? `/sign-in?${query}` : "/sign-in"}
+					aria-disabled={pending}
+					onClick={(event) => {
+						if (pending) event.preventDefault();
+					}}
+				>
+					Another Account
+				</Link>
 			</Button>
-		</Link>
+		</div>
 	);
 }

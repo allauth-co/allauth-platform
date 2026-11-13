@@ -7,6 +7,7 @@ import { createAuthOptions } from "./auth";
 import { applicationMfaCallback } from "./mfa";
 import type { AuthRealm } from "./auth";
 import type { AuthEnvironment } from "./configuration";
+import { signProjectIssuerQuery } from "./projects/owned-project-issuer-authorization-query";
 
 const platform = "https://allauth.fixture.example";
 const application = "https://app.fixture.example";
@@ -202,6 +203,40 @@ describe("hosted authentication challenge origin",()=>{
 		expect([...state.jar.keys()].some(name=>name.endsWith(".two_factor"))).toBe(true);
 		expect((await state.request("/two-factor/verify-totp",{code:state.code})).status).toBe(200);
 		expect(await (await state.request("/get-session")).json()).toMatchObject({user:{email:"mfa@fixture.example"}});
+	});
+	it.each([false, true])("keeps an expired signed hosted project magic link usable with MFA=%s", async (enroll) => {
+		const state = await fixture(hosted, false, enroll);
+		const now = Date.now();
+		const clock = vi.spyOn(Date, "now").mockReturnValue(now - 65_000);
+		const query = signProjectIssuerQuery(new URLSearchParams({ client_id: "fixture-client", state: "one+two" }), secret);
+		clock.mockRestore();
+		const response = await state.verifyMagic(`${hosted}/oauth2/continue?${query}`);
+		expect(response.status).toBe(302);
+		if (enroll) {
+			expect(response.headers.get("location")).toBe(`${hosted}/two-factor?callbackUrl=%2Faccount`);
+			expect(await (await state.request("/get-session")).json()).toBeNull();
+			expect((await state.request("/two-factor/verify-totp", { code: state.code })).status).toBe(200);
+		} else {
+			expect(response.headers.get("location")).toBe(`${hosted}/account`);
+		}
+		expect(await (await state.request("/get-session")).json()).toMatchObject({ user: { id: state.userId } });
+	});
+	it.each([
+		{ publicOrigin: hosted, platformAccount: false, fragment: "#sessions" },
+		{ publicOrigin: undefined, platformAccount: true, fragment: "" },
+	])("preserves only the hosted project account fragment through native magic-link MFA (platform=$platformAccount)", async ({ publicOrigin, platformAccount, fragment }) => {
+		const state = await fixture(publicOrigin, platformAccount);
+		const origin = publicOrigin ?? platform;
+		const path = "/account/security?intent=one%2Btwo";
+		const response = await state.verifyMagic(`${origin}${path}#sessions`);
+		expect(response.status).toBe(302);
+		const challenge = new URL(response.headers.get("location")!);
+		expect(challenge.origin).toBe(origin);
+		expect(challenge.pathname).toBe("/two-factor");
+		expect(challenge.searchParams.get("callbackUrl")).toBe(`${path}${fragment}`);
+		expect(await (await state.request("/get-session")).json()).toBeNull();
+		expect((await state.request("/two-factor/verify-totp", { code: state.code })).status).toBe(200);
+		expect(await (await state.request("/get-session")).json()).toMatchObject({ user: { id: state.userId } });
 	});
 	it("does not carry even a valid signed continuation to another trusted application origin",async()=>{
 		const state=await fixture(hosted);const response=await state.verifyMagic(`${application}/oauth2/continue?${await signedQuery()}`);

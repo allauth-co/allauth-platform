@@ -9,7 +9,8 @@ import { Pool } from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { productionTwoFactor } from "../mfa";
 import { allauthControl } from "./index";
-import { analyticsEntitiesQuery, analyticsQuery, analyticsWindow, createActivityRecorder, queryControlAnalytics, queryControlAnalyticsEntities } from "./analytics";
+import { createActivityRecorder } from "./analytics-activity";
+import { analyticsEntitiesQuery, analyticsQuery, analyticsWindow, queryControlAnalytics, queryControlAnalyticsEntities } from "./analytics-queries";
 import type { AnalyticsEntitiesFilters, AnalyticsFilters } from "./analytics-types";
 import type { ControlDatabase } from "./types";
 
@@ -221,6 +222,28 @@ describe.skipIf(!existsSync(fixturePath))("actual PostgreSQL durable analytics, 
 		await sql`UPDATE "user" SET role='admin',"emailVerified"=false WHERE id=${owner.id}`.execute(database);
 		await expect(instance.auth.api.controlAnalyticsEntities!({ headers: owner.headers, query: {} })).rejects.toMatchObject({ statusCode: 403 });
 		await expect(instance.auth.api.controlAnalytics!({ headers: new Headers(), query: {} })).rejects.toMatchObject({ statusCode: 401 });
+	});
+	it("preserves the unavailable result when analytics collection has no coverage record", async () => {
+		const owner = await nativeUser("admin");
+		const { rows: [coverage] } = await sql<{ startedAt: Date }>`
+			DELETE FROM "allauthAnalyticsCoverage" WHERE id='native-v1' RETURNING "startedAt"
+		`.execute(database);
+		const message = "Analytics collection has not been initialized.";
+		try {
+			await expect(queryControlAnalytics(database, filters())).rejects.toMatchObject({
+				statusCode: 503,
+				message,
+			});
+			const response = await instance.auth.api.controlAnalytics!({
+				headers: owner.headers,
+				query: {},
+				asResponse: true,
+			});
+			expect(response.status).toBe(503);
+			expect(await response.json()).toEqual({ message });
+		} finally {
+			await sql`INSERT INTO "allauthAnalyticsCoverage" (id,"startedAt") VALUES ('native-v1',${coverage.startedAt})`.execute(database);
+		}
 	});
 	it("excludes actual native anonymous and administrator impersonation sessions", async () => {
 		const guest = await instance.auth.api.signInAnonymous({ asResponse: true });

@@ -1,10 +1,12 @@
 import type { BetterAuthPlugin, GenericEndpointContext, HookEndpointContext } from "@better-auth/core";
 import { APIError } from "better-auth";
-import { createAuthEndpoint, createAuthMiddleware, getAuthoritativeSessionFromCtx } from "better-auth/api";
+import { createAuthEndpoint, createAuthMiddleware, getAuthoritativeSessionFromCtx, isAPIError } from "better-auth/api";
 import * as z from "zod";
 import { isPlatformAdmin, rolesInclude } from "../configuration";
-import { controlResponseFailure, isPrimaryAuthenticationPath, mutationEventType, recordControlEvent, writeControlEvent } from "./events";
-import { controlRetentionDays, pruneControlEvents, queryControlEvents, queryControlOverview, queryControlSessions } from "./queries";
+import { isPrimaryAuthenticationPath, mutationEventType } from "./event-contract";
+import { controlResponseFailure, isNativeEndpointValidationError, recordControlEvent, writeControlEvent } from "./events";
+import { controlEventsQuery, controlIdentifier, controlSessionsQuery } from "./read-input";
+import { controlRetentionDays, queryControlEvents, queryControlOverview, queryControlSessions } from "./queries";
 import { createControlSecurity } from "./security";
 import { createControlWebhooks } from "./webhooks";
 import { createControlAnalytics } from "./analytics";
@@ -15,6 +17,7 @@ export type * from "./types";
 export type * from "./analytics-types";
 export { writeControlEvent, recordControlEvent } from "./events";
 export { pruneControlEvents } from "./queries";
+export { controlEventsQuery } from "./read-input";
 
 declare module "@better-auth/core" {
 	interface BetterAuthPluginRegistry<AuthOptions, Options> {
@@ -49,15 +52,6 @@ export function requireControlOrigin(ctx: GenericEndpointContext): void {
 	if (origin !== expected || ctx.headers?.get("sec-fetch-site") === "cross-site") throw new APIError("FORBIDDEN", { message: "Control changes require a same-origin request." });
 }
 
-const identifier = z.string().trim().min(1).max(160);
-const pagination = { limit: z.coerce.number().int().min(1).max(100).default(25), offset: z.coerce.number().int().min(0).max(100000).default(0) };
-export const controlEventsQuery = z.object({
-	scope: z.enum(["admin", "organization", "user"]).default("user"), organizationId: identifier.optional(), userId: identifier.optional(),
-	type: z.string().max(128).regex(/^[a-zA-Z0-9./_-]+$/).optional(), outcome: z.enum(["success", "failure", "blocked"]).optional(),
-	from: z.iso.datetime({ offset: true }).optional(), to: z.iso.datetime({ offset: true }).optional(), q: z.string().trim().min(1).max(128).optional(), ...pagination,
-}).strict().refine((value) => !value.from || !value.to || new Date(value.from) <= new Date(value.to), { message: "The start date must precede the end date." }).prefault({});
-
-const controlSessionsQuery = z.object({ userId: identifier.optional(), q: z.string().trim().min(1).max(128).optional(), ...pagination }).strict().prefault({});
 const noCache = (ctx: GenericEndpointContext) => { ctx.setHeader("cache-control", "no-store"); ctx.setHeader("pragma", "no-cache"); };
 const object = (value: unknown) => value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
 const field = (value: Record<string, unknown> | undefined, key: string) => typeof value?.[key] === "string" ? value[key] as string : undefined;
@@ -105,7 +99,7 @@ export function allauthControl(options: AllauthControlOptions = {}) {
 			noCache(ctx); await requireAdmin(ctx);
 			return ctx.json(await queryControlSessions(ctx.context.adapter, options.database, ctx.query));
 		}),
-		controlRevokeSession: createAuthEndpoint("/control/revoke-session", { method: "POST", requireHeaders: true, body: z.object({ id: identifier }).strict() }, async (ctx) => {
+		controlRevokeSession: createAuthEndpoint("/control/revoke-session", { method: "POST", requireHeaders: true, body: z.object({ id: controlIdentifier }).strict() }, async (ctx) => {
 			noCache(ctx); const current = await requireAdmin(ctx); requireControlOrigin(ctx);
 			const target = await ctx.context.adapter.findOne<{ id: string; userId: string; token: string }>({ model: "session", where: [{ field: "id", value: ctx.body.id }], select: ["id", "userId", "token"] });
 			if (!target) throw new APIError("NOT_FOUND", { message: "This session no longer exists." });
@@ -156,13 +150,77 @@ export function allauthControl(options: AllauthControlOptions = {}) {
 			if (ctx.method === "GET" && path !== "/verify-email") return;
 			const type = mutationEventType(path);
 			if (!type) return;
+			if (
+				options.project &&
+				(path === "/change-email" || path === "/update-user") &&
+				isNativeEndpointValidationError(ctx.context.returned)
+			) {
+				await recordControlEvent(
+					ctx,
+					{ type, outcome: "failure", metadata: { path, errorCode: "VALIDATION_ERROR" } },
+					options.ipHeader,
+				);
+				return;
+			}
+			if (
+				options.project &&
+				type.startsWith("admin.") &&
+				isNativeEndpointValidationError(ctx.context.returned)
+			) return;
+		if (type.startsWith("api-key.")) {
+			const returned = ctx.context.returned;
+			const malformed = isAPIError(returned) && returned.statusCode === 400 && returned.body?.code === "VALIDATION_ERROR";
+			const errorCode = malformed ? "VALIDATION_ERROR" : result.failed ? result.code : undefined;
+			await recordControlEvent(ctx, {
+				type, outcome: malformed || result.failed ? "failure" : "success",
+				actorId: malformed ? undefined : actor?.session.impersonatedBy || actor?.user.id,
+				userId: malformed ? undefined : actor?.user.id || (!ctx.request && !ctx.headers && !result.failed ? field(body, "userId") : undefined),
+				metadata: { path, ...(errorCode ? { errorCode } : {}) },
+			}, options.ipHeader);
+			return;
+		}
+			if (type.startsWith("mfa.")) {
+				const returned = ctx.context.returned;
+				// Body validation errors are emitted by the endpoint library's base APIError.
+				const malformed = isAPIError(returned) && returned.statusCode === 400 && returned.body?.code === "VALIDATION_ERROR";
+				const errorCode = malformed ? "VALIDATION_ERROR" : result.failed ? result.code : undefined;
+				// MFA mutations act only on the current account. Ignore raw body identity fields.
+				await recordControlEvent(ctx, {
+					type, outcome: malformed || result.failed ? "failure" : "success",
+					actorId: actor?.session.impersonatedBy || actor?.user.id,
+					userId: actor?.user.id || authenticated?.user.id,
+					metadata: { path, ...(errorCode ? { errorCode } : {}) },
+				}, options.ipHeader);
+				return;
+			}
+			if (type.startsWith("passkey.")) {
+				const returned = ctx.context.returned;
+				const malformed = isAPIError(returned) && returned.statusCode === 400 && returned.body?.code === "VALIDATION_ERROR";
+				// Publish the same failure for missing or foreign credentials without changing the legacy HTTP response.
+				const opaqueOwnership = actor && isAPIError(returned) && returned.statusCode === 401 && (
+					(path === "/passkey/delete-passkey" && !returned.body?.code) ||
+					(path === "/passkey/update-passkey" && returned.body?.code === "YOU_ARE_NOT_ALLOWED_TO_REGISTER_THIS_PASSKEY")
+				);
+				const errorCode = opaqueOwnership ? "PASSKEY_NOT_FOUND" : malformed ? "VALIDATION_ERROR" : result.failed ? result.code : undefined;
+				await recordControlEvent(ctx, {
+					type, outcome: malformed || result.failed ? "failure" : "success",
+					actorId: actor?.session.impersonatedBy || actor?.user.id,
+					userId: actor?.user.id || authenticated?.user.id,
+					targetId: path === "/passkey/verify-registration" ? undefined : field(body, "id"),
+					metadata: { path, ...(errorCode ? { errorCode } : {}) },
+				}, options.ipHeader);
+				return;
+			}
 			const targetId = field(body, "userId") || field(body, "memberId") || field(body, "teamId") || field(body, "invitationId") || field(body, "providerId") || field(body, "client_id") || field(body, "id");
 			let organizationId = field(body, "organizationId") || field(response, "organizationId") || field(object(response?.organization), "id") || field(object(response?.team), "organizationId");
 			if (path.startsWith("/organization/") && !organizationId && targetId) {
 				const model = field(body, "invitationId") ? "invitation" : field(body, "teamId") ? "team" : field(body, "memberId") ? "member" : undefined;
 				if (model) organizationId = (await ctx.context.adapter.findOne<{ organizationId: string }>({ model, where: [{ field: "id", value: targetId }], select: ["organizationId"] }))?.organizationId;
 			}
-			await recordControlEvent(ctx, { type, outcome: result.failed ? "failure" : "success", actorId: actor?.session.impersonatedBy || actor?.user.id, userId: field(body, "userId") || actor?.user.id || authenticated?.user.id, targetId, organizationId, clientId: field(body, "client_id"), metadata: { path, ...(result.failed ? { errorCode: result.code } : {}) } }, options.ipHeader);
+			const malformedOrganizationMutation = options.project && type.startsWith("organization.") && isNativeEndpointValidationError(ctx.context.returned);
+			const failed = malformedOrganizationMutation || result.failed;
+			const errorCode = malformedOrganizationMutation ? "VALIDATION_ERROR" : result.code;
+			await recordControlEvent(ctx, { type, outcome: failed ? "failure" : "success", actorId: actor?.session.impersonatedBy || actor?.user.id, userId: field(body, "userId") || actor?.user.id || authenticated?.user.id, targetId, organizationId, clientId: field(body, "client_id"), metadata: { path, ...(failed ? { errorCode } : {}) } }, options.ipHeader);
 		}),
 	};
 	return {

@@ -16,7 +16,6 @@ import { admin, emailOTP, genericOAuth, jwt, lastLoginMethod, magicLink, multiSe
 import { createAccessControl } from "better-auth/plugins/access";
 import type { Statements } from "better-auth/plugins/access";
 import { defaultStatements as organizationStatements, defaultRoles as organizationRoles } from "better-auth/plugins/organization/access";
-import { Kysely, PostgresDialect } from "kysely";
 import { Pool } from "pg";
 import type { AuthEnvironment } from "./configuration";
 import { authConfiguration, authOrigin, isPlatformAdmin, projectEmailEnvironment, setting, trustedOrigins, validateRedirectUris } from "./configuration";
@@ -26,10 +25,14 @@ import { authenticationEmail } from "./email/authentication";
 import { reactInvitationEmail } from "./email/invitation";
 import { emailConfigured, sendAuthEmail as sendEmail } from "./email/send";
 import { productionTwoFactor } from "./mfa";
+import { postgresDatabase } from "./postgres-database";
 import { databasePoolSize, isNodeRuntime } from "./runtime";
 import { allauthControl } from "./control";
 import type { ControlDatabase, ControlPrincipal } from "./control";
+import { mutationEventType } from "./control/event-contract";
+import { isNativeEndpointValidationError } from "./control/events";
 import { extraServerPlugins } from "./features/server";
+import type { NativeProjectAgentReplayBridge } from "./projects/owned-project-agent-native-replay";
 import { accountSessions } from "./account-sessions";
 import { defaultAuthPolicy } from "./auth-policy/policy";
 import type { AuthPolicy } from "./auth-policy/policy";
@@ -38,10 +41,11 @@ import { authPolicyPlugin } from "./auth-policy/plugin";
 import { readAuthPolicy } from "./auth-policy/storage";
 import { workspaceBrokerPrivilege } from "./workspaces/broker";
 import { googleCallbackURL } from "./project-providers/google";
-import { appleCallbackURL, appleIntegrity, generateAppleClientSecret } from "./project-providers/apple";
+import { appleCallbackURL, generateAppleClientSecret } from "./project-providers/apple";
 import type { ProjectAppleProvider } from "./project-providers/apple";
 import { revokeAppleBeforeUserDeletion } from "./project-providers/apple-deletion";
-import { microsoftCallbackURL, microsoftIntegrity } from "./project-providers/microsoft";
+import { appleIntegrity, microsoftIntegrity } from "./project-providers/legacy-provider-integrity";
+import { microsoftCallbackURL } from "./project-providers/microsoft";
 import type { ProjectMicrosoftProvider } from "./project-providers/microsoft";
 import { assertWorkspaceAccountDeletion } from "./workspaces/authorization";
 import type { ApplicationBranding } from "./branding/types";
@@ -56,14 +60,13 @@ import { legacyAuthEngine } from "./legacy-auth-engine";
 export { authConfiguration, isPlatformAdmin, validateRedirectUris } from "./configuration";
 export type { AuthEnvironment } from "./configuration";
 
-/** PostgreSQL explicitly advertises native transactions to enterprise plugins. */
-export function postgresDatabase(pool: Pool) {
-	return { db: new Kysely<Record<string, Record<string, unknown>>>({ dialect: new PostgresDialect({ pool }) }), type: "postgres", transaction: true } as const;
-}
+export { postgresDatabase } from "./postgres-database";
 
 const auditPaths = new Set(["/admin/create-user", "/admin/update-user", "/admin/set-role", "/admin/ban-user", "/admin/unban-user", "/admin/impersonate-user", "/admin/stop-impersonating", "/admin/remove-user", "/admin/set-user-password", "/admin/revoke-user-session", "/admin/revoke-user-sessions", "/sso/register", "/sso/update-provider", "/sso/delete-provider", "/sso/verify-domain", "/oauth2/create-client", "/oauth2/update-client", "/oauth2/delete-client", "/oauth2/rotate-client-secret", "/admin/oauth2/create-client", "/admin/oauth2/update-client"]);
 
 export interface AuthRealm {
+	/** Exact protected legacy realm for Agent replay and durable background work. */
+	agentReplayBridge?: NativeProjectAgentReplayBridge;
 	/** Platform-owned billing scope, independent of tenant organisation roles. */
 	workspaceId?: string;
 	/** Validated server-owned native identities for this exact project/environment. */
@@ -211,6 +214,11 @@ export function createAuthOptions(database: BetterAuthOptions["database"], env: 
 					await recordAudit(database, { actorId: current.user.id, action: current.user.twoFactorEnabled ? "two-factor.enrolled" : "two-factor.disabled", targetId: current.user.id });
 				}
 				if (!ctx.path || !auditPaths.has(ctx.path) || ctx.context.returned instanceof APIError) return;
+				if (
+					realm &&
+					mutationEventType(ctx.path)?.startsWith("admin.") &&
+					isNativeEndpointValidationError(ctx.context.returned)
+				) return;
 				const session = ctx.context.session;
 				if (!session) return;
 				const body = ctx.body as Record<string, unknown> | undefined;
@@ -228,7 +236,7 @@ export function createAuthOptions(database: BetterAuthOptions["database"], env: 
 			}),
 			admin({ defaultRole: "user", adminRoles: ["admin"], impersonationSessionDuration: 60 * 15, allowImpersonatingAdmins: false }),
 			productionTwoFactor(realm?.publicOrigin || realm?.primaryOrigin || url, realm && !realm.publicOrigin ? "/sign-in?challenge=two-factor" : undefined, appName),
-			allauthControl({ database: queryDatabase, secret: setting(env, "BETTER_AUTH_SECRET"), baseURL: url, ipHeader: isNodeRuntime(env) ? "x-real-ip" : "cf-connecting-ip", requireTrustedIP: isNodeRuntime(env), authorizeAdmin: realm?.authorizeAdmin,
+			allauthControl({ project: Boolean(realm), database: queryDatabase, secret: setting(env, "BETTER_AUTH_SECRET"), baseURL: url, ipHeader: isNodeRuntime(env) ? "x-real-ip" : "cf-connecting-ip", requireTrustedIP: isNodeRuntime(env), authorizeAdmin: realm?.authorizeAdmin,
 				async onRevokeUser(adapter, userId) { await revokeUserGrants(adapter, userId); await revokeAuthenticationChallenges(adapter, userId); },
 				onVerifiedNewDevice: emailConfigured(emailEnv) ? async (user, device) => { await sendAuthentication({ to: user.email, subject: (name) => `New sign-in to ${name}`, title: "New device signed in", description: (name) => `Hello ${user.name}, a new device signed in to ${name}.${device.ipAddress ? ` IP address: ${device.ipAddress}.` : ""} If this was unexpected, review your sessions and change your password.`, url: `${realm?.publicOrigin || realm?.primaryOrigin || url}/account`, actionLabel: "Review account security" }); } : undefined,
 			}),
@@ -270,8 +278,8 @@ export function createAuthOptions(database: BetterAuthOptions["database"], env: 
 				},
 			}),
 			accountSessions(),
-			...extraServerPlugins(env, { project: Boolean(realm), origin: realm?.publicOrigin || realm?.primaryOrigin || url, projectSlug: realm?.slug }),
-			authPolicyPlugin(policy),
+			...extraServerPlugins(env, { project: Boolean(realm), origin: realm?.publicOrigin || realm?.primaryOrigin || url, projectSlug: realm?.slug, agentReplayBridge: realm?.agentReplayBridge }),
+			authPolicyPlugin(policy, { project: Boolean(realm) }),
 			...(aliasProject ? [projectEmailAliases({ project: aliasProject, readConfiguration: () => setting(env, projectEmailAliasVariable(aliasProject)) })] : []),
 			multiSession({ maximumSessions: 5 }),
 			allauth, nextCookies(),

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { localNavigation } from "../components/better-auth-ui/lib/navigation";
+import { localNavigation } from "./auth-navigation";
 describe("official UI navigation boundary", () => {
 	it("allows the exact server console entry without permitting descendant routes", () => {
 		expect(localNavigation("/console", "https://allauth.co", new URLSearchParams())).toBe("/console");

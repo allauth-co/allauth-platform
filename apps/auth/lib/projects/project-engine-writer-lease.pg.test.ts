@@ -1,0 +1,892 @@
+import { execFile } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
+import {
+	copyFileSync,
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	rmSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
+import { getTestInstance } from "better-auth/test";
+import { exportJWK, generateKeyPair, SignJWT } from "jose";
+import { Kysely, PostgresDialect } from "kysely";
+import { Pool } from "pg";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { assertProjectOAuthGrantAdmission } from "../../scripts/project-engine-oauth-grant-admission.mjs";
+import { extraServerPlugins } from "../features/server";
+import { defaultAuthPolicy } from "../auth-policy/policy";
+import { authPolicyRepository } from "../auth-policy/storage";
+import { dropClosedFixtureDatabase } from "../testing/postgres-fixture";
+import { platformWorkspaceId } from "../workspaces/types";
+import { assertOwnedProjectWebhookAdmission } from "./owned-project-webhook-admission";
+import type { ProjectEngineWriterState } from "./project-engine-writer-lease";
+import {
+	createProjectEngineWriterLease,
+	projectEngineWriterConnectionOptions,
+} from "./project-engine-writer-lease";
+
+const fixturePath = new URL(
+	"../../../../.secrets/local-postgres.json",
+	import.meta.url,
+);
+const execute = promisify(execFile);
+const modeFile = "019-project-engine-writer.sql";
+const webhookModeFile = "020-project-webhook-writer.sql";
+const legacy: ProjectEngineWriterState = { writer: "legacy", revision: 0 };
+const scopeError = { code: "ALLAUTH_PROJECT_WRITER_SCOPE_FORBIDDEN" };
+const mismatch = { code: "ALLAUTH_PROJECT_WRITER_MISMATCH" };
+const staleWrite = { code: "55000" };
+type Binding = Parameters<typeof createProjectEngineWriterLease>[0]["project"];
+
+function realm(
+	environment: Binding["environment"] = "development",
+	workspaceId = platformWorkspaceId,
+): Binding {
+	const id = randomUUID();
+	return {
+		id,
+		schemaName: `allauth_project_${id.replaceAll("-", "")}`,
+		workspaceId,
+		environment,
+	};
+}
+
+function gate() {
+	let open = () => {};
+	const waiting = new Promise<void>((resolve) => {
+		open = resolve;
+	});
+	return { waiting, open };
+}
+
+describe.skipIf(!existsSync(fixturePath))(
+	"protected project PostgreSQL writer fence",
+	() => {
+		const databaseName = `allauth_hosted_${randomUUID().replaceAll("-", "")}`;
+		const alpha = realm();
+		const beta = realm();
+		const gamma = realm();
+		const heartbeatRealm = realm();
+		const upgrade = realm();
+		const webhookActivation = realm();
+		const mixedWebhookActivation = realm();
+		const oauthActivation = realm();
+		const production = realm("production");
+		const externalWorkspace = randomUUID();
+		const external = realm("development", externalWorkspace);
+		const pools: Pool[] = [];
+		let admin: Pool | undefined;
+		let database: Pool;
+		let leases: Pool;
+		let operator: Pool;
+		let url: string;
+		let created = false;
+
+		function pool(applicationName: string, options?: string) {
+			const createdPool = new Pool({
+				connectionString: url,
+				application_name: applicationName,
+				options,
+				max: 8,
+				connectionTimeoutMillis: 2000,
+			});
+			pools.push(createdPool);
+			return createdPool;
+		}
+
+		async function migrate(
+			cwd: string | URL = new URL("../../", import.meta.url),
+		) {
+			const script = fileURLToPath(
+				new URL("../../scripts/database.mjs", import.meta.url),
+			);
+			await execute(process.execPath, [script, "migrate"], {
+				cwd,
+				env: {
+					...process.env,
+					DATABASE_URL: url,
+					ALLAUTH_DEPLOYMENT_MODE: "self-hosted",
+				},
+			});
+		}
+
+		async function seedWebhook(connection: Pool) {
+			await connection.query(
+				`INSERT INTO "allauthWebhookEndpoint"(id,url,"eventTypes","encryptedSecret") VALUES ('fixture-endpoint','https://webhook.fixture.example/events','["mfa.*"]','fixture-encrypted-secret')`,
+			);
+		}
+
+		beforeAll(async () => {
+			const fixture: { container: string; DATABASE_URL: string } = JSON.parse(
+				readFileSync(fixturePath, "utf8"),
+			);
+			const target = new URL(fixture.DATABASE_URL);
+			if (
+				fixture.container !== "allauth-production-test-20261007" ||
+				target.hostname !== "127.0.0.1" ||
+				target.port !== "55445"
+			)
+				throw new Error(
+					"Writer tests require the isolated PostgreSQL fixture.",
+				);
+			admin = new Pool({ connectionString: fixture.DATABASE_URL, max: 1 });
+			await admin.query(`CREATE DATABASE "${databaseName}"`);
+			created = true;
+			target.pathname = `/${databaseName}`;
+			url = target.href;
+			database = pool("allauth-writer-fixture-observer");
+			leases = pool("allauth-writer-fixture-leases");
+			operator = pool("allauth-writer-fixture-operator");
+			const priorRelease = mkdtempSync(join(tmpdir(), "allauth-writer-019-"));
+			try {
+				const priorMigrations = join(priorRelease, "migrations");
+				const migrations = new URL("../../migrations/", import.meta.url);
+				mkdirSync(priorMigrations);
+				for (const name of readdirSync(migrations))
+					if (name.endsWith(".sql") && name <= modeFile)
+						copyFileSync(
+							new URL(name, migrations),
+							join(priorMigrations, name),
+						);
+				await migrate(priorRelease);
+				await database.query(
+					`INSERT INTO public."allauthWorkspace"(id,name,slug,protected) VALUES ($1,'External','writer-external',false)`,
+					[externalWorkspace],
+				);
+				for (const [index, project] of [
+					alpha,
+					beta,
+					gamma,
+					heartbeatRealm,
+					upgrade,
+					webhookActivation,
+					mixedWebhookActivation,
+					oauthActivation,
+					production,
+					external,
+				].entries()) {
+					await database.query(`CREATE SCHEMA "${project.schemaName}"`);
+					await database.query(
+						`INSERT INTO public."allauthProject" (id,name,slug,"schemaName","primaryOrigin","brokerClientId","brokerSecret","proxyVersion","createdBy","applicationId",environment,"workspaceId") VALUES ($1,'Writer fixture',$2,$3,'https://writer.fixture.example','fixture','fixture',$4,'fixture',$1,$5,$6)`,
+						[
+							project.id,
+							`writer-fixture-${index}`,
+							project.schemaName,
+							randomUUID(),
+							project.environment,
+							project.workspaceId,
+						],
+					);
+				}
+				await migrate(priorRelease);
+				const old = writerPool(upgrade);
+				await seedWebhook(old);
+				await expect(fence(upgrade).switch(legacy, "allauth")).resolves.toEqual(
+					{ writer: "allauth", revision: 1 },
+				);
+				const guard = await database.query<{ exists: boolean }>(
+					`SELECT EXISTS (SELECT 1 FROM pg_trigger WHERE tgrelid=to_regclass($1) AND tgname='allauth_project_engine_writer') AS exists`,
+					[`${upgrade.schemaName}."allauthWebhookEndpoint"`],
+				);
+				expect(guard.rows).toEqual([{ exists: false }]);
+				await expect(fence(upgrade).read()).rejects.toMatchObject({
+					code: "ALLAUTH_PROJECT_WRITER_GUARD_MISSING",
+				});
+			} finally {
+				rmSync(priorRelease, { recursive: true, force: true });
+			}
+			await migrate();
+		}, 20_000);
+
+		afterAll(async () => {
+			await Promise.all(pools.map((connection) => connection.end()));
+			if (!admin) return;
+			try {
+				if (created) await dropClosedFixtureDatabase(admin, databaseName);
+			} finally {
+				await admin.end();
+			}
+		});
+
+		function fence(
+			project: Binding,
+			selectedProjectId = project.id,
+			connection = leases,
+		) {
+			return createProjectEngineWriterLease({
+				database: connection,
+				project,
+				selectedProjectId,
+			});
+		}
+
+		function writerPool(
+			project: Binding,
+			admitted?: ProjectEngineWriterState,
+			taggedProject = project.id,
+		) {
+			const tag = admitted
+				? ` ${projectEngineWriterConnectionOptions(taggedProject, admitted)}`
+				: "";
+			return pool(
+				"allauth-writer-fixture-auth",
+				`-c search_path=${project.schemaName}${tag}`,
+			);
+		}
+
+		async function writerCommand(project: Binding, ...args: string[]) {
+			const script = fileURLToPath(
+				new URL("../../scripts/project-engine-writer.mjs", import.meta.url),
+			);
+			const { stdout } = await execute(process.execPath, [script, ...args], {
+				cwd: new URL("../../", import.meta.url),
+				env: {
+					...process.env,
+					DATABASE_URL: url,
+					ALLAUTH_PROJECT_ENGINE_INTERNAL_ID: project.id,
+					ALLAUTH_PROJECT_ENGINE_INTERNAL_PREPARE_REVISION: "0",
+					ALLAUTH_PROJECT_ENGINE_AGENT_BRIDGE_ID: "",
+					ALLAUTH_PROJECT_ENGINE_AGENT_REPLAY_APPROVAL: "",
+					ALLAUTH_PROJECT_ENGINE_ENCRYPTED_SAML_APPROVAL: "",
+				},
+			});
+			return JSON.parse(stdout) as ProjectEngineWriterState;
+		}
+
+		it("checks webhook policy again under the operator's activation lock", async () => {
+			const project = webhookActivation;
+			await seedWebhook(writerPool(project));
+			const policy = authPolicyRepository(database);
+			const eligible = {
+				...defaultAuthPolicy,
+				requireEmailVerification: false,
+			};
+			await policy.update(project.id, 0, eligible, "fixture");
+			await assertOwnedProjectWebhookAdmission(
+				database,
+				project.schemaName,
+				eligible,
+			);
+
+			await policy.update(project.id, 1, defaultAuthPolicy, "fixture");
+			await expect(
+				writerCommand(project, "switch", "legacy", "0", "allauth"),
+			).rejects.toThrow(/configured webhooks/);
+			await expect(fence(project).read()).resolves.toEqual(legacy);
+			await policy.update(project.id, 2, eligible, "fixture");
+			await expect(
+				writerCommand(project, "switch", "legacy", "0", "allauth"),
+			).resolves.toEqual({
+				writer: "allauth",
+				revision: 1,
+			});
+			await expect(
+				writerCommand(project, "switch", "allauth", "1", "legacy"),
+			).resolves.toEqual({
+				writer: "legacy",
+				revision: 2,
+			});
+		});
+
+		it("admits mixed user, admin, directory, organization and security subscriptions under optional MFA", async () => {
+			const project = mixedWebhookActivation;
+			const writer = writerPool(project);
+			const policy = authPolicyRepository(database);
+			const selectors = [
+				"user.*",
+				"user.created",
+				"user.updated",
+				"user.deleted",
+				"admin.*",
+				"directory.*",
+				"organization.*",
+				"security.*",
+			];
+			const required = {
+				...defaultAuthPolicy,
+				mfaMode: "required" as const,
+				signUpEnabled: false,
+			};
+			await seedWebhook(writer);
+			const saveSelectors = (eventTypes: string[]) =>
+				writer.query(
+					`UPDATE "allauthWebhookEndpoint" SET "eventTypes"=$1::jsonb WHERE id='fixture-endpoint'`,
+					[JSON.stringify(eventTypes)],
+				);
+			await saveSelectors(selectors);
+			await policy.update(project.id, 0, required, "fixture");
+			await expect(
+				writerCommand(project, "switch", "legacy", "0", "allauth"),
+			).rejects.toThrow(/configured webhooks/);
+			await expect(fence(project).read()).resolves.toEqual(legacy);
+
+			await policy.update(project.id, 1, defaultAuthPolicy, "fixture");
+			await saveSelectors([...selectors, "session.*"]);
+			await expect(
+				writerCommand(project, "switch", "legacy", "0", "allauth"),
+			).rejects.toThrow(/configured webhooks/);
+			await expect(fence(project).read()).resolves.toEqual(legacy);
+			await saveSelectors(selectors);
+			await expect(
+				writerCommand(project, "switch", "legacy", "0", "allauth"),
+			).resolves.toEqual({ writer: "allauth", revision: 1 });
+			await expect(
+				policy.update(
+					project.id,
+					2,
+					required,
+					"fixture",
+					project.schemaName,
+					"allauth",
+				),
+			).rejects.toMatchObject({ statusCode: 409 });
+			await assertOwnedProjectWebhookAdmission(database, project.schemaName, {
+				...defaultAuthPolicy,
+				requireEmailVerification: false,
+			});
+			await expect(
+				writerCommand(project, "switch", "allauth", "1", "legacy"),
+			).resolves.toEqual({ writer: "legacy", revision: 2 });
+			await expect(
+				policy.update(
+					project.id,
+					2,
+					required,
+					"fixture",
+					project.schemaName,
+					"legacy",
+				),
+			).resolves.toMatchObject({ version: 3, policy: required });
+		});
+
+		it("checks stored OAuth grants again under the operator's activation lock", async () => {
+			const project = oauthActivation;
+			const native = writerPool(project, legacy);
+			const clientId = "fixture-connected-app";
+			await native.query(
+				`INSERT INTO "oauthClient"(id,"clientId","redirectUris","grantTypes")
+				 VALUES ($1,$1,'["https://writer.fixture.example/callback"]','["authorization_code","refresh_token"]')`,
+				[clientId],
+			);
+			await assertProjectOAuthGrantAdmission(database, project.schemaName);
+			await expect(fence(project).read()).resolves.toEqual(legacy);
+
+			await fence(project).run("legacy", () =>
+				native.query(
+					`UPDATE "oauthClient" SET "grantTypes"='["authorization_code","client_credentials"]' WHERE "clientId"=$1`,
+					[clientId],
+				),
+			);
+			await expect(
+				writerCommand(project, "switch", "legacy", "0", "allauth"),
+			).rejects.toThrow(/OAuth client grants/);
+			await expect(fence(project).read()).resolves.toEqual(legacy);
+
+			await fence(project).run("legacy", () =>
+				native.query(
+					`UPDATE "oauthClient" SET "grantTypes"='["authorization_code","refresh_token"]' WHERE "clientId"=$1`,
+					[clientId],
+				),
+			);
+			await writerCommand(project, "switch", "legacy", "0", "allauth");
+			await expect(fence(project).read()).resolves.toEqual({
+				writer: "allauth",
+				revision: 1,
+			});
+		});
+
+		async function waitingOperator() {
+			await vi.waitFor(
+				async () => {
+					const { rows } = await database.query<{ waiting: boolean }>(
+						"SELECT EXISTS (SELECT FROM pg_stat_activity WHERE application_name='allauth-writer-fixture-operator' AND wait_event_type='Lock') AS waiting",
+					);
+					expect(rows[0]?.waiting).toBe(true);
+				},
+				{ timeout: 4000, interval: 15 },
+			);
+		}
+
+		const updateUser = `UPDATE "user" SET "emailVerified"=true WHERE id='fixture-user'`;
+		const updateAccount = `UPDATE "account" SET password='synthetic-new-password-record' WHERE id='fixture-credential'`;
+		const grantWrite = `UPDATE "oauthRefreshToken" SET revoked=now() WHERE id='fixture-grant'`;
+		const sessionWrite = `INSERT INTO "session"(id,token,"userId","expiresAt","updatedAt") VALUES($1,$1,'fixture-user',now()+interval '1 hour',now())`;
+
+		async function seed(connection: Pool) {
+			await connection.query(
+				`INSERT INTO "user"(id,name,email,"emailVerified") VALUES('fixture-user','Writer fixture','writer@fixture.example',false)`,
+			);
+			await connection.query(
+				`INSERT INTO "account"(id,"accountId","providerId","userId",password,"updatedAt") VALUES('fixture-credential','fixture-user','credential','fixture-user','synthetic-original-password-record',now())`,
+			);
+			await connection.query(
+				`INSERT INTO "oauthClient"(id,"clientId","redirectUris") VALUES('fixture-client','fixture-client','[]')`,
+			);
+			await connection.query(
+				`INSERT INTO "oauthRefreshToken"(id,token,"clientId","userId","expiresAt","createdAt",scopes) VALUES('fixture-grant','fixture-grant','fixture-client','fixture-user',now()+interval '1 hour',now(),'[]')`,
+			);
+		}
+
+		it("applies a checksum-tracked public migration and keeps untouched realms on legacy", async () => {
+			for (const file of [modeFile, webhookModeFile]) {
+				const checksum = createHash("sha256")
+					.update(
+						readFileSync(new URL(`../../migrations/${file}`, import.meta.url)),
+					)
+					.digest("hex");
+				for (const namespace of ["public", alpha.schemaName]) {
+					const applied = await database.query<{ checksum: string }>(
+						`SELECT checksum FROM "${namespace}"."allauthMigrations" WHERE name=$1`,
+						[file],
+					);
+					expect(applied.rows).toEqual([{ checksum }]);
+				}
+			}
+			const localTable = await database.query<{ exists: boolean }>(
+				"SELECT to_regclass($1) IS NOT NULL AS exists",
+				[`${alpha.schemaName}.\"allauthProjectEngineWriter\"`],
+			);
+			expect(localTable.rows).toEqual([{ exists: false }]);
+			await expect(fence(alpha).read()).resolves.toEqual(legacy);
+			await expect(fence(alpha).switch(legacy, "legacy")).resolves.toEqual(
+				legacy,
+			);
+			await expect(
+				fence(alpha).run("allauth", async () => {}),
+			).rejects.toMatchObject(mismatch);
+		});
+
+		it("upgrades the endpoint fence on an already active realm and keeps the delivery worker independent", async () => {
+			const native = writerPool(upgrade);
+			const owned = { writer: "allauth", revision: 1 } as const;
+			const current = writerPool(upgrade, owned);
+			const rotate = `UPDATE "allauthWebhookEndpoint" SET "encryptedSecret"='fixture-rotated-secret' WHERE id='fixture-endpoint'`;
+			await expect(native.query(rotate)).rejects.toMatchObject(staleWrite);
+			await expect(
+				writerPool(upgrade, owned, alpha.id).query(rotate),
+			).rejects.toMatchObject(staleWrite);
+			await expect(current.query(rotate)).resolves.toMatchObject({
+				rowCount: 1,
+			});
+			await native.query(
+				`INSERT INTO "allauthWebhookDelivery" (id,"endpointId","eventId","eventType",payload) VALUES ('fixture-delivery','fixture-endpoint','fixture-event','mfa.verified','{}')`,
+			);
+			await expect(
+				native.query(
+					`UPDATE "allauthWebhookDelivery" SET status='delivered' WHERE id='fixture-delivery'`,
+				),
+			).resolves.toMatchObject({ rowCount: 1 });
+			const rollback = await fence(upgrade).switch(owned, "legacy");
+			expect(rollback).toEqual({ writer: "legacy", revision: 2 });
+			const remove = `DELETE FROM "allauthWebhookEndpoint" WHERE id='fixture-endpoint'`;
+			await expect(current.query(remove)).rejects.toMatchObject(staleWrite);
+			const saved = await native.query(
+				`SELECT "encryptedSecret","eventTypes" FROM "allauthWebhookEndpoint" WHERE id='fixture-endpoint'`,
+			);
+			expect(saved.rows).toEqual([
+				{ encryptedSecret: "fixture-rotated-secret", eventTypes: ["mfa.*"] },
+			]);
+			await expect(
+				writerPool(upgrade, rollback).query(remove),
+			).resolves.toMatchObject({ rowCount: 1 });
+			await expect(
+				native.query(`SELECT id FROM "allauthWebhookDelivery"`),
+			).resolves.toMatchObject({ rowCount: 0 });
+		});
+
+		it("rejects wrong-realm, production, unprotected and missing registry bindings", async () => {
+			for (const callback of [
+				() => fence(alpha, beta.id),
+				() => fence(production),
+				() => fence(external),
+				() => fence({ ...alpha, schemaName: beta.schemaName }),
+			])
+				expect(callback).toThrow(expect.objectContaining(scopeError));
+			for (const stale of [
+				{ ...production, environment: "development" as const },
+				{ ...external, workspaceId: platformWorkspaceId },
+				realm(),
+			]) {
+				await expect(fence(stale).read()).rejects.toMatchObject(scopeError);
+				await expect(
+					fence(stale).switch(legacy, "allauth"),
+				).rejects.toMatchObject(scopeError);
+			}
+			await database.query(
+				`UPDATE public."allauthWorkspace" SET protected=false WHERE id=$1`,
+				[platformWorkspaceId],
+			);
+			try {
+				await expect(fence(alpha).read()).rejects.toMatchObject(scopeError);
+				await expect(
+					fence(alpha).switch(legacy, "allauth"),
+				).rejects.toMatchObject(scopeError);
+			} finally {
+				await database.query(
+					`UPDATE public."allauthWorkspace" SET protected=true WHERE id=$1`,
+					[platformWorkspaceId],
+				);
+			}
+		});
+
+		it("waits for a pre-fence legacy mutation, then rejects an untagged writer and its old snapshot", async () => {
+			const old = writerPool(alpha);
+			await seed(old);
+			const pending = await old.connect();
+			const staleSnapshot = await old.connect();
+			let switchMode: Promise<ProjectEngineWriterState> | undefined;
+			try {
+				await staleSnapshot.query("BEGIN ISOLATION LEVEL REPEATABLE READ");
+				await staleSnapshot.query(`SELECT count(*) FROM "session"`);
+				await pending.query("BEGIN");
+				await pending.query(updateUser);
+				switchMode = fence(alpha, alpha.id, operator).switch(legacy, "allauth");
+				void switchMode.catch(() => {});
+				await waitingOperator();
+				await expect(
+					fence(beta).run("legacy", async () => "independent"),
+				).resolves.toBe("independent");
+				await pending.query("COMMIT");
+				const owned = await switchMode;
+				expect(owned).toEqual({ writer: "allauth", revision: 1 });
+				await expect(
+					staleSnapshot.query(sessionWrite, ["stale-snapshot-session"]),
+				).rejects.toMatchObject(staleWrite);
+				for (const query of [
+					updateUser,
+					updateAccount,
+					grantWrite,
+					`TRUNCATE "verification"`,
+					`DELETE FROM "member" WHERE id='fixture-member'`,
+					`DELETE FROM "scimManagedCredential" WHERE id='fixture-credential'`,
+					`DELETE FROM "allauthSecurityCounter" WHERE key='fixture-counter'`,
+					`DELETE FROM "allauthWebhookEndpoint" WHERE id='fixture-endpoint'`,
+				])
+					await expect(old.query(query)).rejects.toMatchObject(staleWrite);
+				await expect(
+					old.query(sessionWrite, ["old-session"]),
+				).rejects.toMatchObject(staleWrite);
+				const wrongRealm = writerPool(alpha, owned, beta.id);
+				await expect(wrongRealm.query(updateAccount)).rejects.toMatchObject(
+					staleWrite,
+				);
+				const current = writerPool(alpha, owned);
+				await seedWebhook(current);
+				await expect(current.query(updateAccount)).resolves.toMatchObject({
+					rowCount: 1,
+				});
+				await expect(current.query(grantWrite)).resolves.toMatchObject({
+					rowCount: 1,
+				});
+				await expect(
+					current.query(sessionWrite, ["owned-session"]),
+				).resolves.toMatchObject({ rowCount: 1 });
+			} finally {
+				await Promise.allSettled([
+					pending.query("ROLLBACK"),
+					staleSnapshot.query("ROLLBACK"),
+				]);
+				pending.release();
+				staleSnapshot.release();
+				await Promise.allSettled([switchMode]);
+			}
+		});
+
+		it("drains an owned lease and nested guarded work before rollback and blocks stale writers", async () => {
+			const native = writerPool(beta);
+			await seed(native);
+			const selection = fence(beta);
+			const owned = await fence(beta, beta.id, operator).switch(
+				legacy,
+				"allauth",
+			);
+			const current = writerPool(beta, owned);
+			const entered = gate();
+			const finish = gate();
+			const callback = vi.fn(async () => "old writer called");
+			const inFlight = selection.run("allauth", async (lease) => {
+				entered.open();
+				await finish.waiting;
+				await expect(fence(beta).run("legacy", callback)).rejects.toMatchObject(
+					mismatch,
+				);
+				await expect(selection.switch(owned, "legacy")).rejects.toMatchObject({
+					code: "ALLAUTH_PROJECT_WRITER_SWITCH_IN_LEASE",
+				});
+				await expect(fence(alpha).read()).rejects.toMatchObject({
+					code: "ALLAUTH_PROJECT_WRITER_NESTING_FORBIDDEN",
+				});
+				await fence(beta).withCurrent(async (nested) => {
+					expect(nested).toBe(lease);
+					await current.query(sessionWrite, ["nested-owned-session"]);
+				});
+			});
+			let rollback: Promise<ProjectEngineWriterState> | undefined;
+			let late: Promise<unknown> | undefined;
+			try {
+				await entered.waiting;
+				rollback = fence(beta, beta.id, operator).switch(owned, "legacy");
+				void rollback.catch(() => {});
+				await waitingOperator();
+				late = selection.run("allauth", callback);
+				void late.catch(() => {});
+				finish.open();
+				await inFlight;
+				const resumed = await rollback;
+				expect(resumed).toEqual({ writer: "legacy", revision: 2 });
+				await expect(late).rejects.toMatchObject(mismatch);
+				expect(callback).not.toHaveBeenCalled();
+				await expect(
+					current.query(sessionWrite, ["late-owned-session"]),
+				).rejects.toMatchObject(staleWrite);
+				await expect(
+					writerPool(beta, legacy).query(updateAccount),
+				).rejects.toMatchObject(staleWrite);
+				await expect(
+					native.query(sessionWrite, ["new-native-session"]),
+				).resolves.toMatchObject({ rowCount: 1 });
+				await expect(
+					writerPool(beta, resumed).query(updateAccount),
+				).resolves.toMatchObject({ rowCount: 1 });
+				await expect(
+					fence(beta, beta.id, operator).switch(legacy, "allauth"),
+				).rejects.toMatchObject({
+					code: "ALLAUTH_PROJECT_WRITER_REVISION_CONFLICT",
+				});
+				expect(
+					(await native.query(`SELECT id FROM "session" ORDER BY id`)).rows,
+				).toEqual([
+					{ id: "nested-owned-session" },
+					{ id: "new-native-session" },
+				]);
+			} finally {
+				finish.open();
+				await Promise.allSettled([inFlight, rollback, late]);
+			}
+		});
+
+		it("drains the native Agent heartbeat before switching the protected writer", async () => {
+			const native = writerPool(heartbeatRealm, legacy);
+			await seed(native);
+			const origin = "https://writer.fixture.example";
+			const secret = "synthetic-writer-agent-fixture-secret";
+			const environment = {
+				ALLAUTH_AUTH_URL: origin,
+				ALLAUTH_AUTH_SECRET: secret,
+			};
+			const hostId = randomUUID();
+			const agentId = randomUUID();
+			const key = await generateKeyPair("EdDSA");
+			const publicKey = JSON.stringify(await exportJWK(key.publicKey));
+			await native.query(
+				`INSERT INTO "agentHost"(id,"userId","publicKey",status,"createdAt","updatedAt") VALUES($1,'fixture-user',$2,'active',now(),now())`,
+				[hostId, publicKey],
+			);
+			await native.query(
+				`INSERT INTO "agent"(id,name,"userId","hostId",status,mode,"publicKey","expiresAt","createdAt","updatedAt")
+				VALUES($1,'Writer Agent fixture','fixture-user',$2,'active','delegated',$3,now()+interval '1 minute',now(),now())`,
+				[agentId, hostId, publicKey],
+			);
+			const agentPlugin = extraServerPlugins(environment, {
+				project: true,
+				origin,
+				agentReplayBridge: { projectId: heartbeatRealm.id, database: native },
+			}).find(({ id }) => id === "agent-auth");
+			if (!agentPlugin)
+				throw new Error("The native Agent plugin is unavailable.");
+			const { auth } = await getTestInstance(
+				{
+					baseURL: origin,
+					secret,
+					database: {
+						db: new Kysely({ dialect: new PostgresDialect({ pool: native }) }),
+						type: "postgres",
+						transaction: true,
+					},
+					plugins: [agentPlugin],
+					logger: { disabled: true },
+				},
+				{ disableTestUser: true },
+			);
+			const entered = gate();
+			const release = gate();
+			const returned = gate();
+			const adapter = (await auth.$context).adapter;
+			const update = adapter.update.bind(adapter);
+			const delay = vi
+				.spyOn(adapter, "update")
+				.mockImplementation(async (input) => {
+					if (input.model === "agent" && "lastUsedAt" in input.update) {
+						entered.open();
+						await release.waiting;
+					}
+					return update(input);
+				});
+			const authorization = await new SignJWT({})
+				.setProtectedHeader({ alg: "EdDSA", typ: "agent+jwt" })
+				.setIssuer(hostId)
+				.setSubject(agentId)
+				.setAudience(`${origin}/api/auth`)
+				.setIssuedAt()
+				.setExpirationTime("45s")
+				.setJti(randomUUID())
+				.sign(key.privateKey);
+			const request = fence(heartbeatRealm).run("legacy", async () => {
+				try {
+					const response = await auth.handler(
+						new Request(`${origin}/api/auth/agent/session`, {
+							headers: { authorization: `Bearer ${authorization}` },
+						}),
+					);
+					expect(response.status).toBe(200);
+					expect(await response.json()).toMatchObject({
+						agent: { id: agentId },
+					});
+				} finally {
+					returned.open();
+				}
+			});
+			let requestSettled = false;
+			void request.then(
+				() => {
+					requestSettled = true;
+				},
+				() => {
+					requestSettled = true;
+				},
+			);
+			let switching: Promise<ProjectEngineWriterState> | undefined;
+			try {
+				await returned.waiting;
+				expect(delay).toHaveBeenCalledWith(
+					expect.objectContaining({
+						model: "agent",
+						update: expect.objectContaining({ lastUsedAt: expect.any(Date) }),
+					}),
+				);
+				await entered.waiting;
+				switching = fence(heartbeatRealm, heartbeatRealm.id, operator).switch(
+					legacy,
+					"allauth",
+				);
+				void switching.catch(() => {});
+				await waitingOperator();
+				expect(
+					(
+						await native.query('SELECT "lastUsedAt" FROM "agent" WHERE id=$1', [
+							agentId,
+						])
+					).rows,
+				).toEqual([{ lastUsedAt: null }]);
+				expect(requestSettled).toBe(false);
+				release.open();
+				await request;
+				await expect(switching).resolves.toEqual({
+					writer: "allauth",
+					revision: 1,
+				});
+				expect(
+					(
+						await native.query(
+							`SELECT "lastUsedAt", "expiresAt">now()+interval '2 minutes' AS extended FROM "agent" WHERE id=$1`,
+							[agentId],
+						)
+					).rows,
+				).toEqual([{ lastUsedAt: expect.any(Date), extended: true }]);
+			} finally {
+				release.open();
+				await Promise.allSettled([request, switching]);
+				delay.mockRestore();
+			}
+		});
+
+		it("drains an open mutation and fences stale writes after the request lease disconnects", async () => {
+			const native = writerPool(gamma);
+			await seed(native);
+			const owned = await fence(gamma, gamma.id, operator).switch(
+				legacy,
+				"allauth",
+			);
+			const active = writerPool(gamma, owned);
+			const isolatedLease = pool("allauth-writer-fixture-disconnect");
+			const guarded = await active.connect();
+			let rollback: Promise<ProjectEngineWriterState> | undefined;
+			let late: Promise<unknown> | undefined;
+			const entered = gate();
+			const resume = gate();
+			const disconnected = gate();
+			const operation = fence(gamma, gamma.id, isolatedLease).withCurrent(
+				async ({ signal }) => {
+					signal.addEventListener("abort", disconnected.open, { once: true });
+					entered.open();
+					await resume.waiting;
+					// Independent SQL must fail even when the old work ignored cancellation.
+					for (const query of [updateAccount, grantWrite])
+						await expect(active.query(query)).rejects.toMatchObject(staleWrite);
+					await expect(
+						active.query(sessionWrite, ["disconnected-session"]),
+					).rejects.toMatchObject(staleWrite);
+				},
+			);
+			void operation.catch(() => {});
+			try {
+				await entered.waiting;
+				await guarded.query("BEGIN");
+				await guarded.query(sessionWrite, ["committed-before-switch"]);
+				const { rows } = await database.query<{ killed: boolean }>(
+					"SELECT pg_terminate_backend(pid) AS killed FROM pg_stat_activity WHERE application_name='allauth-writer-fixture-disconnect' AND state='idle in transaction'",
+				);
+				expect(rows).toEqual([{ killed: true }]);
+				await disconnected.waiting;
+				rollback = fence(gamma, gamma.id, operator).switch(owned, "legacy");
+				void rollback.catch(() => {});
+				await waitingOperator();
+				const lateWriter = pool(
+					"allauth-writer-fixture-stale-statement",
+					`-c search_path=${gamma.schemaName} ${projectEngineWriterConnectionOptions(gamma.id, owned)}`,
+				);
+				late = lateWriter.query(updateAccount);
+				void late.catch(() => {});
+				await vi.waitFor(
+					async () => {
+						const { rows } = await database.query<{ waiting: boolean }>(
+							"SELECT EXISTS (SELECT FROM pg_stat_activity WHERE application_name='allauth-writer-fixture-stale-statement' AND wait_event_type='Lock') AS waiting",
+						);
+						expect(rows[0]?.waiting).toBe(true);
+					},
+					{ timeout: 4000, interval: 15 },
+				);
+				await guarded.query("COMMIT");
+				await expect(rollback).resolves.toEqual({
+					writer: "legacy",
+					revision: 2,
+				});
+				await expect(late).rejects.toMatchObject(staleWrite);
+				resume.open();
+				await expect(operation).rejects.toMatchObject({
+					code: "ALLAUTH_PROJECT_WRITER_LEASE_LOST",
+				});
+				expect(
+					(await native.query(`SELECT password FROM "account"`)).rows,
+				).toEqual([{ password: "synthetic-original-password-record" }]);
+				expect(
+					(await native.query(`SELECT revoked FROM "oauthRefreshToken"`)).rows,
+				).toEqual([{ revoked: null }]);
+				expect((await native.query(`SELECT id FROM "session"`)).rows).toEqual([
+					{ id: "committed-before-switch" },
+				]);
+			} finally {
+				await guarded.query("ROLLBACK");
+				guarded.release();
+				resume.open();
+				await Promise.allSettled([operation, rollback, late]);
+			}
+		});
+	},
+);

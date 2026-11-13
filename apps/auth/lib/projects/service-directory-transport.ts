@@ -38,12 +38,10 @@ const failure = (status: number, code: string, retryAfter?: number) =>
 		},
 	);
 
-/** Only a freshly verified scoped key can enter these four server-native read paths. */
-export async function handleServiceDirectoryRequest(
+function serviceDirectoryCredentials(
 	request: Request,
-	project: Pick<Project, "id" | "slug">,
-	dependencies: Dependencies,
-): Promise<Response | null> {
+	project: Pick<Project, "slug">,
+) {
 	const url = new URL(request.url);
 	const prefix = `/api/projects/${project.slug}/auth/service-directory/`;
 	if (request.method !== "GET" || !url.pathname.startsWith(prefix)) return null;
@@ -51,6 +49,30 @@ export async function handleServiceDirectoryRequest(
 	if (!Object.hasOwn(operations, collection)) return null;
 	const key = request.headers.get("allauth-backend-key") || "";
 	if (!/^aabk_[a-f0-9-]{36}_[A-Za-z0-9_-]{43}$/.test(key)) return null;
+	return {
+		url,
+		key,
+		operation: operations[collection as keyof typeof operations],
+	};
+}
+
+/** The directory can authenticate a GET separately from the browser/app proxy. */
+export function hasServiceDirectoryCredentials(
+	request: Request,
+	project: Pick<Project, "slug">,
+) {
+	return serviceDirectoryCredentials(request, project) !== null;
+}
+
+/** Only a freshly verified scoped key can enter these four server-native read paths. */
+export async function handleServiceDirectoryRequest(
+	request: Request,
+	project: Pick<Project, "id" | "slug">,
+	dependencies: Dependencies,
+): Promise<Response | null> {
+	const credentials = serviceDirectoryCredentials(request, project);
+	if (!credentials) return null;
+	const { url, key, operation } = credentials;
 	try {
 		await dependencies.authorize(request.headers);
 	} catch (error) {
@@ -82,11 +104,7 @@ export async function handleServiceDirectoryRequest(
 		}
 		// Directory authority is independent of browser cookies, bearer sessions and proxy claims.
 		const headers = new Headers({ "allauth-backend-key": key });
-		return await dependencies.read(
-			operations[collection as keyof typeof operations],
-			headers,
-			query,
-		);
+		return await dependencies.read(operation, headers, query);
 	} catch (error) {
 		if (
 			error instanceof APIError &&
