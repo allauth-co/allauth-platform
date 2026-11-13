@@ -52,5 +52,10 @@ export function createPlatformSessionIssuer(options: {
 		return { id, token, createdAt: inserted.rows[0]!.createdAt };
 	}
 
-	return { cookie, issue };
+	return {
+		cookie,
+		issue,
+		expire: (name: string) =>
+			`${prefix}${name}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${secure ? "; Secure" : ""}`,
+	};
 }

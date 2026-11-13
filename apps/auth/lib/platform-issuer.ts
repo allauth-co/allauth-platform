@@ -19,9 +19,11 @@ import { createPlatformIssuerSessionReader } from "./platform-issuer-session";
 import { createPlatformIssuerSigner } from "./platform-issuer-signing";
 import { createPlatformIssuerStore } from "./platform-issuer-store";
 import { createPlatformMcpDeviceToken } from "./platform-mcp-device-token";
+import { createPlatformPasswordSignIn } from "./platform-password-sign-in";
 import { createPlatformPendingMfa } from "./platform-pending-mfa";
 import { createPlatformSessionIssuer } from "./platform-session-issuance";
 import { readLegacyProjectKeyring } from "./projects/legacy-project-keyring";
+import { createOwnedPendingMfa } from "./projects/owned-mfa";
 import { createOwnedProjectIssuerAuthorization } from "./projects/owned-project-issuer-authorization";
 import { createIssuerClientAuthenticator } from "./projects/owned-project-issuer-client";
 import { createOwnedProjectConsentManagement } from "./projects/owned-project-issuer-consent-management";
@@ -187,36 +189,61 @@ export function createPlatformIssuer(database: Pool, env: AuthEnvironment) {
 	});
 	const readPolicy = async () => (await policy.read("platform")).policy;
 	const email = projectEmailEnvironment(env);
-	const verifyPendingMfa = createPlatformPendingMfa({
+	const securitySecret = setting(env, "ALLAUTH_AUTH_SECRET");
+	const notifyNewDevice = emailConfigured(email)
+		? async (user: { name: string; email: string }, request: Request) => {
+				const ip = trustedIP(request);
+				await sendAuthEmail(email, {
+					to: user.email,
+					subject: "New sign-in to AllAuth",
+					fromName: "AllAuth",
+					react: authenticationEmail({
+						title: "New device signed in",
+						description: `Hello ${user.name}, a new device signed in to AllAuth.${ip ? ` IP address: ${ip}.` : ""} If this was unexpected, review your sessions and change your password.`,
+						url: `${issuer}/account`,
+						actionLabel: "Review account security",
+					}),
+				});
+			}
+		: undefined;
+	const credentialOptions = {
 		issuer,
 		signingSecret,
-		securitySecret: setting(env, "ALLAUTH_AUTH_SECRET"),
-		keys: encryptionKeys,
+		securitySecret,
 		store,
 		sessions,
-		readSession,
 		readPolicy,
 		readBody: readBrowserBody,
 		trustedIP,
 		requireTrustedIP: isNodeRuntime(env),
 		trustedOrigins: trustedOrigins(env),
+		notifyNewDevice,
 		continueAuthenticated: authorization.continueAuthenticated,
-		notifyNewDevice: emailConfigured(email)
-			? async (user, request) => {
-					const ip = trustedIP(request);
-					await sendAuthEmail(email, {
-						to: user.email,
-						subject: "New sign-in to AllAuth",
-						fromName: "AllAuth",
-						react: authenticationEmail({
-							title: "New device signed in",
-							description: `Hello ${user.name}, a new device signed in to AllAuth.${ip ? ` IP address: ${ip}.` : ""} If this was unexpected, review your sessions and change your password.`,
-							url: `${issuer}/account`,
-							actionLabel: "Review account security",
-						}),
-					});
-				}
-			: undefined,
+	};
+	const verifyPendingMfa = createPlatformPendingMfa({
+		...credentialOptions,
+		keys: encryptionKeys,
+		readSession,
+	});
+	const signInWithPassword = createPlatformPasswordSignIn({
+		...credentialOptions,
+		database,
+		deviceCookies:
+			securitySecret === signingSecret
+				? sessions
+				: createPlatformSessionIssuer({
+						issuer,
+						signingSecret: securitySecret,
+						trustedIP,
+					}),
+		mfa: createOwnedPendingMfa({
+			schema: store.schemaName,
+			cookiePrefix: "better-auth",
+			transaction: store.transaction,
+			signingSecret,
+			secureCookies: secure,
+			keys: encryptionKeys,
+		}),
 	});
 	const deviceOptions = {
 		database,
@@ -301,6 +328,8 @@ export function createPlatformIssuer(database: Pool, env: AuthEnvironment) {
 		const url = new URL(request.url);
 		if (url.origin !== issuer || !url.pathname.startsWith("/api/auth/")) return;
 		const path = url.pathname.slice("/api/auth".length);
+		const primary = await signInWithPassword(request);
+		if (primary) return primary;
 		const mfa = await verifyPendingMfa(request);
 		if (mfa) return mfa;
 		const route = protocolRoutes.get(path);

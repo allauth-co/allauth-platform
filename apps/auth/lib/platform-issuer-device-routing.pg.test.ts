@@ -350,6 +350,52 @@ describe.skipIf(!existsSync(fixture))(
 			expect(usedAgain?.status).toBe(401);
 		});
 
+		it("authenticates an existing platform password and issues a session readable by both engines", async () => {
+			const email = `password-${randomUUID()}@fixture.example`;
+			const password = "synthetic-platform-password";
+			const account = await native.api.signUpEmail({
+				headers: new Headers({ "x-real-ip": "192.0.2.44", origin: issuer }),
+				body: { email, password, name: "Password Fixture" },
+			});
+			await database.query(
+				'UPDATE "user" SET "emailVerified"=true, username=$2 WHERE id=$1',
+				[account.user.id, "platform_fixture"],
+			);
+			for (const [path, identity] of [
+				["/sign-in/email", { email }],
+				["/sign-in/username", { username: "platform_fixture" }],
+			] as const) {
+				const response = await platform.dispatch(
+					request(path, { ...identity, password, rememberMe: false }),
+				);
+				expect(response?.status).toBe(200);
+				expect(await response?.json()).toMatchObject({
+					user: { id: account.user.id },
+				});
+				const session = response?.headers
+					.getSetCookie()
+					.find((value) => value.startsWith(`${cookieName}=`));
+				expect(session).toBeDefined();
+				expect(session).not.toMatch(/Max-Age=/i);
+				const headers = new Headers({ cookie: session!.split(";", 1)[0]! });
+				expect(
+					await createPlatformIssuerSessionReader(env)(headers, database),
+				).toMatchObject({ user: { id: account.user.id } });
+				expect(await native.api.getSession({ headers })).toMatchObject({
+					user: { id: account.user.id },
+				});
+			}
+			await database.query(
+				'UPDATE "user" SET "directoryDisabled"=true WHERE id=$1',
+				[account.user.id],
+			);
+			const denied = await platform.dispatch(
+				request("/sign-in/email", { email, password }),
+			);
+			expect(denied?.status).toBe(401);
+			expect(denied?.headers.getSetCookie()).toEqual([]);
+		});
+
 		it("routes a root managed OAuth client to AllAuth and retains the wrong-endpoint response", async () => {
 			const clientId = "managed-device-fixture";
 			await register(clientId);
