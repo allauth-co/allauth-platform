@@ -3,10 +3,12 @@ import * as z from "zod";
 import type { AuthInstance } from "../api";
 import { getAuthEnvironment, withAuth, withAuthEngine } from "../auth";
 import type { AuthEngine } from "../auth-engine";
+import { authPolicyRepository } from "../auth-policy/storage";
 import type { AuthEnvironment } from "../configuration";
-import { authOrigin, setting } from "../configuration";
+import { setting } from "../configuration";
 import { readPlatformIssuerMetadata } from "../issuer-metadata";
 import { readPlatformIssuerContext } from "../platform-issuer-context";
+import { createPlatformIssuerSessionReader } from "../platform-issuer-session";
 import type { Project } from "../projects/registry";
 import { getProject, projectRegistryPool } from "../projects/registry";
 import {
@@ -312,11 +314,34 @@ const portalIdentity = z
 	.nullable();
 
 /** Read the live portal identity from the engine selected by the verified realm. */
-export function portalSessionContext(headers: Headers) {
-	return withPortalHeadersEngine(
-		headers,
-		async (engine, bound, binding, env) => {
-			const origin = binding ? `https://${binding.hostname}` : authOrigin(env);
+export async function portalSessionContext(headers: Headers) {
+	const selected = await bindPortalHeaders(headers);
+	if (!selected) {
+		const binding = null;
+		if (!headers.has("cookie")) return { binding, session: null };
+		const env = await getAuthEnvironment();
+		const database = projectRegistryPool(env);
+		const session = await createPlatformIssuerSessionReader(env)(
+			headers,
+			database,
+		);
+		if (!session || session.user.directoryDisabled)
+			return { binding, session: null };
+		const { policy } = await authPolicyRepository(database).read("platform");
+		if (
+			policy.mfaMode === "required" &&
+			!session.session.impersonatedBy &&
+			(!session.user.emailVerified || !session.user.twoFactorEnabled)
+		)
+			return { binding, session: null };
+		return { binding, session };
+	}
+	const { binding, headers: bound, env } = selected;
+	return withHostedProjectAuthEngine(
+		binding.project,
+		binding.hostname,
+		async (engine) => {
+			const origin = `https://${binding.hostname}`;
 			// A browser may navigate here from another site. The server reads only
 			// the cookies already admitted for this realm and session device context.
 			const sessionHeaders = new Headers({ accept: "application/json" });
@@ -347,6 +372,7 @@ export function portalSessionContext(headers: Headers) {
 				throw new Error("Invalid portal session response.");
 			return { binding, session: identity.data };
 		},
+		env,
 	);
 }
 
