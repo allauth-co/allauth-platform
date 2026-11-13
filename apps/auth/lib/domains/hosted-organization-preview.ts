@@ -1,19 +1,25 @@
 import { getAuthEnvironment } from "../auth";
 import { setting } from "../configuration";
 import { portalHeader, verifyPortalBinding } from "./edge";
-import { hostedSdkSelected } from "./hosted-sdk-selection";
+import type { HostedPresentation } from "./hosted-presentation";
+import { hostedSdkSelectionMode } from "./hosted-sdk-selection";
 import { resolveHostedBinding } from "./hosting";
 
-/** Enable the organization client for an eligible, verified project hostname. */
-export async function hostedOrganizationPreview(headers: Headers) {
+/** Resolve the presentation for the exact verified project hostname. */
+export async function hostedPresentation(
+	headers: Headers,
+): Promise<HostedPresentation | undefined> {
 	const proof = headers.get(portalHeader);
-	if (!proof) return false;
+	if (!proof) return;
 	const env = await getAuthEnvironment();
 	const hostname = await verifyPortalBinding(
 		proof,
 		setting(env, "ALLAUTH_EDGE_SECRET"),
 	);
 	const binding = hostname ? await resolveHostedBinding(hostname, env) : null;
-	if (!binding) return false;
-	return hostedSdkSelected(env, binding.project, binding.kind);
+	if (!binding || binding.hostname !== hostname) return;
+	return (
+		(await hostedSdkSelectionMode(env, binding.project, binding.kind)) ??
+		"legacy"
+	);
 }

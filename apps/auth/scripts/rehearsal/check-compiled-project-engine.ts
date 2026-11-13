@@ -221,6 +221,7 @@ async function request(
 		realm,
 		host,
 		accept,
+		flight = false,
 		method = body ? "POST" : "GET",
 		clientIP = "192.0.2.54",
 	}: {
@@ -229,6 +230,7 @@ async function request(
 		realm?: Realm;
 		host?: string;
 		accept?: string;
+		flight?: boolean;
 		method?: "GET" | "POST" | "PATCH";
 		clientIP?: string;
 	} = {},
@@ -239,6 +241,7 @@ async function request(
 		origin: host ? `https://${host}` : (realm?.primaryOrigin ?? platform),
 		...(body ? { "content-type": form ? "application/x-www-form-urlencoded" : "application/json" } : {}),
 		...(accept ? { accept } : {}),
+		...(flight ? { rsc: "1" } : {}),
 		...(cookie ? { cookie } : {}),
 	});
 	let ingress = headers;
@@ -1283,6 +1286,16 @@ try {
 		assert.equal(page.body.includes("/api/auth/hosted-ui"), firstParty);
 	}
 
+	async function expectHostedPresentation(
+		hostname: string,
+		mode: "legacy" | "allauth",
+	) {
+		const response = await request("/api/auth/hosted-presentation", { host: hostname });
+		expectStatus(response, 200, "Read the current mode for the verified project hostname.");
+		assert.deepEqual(JSON.parse(response.body), { mode });
+		assert.deepEqual(response.cookies, []);
+	}
+
 	async function readSession(
 		path: string,
 		options: Parameters<typeof request>[1],
@@ -1424,6 +1437,12 @@ try {
 		);
 		await hostedPage(managedHost, false);
 		await hostedPage(host, false);
+		await expectHostedPresentation(managedHost, "legacy");
+		expectStatus(
+			await request("/api/auth/hosted-presentation"),
+			404,
+			"The platform origin does not expose a project presentation.",
+		);
 		assert.deepEqual(await projectWriter("switch", "legacy", "0", "allauth"), {
 			writer: "allauth", revision: 1,
 		});
@@ -1439,6 +1458,18 @@ try {
 			);
 		}
 		const hostedTransports = [managedHost, host, ...frontendHosts.map(({ hostname }) => hostname)];
+		for (const hostname of hostedTransports) {
+			await expectHostedPresentation(hostname, "allauth");
+			await hostedPage(hostname, true, "/sign-in?callbackUrl=%2faccount%3fdisplay%3dtwo%20words");
+			// With only the RSC marker, Next expects its empty cache-busting hash.
+			const flight = await request("/sign-in?_rsc", {
+				host: hostname,
+				flight: true,
+				accept: "text/x-component",
+			});
+			expectStatus(flight, 200, "The verified hostname serves App Router navigation.");
+			assert.ok(flight.body.includes("/api/auth/hosted-ui"));
+		}
 		if (connected) {
 			const rejectedQuery = new URLSearchParams(connected.queryString);
 			const state = `rejected-continuation-${randomUUID()}`;
@@ -1846,6 +1877,8 @@ try {
 		await hostedPage(managedHost, false);
 		await hostedPage(host, false);
 		for (const { hostname } of frontendHosts) await hostedPage(hostname, false);
+		await expectHostedPresentation(managedHost, "legacy");
+		await expectHostedPresentation(customApi, "legacy");
 		expectStatus(
 			await request("/api/auth/hosted-ui/sdk/config", { host: managedHost }),
 			200,

@@ -4,15 +4,20 @@ import type { ReactNode } from "react";
 import { act, createElement } from "react";
 import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { HostedPresentationGuard } from "@/components/hosted-presentation-guard";
 import { LegacyAuthUI } from "@/components/legacy-auth-ui";
 import Providers from "@/components/providers";
 
 const state = vi.hoisted(() => ({
 	pathname: "/account",
+	search: new URLSearchParams(),
 	loaded: vi.fn(),
 	rendered: vi.fn(),
 }));
-vi.mock("next/navigation", () => ({ usePathname: () => state.pathname }));
+vi.mock("next/navigation", () => ({
+	usePathname: () => state.pathname,
+	useSearchParams: () => state.search,
+}));
 vi.mock("@/components/theme-provider", () => ({
 	ThemeProvider: ({ children }: { children: ReactNode }) => children,
 }));
@@ -54,6 +59,7 @@ afterEach(async () => {
 	await act(async () => root.unmount());
 	container.remove();
 	vi.unstubAllGlobals();
+	vi.restoreAllMocks();
 });
 
 async function render(
@@ -113,4 +119,43 @@ it("keeps platform and unsupported paths on the existing provider", async () => 
 	await render("/sdk/quickstart", false);
 	expect(container.textContent).toBe("Fixture view");
 	expect(container.querySelector("[data-legacy-auth]")).toBeNull();
+});
+
+it("checks the hosted presentation before exposing a destination and reloads only after a mode change", async () => {
+	const reply = Promise.withResolvers<Response>();
+	const request = vi
+		.fn()
+		.mockReturnValueOnce(reply.promise)
+		.mockResolvedValueOnce(Response.json({ mode: "allauth" }));
+	vi.stubGlobal("fetch", request);
+	const reload = vi
+		.spyOn(window.location, "reload")
+		.mockImplementation(() => {});
+	const visit = async (pathname: string, search = "") => {
+		state.pathname = pathname;
+		state.search = new URLSearchParams(search);
+		await act(async () =>
+			root.render(
+				createElement(HostedPresentationGuard, {
+					mode: "legacy",
+					children: `View for ${pathname}`,
+				}),
+			),
+		);
+	};
+	await visit("/account");
+	expect(container.textContent).toBe("View for /account");
+	expect(request).not.toHaveBeenCalled();
+	await visit("/account/security");
+	expect(container.textContent).toBe("Loading AllAuth…");
+	expect(request).toHaveBeenCalledWith(
+		"/api/auth/hosted-presentation",
+		expect.objectContaining({ cache: "no-store" }),
+	);
+	await act(async () => reply.resolve(Response.json({ mode: "legacy" })));
+	expect(container.textContent).toBe("View for /account/security");
+	expect(reload).not.toHaveBeenCalled();
+	await visit("/account/security", "next=fixture");
+	expect(container.textContent).toBe("Loading AllAuth…");
+	expect(reload).toHaveBeenCalledOnce();
 });
