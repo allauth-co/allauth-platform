@@ -16,7 +16,7 @@ export const GET = (request: Request, context: Context) =>
 	apiRoute(
 		request,
 		async (instance, env) => {
-			const owner = await requireWorkspacePrincipal(instance, request.headers);
+			const owner = await requireWorkspacePrincipal(request.headers, env);
 			const project = await getProject((await context.params).slug, env);
 			await requireWorkspaceActor(owner, project.workspaceId, env);
 			return json(
@@ -32,7 +32,7 @@ export const POST = (request: Request, context: Context) =>
 		request,
 		async (instance, env) => {
 			requireSameOrigin(request, env);
-			const owner = await requireWorkspacePrincipal(instance, request.headers);
+			const owner = await requireWorkspacePrincipal(request.headers, env);
 			const project = await getProject((await context.params).slug, env);
 			const input = await consoleBody(request);
 			return json(

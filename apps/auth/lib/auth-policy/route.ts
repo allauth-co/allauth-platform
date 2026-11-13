@@ -30,7 +30,7 @@ export async function authConfigurationRoute(
 	request: Request,
 ): Promise<Response> {
 	try {
-		return await withAuth(async (instance, env) => {
+		return await withAuth(async (_instance, env) => {
 			const pool = projectRegistryPool(env);
 			const dependencies = (
 				database: Pick<Pool, "query">,
@@ -40,10 +40,7 @@ export async function authConfigurationRoute(
 				return {
 					origin: authOrigin(env),
 					authorize: async (headers, scope) => {
-						const principal = await requireWorkspacePrincipal(
-							instance,
-							headers,
-						);
+						const principal = await requireWorkspacePrincipal(headers, env);
 						return scope.type === "project"
 							? projectAdministrator(
 									await getProject(scope.slug!, env),
@@ -73,7 +70,14 @@ export async function authConfigurationRoute(
 					},
 					read: repository.read,
 					update: (id, version, policy, actorId, scope) =>
-						repository.update(id, version, policy, actorId, scope.schemaName, writer),
+						repository.update(
+							id,
+							version,
+							policy,
+							actorId,
+							scope.schemaName,
+							writer,
+						),
 					providers: async (scope) => {
 						const available = authConfiguration(env);
 						const direct =
@@ -133,20 +137,26 @@ export async function authConfigurationRoute(
 					serializeWrite: async (scope, actor, work) => {
 						if (scope.type !== "project") return work(dependencies(database));
 						const project = await getProject(scope.slug!, env);
-						if (scope.id !== project.id || scope.schemaName !== project.schemaName)
+						if (
+							scope.id !== project.id ||
+							scope.schemaName !== project.schemaName
+						)
 							throw new APIError("NOT_FOUND");
-						const save = (activeWriter?: ProjectEngineWriter) => withProjectSettingsWrite(
-							pool,
-							project.id,
-							async (transaction) => {
-								await requireWorkspaceActor(actor, project.workspaceId, env, {
-									database: transaction,
-								});
-								return work(dependencies(transaction, activeWriter));
-							},
-						);
+						const save = (activeWriter?: ProjectEngineWriter) =>
+							withProjectSettingsWrite(
+								pool,
+								project.id,
+								async (transaction) => {
+									await requireWorkspaceActor(actor, project.workspaceId, env, {
+										database: transaction,
+									});
+									return work(dependencies(transaction, activeWriter));
+								},
+							);
 						const lease = projectWriterLease(project, env);
-						return lease ? lease.withCurrent(({ writer }) => save(writer)) : save();
+						return lease
+							? lease.withCurrent(({ writer }) => save(writer))
+							: save();
 					},
 				};
 			};

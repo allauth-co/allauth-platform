@@ -324,8 +324,8 @@ describe.skipIf(!existsSync(fixturePath))(
 				}),
 			);
 			const principal = await requireWorkspacePrincipal(
-				native.auth as unknown as AuthInstance,
 				new Headers({ cookie: rootCookie }),
+				env,
 			);
 			const workspace = (
 				await createWorkspace(
@@ -1483,8 +1483,8 @@ describe.skipIf(!existsSync(fixturePath))(
 
 		it("compares selected development sessions and preserves hosted organization invitation authority", async () => {
 			const workspacePrincipal = await requireWorkspacePrincipal(
-				native.auth as unknown as AuthInstance,
 				new Headers({ cookie: rootCookie }),
+				env,
 			);
 			const project = await provisionProject(
 				{

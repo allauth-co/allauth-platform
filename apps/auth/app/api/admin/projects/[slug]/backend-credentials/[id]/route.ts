@@ -18,7 +18,7 @@ export const DELETE = (
 		request,
 		async (instance, env) => {
 			requireSameOrigin(request, env);
-			const owner = await requireWorkspacePrincipal(instance, request.headers);
+			const owner = await requireWorkspacePrincipal(request.headers, env);
 			const { slug, id } = await context.params;
 			const project = await getProject(slug, env);
 			return json(

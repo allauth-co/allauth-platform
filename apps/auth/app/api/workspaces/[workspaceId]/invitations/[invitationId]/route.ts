@@ -1,5 +1,46 @@
 import { apiRoute, json, requireSameOrigin } from "@/lib/api";
 import { requireWorkspacePrincipal } from "@/lib/workspaces/authorization";
-import { cancelWorkspaceInvitation, resendWorkspaceInvitation } from "@/lib/workspaces/repository";
-export const DELETE = (request: Request, context: { params: Promise<{ workspaceId: string; invitationId: string }> }) => apiRoute(request, async (instance, env) => { requireSameOrigin(request, env); const ids = await context.params; return json(await cancelWorkspaceInvitation(await requireWorkspacePrincipal(instance, request.headers), ids.workspaceId, ids.invitationId, env)); }, { platformOnly: true });
-export const POST = (request: Request, context: { params: Promise<{ workspaceId: string; invitationId: string }> }) => apiRoute(request, async (instance, env) => { requireSameOrigin(request, env); const ids = await context.params; return json(await resendWorkspaceInvitation(await requireWorkspacePrincipal(instance, request.headers), ids.workspaceId, ids.invitationId, env)); }, { platformOnly: true });
+import {
+	cancelWorkspaceInvitation,
+	resendWorkspaceInvitation,
+} from "@/lib/workspaces/repository";
+export const DELETE = (
+	request: Request,
+	context: { params: Promise<{ workspaceId: string; invitationId: string }> },
+) =>
+	apiRoute(
+		request,
+		async (instance, env) => {
+			requireSameOrigin(request, env);
+			const ids = await context.params;
+			return json(
+				await cancelWorkspaceInvitation(
+					await requireWorkspacePrincipal(request.headers, env),
+					ids.workspaceId,
+					ids.invitationId,
+					env,
+				),
+			);
+		},
+		{ platformOnly: true },
+	);
+export const POST = (
+	request: Request,
+	context: { params: Promise<{ workspaceId: string; invitationId: string }> },
+) =>
+	apiRoute(
+		request,
+		async (instance, env) => {
+			requireSameOrigin(request, env);
+			const ids = await context.params;
+			return json(
+				await resendWorkspaceInvitation(
+					await requireWorkspacePrincipal(request.headers, env),
+					ids.workspaceId,
+					ids.invitationId,
+					env,
+				),
+			);
+		},
+		{ platformOnly: true },
+	);

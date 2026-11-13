@@ -5,6 +5,8 @@ interface IssuerUser {
 	emailVerified: boolean;
 	banned: boolean | null;
 	directoryDisabled: boolean | null;
+	directoryManaged: boolean | null;
+	twoFactorEnabled: boolean | null;
 	isAnonymous: boolean | null;
 }
 
@@ -34,7 +36,7 @@ export function createPlatformIssuerStore(database: Pick<Pool, "connect">) {
 
 	async function lockUser(client: PoolClient, userId: string) {
 		const { rows } = await client.query<IssuerUser>(
-			`SELECT id, "emailVerified", banned, "directoryDisabled", "isAnonymous"
+			`SELECT id, "emailVerified", banned, "directoryDisabled", "directoryManaged", "isAnonymous", "twoFactorEnabled"
 			 FROM public."user" WHERE id=$1 FOR UPDATE`,
 			[userId],
 		);
