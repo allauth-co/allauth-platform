@@ -82,6 +82,8 @@ describe.skipIf(!existsSync(fixturePath))("platform issuer storage", () => {
 				emailVerified: true,
 				banned: null,
 				directoryDisabled: null,
+				directoryManaged: null,
+				twoFactorEnabled: null,
 				isAnonymous: false,
 			});
 			expect(await store.lockUser(client, "project-only")).toBeNull();
