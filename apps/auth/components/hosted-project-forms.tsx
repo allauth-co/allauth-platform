@@ -1,13 +1,13 @@
 "use client";
 
-import { Eye, EyeOff } from "lucide-react";
+import { ChevronLeft, Eye, EyeOff, KeyRound } from "lucide-react";
 import type {
 	ComponentProps,
 	CSSProperties,
 	FormEvent,
 	ReactNode,
 } from "react";
-import { useEffect, useId, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { hostedMagicLinkCallbacks } from "@/lib/domains/hosted-sdk-policy";
 import { brandForeground, brandLinkColor } from "@/sdk/branding";
 import { appCallback, authError, proxyBasePath } from "@/sdk/helpers";
@@ -172,39 +172,121 @@ function FormError({ message }: { message: string }) {
 	) : null;
 }
 
+function HostedPasswordInput({
+	id,
+	...input
+}: ComponentProps<"input"> & { id: string }) {
+	const [visible, setVisible] = useState(false);
+	return (
+		<div className="allauth-field">
+			<label htmlFor={id}>Password</label>
+			<div className="allauth-password-field">
+				<input
+					{...input}
+					id={id}
+					name="password"
+					type={visible ? "text" : "password"}
+					required
+				/>
+				<button
+					type="button"
+					className="allauth-password-toggle"
+					aria-label={visible ? "Hide password" : "Show password"}
+					aria-controls={id}
+					aria-pressed={visible}
+					disabled={input.disabled}
+					onClick={() => setVisible(!visible)}
+				>
+					{visible ? (
+						<EyeOff size={18} aria-hidden="true" />
+					) : (
+						<Eye size={18} aria-hidden="true" />
+					)}
+				</button>
+			</div>
+		</div>
+	);
+}
+
 function PasswordForm({
 	identifier,
 	email,
 	destination,
+	showRecovery,
+	showPassword = true,
+	renderProviders,
+	onChallenge,
 }: {
-	identifier: "username" | "email";
+	identifier: "username" | "email" | "combined";
 	email?: string;
 	destination: string;
+	showRecovery?: boolean;
+	showPassword?: boolean;
+	renderProviders?: (controls: {
+		disabled: boolean;
+		cancelAutofill: () => void;
+		setPending: (pending: boolean) => void;
+	}) => ReactNode;
+	onChallenge?: (methods?: string[]) => void;
 }) {
-	const { run, busy, error } = useHostedAction();
+	const { run, busy, error, clearError } = useHostedAction();
+	const combined = identifier === "combined";
+	const offerPasskey = identifier !== "email";
+	const [selected, setSelected] = useState<string>();
+	const [previousIdentifier, setPreviousIdentifier] = useState(email);
+	const [providerPending, setProviderPending] = useState(false);
+	const identifierInput = useRef<HTMLInputElement>(null);
+	const passwordInput = useRef<HTMLInputElement>(null);
 	const passkey = useHostedPasskeySignIn({
 		destination,
-		enabled: identifier === "username",
+		enabled: offerPasskey && selected === undefined,
+		inlineMfa: combined,
 	});
+	const setIdentifierInput = useCallback(
+		(input: HTMLInputElement | null) => {
+			identifierInput.current = input;
+			if (offerPasskey) passkey.identifierRef(input);
+		},
+		[offerPasskey, passkey.identifierRef],
+	);
 	const [verification, setVerification] = useState(false);
 	const id = useId();
-	const label = identifier === "username" ? "Username" : "Email address";
+	const label = combined
+		? "Email address or username"
+		: identifier === "username"
+			? "Username"
+			: "Email address";
+	const fieldName = combined ? "username" : identifier;
+	const disabled = busy || passkey.busy || providerPending;
+	useEffect(() => {
+		if (!combined) return;
+		if (selected !== undefined) passwordInput.current?.focus();
+		else if (previousIdentifier !== undefined) identifierInput.current?.focus();
+	}, [combined, selected, previousIdentifier]);
 	function submit(event: FormEvent<HTMLFormElement>) {
 		event.preventDefault();
-		if (busy || passkey.busy) return;
-		passkey.cancelAutofill();
+		if (disabled || !event.currentTarget.reportValidity()) return;
 		const form = new FormData(event.currentTarget);
-		const value = formValue(form, identifier).trim();
+		const value = (selected ?? formValue(form, fieldName)).trim();
+		if (!value) return;
+		passkey.cancelAutofill();
+		if (combined && selected === undefined) {
+			setPreviousIdentifier(value);
+			setSelected(value);
+			return;
+		}
+		const field = combined
+			? /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value)
+				? "email"
+				: "username"
+			: identifier;
 		void run(async (request) => {
 			setVerification(false);
-			const result = await request(
-				identifier === "username" ? "sign-in/username" : "sign-in/email",
-				{
-					[identifier]: value,
-					password: formValue(form, "password"),
-					callbackURL: appCallback(destination, window.location.origin),
-				},
-			);
+			const result = await request(`sign-in/${field}`, {
+				[field]: value,
+				password: formValue(form, "password"),
+				callbackURL: appCallback(destination, window.location.origin),
+			});
 			if (!result.ok) {
 				if (
 					(result.data.code ?? fields(result.data.error).code) ===
@@ -212,76 +294,201 @@ function PasswordForm({
 				) {
 					setVerification(true);
 					try {
-						if (identifier === "email")
+						if (field === "email")
 							sessionStorage.setItem("better-auth-ui.verify-email", value);
 						else sessionStorage.removeItem("better-auth-ui.verify-email");
 					} catch {
-						// The legacy verification page remains available without browser storage.
+						// The verification page supports manual email entry.
 					}
 					return;
 				}
 				throw result.data;
 			}
-			complete(result.data, destination);
+			if (onChallenge && result.data.twoFactorRedirect === true) {
+				const methods = result.data.twoFactorMethods;
+				onChallenge(
+					Array.isArray(methods)
+						? methods.filter(
+								(method): method is string => typeof method === "string",
+							)
+						: undefined,
+				);
+			} else complete(result.data, destination);
 		});
 	}
 	return (
-		<form className="allauth-auth-form" onSubmit={submit}>
+		<>
 			<FormError message={error || passkey.error} />
 			{verification && (
 				<p role="status">
 					Verify your email address to sign in.{" "}
-					<a
-						href={`/verify-email?${new URLSearchParams({ callbackUrl: destination })}`}
-					>
+					<a href={withAuthReturnTo("/verify-email", destination)}>
 						Email verification
 					</a>
 				</p>
 			)}
-			<div className="allauth-field">
-				<label htmlFor={`${id}-identifier`}>{label}</label>
-				<input
-					id={`${id}-identifier`}
-					ref={passkey.identifierRef}
-					name={identifier}
-					type={identifier === "email" ? "email" : "text"}
-					autoComplete={
-						identifier === "username" ? "username webauthn" : "username"
-					}
-					required
-					defaultValue={email}
-					disabled={busy || passkey.busy}
-				/>
-			</div>
-			<div className="allauth-field">
-				<label htmlFor={`${id}-password`}>Password</label>
-				<input
-					id={`${id}-password`}
-					name="password"
-					type="password"
-					autoComplete="current-password"
-					required
-					disabled={busy || passkey.busy}
-				/>
-			</div>
-			<button
-				type="submit"
-				className="allauth-primary"
-				disabled={busy || passkey.busy}
-			>
-				{busy ? "Signing in…" : "Sign in"}
-			</button>
-			{identifier === "username" && (
+			{selected === undefined &&
+				renderProviders?.({
+					disabled,
+					cancelAutofill: passkey.cancelAutofill,
+					setPending: setProviderPending,
+				})}
+			{offerPasskey && selected === undefined && (
 				<button
 					type="button"
 					className="allauth-secondary"
-					disabled={busy || passkey.busy}
+					disabled={disabled}
 					onClick={passkey.signInWithPasskey}
 				>
+					<KeyRound size={16} aria-hidden="true" />
 					{passkey.busy ? "Waiting for passkey…" : "Sign in with a passkey"}
 				</button>
 			)}
-		</form>
+			{combined && showPassword && selected === undefined && (
+				<div className="allauth-divider">
+					<span>or</span>
+				</div>
+			)}
+			{showPassword && (
+				<form className="allauth-auth-form" onSubmit={submit}>
+					{selected !== undefined ? (
+						<>
+							<div className="allauth-email-summary">
+								<span>{selected}</span>
+								<button
+									type="button"
+									className="allauth-back-button"
+									disabled={disabled}
+									onClick={() => {
+										setSelected(undefined);
+										setVerification(false);
+										clearError();
+									}}
+								>
+									<ChevronLeft size={16} aria-hidden="true" /> Change email or
+									username
+								</button>
+							</div>
+							<input
+								type="hidden"
+								name="username"
+								autoComplete="username"
+								value={selected}
+							/>
+						</>
+					) : (
+						<SignupField
+							id={`${id}-identifier`}
+							label={label}
+							ref={setIdentifierInput}
+							name={fieldName}
+							type={identifier === "email" ? "email" : "text"}
+							autoComplete={offerPasskey ? "username webauthn" : "username"}
+							autoCapitalize={combined ? "none" : undefined}
+							spellCheck={combined ? false : undefined}
+							required
+							defaultValue={previousIdentifier}
+							disabled={disabled}
+						/>
+					)}
+					{(!combined || selected !== undefined) && (
+						<>
+							<HostedPasswordInput
+								id={`${id}-password`}
+								autoComplete="current-password"
+								ref={passwordInput}
+								disabled={disabled}
+							/>
+							{showRecovery && (
+								<a
+									className="allauth-forgot-password"
+									href={withAuthReturnTo("/forgot-password", destination)}
+								>
+									Forgot your password?
+								</a>
+							)}
+						</>
+					)}
+					<button type="submit" className="allauth-primary" disabled={disabled}>
+						{busy ? "Signing in…" : combined ? "Continue" : "Sign in"}
+					</button>
+				</form>
+			)}
+		</>
+	);
+}
+
+export function HostedProjectSignIn({
+	destination,
+	legacyPath,
+	showRecovery,
+	renderProviders,
+}: FormContext & {
+	showRecovery: boolean;
+	renderProviders: NonNullable<
+		ComponentProps<typeof PasswordForm>["renderProviders"]
+	>;
+}) {
+	const {
+		branding,
+		capabilities,
+		challenge,
+		configError,
+		reloadConfig,
+		setChallenge,
+	} = useAllAuth();
+	const [methods, setMethods] = useState<string[]>();
+	if (challenge)
+		return (
+			<HostedProjectMfa
+				destination={destination}
+				legacyPath={legacyPath}
+				methods={methods}
+				inline
+			/>
+		);
+	return (
+		<HostedProjectCard
+			title={branding?.name ? `Sign in to ${branding.name}` : "Sign in"}
+			showBrandName={false}
+			footer={
+				capabilities?.signUpEnabled !== false && (
+					<p>
+						Don’t have an account?{" "}
+						<a href={withAuthReturnTo("/sign-up", destination)}>Sign up</a>
+					</p>
+				)
+			}
+		>
+			{capabilities ? (
+				<PasswordForm
+					identifier="combined"
+					destination={destination}
+					showRecovery={showRecovery}
+					showPassword={capabilities.emailPassword}
+					renderProviders={renderProviders}
+					onChallenge={(methods) => {
+						setMethods(methods);
+						setChallenge(true);
+					}}
+				/>
+			) : configError ? (
+				<>
+					<FormError message={configError} />
+					<button
+						type="button"
+						className="allauth-secondary"
+						onClick={reloadConfig}
+					>
+						Try again
+					</button>
+				</>
+			) : (
+				<p role="status" className="allauth-muted">
+					Loading sign-in options…
+				</p>
+			)}
+		</HostedProjectCard>
 	);
 }
 
@@ -324,7 +531,6 @@ export function HostedProjectPasswordSignup({
 	const submitting = useRef(false);
 	const [username, setUsername] = useState("");
 	const [available, setAvailable] = useState<boolean>();
-	const [visible, setVisible] = useState(false);
 	const [busy, setBusy] = useState(false);
 	const [error, setError] = useState("");
 	const [waitingForEmail, setWaitingForEmail] = useState(false);
@@ -473,34 +679,12 @@ export function HostedProjectPasswordSignup({
 								: "Use 3–30 letters, numbers, underscores or dots."}
 					</p>
 				</SignupField>
-				<div className="allauth-field">
-					<label htmlFor={`${id}-password`}>Password</label>
-					<div className="allauth-password-field">
-						<input
-							id={`${id}-password`}
-							name="password"
-							type={visible ? "text" : "password"}
-							autoComplete="new-password"
-							required
-							minLength={policy.minLength}
-							maxLength={policy.maxLength}
-						/>
-						<button
-							type="button"
-							className="allauth-password-toggle"
-							aria-label={visible ? "Hide password" : "Show password"}
-							aria-controls={`${id}-password`}
-							aria-pressed={visible}
-							onClick={() => setVisible(!visible)}
-						>
-							{visible ? (
-								<EyeOff size={18} aria-hidden="true" />
-							) : (
-								<Eye size={18} aria-hidden="true" />
-							)}
-						</button>
-					</div>
-				</div>
+				<HostedPasswordInput
+					id={`${id}-password`}
+					autoComplete="new-password"
+					minLength={policy.minLength}
+					maxLength={policy.maxLength}
+				/>
 			</fieldset>
 			<p className="allauth-muted">{passwordPolicyDescription(policy)}</p>
 			<button type="submit" className="allauth-primary" disabled={busy}>
@@ -743,9 +927,21 @@ export function HostedProjectSso({
 	);
 }
 
-export function HostedProjectMfa(context: FormContext) {
+export function HostedProjectMfa(
+	context: FormContext & { inline?: boolean; methods?: string[] },
+) {
 	const { run, busy, error, clearError } = useHostedAction();
-	const [recovery, setRecovery] = useState(false);
+	const { challengeMethods } = useAllAuth();
+	const methods = context.methods ?? challengeMethods;
+	const backupOnly = Boolean(
+		context.inline && methods?.length && !methods.includes("totp"),
+	);
+	const codeInput = useRef<HTMLInputElement>(null);
+	useEffect(() => {
+		if (context.inline) codeInput.current?.focus();
+	}, [context.inline]);
+	const [useRecovery, setRecovery] = useState(false);
+	const recovery = backupOnly || useRecovery;
 	const [trustDevice, setTrustDevice] = useState(false);
 	const id = useId();
 	const label = recovery ? "Recovery code" : "Authenticator code";
@@ -764,7 +960,7 @@ export function HostedProjectMfa(context: FormContext) {
 	return (
 		<HostedProjectCard
 			title="Verify your sign-in"
-			footer={<FormFooter {...context} />}
+			footer={context.inline ? undefined : <FormFooter {...context} />}
 		>
 			<FormError message={error} />
 			<form className="allauth-auth-form" onSubmit={submit}>
@@ -772,6 +968,7 @@ export function HostedProjectMfa(context: FormContext) {
 					<label htmlFor={`${id}-code`}>{label}</label>
 					<input
 						key={label}
+						ref={codeInput}
 						id={`${id}-code`}
 						name="code"
 						autoComplete="one-time-code"
@@ -804,17 +1001,19 @@ export function HostedProjectMfa(context: FormContext) {
 					{busy ? "Verifying…" : "Verify and sign in"}
 				</button>
 			</form>
-			<button
-				type="button"
-				className="allauth-secondary"
-				disabled={busy}
-				onClick={() => {
-					setRecovery(!recovery);
-					clearError();
-				}}
-			>
-				{recovery ? "Use an authenticator code" : "Use a recovery code"}
-			</button>
+			{!backupOnly && (
+				<button
+					type="button"
+					className="allauth-secondary"
+					disabled={busy}
+					onClick={() => {
+						setRecovery(!useRecovery);
+						clearError();
+					}}
+				>
+					{recovery ? "Use an authenticator code" : "Use a recovery code"}
+				</button>
+			)}
 		</HostedProjectCard>
 	);
 }

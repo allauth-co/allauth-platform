@@ -14,11 +14,13 @@ type PasskeyAttempt = {
 export function useHostedPasskeySignIn({
 	destination,
 	enabled,
+	inlineMfa = false,
 }: {
 	destination: string;
 	enabled: boolean;
+	inlineMfa?: boolean;
 }) {
-	const { capabilities, challenge, client } = useAllAuth();
+	const { capabilities, challenge, client, setChallenge } = useAllAuth();
 	const available = enabled && capabilities !== null && !challenge;
 	const active = useRef<PasskeyAttempt | null>(null);
 	const [identifier, identifierRef] = useState<HTMLInputElement | null>(null);
@@ -54,9 +56,11 @@ export function useHostedPasskeySignIn({
 				if (result.error) throw result.error;
 				const target = appPath(destination);
 				if (result.data?.twoFactorRedirect === true) {
-					window.location.assign(
-						`/two-factor?${new URLSearchParams({ callbackUrl: target })}`,
-					);
+					if (inlineMfa) setChallenge(true);
+					else
+						window.location.assign(
+							`/two-factor?${new URLSearchParams({ callbackUrl: target })}`,
+						);
 				} else if (result.data?.user?.id) {
 					window.location.assign(target);
 				} else {
@@ -73,7 +77,7 @@ export function useHostedPasskeySignIn({
 				}
 			}
 		},
-		[client, destination],
+		[client, destination, inlineMfa, setChallenge],
 	);
 
 	useEffect(() => {

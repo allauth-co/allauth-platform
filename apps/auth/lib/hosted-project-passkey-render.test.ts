@@ -16,6 +16,7 @@ const fixture = vi.hoisted(() => ({
 				fetchOptions: { signal: AbortSignal };
 			}) => Promise<{ data: unknown; error: unknown }>
 		>(),
+	setChallenge: vi.fn(),
 	ready: true,
 	challenge: false,
 }));
@@ -31,6 +32,7 @@ vi.mock("@/sdk/react", () => {
 			client,
 			capabilities: fixture.ready ? {} : null,
 			challenge: fixture.challenge,
+			setChallenge: fixture.setChallenge,
 		}),
 	};
 });
@@ -46,13 +48,15 @@ function Form({
 	enabled = true,
 	destination = signedReturn,
 	autocomplete = "username webauthn",
+	inlineMfa = false,
 }: {
 	input?: boolean;
 	enabled?: boolean;
 	destination?: string;
 	autocomplete?: string;
+	inlineMfa?: boolean;
 }) {
-	const passkey = useHostedPasskeySignIn({ destination, enabled });
+	const passkey = useHostedPasskeySignIn({ destination, enabled, inlineMfa });
 	return createElement(
 		"form",
 		{
@@ -107,6 +111,7 @@ beforeEach(() => {
 	fixture.challenge = false;
 	fixture.available.mockReset().mockResolvedValue(true);
 	fixture.signIn.mockReset();
+	fixture.setChallenge.mockReset();
 });
 
 afterEach(async () => {
@@ -180,6 +185,20 @@ it("silences conditional failures and hands a completed passkey's MFA to the hos
 	expect(assign).toHaveBeenCalledExactlyOnceWith(
 		`/two-factor?${new URLSearchParams({ callbackUrl: signedReturn })}`,
 	);
+});
+
+it("keeps passkey MFA on the default form without document navigation", async () => {
+	const assign = vi
+		.spyOn(window.location, "assign")
+		.mockImplementation(() => {});
+	fixture.signIn.mockResolvedValue({
+		data: { twoFactorRedirect: true },
+		error: null,
+	});
+	await render({ inlineMfa: true });
+	expect(fixture.signIn).toHaveBeenCalledTimes(1);
+	expect(fixture.setChallenge).toHaveBeenCalledExactlyOnceWith(true);
+	expect(assign).not.toHaveBeenCalled();
 });
 
 it("cancels conditional authentication before manual sign-in and ignores its delayed result", async () => {

@@ -14,6 +14,7 @@ import type {
 
 const native = vi.hoisted(() => ({
 	social: vi.fn(),
+	passkeyAutofill: vi.fn<() => Promise<boolean>>(),
 	passkey: vi.fn(),
 	signUp: vi.fn(),
 	usernameAvailable: vi.fn(),
@@ -22,6 +23,12 @@ const native = vi.hoisted(() => ({
 	sendVerificationEmail: vi.fn(),
 	onChallenge: undefined as ((methods?: string[]) => void) | undefined,
 }));
+vi.mock("@simplewebauthn/browser", async (importOriginal) => ({
+	...(await importOriginal<typeof import("@simplewebauthn/browser")>()),
+	browserSupportsWebAuthnAutofill: native.passkeyAutofill,
+}));
+native.passkeyAutofill.mockResolvedValue(false);
+
 vi.mock("@/sdk/client", () => ({
 	createAllAuthClient: (
 		_path: string,
@@ -54,6 +61,7 @@ afterEach(async () => {
 	window.sessionStorage.clear();
 	native.social.mockReset();
 	native.passkey.mockReset();
+	native.passkeyAutofill.mockReset().mockResolvedValue(false);
 	native.signUp.mockReset();
 	native.usernameAvailable.mockReset();
 	native.getSession.mockReset();
@@ -743,6 +751,154 @@ async function submit(container: HTMLElement) {
 	);
 }
 
+it.each([
+	["login@customer.example", "email"],
+	["Fixture.User", "username"],
+] as const)("continues the combined first-party form with %s and the exact signed return", async (identifier, method) => {
+	const signed =
+		"/oauth2/continue?client_id=fixture&resource=one&resource=two&sig=fixture%2Bsignature";
+	const request = hostedRequests(() =>
+		Response.json({
+			redirect: true,
+			url: `${window.location.origin}${signed}`,
+			user: { id: "fixture-user" },
+		}),
+	);
+	const assign = vi
+		.spyOn(window.location, "assign")
+		.mockImplementation(() => {});
+	const container = await renderHostedAuth("signIn", signed);
+	const input = container.querySelector<HTMLInputElement>(
+		'input[name="username"]',
+	);
+	expect(input?.getAttribute("autocomplete")).toBe("username webauthn");
+	expect(container.querySelector('input[name="password"]')).toBeNull();
+	await enter(container, "username", identifier);
+	await submit(container);
+	expect(request).not.toHaveBeenCalled();
+	expect(
+		container.querySelector<HTMLInputElement>(
+			'input[type="hidden"][name="username"]',
+		)?.value,
+	).toBe(identifier);
+	expect(document.activeElement).toBe(
+		container.querySelector('input[name="password"]'),
+	);
+	const recover = [...container.querySelectorAll("a")].find(
+		(link) => link.textContent === "Forgot your password?",
+	);
+	expect(new URL(recover!.href).searchParams.get("returnTo")).toBe(signed);
+	await enter(container, "password", "fixture-password");
+	await submit(container);
+	expect(request).toHaveBeenCalledExactlyOnceWith(`sign-in/${method}`, {
+		[method]: identifier,
+		password: "fixture-password",
+		callbackURL: `${window.location.origin}${signed}`,
+	});
+	expect(assign).toHaveBeenCalledExactlyOnceWith(signed);
+});
+
+it.each([
+	["totp", "verify-totp"],
+	["backup", "verify-backup-code"],
+] as const)("finishes inline hosted %s with the trust-device choice and signed return", async (factor, endpoint) => {
+	const signed =
+		"/oauth2/continue?client_id=fixture&resource=one&resource=two&sig=fixture%2Bsignature";
+	const requests = hostedRequests((path) =>
+		path === "sign-in/email"
+			? Response.json({
+					twoFactorRedirect: true,
+					...(factor === "backup" && { twoFactorMethods: ["backup-code"] }),
+				})
+			: Response.json({ user: { id: "fixture-user" } }),
+	);
+	const assign = vi
+		.spyOn(window.location, "assign")
+		.mockImplementation(() => {});
+	const container = await renderHostedAuth("signIn", signed);
+	await enter(container, "username", "login@customer.example");
+	await submit(container);
+	await enter(container, "password", "fixture-password");
+	await submit(container);
+	expect(assign).not.toHaveBeenCalled();
+	expect(container.textContent).toContain("Verify your sign-in");
+	expect(document.activeElement).toBe(
+		container.querySelector('input[name="code"]'),
+	);
+	expect(container.textContent).toContain(
+		factor === "backup" ? "Recovery code" : "Authenticator code",
+	);
+	const options = container.querySelector<HTMLAnchorElement>(
+		'a[href^="/two-factor?"]',
+	);
+	expect(new URL(options!.href).searchParams.get("callbackUrl")).toBe(signed);
+	const code = factor === "backup" ? "fixture-recovery" : "123456";
+	await enter(container, "code", code);
+	await act(async () =>
+		container
+			.querySelector<HTMLInputElement>('input[name="trustDevice"]')!
+			.click(),
+	);
+	await submit(container);
+	expect(requests).toHaveBeenLastCalledWith(`two-factor/${endpoint}`, {
+		code,
+		trustDevice: true,
+	});
+	expect(assign).toHaveBeenCalledExactlyOnceWith(signed);
+});
+
+it("aborts the default hosted conditional passkey when advancing to password or starting a provider", async () => {
+	native.passkeyAutofill.mockResolvedValue(true);
+	const first = Promise.withResolvers<unknown>();
+	const second = Promise.withResolvers<unknown>();
+	native.passkey
+		.mockReturnValueOnce(first.promise)
+		.mockReturnValueOnce(second.promise);
+	native.social.mockResolvedValue({
+		data: { redirect: true, url: "https://broker.fixture.example/authorize" },
+		error: null,
+	});
+	const requests = hostedRequests(() => Response.json({}));
+	const assign = vi
+		.spyOn(window.location, "assign")
+		.mockImplementation(() => {});
+	const container = await renderHostedAuth("signIn");
+	expect(native.passkey).toHaveBeenCalledExactlyOnceWith({
+		autoFill: true,
+		fetchOptions: { signal: expect.any(AbortSignal) },
+	});
+	await enter(container, "username", "fixture");
+	await submit(container);
+	expect(native.passkey.mock.calls[0]?.[0].fetchOptions.signal.aborted).toBe(
+		true,
+	);
+	expect(requests).not.toHaveBeenCalled();
+	const change = [...container.querySelectorAll("button")].find(
+		({ textContent }) => textContent?.includes("Change email"),
+	);
+	await act(async () => change?.click());
+	expect(
+		container.querySelector<HTMLInputElement>('input[name="username"]')?.value,
+	).toBe("fixture");
+	expect(native.passkey).toHaveBeenCalledTimes(2);
+	const broker = [...container.querySelectorAll("button")].find(
+		({ textContent }) => textContent === "Continue with AllAuth",
+	);
+	await act(async () => broker?.click());
+	expect(native.passkey.mock.calls[1]?.[0].fetchOptions.signal.aborted).toBe(
+		true,
+	);
+	expect(native.social).toHaveBeenCalledExactlyOnceWith({
+		provider: "allauth",
+		callbackURL: `${window.location.origin}${destination}`,
+	});
+	await act(async () => {
+		first.resolve({ data: { user: { id: "fixture-first" } }, error: null });
+		second.resolve({ data: { user: { id: "fixture-second" } }, error: null });
+	});
+	expect(assign).not.toHaveBeenCalled();
+});
+
 it("continues username sign-in to dedicated MFA before navigating to the account", async () => {
 	const requests = hostedRequests(() =>
 		Response.json({ twoFactorRedirect: true }),
@@ -775,7 +931,9 @@ it("offers conditional and explicit passkey sign-in on the hosted username form"
 		.mockImplementation(() => {});
 	const container = await renderHostedAuth("username");
 	expect(
-		container.querySelector('input[name="username"]')?.getAttribute("autocomplete"),
+		container
+			.querySelector('input[name="username"]')
+			?.getAttribute("autocomplete"),
 	).toBe("username webauthn");
 	const passkey = [...container.querySelectorAll("button")].find(
 		(button) => button.textContent === "Sign in with a passkey",

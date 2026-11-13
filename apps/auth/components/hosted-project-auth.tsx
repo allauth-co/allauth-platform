@@ -10,7 +10,6 @@ import {
 	AllAuthProvider,
 	ForgotPassword,
 	ResetPassword,
-	SignIn,
 	SignUp,
 	useAllAuth,
 	withAuthReturnTo,
@@ -26,6 +25,7 @@ import {
 	HostedProjectEmail,
 	HostedProjectMfa,
 	HostedProjectPasswordSignup,
+	HostedProjectSignIn,
 	HostedProjectSso,
 	HostedProjectUsername,
 } from "./hosted-project-forms";
@@ -45,25 +45,104 @@ type HostedProjectAuthProps = {
 	showSso: boolean;
 };
 
+function HostedProjectProviderButtons({
+	destination,
+	showBroker,
+	includeNative,
+	signUp = false,
+	controls,
+}: {
+	destination: string;
+	showBroker: boolean;
+	includeNative: boolean;
+	signUp?: boolean;
+	controls?: {
+		disabled: boolean;
+		cancelAutofill: () => void;
+		setPending: (pending: boolean) => void;
+	};
+}) {
+	const { capabilities, client } = useAllAuth();
+	const [busy, setBusy] = useState(false);
+	const [error, setError] = useState("");
+	if (!capabilities || (signUp && capabilities.signUpEnabled === false))
+		return null;
+	const providers = [
+		...(["apple", "google", "microsoft"] as const).filter(
+			(provider) => includeNative && capabilities[provider],
+		),
+		...(showBroker ? (["allauth"] as const) : []),
+	];
+	if (!providers.length) return null;
+	const labels = {
+		apple: "Apple",
+		google: "Google",
+		microsoft: "Microsoft",
+		allauth: "AllAuth",
+	};
+	async function start(provider: (typeof providers)[number]) {
+		controls?.cancelAutofill();
+		controls?.setPending(true);
+		setBusy(true);
+		setError("");
+		try {
+			const callbackURL = new URL(destination, window.location.origin).href;
+			const result = await client.signIn.social({
+				provider:
+					provider === "google"
+						? capabilities?.googleProvider || "allauth"
+						: provider,
+				callbackURL,
+				...(signUp ? { newUserCallbackURL: callbackURL } : {}),
+			});
+			if (result.error || !result.data?.redirect || !result.data.url)
+				throw new Error(
+					result.error?.message || "AllAuth sign-in could not be started.",
+				);
+		} catch (cause) {
+			setError(
+				cause instanceof Error
+					? cause.message
+					: "AllAuth sign-in could not be started.",
+			);
+			setBusy(false);
+			controls?.setPending(false);
+		}
+	}
+	return (
+		<>
+			{providers.map((provider) => (
+				<button
+					key={provider}
+					type="button"
+					className="allauth-secondary allauth-social-button w-full"
+					disabled={busy || controls?.disabled}
+					onClick={() => void start(provider)}
+				>
+					{busy ? "Connecting…" : `Continue with ${labels[provider]}`}
+				</button>
+			))}
+			{error && (
+				<p role="alert" className="allauth-error">
+					{error}
+				</p>
+			)}
+		</>
+	);
+}
+
 function HostedProjectChoices({
 	view,
 	destination,
 	legacyPath,
-	showBroker,
 	showPassword,
 	showEmail,
 	showSso,
-	nativeSignup = false,
-}: Pick<
-	HostedProjectAuthProps,
-	"view" | "destination" | "legacyPath" | "showBroker"
-> &
+}: Pick<HostedProjectAuthProps, "view" | "destination" | "legacyPath"> &
 	Partial<
 		Pick<HostedProjectAuthProps, "showPassword" | "showEmail" | "showSso">
-	> & { nativeSignup?: boolean }) {
-	const { capabilities, challenge, client } = useAllAuth();
-	const [busy, setBusy] = useState(false);
-	const [error, setError] = useState("");
+	>) {
+	const { capabilities, challenge } = useAllAuth();
 	if (challenge) {
 		const challengeQuery = new URLSearchParams({ callbackUrl: destination });
 		return (
@@ -80,70 +159,8 @@ function HostedProjectChoices({
 			</div>
 		);
 	}
-	const primary = view === "signIn" || view === "signUp";
-	const nativeProviders = nativeSignup
-		? (["apple", "google", "microsoft"] as const).filter(
-				(provider) => capabilities?.[provider],
-			)
-		: [];
-	const labels = { apple: "Apple", google: "Google", microsoft: "Microsoft" };
-
-	async function startProvider(provider: "allauth" | keyof typeof labels) {
-		setBusy(true);
-		setError("");
-		try {
-			const callbackURL = new URL(destination, window.location.origin).href;
-			const result = await client.signIn.social({
-				provider:
-					provider === "google"
-						? capabilities?.googleProvider || "allauth"
-						: provider,
-				callbackURL,
-				...(view === "signUp" ? { newUserCallbackURL: callbackURL } : {}),
-			});
-			if (result.error || !result.data?.redirect || !result.data.url) {
-				setError(
-					result.error?.message || "AllAuth sign-in could not be started.",
-				);
-				setBusy(false);
-			}
-		} catch {
-			setError("AllAuth sign-in could not be started.");
-			setBusy(false);
-		}
-	}
-
 	return (
 		<div className="allauth space-y-3 text-center">
-			{showBroker &&
-				primary &&
-				capabilities &&
-				(view !== "signUp" || capabilities.signUpEnabled !== false) && (
-					<button
-						type="button"
-						className="allauth-secondary w-full"
-						disabled={busy}
-						onClick={() => void startProvider("allauth")}
-					>
-						{busy ? "Connecting…" : "Continue with AllAuth"}
-					</button>
-				)}
-			{nativeProviders.map((provider) => (
-				<button
-					key={provider}
-					type="button"
-					className="allauth-secondary allauth-social-button w-full"
-					disabled={busy}
-					onClick={() => void startProvider(provider)}
-				>
-					Continue with {labels[provider]}
-				</button>
-			))}
-			{error && (
-				<p role="alert" className="allauth-error">
-					{error}
-				</p>
-			)}
 			{view === "signIn" && capabilities && (
 				<nav
 					className="flex flex-wrap justify-center gap-x-4 gap-y-2 text-sm"
@@ -225,13 +242,19 @@ function HostedProjectSignUp({
 		</p>
 	);
 	const choices = (
-		<HostedProjectChoices
-			view="signUp"
-			destination={destination}
-			legacyPath={legacyPath}
-			showBroker={showBroker}
-			nativeSignup={passwordSignup}
-		/>
+		<>
+			<HostedProjectProviderButtons
+				destination={destination}
+				showBroker={showBroker}
+				includeNative={passwordSignup}
+				signUp
+			/>
+			<HostedProjectChoices
+				view="signUp"
+				destination={destination}
+				legacyPath={legacyPath}
+			/>
+		</>
 	);
 	if (
 		showBroker &&
@@ -301,11 +324,17 @@ export function HostedProjectAuth({
 				afterSignUpUrl={destination}
 			>
 				{view === "signIn" && (
-					<SignIn
-						passkeySignIn
-						afterSignInUrl={destination}
-						signUpUrl="/sign-up"
-						forgotPasswordUrl={showRecovery ? "/forgot-password" : undefined}
+					<HostedProjectSignIn
+						{...continuation}
+						showRecovery={showRecovery}
+						renderProviders={(controls) => (
+							<HostedProjectProviderButtons
+								destination={destination}
+								showBroker={showBroker}
+								includeNative
+								controls={controls}
+							/>
+						)}
 					/>
 				)}
 				{view === "signUp" && (
@@ -364,7 +393,6 @@ export function HostedProjectAuth({
 						view={view}
 						destination={destination}
 						legacyPath={legacyPath}
-						showBroker={showBroker}
 						showPassword={showPassword}
 						showEmail={showEmail}
 						showSso={showSso}
