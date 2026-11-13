@@ -1,7 +1,14 @@
 import type { Pool, PoolClient } from "pg";
 import { authPolicyRepository } from "./auth-policy/storage";
 import type { AuthEnvironment } from "./configuration";
-import { authOrigin, setting, trustedOrigins } from "./configuration";
+import {
+	authOrigin,
+	projectEmailEnvironment,
+	setting,
+	trustedOrigins,
+} from "./configuration";
+import { authenticationEmail } from "./email/authentication";
+import { emailConfigured, sendAuthEmail } from "./email/send";
 import {
 	platformIssuerDevicePath,
 	routePlatformIssuerDevice,
@@ -12,6 +19,8 @@ import { createPlatformIssuerSessionReader } from "./platform-issuer-session";
 import { createPlatformIssuerSigner } from "./platform-issuer-signing";
 import { createPlatformIssuerStore } from "./platform-issuer-store";
 import { createPlatformMcpDeviceToken } from "./platform-mcp-device-token";
+import { createPlatformPendingMfa } from "./platform-pending-mfa";
+import { createPlatformSessionIssuer } from "./platform-session-issuance";
 import { readLegacyProjectKeyring } from "./projects/legacy-project-keyring";
 import { createOwnedProjectIssuerAuthorization } from "./projects/owned-project-issuer-authorization";
 import { createIssuerClientAuthenticator } from "./projects/owned-project-issuer-client";
@@ -171,6 +180,44 @@ export function createPlatformIssuer(database: Pool, env: AuthEnvironment) {
 	});
 	const trustedIP = (request: Request) =>
 		request.headers.get(isNodeRuntime(env) ? "x-real-ip" : "cf-connecting-ip");
+	const sessions = createPlatformSessionIssuer({
+		issuer,
+		signingSecret,
+		trustedIP,
+	});
+	const readPolicy = async () => (await policy.read("platform")).policy;
+	const email = projectEmailEnvironment(env);
+	const verifyPendingMfa = createPlatformPendingMfa({
+		issuer,
+		signingSecret,
+		securitySecret: setting(env, "ALLAUTH_AUTH_SECRET"),
+		keys: encryptionKeys,
+		store,
+		sessions,
+		readSession,
+		readPolicy,
+		readBody: readBrowserBody,
+		trustedIP,
+		requireTrustedIP: isNodeRuntime(env),
+		trustedOrigins: trustedOrigins(env),
+		continueAuthenticated: authorization.continueAuthenticated,
+		notifyNewDevice: emailConfigured(email)
+			? async (user, request) => {
+					const ip = trustedIP(request);
+					await sendAuthEmail(email, {
+						to: user.email,
+						subject: "New sign-in to AllAuth",
+						fromName: "AllAuth",
+						react: authenticationEmail({
+							title: "New device signed in",
+							description: `Hello ${user.name}, a new device signed in to AllAuth.${ip ? ` IP address: ${ip}.` : ""} If this was unexpected, review your sessions and change your password.`,
+							url: `${issuer}/account`,
+							actionLabel: "Review account security",
+						}),
+					});
+				}
+			: undefined,
+	});
 	const deviceOptions = {
 		database,
 		schemaName: store.schemaName,
@@ -195,10 +242,10 @@ export function createPlatformIssuer(database: Pool, env: AuthEnvironment) {
 	});
 	const mcpDeviceToken = createPlatformMcpDeviceToken({
 		issuer,
-		signingSecret,
 		store,
 		trustedIP,
-		policy: async () => (await policy.read("platform")).policy,
+		policy: readPolicy,
+		sessions,
 	});
 	async function dispatchDevice(request: Request) {
 		const selected = await routePlatformIssuerDevice(database, request);
@@ -254,6 +301,8 @@ export function createPlatformIssuer(database: Pool, env: AuthEnvironment) {
 		const url = new URL(request.url);
 		if (url.origin !== issuer || !url.pathname.startsWith("/api/auth/")) return;
 		const path = url.pathname.slice("/api/auth".length);
+		const mfa = await verifyPendingMfa(request);
+		if (mfa) return mfa;
 		const route = protocolRoutes.get(path);
 		if (!route?.methods.includes(request.method)) return;
 		if (path.startsWith("/oauth2/") && request.headers.has("cookie")) {

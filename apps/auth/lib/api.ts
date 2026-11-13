@@ -12,6 +12,8 @@ import {
 	withProjectAuth,
 } from "./projects/runtime";
 
+import { requireWorkspacePrincipal } from "./workspaces/authorization";
+
 export type AuthInstance = ReturnType<typeof createAuth>;
 
 export function json(value: unknown, status = 200): Response {
@@ -32,7 +34,11 @@ export function requireSameOrigin(request: Request, env: AuthEnvironment) {
 		});
 }
 
-export async function requireAdmin(instance: AuthInstance, headers: Headers) {
+export async function requireAdmin(
+	instance: AuthInstance,
+	headers: Headers,
+	env: AuthEnvironment,
+) {
 	const selected = projectInstance(instance);
 	if (selected) {
 		const principal = await selectedProjectAdministrator(
@@ -43,11 +49,7 @@ export async function requireAdmin(instance: AuthInstance, headers: Headers) {
 		if (!principal) throw new APIError("FORBIDDEN");
 		return principal;
 	}
-	const session = await instance.api.getSession({
-		headers,
-		query: { disableCookieCache: true },
-	});
-	if (!session) throw new APIError("UNAUTHORIZED");
+	const session = await requireWorkspacePrincipal(headers, env);
 	if (
 		!session.user.emailVerified ||
 		!isPlatformAdmin(session.user, session.session)

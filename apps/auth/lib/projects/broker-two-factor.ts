@@ -1,5 +1,5 @@
-import { APIError } from "better-auth";
 import { runWithAdapter } from "@better-auth/core/context";
+import { APIError } from "better-auth";
 import type { AuthInstance } from "../api";
 import { verifyBrokerTwoFactor } from "../broker-two-factor";
 import type { ProjectBrokerFactor } from "./owned-project-broker-mfa";
@@ -15,6 +15,7 @@ export async function projectBrokerTwoFactor(
 	platform: AuthInstance,
 	platformOrigin: string,
 	parsedBody?: ProjectBrokerFactor,
+	dispatchFactor?: (request: Request) => Promise<Response>,
 ): Promise<Response> {
 	const origin = request.headers.get("allauth-proxy-origin");
 	if (
@@ -56,6 +57,7 @@ export async function projectBrokerTwoFactor(
 				binding: read("broker_mfa_binding"),
 			},
 			request.headers,
+			dispatchFactor,
 		),
 	);
 	return Response.json(result, {

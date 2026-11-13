@@ -14,7 +14,7 @@ export const PATCH = async (
 		{ operation: "metadata", userId },
 		async (instance, env) => {
 			requireSameOrigin(request, env);
-			const actor = await requireAdmin(instance, request.headers);
+			const actor = await requireAdmin(instance, request.headers, env);
 			const body = await readConsoleUserMetadata(request);
 			const database = (await instance.$context).adapter;
 			const where = [{ field: "id", value: userId }];

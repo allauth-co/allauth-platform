@@ -16,9 +16,17 @@ interface EnrolmentRow {
  */
 export async function consumeProjectRecoveryCode(
 	database: PoolClient,
-	input: { schemaName: string; userId: string; code: string; keys: LegacyMfaKeys },
+	input: {
+		schemaName: string;
+		userId: string;
+		code: string;
+		keys: LegacyMfaKeys;
+	},
 ): Promise<"consumed" | "invalid" | "conflict"> {
-	const schema = checkedProjectSchema(input.schemaName);
+	const schema =
+		input.schemaName === "public"
+			? "public"
+			: checkedProjectSchema(input.schemaName);
 	if (!input.code || input.code.length > 128) return "invalid";
 	// Serialize with account deprovisioning and hold the lock through session issuance.
 	const owner = await database.query(
@@ -48,14 +56,20 @@ export async function consumeProjectRecoveryCode(
 	} catch {
 		throw new Error("Could not read the existing recovery codes.");
 	}
-	if (!Array.isArray(codes) || !codes.every((code: unknown): code is string => typeof code === "string")) {
+	if (
+		!Array.isArray(codes) ||
+		!codes.every((code: unknown): code is string => typeof code === "string")
+	) {
 		throw new Error("Could not read the existing recovery codes.");
 	}
 	const encoder = new TextEncoder();
 	const presented = encoder.encode(input.code);
 	const remaining = codes.filter((code) => {
 		const expected = encoder.encode(code);
-		return expected.length !== presented.length || !timingSafeEqual(expected, presented);
+		return (
+			expected.length !== presented.length ||
+			!timingSafeEqual(expected, presented)
+		);
 	});
 	if (remaining.length === codes.length) return "invalid";
 
@@ -67,7 +81,12 @@ export async function consumeProjectRecoveryCode(
 			AND u."twoFactorEnabled" = TRUE AND COALESCE(u.banned, FALSE) = FALSE
 			AND COALESCE(u."directoryDisabled", FALSE) = FALSE
 			AND (f."lockedUntil" IS NULL OR f."lockedUntil" <= statement_timestamp())`,
-		[sealLegacyMfaRecord(JSON.stringify(remaining), input.keys), record.id, input.userId, record.backupCodes],
+		[
+			sealLegacyMfaRecord(JSON.stringify(remaining), input.keys),
+			record.id,
+			input.userId,
+			record.backupCodes,
+		],
 	);
 	return updated.rowCount === 1 ? "consumed" : "conflict";
 }

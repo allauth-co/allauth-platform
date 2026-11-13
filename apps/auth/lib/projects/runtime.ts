@@ -4,6 +4,7 @@ import { APIError } from "better-auth";
 import { Pool } from "pg";
 import {
 	createAuth,
+	dispatchPlatformAuth,
 	getAuthEnvironment,
 	postgresDatabase,
 	withAuth,
@@ -389,13 +390,14 @@ async function build(
 							current,
 							environment,
 						);
-						return withAuth((platform) =>
+						return withAuth((platform, rootEnv) =>
 							projectBrokerTwoFactor(
 								verified,
 								current,
 								platform,
 								authOrigin(environment),
 								body,
+								(input) => dispatchPlatformAuth(input, platform, rootEnv),
 							),
 						);
 					},

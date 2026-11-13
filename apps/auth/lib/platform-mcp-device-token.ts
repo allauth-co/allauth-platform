@@ -1,12 +1,11 @@
-import { createHmac, randomBytes, randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import type { PoolClient } from "pg";
 import type { AuthPolicy } from "./auth-policy/policy";
-import { canonicalIP } from "./control/security-policy";
 import { isServerTokenRequest } from "./features/helpers";
 import { MCP_DEVICE_CLIENT_ID } from "./features/mcp-device-contract";
 import { readDeviceBody } from "./platform-issuer-device-routing";
 import type { createPlatformIssuerStore } from "./platform-issuer-store";
-import { recordOwnedProjectEvent } from "./projects/owned-project-engine-store";
+import type { createPlatformSessionIssuer } from "./platform-session-issuance";
 import { projectDeviceGrantType } from "./projects/owned-project-issuer-device";
 import {
 	issuerFormParameters,
@@ -29,9 +28,9 @@ interface DeviceGrant {
 
 interface PlatformMcpDeviceTokenOptions {
 	issuer: string;
-	signingSecret: string;
 	store: ReturnType<typeof createPlatformIssuerStore>;
 	policy: () => Promise<AuthPolicy>;
+	sessions: ReturnType<typeof createPlatformSessionIssuer>;
 	trustedIP: (request: Request) => string | null;
 }
 
@@ -82,24 +81,6 @@ async function tokenInput(request: Request) {
 export function createPlatformMcpDeviceToken(
 	options: PlatformMcpDeviceTokenOptions,
 ) {
-	const secure = options.issuer.startsWith("https:");
-	const cookiePrefix = secure ? "__Secure-better-auth." : "better-auth.";
-
-	function cookie(
-		response: Response,
-		name: string,
-		value: string,
-		maxAge: number,
-	) {
-		const signature = createHmac("sha256", options.signingSecret)
-			.update(value)
-			.digest("base64");
-		response.headers.append(
-			"set-cookie",
-			`${cookiePrefix}${name}=${encodeURIComponent(`${value}.${signature}`)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge}${secure ? "; Secure" : ""}`,
-		);
-	}
-
 	async function findGrant(client: PoolClient, code: string, lock = false) {
 		const { rows } = await client.query<DeviceGrant>(
 			`SELECT id,"userId","clientId","oauthClientId",status,"expiresAt","lastPolledAt","pollingInterval",scope
@@ -131,7 +112,10 @@ export function createPlatformMcpDeviceToken(
 			twoFactorRedirect: true,
 			twoFactorMethods: rowCount ? ["totp"] : [],
 		});
-		cookie(response, "two_factor", identifier, maxAge);
+		response.headers.append(
+			"set-cookie",
+			options.sessions.cookie("two_factor", identifier, maxAge),
+		);
 		return response;
 	}
 
@@ -240,27 +224,12 @@ export function createPlatformMcpDeviceToken(
 				]);
 				if (user.twoFactorEnabled) return startMfa(client, user.id);
 
-				const id = randomUUID();
-				const token = randomBytes(32).toString("base64url");
 				const lifetime = policy.sessionExpiresInSeconds;
-				await client.query(
-					`INSERT INTO public."session" (id,token,"userId","expiresAt","updatedAt","ipAddress","userAgent")
-					 VALUES ($1,$2,$3,now()+$4::integer*interval '1 second',now(),$5,$6)`,
-					[
-						id,
-						token,
-						user.id,
-						lifetime,
-						canonicalIP(options.trustedIP(request)) ?? "",
-						request.headers.get("user-agent") ?? "",
-					],
-				);
-				await recordOwnedProjectEvent(client, {
-					type: "session.created",
-					outcome: "success",
+				const { token } = await options.sessions.issue(client, {
 					userId: user.id,
-					targetId: id,
-					metadata: { path: "/device/token" },
+					lifetime,
+					request,
+					path: "/device/token",
 				});
 				const response = issuerJSON({
 					access_token: token,
@@ -269,7 +238,10 @@ export function createPlatformMcpDeviceToken(
 					scope: grant.scope ?? "",
 				});
 				if (isServerTokenRequest(request.headers))
-					cookie(response, "session_token", token, lifetime);
+					response.headers.append(
+						"set-cookie",
+						options.sessions.cookie("session_token", token, lifetime),
+					);
 				return response;
 			});
 		} catch (error) {
