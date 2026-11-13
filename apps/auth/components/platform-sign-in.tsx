@@ -1,17 +1,20 @@
 "use client";
+import { Fingerprint } from "lucide-react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { useState } from "react";
 import { toast } from "sonner";
-import { Fingerprint } from "lucide-react";
-import { authClient } from "@/lib/auth-client";
-import { defaultPasswordPolicy, passwordPolicyDescription, passwordPolicyError } from "@/lib/auth-policy/password";
+import * as z from "zod";
+import { localNavigation } from "@/lib/auth-navigation";
 import { useConfiguration } from "@/lib/configuration-client";
+import { oauthBrowserQuery } from "@/lib/oauth-browser";
 import {
 	authenticationCallback,
 	completeAuthentication,
 	errorMessage,
 } from "@/lib/shared";
+import { createAllAuthClient } from "@/sdk/client";
+import { LogoIcon } from "./logo";
 import { Button } from "./ui/button";
 import {
 	Card,
@@ -23,16 +26,56 @@ import {
 import { Input } from "./ui/input";
 import { Label } from "./ui/label";
 import { PasswordInput } from "./ui/password-input";
-import { LogoIcon } from "./logo";
-export function HostedAuth({ signup = false }: { signup?: boolean }) {
+
+const client = createAllAuthClient("/api/auth", () => {
+	window.location.assign(`/two-factor${window.location.search}`);
+});
+const ssoRedirect = z.object({ redirect: z.literal(true), url: z.url() });
+
+async function startEnterpriseSignIn(email: string, callbackURL: string) {
+	const response = await fetch("/api/auth/sign-in/sso", {
+		method: "POST",
+		headers: { accept: "application/json", "content-type": "application/json" },
+		body: JSON.stringify({ email, callbackURL }),
+		credentials: "same-origin",
+		cache: "no-store",
+		redirect: "error",
+	});
+	const value: unknown = await response.json().catch(() => null);
+	const redirect = ssoRedirect.safeParse(value);
+	if (!response.ok || !redirect.success)
+		throw new Error(
+			response.status === 404
+				? "No organization sign-in was found for this email address."
+				: "Organization sign-in could not be started.",
+		);
+	const target = new URL(redirect.data.url);
+	if (target.protocol !== "https:" || target.username || target.password)
+		throw new Error("Organization sign-in returned an invalid destination.");
+	window.location.assign(target.href);
+}
+
+export function PlatformSignIn() {
 	const params = useSearchParams();
 	const { data: configuration, error: configurationError } = useConfiguration();
-	const policy = configuration?.passwordPolicy || defaultPasswordPolicy;
+	const passwordEnabled = configuration?.emailPassword !== false;
+	const canUseEmail = configuration?.email === true;
+	const oauthQuery = params.has("client_id")
+		? oauthBrowserQuery(params)?.toString()
+		: undefined;
+	const oauthBody = oauthQuery ? { oauth_query: oauthQuery } : {};
+	const confirmIdentity =
+		params.get("prompt")?.split(" ").includes("login") ||
+		params.get("callbackUrl")?.startsWith("/device");
+	const authLink = (path: string) =>
+		localNavigation(
+			path,
+			"https://allauth.invalid",
+			new URLSearchParams(params.toString()),
+		) ?? path;
 	const [busy, setBusy] = useState(false);
 	const [email, setEmail] = useState("");
 	const [password, setPassword] = useState("");
-	const [confirm, setConfirm] = useState("");
-	const [name, setName] = useState("");
 	const [otp, setOtp] = useState("");
 	const [otpSent, setOtpSent] = useState(false);
 	const [notice, setNotice] = useState("");
@@ -51,43 +94,32 @@ export function HostedAuth({ signup = false }: { signup?: boolean }) {
 	const submit = (event: React.FormEvent) => {
 		event.preventDefault();
 		void run(async () => {
-			if (signup) { const error = passwordPolicyError(password, policy); if (error) throw new Error(error); }
-			if (signup && password !== confirm)
-				throw new Error("Passwords do not match");
 			const callbackURL = await authenticationCallback(params);
-			if (signup) {
-				const { data, error } = await authClient.signUp.email({
-					name,
-					email,
-					password,
-					callbackURL,
-				});
-				if (error) throw new Error(error.message);
-				if (!data?.token) {
-					setNotice(
-						"Check your email to verify your account before signing in.",
-					);
-					return;
-				}
-			} else {
-				const { data, error } = await authClient.signIn.email({
-					email,
-					password,
-					callbackURL,
-				});
-				if (error) throw new Error(error.message);
-				await finish(data);
-				return;
-			}
-			await finish();
+			const identifier = email.trim();
+			const { data, error } = identifier.includes("@")
+				? await client.signIn.email({
+						email: identifier,
+						password,
+						callbackURL,
+						...oauthBody,
+					})
+				: await client.signIn.username({
+						username: identifier,
+						password,
+						callbackURL,
+						...oauthBody,
+					});
+			if (error) throw new Error(error.message);
+			await finish(data);
 		});
 	};
 	const social = (provider: "google" | "github" | "microsoft" | "apple") =>
 		run(async () => {
 			const callbackURL = await authenticationCallback(params);
-			const { error } = await authClient.signIn.social({
+			const { error } = await client.signIn.social({
 				provider,
 				callbackURL,
+				...oauthBody,
 			});
 			if (error) throw new Error(error.message);
 		});
@@ -96,7 +128,7 @@ export function HostedAuth({ signup = false }: { signup?: boolean }) {
 			<div className="text-center mb-7">
 				<LogoIcon className="size-20 mx-auto mb-1" aria-hidden="true" />
 				<h1 className="text-2xl font-semibold tracking-tight">
-					{signup ? "Create your AllAuth account" : "Welcome to AllAuth"}
+					Welcome to AllAuth
 				</h1>
 				<p className="text-muted-foreground text-sm mt-2">
 					One account for your connected applications.
@@ -104,14 +136,15 @@ export function HostedAuth({ signup = false }: { signup?: boolean }) {
 			</div>
 			<Card>
 				<CardHeader>
-					<CardTitle>{signup ? "Create account" : "Sign in"}</CardTitle>
-					<CardDescription>
-						{signup
-							? "Use your email address to get started."
-							: "Choose how you want to sign in."}
-					</CardDescription>
+					<CardTitle>Sign in</CardTitle>
+					<CardDescription>Choose how you want to sign in.</CardDescription>
 				</CardHeader>
 				<CardContent className="space-y-5">
+					{confirmIdentity && (
+						<p role="status" className="rounded-md bg-muted p-3 text-sm">
+							Sign in again to confirm your identity.
+						</p>
+					)}
 					{configurationError && (
 						<p role="alert" className="text-sm text-destructive">
 							Authentication configuration could not be loaded. Refresh to try
@@ -123,71 +156,62 @@ export function HostedAuth({ signup = false }: { signup?: boolean }) {
 							{notice}
 						</p>
 					)}
-					<form onSubmit={submit} className="space-y-4">
-						{signup && (
+					{passwordEnabled && (
+						<form onSubmit={submit} className="space-y-4">
 							<div className="space-y-2">
-								<Label htmlFor="name">Full name</Label>
+								<Label htmlFor="email">Email or username</Label>
 								<Input
-									id="name"
-									value={name}
-									onChange={(e) => setName(e.target.value)}
+									id="email"
+									type="text"
+									autoComplete="username webauthn"
+									value={email}
+									onChange={(e) => setEmail(e.target.value)}
 									required
-									maxLength={100}
-									autoComplete="name"
 								/>
 							</div>
-						)}
-						<div className="space-y-2">
-							<Label htmlFor="email">Email address</Label>
-							<Input
-								id="email"
-								type="email"
-								autoComplete="email"
-								value={email}
-								onChange={(e) => setEmail(e.target.value)}
-								required
-							/>
-						</div>
-						<div className="space-y-2">
-							<div className="flex justify-between">
-								<Label htmlFor="password">Password</Label>
-								{!signup && configuration?.email && (
-									<Link className="text-xs underline" href="/forgot-password">
-										Forgot password?
-									</Link>
-								)}
-							</div>
-							<PasswordInput
-								id="password"
-								value={password}
-								onChange={(e) => setPassword(e.target.value)}
-								minLength={signup ? policy.minLength : 1}
-								maxLength={signup ? policy.maxLength : undefined}
-								required
-								autoComplete={signup ? "new-password" : "current-password"}
-							/>
-							{signup && (
-								<p className="text-xs text-muted-foreground">
-									{passwordPolicyDescription(policy)}
-								</p>
-							)}
-						</div>
-						{signup && (
 							<div className="space-y-2">
-								<Label htmlFor="confirm">Confirm password</Label>
+								<div className="flex justify-between">
+									<Label htmlFor="password">Password</Label>
+									{configuration?.email && (
+										<Link
+											className="text-xs underline"
+											href={authLink("/forgot-password")}
+										>
+											Forgot password?
+										</Link>
+									)}
+								</div>
 								<PasswordInput
-									id="confirm"
-									value={confirm}
-									onChange={(e) => setConfirm(e.target.value)}
+									id="password"
+									value={password}
+									onChange={(e) => setPassword(e.target.value)}
+									minLength={1}
 									required
-									autoComplete="new-password"
+									autoComplete="current-password"
+								/>
+							</div>
+							<Button
+								type="submit"
+								className="w-full"
+								disabled={busy || !configuration}
+							>
+								{busy ? "Please wait…" : "Sign in"}
+							</Button>
+						</form>
+					)}
+					{!passwordEnabled &&
+						(canUseEmail || configuration?.enterpriseSSO) && (
+							<div className="space-y-2">
+								<Label htmlFor="email">Email address</Label>
+								<Input
+									id="email"
+									type="email"
+									autoComplete="email"
+									value={email}
+									onChange={(event) => setEmail(event.target.value)}
 								/>
 							</div>
 						)}
-						<Button type="submit" className="w-full" disabled={busy}>
-							{busy ? "Please wait…" : signup ? "Create account" : "Sign in"}
-						</Button>
-					</form>
 					{configuration &&
 						(["google", "apple", "microsoft", "github"] as const).some(
 							(provider) => configuration[provider],
@@ -208,7 +232,7 @@ export function HostedAuth({ signup = false }: { signup?: boolean }) {
 									))}
 							</div>
 						)}
-					{!signup && (
+					{
 						<Button
 							variant="outline"
 							className="w-full gap-2"
@@ -216,7 +240,7 @@ export function HostedAuth({ signup = false }: { signup?: boolean }) {
 							onClick={() =>
 								void run(async () => {
 									await authenticationCallback(params);
-									const { data, error } = await authClient.signIn.passkey();
+									const { data, error } = await client.signIn.passkey();
 									if (error) throw new Error(error.message);
 									await finish(data);
 								})
@@ -225,8 +249,8 @@ export function HostedAuth({ signup = false }: { signup?: boolean }) {
 							<Fingerprint className="size-4" />
 							Sign in with a passkey
 						</Button>
-					)}
-					{!signup && configuration?.email && (
+					}
+					{configuration?.email && (
 						<details className="border-t pt-4">
 							<summary className="text-sm cursor-pointer">
 								Email sign-in options
@@ -242,7 +266,7 @@ export function HostedAuth({ signup = false }: { signup?: boolean }) {
 									onClick={() =>
 										void run(async () => {
 											const callbackURL = await authenticationCallback(params);
-											const { error } = await authClient.signIn.magicLink({
+											const { error } = await client.signIn.magicLink({
 												email,
 												callbackURL,
 											});
@@ -263,7 +287,7 @@ export function HostedAuth({ signup = false }: { signup?: boolean }) {
 										onClick={() =>
 											void run(async () => {
 												const { error } =
-													await authClient.emailOtp.sendVerificationOtp({
+													await client.emailOtp.sendVerificationOtp({
 														email,
 														type: "sign-in",
 													});
@@ -288,11 +312,11 @@ export function HostedAuth({ signup = false }: { signup?: boolean }) {
 											disabled={busy}
 											onClick={() =>
 												void run(async () => {
-													const { data, error } =
-														await authClient.signIn.emailOtp({
-															email,
-															otp,
-														});
+													const { data, error } = await client.signIn.emailOtp({
+														email,
+														otp,
+														...oauthBody,
+													});
 													if (error) throw new Error(error.message);
 													await finish(data);
 												})
@@ -305,7 +329,7 @@ export function HostedAuth({ signup = false }: { signup?: boolean }) {
 							</div>
 						</details>
 					)}
-					{!signup && configuration?.enterpriseSSO && (
+					{configuration?.enterpriseSSO && (
 						<details className="border-t pt-4">
 							<summary className="text-sm cursor-pointer">
 								Enterprise SSO
@@ -321,11 +345,7 @@ export function HostedAuth({ signup = false }: { signup?: boolean }) {
 								onClick={() =>
 									void run(async () => {
 										const callbackURL = await authenticationCallback(params);
-										const { error } = await authClient.signIn.sso({
-											email,
-											callbackURL,
-										});
-										if (error) throw new Error(error.message);
+										await startEnterpriseSignIn(email.trim(), callbackURL);
 									})
 								}
 							>
@@ -333,15 +353,17 @@ export function HostedAuth({ signup = false }: { signup?: boolean }) {
 							</Button>
 						</details>
 					)}
-					<p className="text-sm text-center text-muted-foreground">
-						{signup ? "Already have an account?" : "New to AllAuth?"}{" "}
-						<Link
-							className="text-foreground underline"
-							href={`${signup ? "/sign-in" : "/sign-up"}${params.toString() ? `?${params.toString()}` : ""}`}
-						>
-							{signup ? "Sign in" : "Create account"}
-						</Link>
-					</p>
+					{configuration?.signUpEnabled !== false && (
+						<p className="text-sm text-center text-muted-foreground">
+							New to AllAuth?{" "}
+							<Link
+								className="text-foreground underline"
+								href={authLink("/sign-up")}
+							>
+								Create account
+							</Link>
+						</p>
+					)}
 				</CardContent>
 			</Card>
 		</div>
