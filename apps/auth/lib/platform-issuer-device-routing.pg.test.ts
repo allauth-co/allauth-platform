@@ -1,9 +1,11 @@
 import { createHmac, randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
+import { symmetricEncrypt } from "better-auth/crypto";
 import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { createAuth } from "./auth";
 import { MCP_DEVICE_CLIENT_ID } from "./features/mcp-device";
+import { createPlatformIssuer } from "./platform-issuer";
 import {
 	platformIssuerDevicePath,
 	routePlatformIssuerDevice,
@@ -59,6 +61,7 @@ describe.skipIf(!existsSync(fixture))(
 		let administrator: Pool | undefined;
 		let database: Pool;
 		let native: ReturnType<typeof createAuth>;
+		let platform: ReturnType<typeof createPlatformIssuer>;
 		let owned: ReturnType<typeof createOwnedProjectIssuerDevice>;
 		const readBody = vi.fn((request: Request) => request.json());
 		let user: string;
@@ -84,6 +87,8 @@ describe.skipIf(!existsSync(fixture))(
 				"002-control-plane.sql",
 				"004-webhooks.sql",
 				"005-free-plugins.sql",
+				"006-analytics.sql",
+				"007-auth-configuration.sql",
 			])
 				await database.query(
 					readFileSync(
@@ -107,6 +112,7 @@ describe.skipIf(!existsSync(fixture))(
 				[randomUUID(), token, user],
 			);
 			native = createAuth(postgresDatabase(database), env);
+			platform = createPlatformIssuer(database, env);
 			const store = createPlatformIssuerStore(database);
 			const session = createPlatformIssuerSessionReader(env);
 			owned = createOwnedProjectIssuerDevice({
@@ -144,7 +150,10 @@ describe.skipIf(!existsSync(fixture))(
 		async function dispatch(incoming: Request, kind: "native" | "oauth") {
 			const selected = await routePlatformIssuerDevice(database, incoming);
 			expect(selected?.kind).toBe(kind);
-			if (selected?.kind === "native") return native.handler(selected.request);
+			if (selected?.kind === "native") {
+				const result = await platform.dispatchDevice(selected.request);
+				if (result) return result.response;
+			}
 			if (selected?.kind === "oauth") {
 				const response = await owned(
 					selected.path,
@@ -166,12 +175,12 @@ describe.skipIf(!existsSync(fixture))(
 			return row;
 		}
 
-		it("keeps the exact standalone MCP code, review, approval and signed token handoff native", async () => {
+		it("redeems a legacy standalone MCP code through AllAuth and preserves the native session handoff", async () => {
 			const form = new URLSearchParams([
 				["client_id", ""],
 				["client_id", MCP_DEVICE_CLIENT_ID],
 			]);
-			const code = await dispatch(request("/device/code", form), "native");
+			const code = await native.handler(request("/device/code", form));
 			expect(code.status).toBe(200);
 			const issued = (await code.json()) as {
 				device_code: string;
@@ -217,7 +226,106 @@ describe.skipIf(!existsSync(fixture))(
 			expect(await deviceRow(issued.device_code)).toBeUndefined();
 		});
 
-		it("routes a root managed OAuth client to AllAuth and retains the native wrong-endpoint response", async () => {
+		it("uses the existing MFA verifier for an AllAuth-issued device challenge", async () => {
+			const mfaUser = randomUUID();
+			const browserToken = randomUUID();
+			const proof = createHmac("sha256", secret)
+				.update(browserToken)
+				.digest("base64");
+			const browserCookie = `${cookieName}=${encodeURIComponent(`${browserToken}.${proof}`)}`;
+			await database.query(
+				`INSERT INTO "user" (id,name,email,"emailVerified","twoFactorEnabled") VALUES ($1,'MFA Fixture',$2,true,true)`,
+				[mfaUser, `${mfaUser}@fixture.example`],
+			);
+			await database.query(
+				`INSERT INTO "session" (id,token,"userId","expiresAt","updatedAt") VALUES ($1,$2,$3,now()+interval '1 hour',now())`,
+				[randomUUID(), browserToken, mfaUser],
+			);
+			const otpSecret = "synthetic-mcp-device-totp-fixture";
+			await database.query(
+				`INSERT INTO "twoFactor" (id,secret,"backupCodes","userId",verified) VALUES ($1,$2,$3,$4,true)`,
+				[
+					randomUUID(),
+					await symmetricEncrypt({ key: secret, data: otpSecret }),
+					"[]",
+					mfaUser,
+				],
+			);
+			const issued = (await (
+				await dispatch(
+					request("/device/code", { client_id: MCP_DEVICE_CLIENT_ID }),
+					"native",
+				)
+			).json()) as { device_code: string; user_code: string };
+			expect(
+				(
+					await dispatch(
+						request(
+							`/device?user_code=${issued.user_code}`,
+							undefined,
+							browserCookie,
+						),
+						"native",
+					)
+				).status,
+			).toBe(200);
+			expect(
+				(
+					await dispatch(
+						request(
+							"/device/approve",
+							{ userCode: issued.user_code },
+							browserCookie,
+						),
+						"native",
+					)
+				).status,
+			).toBe(200);
+			const grant = {
+				client_id: MCP_DEVICE_CLIENT_ID,
+				device_code: issued.device_code,
+				grant_type: projectDeviceGrantType,
+			};
+			const results = await Promise.all([
+				dispatch(request("/device/token", grant), "native"),
+				dispatch(request("/device/token", grant), "native"),
+			]);
+			expect(results.map(({ status }) => status).sort()).toEqual([200, 400]);
+			const challenge = results.find(({ status }) => status === 200)!;
+			expect(await challenge.json()).toMatchObject({
+				twoFactorRedirect: true,
+				twoFactorMethods: ["totp"],
+			});
+			const pending = challenge.headers.getSetCookie();
+			expect(pending).toHaveLength(1);
+			expect(pending[0]).toMatch(/^__Secure-better-auth.two_factor=/);
+			const sessionCount = await database.query(
+				'SELECT 1 FROM "session" WHERE "userId"=$1',
+				[mfaUser],
+			);
+			expect(sessionCount.rowCount).toBe(1);
+			const verification = await native.handler(
+				request(
+					"/two-factor/verify-totp",
+					{
+						code: (
+							await native.api.generateTOTP({ body: { secret: otpSecret } })
+						).code,
+					},
+					pending[0]?.split(";", 1)[0],
+				),
+			);
+			expect(await verification.json()).toMatchObject({
+				user: { id: mfaUser },
+			});
+			expect(
+				verification.headers
+					.getSetCookie()
+					.some((value) => value.startsWith(`${cookieName}=`)),
+			).toBe(true);
+		});
+
+		it("routes a root managed OAuth client to AllAuth and retains the wrong-endpoint response", async () => {
 			const clientId = "managed-device-fixture";
 			await register(clientId);
 			const code = await dispatch(

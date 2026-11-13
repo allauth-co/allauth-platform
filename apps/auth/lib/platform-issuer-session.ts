@@ -18,6 +18,7 @@ interface PlatformIssuerSessionRow {
 	role: string | null;
 	banned: boolean | null;
 	directoryDisabled: boolean | null;
+	isAnonymous: boolean | null;
 }
 
 /** Read the stored platform identity without renewing or changing its browser session. */
@@ -44,7 +45,7 @@ export function createPlatformIssuerSessionReader(env: AuthEnvironment) {
 		} = await database.query<PlatformIssuerSessionRow>(
 			`SELECT s.id AS "sessionId", s."userId", s."createdAt", s."expiresAt", s."activeOrganizationId",
 			  s."impersonatedBy", u.name, u.email, u."emailVerified", u.role, u.banned,
-			  u."directoryDisabled", u."twoFactorEnabled"
+			  u."directoryDisabled", u."twoFactorEnabled", u."isAnonymous"
 			 FROM public."session" s JOIN public."user" u ON u.id = s."userId"
 			 WHERE ${predicate} AND s."expiresAt" >= statement_timestamp()`,
 			values,
@@ -68,6 +69,7 @@ export function createPlatformIssuerSessionReader(env: AuthEnvironment) {
 				role: row.role,
 				banned: row.banned,
 				directoryDisabled: row.directoryDisabled,
+				isAnonymous: row.isAnonymous,
 			},
 		};
 	}

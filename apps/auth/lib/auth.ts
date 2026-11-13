@@ -1260,7 +1260,6 @@ export function dispatchPlatformAuth(
 					);
 		const device = await candidate?.dispatchDevice(bound);
 		if (device?.kind === "response") return device.response;
-		if (device?.kind === "native") return instance.handler(device.request);
 		const response = await candidate?.dispatch(bound);
 		if (response) return response;
 		if (state.writer !== "legacy" || state.revision === 0)

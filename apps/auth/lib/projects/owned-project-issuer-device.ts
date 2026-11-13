@@ -2,6 +2,7 @@ import { randomInt, randomUUID } from "node:crypto";
 import type { PoolClient } from "pg";
 import * as z from "zod";
 import { freshFeatureSession } from "../features/helpers";
+import { MCP_DEVICE_CLIENT_ID } from "../features/mcp-device-contract";
 import type { createPlatformIssuerStore } from "../platform-issuer-store";
 import { createProjectEngineStore } from "./owned-project-engine-store";
 import type { OwnedProjectIssuerAuthorizationOptions } from "./owned-project-issuer-authorization";
@@ -97,6 +98,8 @@ export interface OwnedProjectIssuerDeviceOptions
 	trustedOrigins?: readonly string[];
 	trustedIP(request: Request): string | null;
 	authenticateClient?: IssuerClientAuthenticator;
+	standalonePlatformMcp?: boolean;
+	requireBrowserMfa?: () => Promise<boolean>;
 }
 
 export interface ProjectDeviceGrant {
@@ -396,24 +399,37 @@ export function createOwnedProjectIssuerDevice(
 				);
 			if (!bodyId && !hasCredentials)
 				throw new ProjectOAuthError("invalid_request", "client_id is required");
+			const standalone = options.standalonePlatformMcp === true;
 			if (
+				standalone &&
+				(bodyId !== MCP_DEVICE_CLIENT_ID ||
+					hasCredentials ||
+					(await readIssuerClient(database, MCP_DEVICE_CLIENT_ID)))
+			)
+				throw new ProjectOAuthError("invalid_client", "Invalid client ID");
+			if (
+				!standalone &&
 				bodyId &&
 				!hasCredentials &&
 				!(await readIssuerClient(database, bodyId))
 			)
 				throw new ProjectOAuthError("invalid_client", "Invalid client ID");
-			const client = await authenticateClient(database, request, form, true);
+			const client = standalone
+				? null
+				: await authenticateClient(database, request, form, true);
 			try {
-				requireDeviceClient(client);
-				const scopes = deviceScopes(form.get("scope"), client);
-				const resources = formResources(form);
-				await issuerResourcePolicy(
-					database,
-					client,
-					resources,
-					scopes,
-					`${endpointBase}/oauth2/userinfo`,
-				);
+				const scopes = client ? deviceScopes(form.get("scope"), client) : [];
+				const resources = client ? formResources(form) : [];
+				if (client) {
+					requireDeviceClient(client);
+					await issuerResourcePolicy(
+						database,
+						client,
+						resources,
+						scopes,
+						`${endpointBase}/oauth2/userinfo`,
+					);
+				}
 				const userId = form.get("user_id") || null;
 				if (userId && userId.length > 256)
 					throw new ProjectOAuthError("invalid_request", "Invalid user_id");
@@ -422,7 +438,7 @@ export function createOwnedProjectIssuerDevice(
 					const userCode = randomCode(userAlphabet, 8);
 					const created = await database.query(
 						`INSERT INTO "deviceCode"(id,"deviceCode","userCode","userId","expiresAt",status,"pollingInterval","clientId",scope,resources,"oauthClientId")
-						 VALUES($1,$2,$3,$4,clock_timestamp() + $5::integer * interval '1 second','pending',$6,$7,$8,$9,$7) ON CONFLICT DO NOTHING`,
+						 VALUES($1,$2,$3,$4,clock_timestamp() + $5::integer * interval '1 second','pending',$6,$7,$8,$9,$10) ON CONFLICT DO NOTHING`,
 						[
 							randomUUID(),
 							deviceCode,
@@ -430,9 +446,14 @@ export function createOwnedProjectIssuerDevice(
 							userId,
 							expirySeconds,
 							intervalSeconds * 1000,
-							client.clientId,
-							form.get("scope") ? scopes.join(" ") : null,
+							client?.clientId ?? MCP_DEVICE_CLIENT_ID,
+							form.get("scope")
+								? standalone
+									? form.get("scope")
+									: scopes.join(" ")
+								: null,
 							resources.length ? JSON.stringify(resources) : null,
+							client?.clientId ?? null,
 						],
 					);
 					if (created.rowCount !== 1) continue;
@@ -465,6 +486,7 @@ export function createOwnedProjectIssuerDevice(
 		decision?: "approve" | "deny",
 	) {
 		const caller = request.headers.get("origin");
+		const requireMfa = await options.requireBrowserMfa?.();
 		if (
 			request.headers.has("authorization") ||
 			request.headers.get("sec-fetch-site") === "cross-site" ||
@@ -504,6 +526,8 @@ export function createOwnedProjectIssuerDevice(
 				!user ||
 				user.directoryDisabled ||
 				user.isAnonymous ||
+				(requireMfa &&
+					!("twoFactorEnabled" in user && user.twoFactorEnabled === true)) ||
 				!session ||
 				!freshFeatureSession({ user, session })
 			)
@@ -519,7 +543,13 @@ export function createOwnedProjectIssuerDevice(
 					 ORDER BY ("userCode"=$2) DESC LIMIT 1 FOR UPDATE`,
 					[candidates, userCode],
 				);
-				if (!row || (sharedIssuer && !row.oauthClientId))
+				if (
+					!row ||
+					(options.standalonePlatformMcp
+						? row.oauthClientId !== null ||
+							row.clientId !== MCP_DEVICE_CLIENT_ID
+						: sharedIssuer && !row.oauthClientId)
+				)
 					throw new ProjectOAuthError("invalid_request", "Invalid user code");
 				if (row.expiresAt.getTime() <= Date.now())
 					throw new ProjectOAuthError("expired_token", "User code has expired");
@@ -561,7 +591,9 @@ export function createOwnedProjectIssuerDevice(
 					user_code: userCode,
 					status: row.status,
 					client_id: row.clientId,
-					scope: row.scope,
+					scope: options.standalonePlatformMcp
+						? (row.scope ?? undefined)
+						: row.scope,
 					resource: resources.length > 1 ? resources : resources[0],
 				});
 			} catch (error) {

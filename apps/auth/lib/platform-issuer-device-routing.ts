@@ -1,5 +1,5 @@
 import type { Pool } from "pg";
-import { MCP_DEVICE_CLIENT_ID } from "./features/mcp-device";
+import { MCP_DEVICE_CLIENT_ID } from "./features/mcp-device-contract";
 import type { PreparedIssuerDeviceBody } from "./projects/owned-project-issuer-device";
 import { deviceUserCodeCandidates } from "./projects/owned-project-issuer-device";
 import {
@@ -14,7 +14,7 @@ type OAuthDevicePath =
 	| "/device/approve"
 	| "/device/deny";
 type PlatformDeviceRoute =
-	| { kind: "native"; request: Request }
+	| { kind: "native"; request: Request; prepared?: PreparedIssuerDeviceBody }
 	| {
 			kind: "oauth";
 			path: OAuthDevicePath;
@@ -39,7 +39,7 @@ export function platformIssuerDevicePath(
 	}
 }
 
-async function readDeviceBody(request: Request) {
+export async function readDeviceBody(request: Request) {
 	const tooLarge = () =>
 		new ProjectOAuthError("invalid_request", "The OAuth request is too large.");
 	const declared = request.headers.get("content-length");
@@ -202,7 +202,23 @@ export async function routePlatformIssuerDevice(
 			: (body as Record<string, unknown> | undefined)?.userCode;
 		if (await registeredUserCode(database, userCode))
 			return { kind: "oauth", path, request, prepared: { body: { userCode } } };
+		body = { userCode };
 	}
-	// The legacy endpoint receives the original bytes and content type.
-	return { kind: "native", request: new Request(request, { body: bytes }) };
+	// A single nonempty client ID is accepted for installed standalone clients.
+	if (path === "/device/code" && body instanceof URLSearchParams)
+		for (const name of [
+			"client_id",
+			"client_secret",
+			"client_assertion",
+			"client_assertion_type",
+		]) {
+			body.delete(name);
+			if (name === "client_id") body.set(name, MCP_DEVICE_CLIENT_ID);
+		}
+	// Keep the original bytes available to rollback and legacy fixtures.
+	return {
+		kind: "native",
+		request: new Request(request, { body: bytes }),
+		prepared: { body },
+	};
 }

@@ -2,12 +2,16 @@ import type { Pool, PoolClient } from "pg";
 import { authPolicyRepository } from "./auth-policy/storage";
 import type { AuthEnvironment } from "./configuration";
 import { authOrigin, setting, trustedOrigins } from "./configuration";
-import { routePlatformIssuerDevice } from "./platform-issuer-device-routing";
+import {
+	platformIssuerDevicePath,
+	routePlatformIssuerDevice,
+} from "./platform-issuer-device-routing";
 import { readPlatformIssuerJwks } from "./platform-issuer-jwks";
 import { createPlatformIssuerLogout } from "./platform-issuer-logout";
 import { createPlatformIssuerSessionReader } from "./platform-issuer-session";
 import { createPlatformIssuerSigner } from "./platform-issuer-signing";
 import { createPlatformIssuerStore } from "./platform-issuer-store";
+import { createPlatformMcpDeviceToken } from "./platform-mcp-device-token";
 import { readLegacyProjectKeyring } from "./projects/legacy-project-keyring";
 import { createOwnedProjectIssuerAuthorization } from "./projects/owned-project-issuer-authorization";
 import { createIssuerClientAuthenticator } from "./projects/owned-project-issuer-client";
@@ -167,7 +171,7 @@ export function createPlatformIssuer(database: Pool, env: AuthEnvironment) {
 	});
 	const trustedIP = (request: Request) =>
 		request.headers.get(isNodeRuntime(env) ? "x-real-ip" : "cf-connecting-ip");
-	const device = createOwnedProjectIssuerDevice({
+	const deviceOptions = {
 		database,
 		schemaName: store.schemaName,
 		store,
@@ -178,17 +182,35 @@ export function createPlatformIssuer(database: Pool, env: AuthEnvironment) {
 		trustedIP,
 		authenticateClient,
 		readBody: readBrowserBody,
-		readSession: (request, client) => readSession(request.headers, client),
+		readSession: (request: Request, client: PoolClient) =>
+			readSession(request.headers, client),
+	};
+	const device = createOwnedProjectIssuerDevice(deviceOptions);
+	const mcpDevice = createOwnedProjectIssuerDevice({
+		...deviceOptions,
+		standalonePlatformMcp: true,
+		trustedOrigins: [],
+		requireBrowserMfa: async () =>
+			(await policy.read("platform")).policy.mfaMode === "required",
+	});
+	const mcpDeviceToken = createPlatformMcpDeviceToken({
+		issuer,
+		signingSecret,
+		store,
+		trustedIP,
+		policy: async () => (await policy.read("platform")).policy,
 	});
 	async function dispatchDevice(request: Request) {
 		const selected = await routePlatformIssuerDevice(database, request);
-		if (!selected || selected.kind === "native") return selected;
+		if (!selected) return;
 		if (selected.kind === "response") return selected;
-		const response = await device(
-			selected.path,
-			selected.request,
-			selected.prepared,
-		);
+		const standalonePath = platformIssuerDevicePath(selected.request);
+		const response =
+			selected.kind === "oauth"
+				? await device(selected.path, selected.request, selected.prepared)
+				: standalonePath
+					? await mcpDevice(standalonePath, selected.request, selected.prepared)
+					: await mcpDeviceToken(selected.request);
 		if (!response)
 			throw new Error("The shared OAuth device route is unavailable.");
 		return { kind: "response" as const, response };

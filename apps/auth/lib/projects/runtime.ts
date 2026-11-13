@@ -1,15 +1,12 @@
 import { createHmac } from "node:crypto";
 import type { GenericEndpointContext } from "@better-auth/core";
-import { runWithAdapter } from "@better-auth/core/context";
 import { APIError } from "better-auth";
 import { Pool } from "pg";
 import {
-	auth,
 	createAuth,
 	getAuthEnvironment,
 	postgresDatabase,
 	withAuth,
-	withAuthEngine,
 } from "../auth";
 import type { AuthEngine, ProjectAuthScope } from "../auth-engine";
 import type { AuthPolicy } from "../auth-policy/policy";
@@ -21,8 +18,8 @@ import {
 	ownedAvatarSelected,
 	storeOwnedAvatar,
 } from "../avatars/lifecycle";
-import { readApplicationBranding } from "../branding/repository";
 import { guardCommercialAdapter } from "../billing/entitlements";
+import { readApplicationBranding } from "../branding/repository";
 import { storeBrandingAsset } from "../branding/storage-client";
 import { brandingStorage } from "../branding/validation";
 import type { AuthEnvironment } from "../configuration";
@@ -64,7 +61,10 @@ import {
 import { backendCredentialRepository } from "./backend-credentials";
 import { projectBrokerTwoFactor } from "./broker-two-factor";
 import { createBoundedProjectCache } from "./cache";
-import { observeProjectEngine, projectEngineMetricsSelected } from "./engine-metrics";
+import {
+	observeProjectEngine,
+	projectEngineMetricsSelected,
+} from "./engine-metrics";
 import { projectManagement } from "./management-plugin";
 import { projectOriginFingerprint } from "./origins";
 import type { OwnedProjectSCIMConsole } from "./owned-project-scim-console";
@@ -80,13 +80,11 @@ import {
 import { projectWriterLease } from "./project-engine-internal-writer";
 import { selectRehearsalProjectEngine } from "./project-engine-rehearsal-selection";
 import { projectWriterUnavailable } from "./project-engine-unavailable";
-import {
-	projectEngineWriterConnectionOptions,
-	type ProjectEngineWriterState,
-} from "./project-engine-writer-lease";
+import type { ProjectEngineWriterState } from "./project-engine-writer-lease";
+import { projectEngineWriterConnectionOptions } from "./project-engine-writer-lease";
 import { localizeProjectErrors } from "./project-error-localization";
-import { verifiedProjectRequest } from "./proxy";
 import { projectSecret } from "./project-secret";
+import { verifiedProjectRequest } from "./proxy";
 import type { Project } from "./registry";
 import {
 	getProject,
@@ -95,7 +93,10 @@ import {
 } from "./registry";
 import { consumeProxySessionCheck } from "./session-introspection-admission";
 import { readProjectSessionPrincipal } from "./session-principal";
-import { observeProjectSessions, projectSessionShadowSelected } from "./session-shadow";
+import {
+	observeProjectSessions,
+	projectSessionShadowSelected,
+} from "./session-shadow";
 import { checkedProjectSchema } from "./validation";
 
 type Instance = ReturnType<typeof createAuth>;
@@ -106,6 +107,7 @@ interface EntryBase {
 	pool: Pool;
 }
 interface LegacyEntry extends EntryBase {
+	platformEnv: AuthEnvironment;
 	kind: "legacy";
 	auth: Instance;
 	shadowPool?: Pool;
@@ -153,10 +155,15 @@ export function installIsolatedProjectEngineFixture(
 		url.hostname !== "127.0.0.1" ||
 		url.port !== "55445" ||
 		!/^\/allauth_hosted_[a-f0-9]{32}$/.test(url.pathname) ||
-		!/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(selection.projectId) ||
-		selection.schemaName !== `allauth_project_${selection.projectId.replaceAll("-", "")}`
+		!/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(
+			selection.projectId,
+		) ||
+		selection.schemaName !==
+			`allauth_project_${selection.projectId.replaceAll("-", "")}`
 	)
-		throw new Error("The owned project engine fixture requires a new isolated development realm.");
+		throw new Error(
+			"The owned project engine fixture requires a new isolated development realm.",
+		);
 	fixture = Object.freeze({ ...selection, databaseURL: url.href });
 }
 
@@ -167,14 +174,17 @@ function fixtureFor(project: Project, env: AuthEnvironment) {
 		project.schemaName !== fixture.schemaName ||
 		new URL(setting(env, "DATABASE_URL")).href !== fixture.databaseURL
 	)
-		throw new APIError("SERVICE_UNAVAILABLE", { message: "The selected project fixture is unavailable." });
+		throw new APIError("SERVICE_UNAVAILABLE", {
+			message: "The selected project fixture is unavailable.",
+		});
 	return fixture;
 }
 
 function legacyInstance(entry: Entry) {
 	if (entry.kind !== "legacy")
 		throw new APIError("SERVICE_UNAVAILABLE", {
-			message: "This operation is unavailable in the selected authentication realm.",
+			message:
+				"This operation is unavailable in the selected authentication realm.",
 		});
 	return entry.auth;
 }
@@ -183,12 +193,16 @@ function legacyInstance(entry: Entry) {
 export async function platformProjectAdministrator(
 	headers: Headers,
 ): Promise<ControlPrincipal | null> {
-	const current = await withAuthEngine((engine) =>
-		engine.readPrincipal(headers),
-	);
-	return current && isPlatformAdmin(current.user, current.session)
-		? current
-		: null;
+	try {
+		const current = await requireWorkspacePrincipal(
+			headers,
+			await getAuthEnvironment(),
+		);
+		return isPlatformAdmin(current.user, current.session) ? current : null;
+	} catch (error) {
+		if (error instanceof APIError) return null;
+		throw error;
+	}
 }
 export const projectInstance = (instance: Instance) => instances.get(instance);
 
@@ -199,9 +213,7 @@ export async function selectedProjectAdministrator(
 	env: AuthEnvironment,
 ): Promise<ControlPrincipal | null> {
 	try {
-		const principal = await runWithAdapter((await auth.$context).adapter, () =>
-			requireWorkspacePrincipal(auth, headers),
-		);
+		const principal = await requireWorkspacePrincipal(headers, env);
 		return await projectAdministrator(project, principal, env);
 	} catch (error) {
 		if (error instanceof APIError) return null;
@@ -211,7 +223,10 @@ export async function selectedProjectAdministrator(
 
 export { projectSecret } from "./project-secret";
 
-function bindOwnedDirectTransport(engine: AuthEngine, origin: string): AuthEngine {
+function bindOwnedDirectTransport(
+	engine: AuthEngine,
+	origin: string,
+): AuthEngine {
 	function bind(request: Request) {
 		const incoming = new URL(request.url);
 		if (incoming.origin === origin) return request;
@@ -269,14 +284,19 @@ async function build(
 		const basePath = publicOrigin
 			? "/api/auth"
 			: `/api/projects/${project.slug}/auth`;
-		const metricsEnabled = projectEngineMetricsSelected(environment, project.id);
+		const metricsEnabled = projectEngineMetricsSelected(
+			environment,
+			project.id,
+		);
 		const observe = (engine: AuthEngine, writer: "legacy" | "allauth") =>
-			metricsEnabled ? observeProjectEngine(engine, {
-				projectId: project.id,
-				writer,
-				transport: publicOrigin ? "hosted" : "project",
-				basePath,
-			}) : engine;
+			metricsEnabled
+				? observeProjectEngine(engine, {
+						projectId: project.id,
+						writer,
+						transport: publicOrigin ? "hosted" : "project",
+						basePath,
+					})
+				: engine;
 		if (owned) {
 			const baseURL = publicOrigin ?? authOrigin(environment);
 			const engine = await owned({
@@ -343,7 +363,7 @@ async function build(
 				...(microsoft ? { microsoft } : {}),
 				nativePasskeys,
 				name: project.name,
-					workspaceId: project.workspaceId,
+				workspaceId: project.workspaceId,
 				slug: project.slug,
 				basePath,
 				cookiePrefix: `allauth_project_${project.slug}`,
@@ -365,11 +385,19 @@ async function build(
 						if (!request.headers.has("allauth-proxy-signature"))
 							throw new APIError("FORBIDDEN");
 						const verified = await verifiedProjectRequest(
-							request, current, environment,
+							request,
+							current,
+							environment,
 						);
-						return withAuth(platform => projectBrokerTwoFactor(
-							verified, current, platform, authOrigin(environment), body,
-						));
+						return withAuth((platform) =>
+							projectBrokerTwoFactor(
+								verified,
+								current,
+								platform,
+								authOrigin(environment),
+								body,
+							),
+						);
 					},
 					directory: {
 						project: project.slug,
@@ -509,18 +537,31 @@ async function build(
 				allowExitOnIdle: true,
 				options: "-c default_transaction_read_only=on",
 			});
-			shadow.on("error", () => console.error("AllAuth project session comparison connection error."));
+			shadow.on("error", () =>
+				console.error("AllAuth project session comparison connection error."),
+			);
 			shadowPool = shadow;
 			engine = observeProjectSessions(legacy, {
 				projectId: project.id,
 				basePath,
-				read: (headers) => readProjectSessionPrincipal(shadow, project, headers, {
-					signingSecret: context.secret,
-					secureCookies: context.authCookies.sessionToken.attributes.secure === true,
-				}),
+				read: (headers) =>
+					readProjectSessionPrincipal(shadow, project, headers, {
+						signingSecret: context.secret,
+						secureCookies:
+							context.authCookies.sessionToken.attributes.secure === true,
+					}),
 			});
 		}
-		const entry: LegacyEntry = { kind: "legacy", auth: instance, engine: observe(engine, "legacy"), env, project, pool, shadowPool };
+		const entry: LegacyEntry = {
+			kind: "legacy",
+			auth: instance,
+			engine: observe(engine, "legacy"),
+			env,
+			platformEnv: environment,
+			project,
+			pool,
+			shadowPool,
+		};
 		instances.set(instance, entry);
 		return entry;
 	} catch (error) {
@@ -541,17 +582,29 @@ async function withProjectEntry<T>(
 		fixtureFor(project, env)?.build ??
 		(await selectRehearsalProjectEngine(project, env));
 	if (rehearsal)
-		return withConfiguredProjectEntry(project, env, publicOrigin, callback, rehearsal);
-	const lease = projectWriterLease(project, env);
-	if (!lease) return withConfiguredProjectEntry(project, env, publicOrigin, callback);
-	return lease.withCurrent(({ writer, revision }) => {
-		const candidate = writer === "allauth"
-			? selectProjectEngine(project, env, { revision, preparing: false })
-			: undefined;
-		if (writer === "allauth" && !candidate)
-			throw projectWriterUnavailable();
 		return withConfiguredProjectEntry(
-			project, env, publicOrigin, callback, candidate, { writer, revision },
+			project,
+			env,
+			publicOrigin,
+			callback,
+			rehearsal,
+		);
+	const lease = projectWriterLease(project, env);
+	if (!lease)
+		return withConfiguredProjectEntry(project, env, publicOrigin, callback);
+	return lease.withCurrent(({ writer, revision }) => {
+		const candidate =
+			writer === "allauth"
+				? selectProjectEngine(project, env, { revision, preparing: false })
+				: undefined;
+		if (writer === "allauth" && !candidate) throw projectWriterUnavailable();
+		return withConfiguredProjectEntry(
+			project,
+			env,
+			publicOrigin,
+			callback,
+			candidate,
+			{ writer, revision },
 		);
 	});
 }
@@ -571,26 +624,42 @@ async function withConfiguredProjectEntry<T>(
 	]);
 	const apple = readProjectAppleProvider(env, project.slug);
 	const microsoft = readProjectMicrosoftProvider(env, project.slug);
-	const aliasConfiguration = owned && setting(env, projectEmailAliasVariable(project.slug));
+	const aliasConfiguration =
+		owned && setting(env, projectEmailAliasVariable(project.slug));
 	const aliasVersion = aliasConfiguration
 		? createHmac("sha256", setting(env, "ALLAUTH_AUTH_SECRET"))
 				.update(aliasConfiguration)
 				.digest("hex")
 		: "";
-	const samlApproval = owned && writer && projectSamlApprovalValue(project, env);
+	const samlApproval =
+		owned && writer && projectSamlApprovalValue(project, env);
 	const samlApprovalVersion = samlApproval
-		? createHmac("sha256", setting(env, "ALLAUTH_AUTH_SECRET")).update(samlApproval).digest("hex")
+		? createHmac("sha256", setting(env, "ALLAUTH_AUTH_SECRET"))
+				.update(samlApproval)
+				.digest("hex")
 		: "";
-	const agentApproval = owned && writer && projectAgentReplayApprovalValue(project, env);
+	const agentApproval =
+		owned && writer && projectAgentReplayApprovalValue(project, env);
 	const agentApprovalVersion = agentApproval
-		? createHmac("sha256", setting(env, "ALLAUTH_AUTH_SECRET")).update(agentApproval).digest("hex")
+		? createHmac("sha256", setting(env, "ALLAUTH_AUTH_SECRET"))
+				.update(agentApproval)
+				.digest("hex")
 		: "";
 	const agentBridge = projectAgentReplayBridgeSelected(project, env);
 	// Transport secrets can rotate while the native auth instance remains cached.
 	// Verification must receive the registry row read for this request.
 	return entries.use(
 		`${project.id}:${configured.version}:engine:${preparing ? "preflight:" : ""}${writer ? `${writer.writer}:${writer.revision}` : owned ? "owned-fixture" : "legacy"}:metrics:${projectEngineMetricsSelected(env, project.id)}:shadow:${projectSessionShadowSelected(env, project)}:origins:${projectOriginFingerprint(project)}:owned-avatars:${ownedAvatarSelected(env, project.id)}:native-passkeys:${selectedNativePasskeys(env, project, publicOrigin).version}:google:${googleProvider.version}:microsoft:${microsoftConfigurationVersion(microsoft)}:apple:${appleConfigurationVersion(apple)}:${apple ? Math.floor(Date.now() / 86400000) : 0}:aliases:${aliasVersion}:saml:${samlApprovalVersion}:agent:${agentBridge}:${agentApprovalVersion}:${publicOrigin ?? ""}`,
-		() => build(project, env, configured.policy, googleProvider, publicOrigin, owned, writer),
+		() =>
+			build(
+				project,
+				env,
+				configured.policy,
+				googleProvider,
+				publicOrigin,
+				owned,
+				writer,
+			),
 		(entry) => callback(entry, project),
 	);
 }
@@ -671,7 +740,12 @@ export function withProjectUserConsole(
 	) => Promise<Response>,
 ) {
 	return withDirectProjectEntry(slug, (entry, project) =>
-		callback(entry.engine.manageUserConsole, () => legacyInstance(entry), entry.env, project),
+		callback(
+			entry.engine.manageUserConsole,
+			() => legacyInstance(entry),
+			entry.env,
+			project,
+		),
 	);
 }
 
@@ -685,7 +759,12 @@ export function withProjectApplicationConsole(
 	) => Promise<Response>,
 ) {
 	return withDirectProjectEntry(slug, (entry, project) =>
-		callback(entry.engine.manageApplicationConsole, () => legacyInstance(entry), entry.env, project),
+		callback(
+			entry.engine.manageApplicationConsole,
+			() => legacyInstance(entry),
+			entry.env,
+			project,
+		),
 	);
 }
 
@@ -704,7 +783,11 @@ export async function withProjectAuthEngine<T>(
 	environment?: AuthEnvironment,
 ): Promise<T> {
 	const env = environment || (await getAuthEnvironment());
-	return withResolvedProjectAuthEngine(await getProject(slug, env), callback, env);
+	return withResolvedProjectAuthEngine(
+		await getProject(slug, env),
+		callback,
+		env,
+	);
 }
 
 /** Admit the same immutable registry binding used to verify the app proxy. */
@@ -761,11 +844,15 @@ export function confirmProjectEngine(
 	return lease.withCurrent(async ({ writer, revision }) => {
 		// Keep preflight separate from live cache entries. Legacy can
 		// still change configuration until the database commits the switch.
-		const preparing = writer === "legacy" && revision === projectEnginePreparationRevision(env, project);
+		const preparing =
+			writer === "legacy" &&
+			revision === projectEnginePreparationRevision(env, project);
 		if (preparing)
 			projectAgentReplayApproved(project, env, { revision, preparing });
 		const useCandidate = preparing || writer === "allauth";
-		const candidate = useCandidate ? selectProjectEngine(project, env, { revision, preparing }) : undefined;
+		const candidate = useCandidate
+			? selectProjectEngine(project, env, { revision, preparing })
+			: undefined;
 		if (useCandidate && !candidate)
 			throw new Error("The project writer is unavailable.");
 		await withConfiguredProjectEntry(
@@ -774,12 +861,17 @@ export function confirmProjectEngine(
 			origin,
 			async (entry) => {
 				const expected = useCandidate ? "owned" : "legacy";
-				if (entry.kind !== expected || !projectEngineSelected(env, entry.project))
+				if (
+					entry.kind !== expected ||
+					!projectEngineSelected(env, entry.project)
+				)
 					throw new Error("The project writer is unavailable.");
 				if (entry.kind === "owned") await entry.engine.verifySamlReadiness?.();
 			},
 			candidate,
-			preparing ? { writer: "allauth", revision: revision + 1 } : { writer, revision },
+			preparing
+				? { writer: "allauth", revision: revision + 1 }
+				: { writer, revision },
 			preparing,
 		);
 	});

@@ -1,9 +1,12 @@
 import { headers } from "next/headers";
+import { redirect } from "next/navigation";
 import { Suspense } from "react";
 import { ConsoleShell } from "@/components/console/shell";
-import { redirect } from "next/navigation";
 import { withAuth } from "@/lib/auth";
-import { requireWorkspacePrincipal, storedWorkspacePrincipal } from "@/lib/workspaces/authorization";
+import {
+	requireWorkspacePrincipal,
+	storedWorkspacePrincipal,
+} from "@/lib/workspaces/authorization";
 
 export default async function Layout({
 	children,
@@ -11,9 +14,14 @@ export default async function Layout({
 	children: React.ReactNode;
 }) {
 	const requestHeaders = await headers();
-	const session = await withAuth(async (instance, env) => {
-		try { const principal = await requireWorkspacePrincipal(instance, requestHeaders); await storedWorkspacePrincipal(principal, env); return principal; }
-		catch { return null; }
+	const session = await withAuth(async (_instance, env) => {
+		try {
+			const principal = await requireWorkspacePrincipal(requestHeaders, env);
+			await storedWorkspacePrincipal(principal, env);
+			return principal;
+		} catch {
+			return null;
+		}
 	});
 	if (!session) redirect("/sign-in?callbackUrl=%2Fadmin%2Fworkspaces");
 	return (
