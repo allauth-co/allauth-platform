@@ -25,6 +25,7 @@ import { AllAuthAuth } from "./better-auth-ui/allauth-auth";
 import { HostedProjectAuth } from "./hosted-project-auth";
 import { HostedProjectIssuerNavigation } from "./hosted-project-auth-status";
 import { HostedProjectUnavailable } from "./hosted-project-unavailable";
+import { PlatformSignIn } from "./platform-sign-in";
 
 export type HostedProjectAuthPageProps = {
 	searchParams: Promise<HostedSdkSearchParams>;
@@ -78,7 +79,10 @@ export async function HostedProjectAuthPage({
 			<AllAuthAuth view={view} />
 		);
 	const requestHeaders = await headers();
-	if (!requestHeaders.has(portalHeader)) return standardForm;
+	if (!requestHeaders.has(portalHeader)) {
+		if (view === "signIn") return <PlatformSignIn />;
+		return standardForm;
+	}
 
 	const env = await getAuthEnvironment();
 	const params = await searchParams;
