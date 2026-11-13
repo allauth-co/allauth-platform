@@ -26,13 +26,15 @@ export function createPlatformSessionIssuer(options: {
 			lifetime: number;
 			request: Request;
 			path: string;
+			activeOrganizationId?: string | null;
+			activeTeamId?: string | null;
 		},
 	) {
 		const id = randomUUID();
 		const token = randomBytes(32).toString("base64url");
 		const inserted = await client.query<{ createdAt: Date }>(
-			`INSERT INTO public."session" (id,token,"userId","expiresAt","updatedAt","ipAddress","userAgent")
-			 VALUES ($1,$2,$3,now()+$4::integer*interval '1 second',now(),$5,$6) RETURNING "createdAt"`,
+			`INSERT INTO public."session" (id,token,"userId","expiresAt","updatedAt","ipAddress","userAgent","activeOrganizationId","activeTeamId")
+			 VALUES ($1,$2,$3,now()+$4::integer*interval '1 second',now(),$5,$6,$7,$8) RETURNING "createdAt"`,
 			[
 				id,
 				token,
@@ -40,6 +42,8 @@ export function createPlatformSessionIssuer(options: {
 				input.lifetime,
 				canonicalIP(options.trustedIP(input.request)) ?? "",
 				input.request.headers.get("user-agent") ?? "",
+				input.activeOrganizationId ?? null,
+				input.activeTeamId ?? null,
 			],
 		);
 		await recordOwnedProjectEvent(client, {

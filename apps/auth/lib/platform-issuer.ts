@@ -19,6 +19,7 @@ import { createPlatformIssuerSessionReader } from "./platform-issuer-session";
 import { createPlatformIssuerSigner } from "./platform-issuer-signing";
 import { createPlatformIssuerStore } from "./platform-issuer-store";
 import { createPlatformMcpDeviceToken } from "./platform-mcp-device-token";
+import { createPlatformMfaEnrollment } from "./platform-mfa-enrollment";
 import { createPlatformPasswordSignIn } from "./platform-password-sign-in";
 import { createPlatformPendingMfa } from "./platform-pending-mfa";
 import { createPlatformSessionIssuer } from "./platform-session-issuance";
@@ -220,6 +221,11 @@ export function createPlatformIssuer(database: Pool, env: AuthEnvironment) {
 		notifyNewDevice,
 		continueAuthenticated: authorization.continueAuthenticated,
 	};
+	const manageMfa = createPlatformMfaEnrollment({
+		...credentialOptions,
+		keys: encryptionKeys,
+		readSession,
+	});
 	const verifyPendingMfa = createPlatformPendingMfa({
 		...credentialOptions,
 		keys: encryptionKeys,
@@ -330,7 +336,7 @@ export function createPlatformIssuer(database: Pool, env: AuthEnvironment) {
 		const path = url.pathname.slice("/api/auth".length);
 		const primary = await signInWithPassword(request);
 		if (primary) return primary;
-		const mfa = await verifyPendingMfa(request);
+		const mfa = (await manageMfa(request)) ?? (await verifyPendingMfa(request));
 		if (mfa) return mfa;
 		const route = protocolRoutes.get(path);
 		if (!route?.methods.includes(request.method)) return;

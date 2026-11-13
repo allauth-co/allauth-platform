@@ -14,7 +14,10 @@ import {
 	ownedMfaTotpUri,
 	verifyOwnedMfaTotp,
 } from "./owned-mfa-enrollment-totp";
-import { createProjectEngineStore } from "./owned-project-engine-store";
+import {
+	createProjectEngineStore,
+	recordOwnedProjectEvent,
+} from "./owned-project-engine-store";
 import type { Project } from "./registry";
 import { checkedProjectSchema, projectSlug } from "./validation";
 
@@ -137,11 +140,47 @@ export function createOwnedMfaEnrollment<
 	Rotation,
 >(options: Options<User, Session, Rotation>) {
 	const schema = checkedProjectSchema(options.project.schemaName);
-	const slug = projectSlug.parse(options.project.slug);
-	const store = createProjectEngineStore(options.database, schema);
-	const { keys, issuer } = options;
-	const { secureCookies } = options;
-	const prefix = `${secureCookies ? "__Secure-" : ""}allauth_project_${slug}.`;
+	return createOwnedRealmMfaEnrollment({
+		...options,
+		schema,
+		cookiePrefix: `allauth_project_${projectSlug.parse(options.project.slug)}`,
+		transaction: createProjectEngineStore(options.database, schema).transaction,
+	});
+}
+
+export function createOwnedRealmMfaEnrollment<
+	User extends MfaUser,
+	Session extends MfaSession,
+	Rotation,
+>(
+	options: Omit<Options<User, Session, Rotation>, "database" | "project"> & {
+		schema: string;
+		cookiePrefix: string;
+		transaction: <T>(work: (client: PoolClient) => Promise<T>) => Promise<T>;
+	},
+) {
+	const schema =
+		options.schema === "public"
+			? "public"
+			: checkedProjectSchema(options.schema);
+	const { keys, issuer, secureCookies } = options;
+	const prefix = `${secureCookies ? "__Secure-" : ""}${options.cookiePrefix}.`;
+	const record = (
+		client: PoolClient,
+		type: string,
+		path: string,
+		userId: string,
+		targetId = userId,
+	) =>
+		recordOwnedProjectEvent(client, {
+			type,
+			outcome: "success",
+			actorId: userId,
+			userId,
+			targetId,
+			metadata: { path },
+		});
+
 	const expired = (name: string) =>
 		`${prefix}${name}=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax${secureCookies ? "; Secure" : ""}`;
 
@@ -153,7 +192,7 @@ export function createOwnedMfaEnrollment<
 		path: string,
 		errorCode?: string,
 	) {
-		return store.recordEvent(client, {
+		return recordOwnedProjectEvent(client, {
 			...options.auditContext(request),
 			type,
 			outcome: errorCode ? "failure" : "success",
@@ -168,7 +207,7 @@ export function createOwnedMfaEnrollment<
 		path: keyof typeof mutationEvents,
 		work: (client: PoolClient, auth: Authority<User, Session>) => Promise<T>,
 	) {
-		return store.transaction(async (client) => {
+		return options.transaction(async (client) => {
 			const auth = await options.lockAuthority(client, request, {
 				fresh: false,
 			});
@@ -190,7 +229,7 @@ export function createOwnedMfaEnrollment<
 		path: keyof typeof mutationEvents,
 	) {
 		if (path === "/two-factor/disable" && options.mfaRequired) return;
-		await store.transaction(async (client) => {
+		await options.transaction(async (client) => {
 			const auth = await options.lockAuthority(client, request, {
 				fresh: false,
 			});
@@ -295,7 +334,7 @@ export function createOwnedMfaEnrollment<
 			`UPDATE "${schema}"."user" SET "twoFactorEnabled" = $1, "updatedAt" = statement_timestamp() WHERE id = $2`,
 			[enabled, userId],
 		);
-		await store.record(client, "user.updated", "success", path, userId, userId);
+		await record(client, "user.updated", path, userId);
 		const replacement = await options.rotateSession(
 			client,
 			request,
@@ -315,14 +354,7 @@ export function createOwnedMfaEnrollment<
 		);
 		// The native MFA endpoint audits the active rotation. Its account-wide cleanup deletes sibling sessions directly.
 		if (revoked.rows.some(({ id }) => id === auth.session.id))
-			await store.record(
-				client,
-				"session.deleted",
-				"success",
-				path,
-				userId,
-				auth.session.id,
-			);
+			await record(client, "session.deleted", path, userId, auth.session.id);
 		if (changed) {
 			await client.query(
 				`DELETE FROM "${schema}"."oauthAccessToken" WHERE "userId" = $1`,
@@ -348,7 +380,7 @@ export function createOwnedMfaEnrollment<
 				VALUES ($1, $2, $3, $2, statement_timestamp())`,
 				[randomUUID(), userId, action],
 			);
-			await store.record(client, action, "success", path, userId, userId);
+			await record(client, action, path, userId);
 		}
 		return {
 			status: "rotated" as const,
@@ -361,7 +393,7 @@ export function createOwnedMfaEnrollment<
 		request: Request,
 		input: { method: "totp" | "backup"; code: string },
 	) {
-		return store.transaction(async (client) => {
+		return options.transaction(async (client) => {
 			const auth = await options.lockAuthority(client, request, {
 				fresh: false,
 			});
@@ -435,7 +467,7 @@ export function createOwnedMfaEnrollment<
 	}
 
 	async function readTotp(request: Request, input: PasswordInput) {
-		return store.transaction(async (client) => {
+		return options.transaction(async (client) => {
 			const auth = await options.lockAuthority(client, request, {
 				fresh: false,
 			});

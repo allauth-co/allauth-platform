@@ -1,6 +1,6 @@
 import { createHmac, randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
-import { symmetricEncrypt } from "better-auth/crypto";
+import { symmetricDecrypt, symmetricEncrypt } from "better-auth/crypto";
 import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { createAuth } from "./auth";
@@ -394,6 +394,67 @@ describe.skipIf(!existsSync(fixture))(
 			);
 			expect(denied?.status).toBe(401);
 			expect(denied?.headers.getSetCookie()).toEqual([]);
+		});
+
+		it("enrolls platform MFA through AllAuth and rotates the installed session", async () => {
+			const userId = randomUUID();
+			const sessionId = randomUUID();
+			const token = randomUUID();
+			const signature = createHmac("sha256", secret)
+				.update(token)
+				.digest("base64");
+			const current = `${cookieName}=${encodeURIComponent(`${token}.${signature}`)}`;
+			await database.query(
+				'INSERT INTO public."user" (id,name,email,"emailVerified") VALUES ($1,$2,$3,true)',
+				[userId, "Enrollment Fixture", `${userId}@fixture.example`],
+			);
+			await database.query(
+				`INSERT INTO public."session" (id,token,"userId","expiresAt","updatedAt","activeOrganizationId") VALUES
+				 ($1,$2,$3,now()+interval '1 hour',now(),'fixture-org')`,
+				[sessionId, token, userId],
+			);
+			const setup = await platform.dispatch(
+				request("/two-factor/enable", {}, current),
+			);
+			expect(setup?.status).toBe(200);
+			expect(await setup?.json()).toMatchObject({
+				method: "totp",
+				backupCodes: expect.any(Array),
+			});
+			const {
+				rows: [enrollment],
+			} = await database.query<{ secret: string }>(
+				'SELECT secret FROM public."twoFactor" WHERE "userId"=$1',
+				[userId],
+			);
+			const factor = await symmetricDecrypt({
+				key: secret,
+				data: enrollment!.secret,
+			});
+			const { code } = await native.api.generateTOTP({
+				body: { secret: factor },
+			});
+			const verified = await platform.dispatch(
+				request("/two-factor/verify-totp", { code }, current),
+			);
+			expect(verified?.status).toBe(200);
+			const replacement = verified?.headers
+				.getSetCookie()
+				.find((cookie) => cookie.startsWith(`${cookieName}=`));
+			expect(replacement).toBeDefined();
+			expect(
+				await native.api.getSession({
+					headers: new Headers({ cookie: replacement!.split(";", 1)[0]! }),
+				}),
+			).toMatchObject({
+				user: { id: userId, twoFactorEnabled: true },
+				session: { activeOrganizationId: "fixture-org" },
+			});
+			expect(
+				await native.api.getSession({
+					headers: new Headers({ cookie: current }),
+				}),
+			).toBeNull();
 		});
 
 		it("routes a root managed OAuth client to AllAuth and retains the wrong-endpoint response", async () => {
