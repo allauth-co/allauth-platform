@@ -114,7 +114,10 @@ const googleMetadata: oauth.AuthorizationServer = {
 export const ownedProjectOAuthStartInput = z.strictObject({
 	provider: projectOAuthProvider,
 	callbackURL: z.string().max(standardProjectOAuthReturnLength).optional(),
-	newUserCallbackURL: z.string().max(standardProjectOAuthReturnLength).optional(),
+	newUserCallbackURL: z
+		.string()
+		.max(standardProjectOAuthReturnLength)
+		.optional(),
 	errorCallbackURL: z.string().max(standardProjectOAuthReturnLength).optional(),
 	disableRedirect: z.boolean().optional(),
 	requestSignUp: z.boolean().optional(),
@@ -300,10 +303,23 @@ function publicRedirect(url: string) {
 	return new Response(null, { status: 302, headers: { location: url } });
 }
 
-/** A project OAuth client for the shared AllAuth broker and an explicitly configured Google client. */
-export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
+type OwnedPlatformProviderOptions = Omit<
+	OwnedProjectOAuthOptions,
+	"project" | "broker"
+> & {
+	project: { schemaName: "public"; slug: "platform" };
+	broker?: never;
+};
+
+/** OAuth client for configured identity providers in a project or the platform. */
+export function createOwnedProjectOAuth(
+	options: OwnedProjectOAuthOptions | OwnedPlatformProviderOptions,
+) {
 	const origin = projectOrigin.parse(options.baseURL);
-	const slug = projectSlug.parse(options.project.slug);
+	const slug =
+		options.project.schemaName === "public"
+			? "platform"
+			: projectSlug.parse(options.project.slug);
 	const origins = new Set([
 		origin,
 		...options.trustedOrigins.map((value) => projectOrigin.parse(value)),
@@ -336,8 +352,12 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 		},
 	);
 	const secure = origin.startsWith("https:");
-	const stateCookie = `${secure ? "__Secure-" : ""}allauth_project_${slug}.state`;
-	const sessionCookie = `${secure ? "__Secure-" : ""}allauth_project_${slug}.session_token`;
+	const cookiePrefix =
+		options.project.schemaName === "public"
+			? "better-auth"
+			: `allauth_project_${slug}`;
+	const stateCookie = `${secure ? "__Secure-" : ""}${cookiePrefix}.state`;
+	const sessionCookie = `${secure ? "__Secure-" : ""}${cookiePrefix}.session_token`;
 	const attributes = `Path=/; HttpOnly; SameSite=${options.apple ? "None" : "Lax"}${secure ? "; Secure" : ""}`;
 	const expireState = `${stateCookie}=; Max-Age=0; ${attributes}`;
 	const network: ProjectOAuthFetch = (input, init) =>
@@ -367,18 +387,20 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 			403,
 		],
 	} as const;
-	const issuer = new URL(options.broker.issuer);
-	const discoveryURL = new URL(options.broker.discoveryURL);
+	const issuer = options.broker && new URL(options.broker.issuer);
+	const discoveryURL = options.broker && new URL(options.broker.discoveryURL);
 	if (
-		issuer.protocol !== "https:" ||
-		issuer.username ||
-		issuer.password ||
-		issuer.search ||
-		issuer.hash ||
-		discoveryURL.origin !== issuer.origin ||
-		discoveryURL.username ||
-		discoveryURL.password ||
-		discoveryURL.hash
+		issuer &&
+		discoveryURL &&
+		(issuer.protocol !== "https:" ||
+			issuer.username ||
+			issuer.password ||
+			issuer.search ||
+			issuer.hash ||
+			discoveryURL.origin !== issuer.origin ||
+			discoveryURL.username ||
+			discoveryURL.password ||
+			discoveryURL.hash)
 	)
 		throw new Error("Invalid project broker issuer.");
 
@@ -402,7 +424,7 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 		)
 			throw new Error("Invalid project OAuth provider configuration.");
 	}
-	checkCredentials("allauth", options.broker);
+	if (options.broker) checkCredentials("allauth", options.broker);
 	if (options.google) checkCredentials("google", options.google);
 	if (options.apple) checkCredentials("apple", options.apple);
 	if (options.microsoft) checkCredentials("microsoft", options.microsoft);
@@ -415,6 +437,8 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 	const resolvers = new Map<string, ReturnType<typeof createRemoteJWKSet>>();
 
 	async function discoverBroker() {
+		if (!issuer || !discoveryURL)
+			throw new Error("The project broker is unavailable.");
 		const response = await network(discoveryURL, {
 			headers: { accept: "application/json" },
 			redirect: "error",
@@ -513,7 +537,10 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 		// Preserve its exact redirect to the issuer's existing expiry handling.
 		return (
 			allowExpired &&
-			isAuthenticExpiredProjectIssuerEmailContinuation(query, options.signingSecret)
+			isAuthenticExpiredProjectIssuerEmailContinuation(
+				query,
+				options.signingSecret,
+			)
 		);
 	}
 
@@ -636,7 +663,7 @@ export function createOwnedProjectOAuth(options: OwnedProjectOAuthOptions) {
 				authorization.searchParams.set("login_hint", body.loginHint);
 			if (body.provider === "google")
 				authorization.searchParams.set("include_granted_scopes", "true");
-			if (body.provider === "allauth" && options.broker.hintGoogle)
+			if (body.provider === "allauth" && options.broker?.hintGoogle)
 				authorization.searchParams.set("idp_hint", "google");
 			setProjectAdditionalAuthorizationParams(
 				authorization,

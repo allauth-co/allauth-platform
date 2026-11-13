@@ -81,7 +81,8 @@ export function createProjectOAuthStore(
 	keys: LegacyMfaKeys,
 	reservedEmail?: (email: string) => boolean,
 ) {
-	const schema = checkedProjectSchema(schemaName);
+	const schema =
+		schemaName === "public" ? "public" : checkedProjectSchema(schemaName);
 	const realm = createProjectEngineStore(database, schema);
 
 	async function issue(
@@ -212,8 +213,7 @@ export function createProjectOAuthStore(
 			identity.email ?? (directSignIn ? persistedOwner?.email : undefined);
 		let checkedProfile = false;
 		async function profileDenied(operation: "existing" | "signup") {
-			if (checkedProfile || !profileEmail || !policy.denyProfile)
-				return false;
+			if (checkedProfile || !profileEmail || !policy.denyProfile) return false;
 			checkedProfile = true;
 			return policy.denyProfile(profileEmail.toLowerCase(), operation);
 		}
