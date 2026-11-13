@@ -216,6 +216,7 @@ export async function verifyBrokerTwoFactor(
 	identity: Identity,
 	input: z.infer<typeof brokerTwoFactorInput>,
 	incoming: Headers,
+	dispatchFactor?: (request: Request) => Promise<Response>,
 ): Promise<{ url: string }> {
 	const body = brokerTwoFactorInput.parse(input);
 	const context = await instance.$context;
@@ -263,16 +264,17 @@ export async function verifyBrokerTwoFactor(
 		const value = incoming.get(name);
 		if (value) headers.set(name, value);
 	}
-	const verified = await instance.handler(
-		new Request(
-			`${origin}/api/auth/two-factor/${body.method === "backup" ? "verify-backup-code" : "verify-totp"}`,
-			{
-				method: "POST",
-				headers,
-				body: JSON.stringify({ code: body.code, trustDevice: false }),
-			},
-		),
+	const factorRequest = new Request(
+		`${origin}/api/auth/two-factor/${body.method === "backup" ? "verify-backup-code" : "verify-totp"}`,
+		{
+			method: "POST",
+			headers,
+			body: JSON.stringify({ code: body.code, trustDevice: false }),
+		},
 	);
+	const verified = await (dispatchFactor
+		? dispatchFactor(factorRequest)
+		: instance.handler(factorRequest));
 	if (!verified.ok)
 		throw new APIError(
 			verified.status === 429 ? "TOO_MANY_REQUESTS" : "UNAUTHORIZED",

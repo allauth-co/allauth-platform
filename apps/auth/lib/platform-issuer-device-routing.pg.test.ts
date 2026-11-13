@@ -226,7 +226,10 @@ describe.skipIf(!existsSync(fixture))(
 			expect(await deviceRow(issued.device_code)).toBeUndefined();
 		});
 
-		it("uses the existing MFA verifier for an AllAuth-issued device challenge", async () => {
+		it.each([
+			"totp",
+			"backup",
+		] as const)("completes an in-flight platform challenge with the existing %s enrollment", async (method) => {
 			const mfaUser = randomUUID();
 			const browserToken = randomUUID();
 			const proof = createHmac("sha256", secret)
@@ -242,12 +245,16 @@ describe.skipIf(!existsSync(fixture))(
 				[randomUUID(), browserToken, mfaUser],
 			);
 			const otpSecret = "synthetic-mcp-device-totp-fixture";
+			const recoveryCode = "synthetic-recovery-code";
 			await database.query(
 				`INSERT INTO "twoFactor" (id,secret,"backupCodes","userId",verified) VALUES ($1,$2,$3,$4,true)`,
 				[
 					randomUUID(),
 					await symmetricEncrypt({ key: secret, data: otpSecret }),
-					"[]",
+					await symmetricEncrypt({
+						key: secret,
+						data: JSON.stringify([recoveryCode]),
+					}),
 					mfaUser,
 				],
 			);
@@ -286,43 +293,61 @@ describe.skipIf(!existsSync(fixture))(
 				device_code: issued.device_code,
 				grant_type: projectDeviceGrantType,
 			};
-			const results = await Promise.all([
-				dispatch(request("/device/token", grant), "native"),
-				dispatch(request("/device/token", grant), "native"),
-			]);
-			expect(results.map(({ status }) => status).sort()).toEqual([200, 400]);
-			const challenge = results.find(({ status }) => status === 200)!;
+			const challenge =
+				method === "totp"
+					? await dispatch(request("/device/token", grant), "native")
+					: await native.handler(request("/device/token", grant));
+			expect(challenge.status).toBe(200);
 			expect(await challenge.json()).toMatchObject({
 				twoFactorRedirect: true,
 				twoFactorMethods: ["totp"],
 			});
 			const pending = challenge.headers.getSetCookie();
-			expect(pending).toHaveLength(1);
-			expect(pending[0]).toMatch(/^__Secure-better-auth.two_factor=/);
+			const factorCookie = pending.find((cookie) =>
+				cookie.startsWith("__Secure-better-auth.two_factor="),
+			);
+			expect(factorCookie).toBeDefined();
 			const sessionCount = await database.query(
 				'SELECT 1 FROM "session" WHERE "userId"=$1',
 				[mfaUser],
 			);
 			expect(sessionCount.rowCount).toBe(1);
-			const verification = await native.handler(
+			const verification = await platform.dispatch(
 				request(
-					"/two-factor/verify-totp",
+					method === "totp"
+						? "/two-factor/verify-totp"
+						: "/two-factor/verify-backup-code",
 					{
-						code: (
-							await native.api.generateTOTP({ body: { secret: otpSecret } })
-						).code,
+						code:
+							method === "backup"
+								? recoveryCode
+								: (
+										await native.api.generateTOTP({
+											body: { secret: otpSecret },
+										})
+									).code,
 					},
-					pending[0]?.split(";", 1)[0],
+					factorCookie?.split(";", 1)[0],
 				),
 			);
-			expect(await verification.json()).toMatchObject({
+			expect(await verification?.json()).toMatchObject({
 				user: { id: mfaUser },
 			});
 			expect(
-				verification.headers
+				verification?.headers
 					.getSetCookie()
 					.some((value) => value.startsWith(`${cookieName}=`)),
 			).toBe(true);
+			const usedAgain = await platform.dispatch(
+				request(
+					method === "totp"
+						? "/two-factor/verify-totp"
+						: "/two-factor/verify-backup-code",
+					{ code: recoveryCode },
+					factorCookie?.split(";", 1)[0],
+				),
+			);
+			expect(usedAgain?.status).toBe(401);
 		});
 
 		it("routes a root managed OAuth client to AllAuth and retains the wrong-endpoint response", async () => {

@@ -85,13 +85,31 @@ export function createOwnedProjectMfa(options: {
 	keys?: LegacyMfaKeys;
 }) {
 	const schema = checkedProjectSchema(options.project.schemaName);
-	const slug = projectSlug.parse(options.project.slug);
+	return createOwnedPendingMfa({
+		...options,
+		schema,
+		cookiePrefix: `allauth_project_${projectSlug.parse(options.project.slug)}`,
+		transaction: createProjectEngineStore(options.database, schema).transaction,
+	});
+}
+
+/** Complete a challenge against the fixed schema and cookie namespace of the selected realm. */
+export function createOwnedPendingMfa(options: {
+	schema: string;
+	cookiePrefix: string;
+	transaction: <T>(work: (client: PoolClient) => Promise<T>) => Promise<T>;
+	signingSecret: string;
+	secureCookies: boolean;
+	keys?: LegacyMfaKeys;
+}) {
+	const schema =
+		options.schema === "public"
+			? "public"
+			: checkedProjectSchema(options.schema);
 	const { signingSecret, secureCookies } = options;
-	if (signingSecret.length < 32)
-		throw new Error("Invalid project MFA signing key.");
-	const store = createProjectEngineStore(options.database, schema);
+	if (signingSecret.length < 32) throw new Error("Invalid MFA signing key.");
 	const keys = options.keys ?? { secret: signingSecret };
-	const prefix = `${secureCookies ? "__Secure-" : ""}allauth_project_${slug}.`;
+	const prefix = `${secureCookies ? "__Secure-" : ""}${options.cookiePrefix}.`;
 	const sessionCookie = `${prefix}session_token`;
 	const challengeCookie = `${prefix}two_factor`;
 	const trustCookie = `${prefix}trust_device`;
@@ -245,7 +263,7 @@ export function createOwnedProjectMfa(options: {
 		const attemptsIdentifier = `2fa-attempts-${identifier}`;
 		const expiredCookie = [expire(challengeCookie)];
 		try {
-			return await store.transaction(async (client) => {
+			return await options.transaction(async (client) => {
 				// Authenticated re-verification belongs to the active session, not a pending sign-in.
 				if (existingSession) {
 					const current = await client.query(
