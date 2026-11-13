@@ -15,6 +15,7 @@ import {
 } from "./owned-project-issuer-client";
 import {
 	issuerForm,
+	issuerFormParameters,
 	issuerJSON,
 	ProjectOAuthError,
 } from "./owned-project-issuer-http";
@@ -50,6 +51,21 @@ const standaloneTokenInput = z.object({
 });
 const scopeToken = /^[\x21\x23-\x5b\x5d-\x7e]{1,256}$/;
 const codeColumns = `id,"deviceCode","userCode","userId","expiresAt",status,"lastPolledAt","pollingInterval","clientId",scope,resources,"oauthClientId"`;
+
+export interface PreparedIssuerDeviceBody {
+	body: unknown;
+}
+
+/** Preserve exact installed custom user codes before trying the default alphabet. */
+export function deviceUserCodeCandidates(value: unknown) {
+	const parsed = codeInput.safeParse(value);
+	if (!parsed.success) return;
+	const exact = parsed.data;
+	const normalized = exact.replace(/[^a-zA-Z0-9]/g, "").toUpperCase();
+	return normalized !== exact && defaultUserCode.test(normalized)
+		? [exact, normalized]
+		: [exact];
+}
 
 type DeviceRow = {
 	id: string;
@@ -273,6 +289,8 @@ export function createOwnedProjectIssuerDevice(
 	const platform = projectOrigin.parse(options.platformOrigin);
 	const origin = new URL(options.issuer).origin;
 	const endpointBase = options.endpointBase ?? options.issuer;
+	const sharedIssuer =
+		options.endpointBase !== undefined && options.projectSlug === undefined;
 	const browserOrigins = new Set([
 		origin,
 		...(options.trustedOrigins?.map((value) => projectOrigin.parse(value)) ??
@@ -298,9 +316,22 @@ export function createOwnedProjectIssuerDevice(
 		);
 	}
 
-	async function initiationForm(request: Request) {
-		if (formEncoded(request)) return issuerForm(request);
-		const parsed = initiationInput.safeParse(await options.readBody(request));
+	async function initiationForm(
+		request: Request,
+		prepared?: PreparedIssuerDeviceBody,
+	) {
+		if (formEncoded(request)) {
+			if (!prepared) return issuerForm(request);
+			if (!(prepared.body instanceof URLSearchParams))
+				throw new ProjectOAuthError(
+					"invalid_request",
+					"Supply a form-encoded OAuth request.",
+				);
+			return issuerFormParameters(prepared.body);
+		}
+		const parsed = initiationInput.safeParse(
+			prepared ? prepared.body : await options.readBody(request),
+		);
 		if (!parsed.success) {
 			if (parsed.error.issues.every(({ path }) => path[0] === "resource"))
 				throw new ProjectOAuthError(
@@ -354,8 +385,8 @@ export function createOwnedProjectIssuerDevice(
 		});
 	}
 
-	async function create(request: Request) {
-		const form = await initiationForm(request);
+	async function create(request: Request, prepared?: PreparedIssuerDeviceBody) {
+		const form = await initiationForm(request, prepared);
 		return store.transaction(async (database) => {
 			const bodyId = form.get("client_id");
 			const hasCredentials =
@@ -478,13 +509,9 @@ export function createOwnedProjectIssuerDevice(
 			)
 				throw denied();
 			try {
-				if (!codeInput.safeParse(userCode).success)
+				const candidates = deviceUserCodeCandidates(userCode);
+				if (!candidates)
 					throw new ProjectOAuthError("invalid_request", "Invalid user code");
-				const normalized = userCode.replace(/[^a-zA-Z0-9]/g, "").toUpperCase();
-				const candidates =
-					normalized !== userCode && defaultUserCode.test(normalized)
-						? [userCode, normalized]
-						: [userCode];
 				const {
 					rows: [row],
 				} = await database.query<DeviceRow>(
@@ -492,7 +519,7 @@ export function createOwnedProjectIssuerDevice(
 					 ORDER BY ("userCode"=$2) DESC LIMIT 1 FOR UPDATE`,
 					[candidates, userCode],
 				);
-				if (!row)
+				if (!row || (sharedIssuer && !row.oauthClientId))
 					throw new ProjectOAuthError("invalid_request", "Invalid user code");
 				if (row.expiresAt.getTime() <= Date.now())
 					throw new ProjectOAuthError("expired_token", "User code has expired");
@@ -544,7 +571,11 @@ export function createOwnedProjectIssuerDevice(
 		});
 	}
 
-	return async function dispatch(path: string, request: Request) {
+	return async function dispatch(
+		path: string,
+		request: Request,
+		prepared?: PreparedIssuerDeviceBody,
+	) {
 		if (
 			path !== "/device/code" &&
 			path !== "/device/token" &&
@@ -577,7 +608,7 @@ export function createOwnedProjectIssuerDevice(
 				),
 			);
 			if (limited) return limited;
-			if (path === "/device/code") return await create(request);
+			if (path === "/device/code") return await create(request, prepared);
 			if (path === "/device/token") return await rejectStandaloneToken(request);
 			if (path === "/device") {
 				const codes = url.searchParams.getAll("user_code");
@@ -588,7 +619,9 @@ export function createOwnedProjectIssuerDevice(
 					);
 				return await browser(request, codes[0]!);
 			}
-			const parsed = browserInput.safeParse(await options.readBody(request));
+			const parsed = browserInput.safeParse(
+				prepared ? prepared.body : await options.readBody(request),
+			);
 			if (!parsed.success)
 				throw new ProjectOAuthError("invalid_request", "Invalid user code");
 			return await browser(

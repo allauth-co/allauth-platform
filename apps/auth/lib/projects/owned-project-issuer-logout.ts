@@ -48,7 +48,7 @@ export type OwnedProjectIssuerLogoutOptions = IssuerKeyStorageOptions & {
 		path: typeof endSessionPath | typeof confirmSessionPath,
 		actorId: string | null,
 	): Promise<void>;
-	clearBrowserSession(headers: Headers): void;
+	clearBrowserSession(headers: Headers, request: Request): void;
 };
 
 function isNavigation(request: Request) {
@@ -361,7 +361,7 @@ export function createOwnedProjectIssuerLogout(
 							path,
 							actorId,
 						);
-						options.clearBrowserSession(headers);
+						options.clearBrowserSession(headers, request);
 					} else if (!isNavigation(request) && !redirect) {
 						throw new ProjectOAuthError(
 							"invalid_request",
@@ -466,7 +466,7 @@ export function createOwnedProjectIssuerLogout(
 						path,
 						actorId,
 					);
-				if (current) options.clearBrowserSession(headers);
+				if (current) options.clearBrowserSession(headers, request);
 				setConfirmation(headers);
 				const redirect = logoutRedirect(
 					client,

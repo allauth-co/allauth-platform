@@ -75,6 +75,10 @@ export interface OwnedProjectIssuerAuthorizationOptions {
 	loginPage?: string;
 	allowImpersonatedSession?: boolean;
 	store?: Pick<ReturnType<typeof createPlatformIssuerStore>, "transaction">;
+	readAuthenticatedSession?(
+		client: PoolClient,
+		identity: { id: string; userId: string },
+	): Promise<ProjectIssuerBrowserSession | null>;
 	signingSecret: string;
 	errorURL?: string;
 	readBody(request: Request): Promise<unknown>;
@@ -459,11 +463,18 @@ export function createOwnedProjectIssuerAuthorization(
 		request: Request,
 		input: URLSearchParams,
 		signed?: SignedQuery,
+		authenticated?: {
+			identity: { id: string; userId: string };
+			responseMode: "navigation" | "json";
+		},
 	) {
-		const authorizationHeaders = signed ? undefined : new Headers();
+		const authorizationHeaders =
+			signed || authenticated ? undefined : new Headers();
 		const response = await store.transaction(async (client) => {
 			let target: string | undefined;
-			const asJSON = Boolean(signed);
+			const asJSON = authenticated
+				? authenticated.responseMode === "json"
+				: Boolean(signed);
 			try {
 				const params = projectIssuerAuthorizationParams(input);
 				const registration = await registeredClient(client, params);
@@ -478,7 +489,7 @@ export function createOwnedProjectIssuerAuthorization(
 						"invalid redirect uri",
 					);
 				const query = validateQuery(params, registration);
-				if (query.prompt.has("select_account") && !signed)
+				if (query.prompt.has("select_account") && !signed && !authenticated)
 					return protocolError(
 						request,
 						new ProjectOAuthError(
@@ -488,11 +499,12 @@ export function createOwnedProjectIssuerAuthorization(
 						asJSON,
 					);
 				await assertResources(client, registration, query);
-				const ordinary = await liveSession(
-					request,
-					client,
-					authorizationHeaders,
-				);
+				const ordinary = authenticated
+					? await options.readAuthenticatedSession?.(
+							client,
+							authenticated.identity,
+						)
+					: await liveSession(request, client, authorizationHeaders);
 				const consoleSession =
 					!ordinary &&
 					!signed &&
@@ -508,7 +520,7 @@ export function createOwnedProjectIssuerAuthorization(
 					Number.isFinite(authTime(consoleSession))
 						? consoleSession
 						: null);
-				if (signed && !session)
+				if ((signed || authenticated) && !session)
 					return new ProjectOAuthError(
 						"login_required",
 						"Authentication is required.",
@@ -861,5 +873,15 @@ export function createOwnedProjectIssuerAuthorization(
 		}
 	}
 
-	return Object.assign(dispatch, { readContext });
+	return Object.assign(dispatch, {
+		readContext,
+		continueAuthenticated(
+			request: Request,
+			query: URLSearchParams,
+			identity: { id: string; userId: string },
+			responseMode: "navigation" | "json",
+		) {
+			return authorize(request, query, undefined, { identity, responseMode });
+		},
+	});
 }

@@ -714,6 +714,25 @@ export const oauthProvider = <O extends OAuthOptions<Scope[]>>(options: O) => {
 						) {
 							authorizationQuery = removeMaxAgeFromQuery(authorizationQuery);
 						}
+						if (opts.onAuthenticatedAuthorization && ctx.request) {
+							const continued = await opts.onAuthenticatedAuthorization({
+								request: ctx.request,
+								headers: new Headers(ctx.headers ?? ctx.request.headers),
+								query: new URLSearchParams(authorizationQuery),
+								session: { id: session.session.id, userId: session.user.id },
+								signedQueryIssuedAt,
+								responseMode: isNavigationRequest ? "navigation" : "json",
+							});
+							if (continued) {
+								// The dispatcher appends native cookies to a returned Response.
+								// Let the continuation replace the primary redirect and headers.
+								const primaryHeaders = ctx.context.responseHeaders;
+								primaryHeaders?.delete("location");
+								for (const name of continued.headers.keys())
+									if (name !== "set-cookie") primaryHeaders?.delete(name);
+								return new Response(continued.body, continued);
+							}
+						}
 						ctx.query = searchParamsToQuery(authorizationQuery);
 						return await runOAuth2Authorize(ctx);
 					}),

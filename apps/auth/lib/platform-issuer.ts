@@ -1,28 +1,40 @@
 import type { Pool, PoolClient } from "pg";
+import { authPolicyRepository } from "./auth-policy/storage";
 import type { AuthEnvironment } from "./configuration";
 import { authOrigin, setting, trustedOrigins } from "./configuration";
+import { routePlatformIssuerDevice } from "./platform-issuer-device-routing";
 import { readPlatformIssuerJwks } from "./platform-issuer-jwks";
+import { createPlatformIssuerLogout } from "./platform-issuer-logout";
 import { createPlatformIssuerSessionReader } from "./platform-issuer-session";
 import { createPlatformIssuerSigner } from "./platform-issuer-signing";
 import { createPlatformIssuerStore } from "./platform-issuer-store";
 import { readLegacyProjectKeyring } from "./projects/legacy-project-keyring";
 import { createOwnedProjectIssuerAuthorization } from "./projects/owned-project-issuer-authorization";
 import { createIssuerClientAuthenticator } from "./projects/owned-project-issuer-client";
+import { createOwnedProjectConsentManagement } from "./projects/owned-project-issuer-consent-management";
+import { createOwnedProjectIssuerDevice } from "./projects/owned-project-issuer-device";
 import { issuerJSON } from "./projects/owned-project-issuer-http";
 import { createOwnedProjectIssuerIntrospection } from "./projects/owned-project-issuer-introspection";
 import { createOwnedProjectIssuerToken } from "./projects/owned-project-issuer-token";
 import { createOwnedProjectIssuerUserInfo } from "./projects/owned-project-issuer-userinfo";
 import { admitOwnedProjectNativeRoute } from "./projects/owned-project-native-admission";
+import { timedProjectProtocolStream } from "./projects/project-protocol-body";
 import { isNodeRuntime } from "./runtime";
 
 const protocolRoutes = new Map([
 	["/oauth2/authorize", { methods: ["GET", "POST"], max: 30 }],
 	["/oauth2/continue", { methods: ["POST"], max: 100 }],
 	["/oauth2/consent", { methods: ["POST"], max: 100 }],
+	["/oauth2/get-consent", { methods: ["GET"], max: 100 }],
+	["/oauth2/get-consents", { methods: ["GET"], max: 100 }],
+	["/oauth2/update-consent", { methods: ["POST"], max: 100 }],
+	["/oauth2/delete-consent", { methods: ["POST"], max: 100 }],
 	["/oauth2/token", { methods: ["POST"], max: 20 }],
 	["/oauth2/introspect", { methods: ["POST"], max: 100 }],
 	["/oauth2/revoke", { methods: ["POST"], max: 30 }],
 	["/oauth2/userinfo", { methods: ["GET", "POST"], max: 60 }],
+	["/oauth2/end-session", { methods: ["GET", "POST"], max: 100 }],
+	["/oauth2/end-session/confirm", { methods: ["POST"], max: 100 }],
 	["/jwks", { methods: ["GET"], max: 100 }],
 ]);
 
@@ -35,7 +47,8 @@ async function readBrowserBody(request: Request): Promise<unknown> {
 			.toLowerCase() !== "application/json"
 	)
 		return;
-	const reader = request.body?.getReader();
+	const reader =
+		request.body && timedProjectProtocolStream(request.body).stream.getReader();
 	if (!reader) return;
 	const decoder = new TextDecoder("utf-8", { fatal: true });
 	let size = 0;
@@ -62,11 +75,14 @@ async function readBrowserBody(request: Request): Promise<unknown> {
 export function createPlatformIssuer(database: Pool, env: AuthEnvironment) {
 	const issuer = authOrigin(env);
 	const endpointBase = `${issuer}/api/auth`;
+	const secure = issuer.startsWith("https:");
+	const cookiePrefix = `${secure ? "__Secure-" : ""}better-auth.`;
 	const { signingSecret, encryptionKeys } = readLegacyProjectKeyring(
 		setting(env, "ALLAUTH_AUTH_SECRET"),
 		setting(env, "BETTER_AUTH_SECRETS"),
 	);
 	const store = createPlatformIssuerStore(database);
+	const policy = authPolicyRepository(database);
 	const readSession = createPlatformIssuerSessionReader(env);
 	const signer = createPlatformIssuerSigner({ database, env });
 	const keyring = {
@@ -78,6 +94,24 @@ export function createPlatformIssuer(database: Pool, env: AuthEnvironment) {
 		issuer,
 		new Set(trustedOrigins(env)),
 	);
+	const consentManagement = createOwnedProjectConsentManagement({
+		store,
+		readBody: readBrowserBody,
+		async authorize(client, request, write) {
+			if (
+				request.headers.has("authorization") ||
+				(write && request.headers.get("origin") !== issuer)
+			)
+				return null;
+			const session = await readSession(request.headers, client);
+			return !session ||
+				session.user.banned ||
+				session.user.directoryDisabled ||
+				session.session.impersonatedBy
+				? null
+				: session.user.id;
+		},
+	});
 	const authorization = createOwnedProjectIssuerAuthorization({
 		database,
 		schemaName: store.schemaName,
@@ -90,6 +124,12 @@ export function createPlatformIssuer(database: Pool, env: AuthEnvironment) {
 		readBody: readBrowserBody,
 		async readSession(request, client) {
 			const session = await readSession(request.headers, client);
+			return session?.user.banned || session?.user.directoryDisabled
+				? null
+				: session;
+		},
+		async readAuthenticatedSession(client, identity) {
+			const session = await readSession.readAuthenticated(client, identity);
 			return session?.user.banned || session?.user.directoryDisabled
 				? null
 				: session;
@@ -125,6 +165,68 @@ export function createPlatformIssuer(database: Pool, env: AuthEnvironment) {
 		endpointBase,
 		activeAccess,
 	});
+	const trustedIP = (request: Request) =>
+		request.headers.get(isNodeRuntime(env) ? "x-real-ip" : "cf-connecting-ip");
+	const device = createOwnedProjectIssuerDevice({
+		database,
+		schemaName: store.schemaName,
+		store,
+		issuer,
+		endpointBase,
+		platformOrigin: issuer,
+		trustedOrigins: trustedOrigins(env),
+		trustedIP,
+		authenticateClient,
+		readBody: readBrowserBody,
+		readSession: (request, client) => readSession(request.headers, client),
+	});
+	async function dispatchDevice(request: Request) {
+		const selected = await routePlatformIssuerDevice(database, request);
+		if (!selected || selected.kind === "native") return selected;
+		if (selected.kind === "response") return selected;
+		const response = await device(
+			selected.path,
+			selected.request,
+			selected.prepared,
+		);
+		if (!response)
+			throw new Error("The shared OAuth device route is unavailable.");
+		return { kind: "response" as const, response };
+	}
+
+	async function logout(
+		path: "/oauth2/end-session" | "/oauth2/end-session/confirm",
+		request: Request,
+	) {
+		const { policy: current } = await policy.read("platform");
+		return createPlatformIssuerLogout({
+			store,
+			signer,
+			env,
+			requireMfa: current.mfaMode === "required",
+			readBody: readBrowserBody,
+			clearBrowserSession(headers, incoming) {
+				const names = new Set(
+					["session_token", "session_data", "dont_remember"].map(
+						(name) => cookiePrefix + name,
+					),
+				);
+				for (const pair of (incoming.headers.get("cookie") ?? "").split(";")) {
+					const name = pair.split("=", 1)[0]?.trim();
+					if (
+						name?.startsWith(`${cookiePrefix}session_data.`) &&
+						/^\d+$/.test(name.slice(`${cookiePrefix}session_data.`.length))
+					)
+						names.add(name);
+				}
+				for (const name of names)
+					headers.append(
+						"set-cookie",
+						`${name}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${secure ? "; Secure" : ""}`,
+					);
+			},
+		})(path, request);
+	}
 
 	async function dispatch(request: Request): Promise<Response | undefined> {
 		const url = new URL(request.url);
@@ -132,9 +234,25 @@ export function createPlatformIssuer(database: Pool, env: AuthEnvironment) {
 		const path = url.pathname.slice("/api/auth".length);
 		const route = protocolRoutes.get(path);
 		if (!route?.methods.includes(request.method)) return;
-		const ip = request.headers.get(
-			isNodeRuntime(env) ? "x-real-ip" : "cf-connecting-ip",
-		);
+		if (path.startsWith("/oauth2/") && request.headers.has("cookie")) {
+			const { policy: configured } = await policy.read("platform");
+			if (configured.mfaMode === "required") {
+				const session = await readSession(request.headers, database);
+				if (
+					session &&
+					!session.session.impersonatedBy &&
+					(!session.user.emailVerified || !session.user.twoFactorEnabled)
+				)
+					return issuerJSON(
+						{
+							message:
+								"This application requires an already verified account enrolled in MFA.",
+						},
+						403,
+					);
+			}
+		}
+		const ip = trustedIP(request);
 		const denied = await store.transaction((client) =>
 			admitOwnedProjectNativeRoute(client, ip, path, {
 				max: route.max,
@@ -151,6 +269,14 @@ export function createPlatformIssuer(database: Pool, env: AuthEnvironment) {
 				return revoke(request);
 			case "/oauth2/userinfo":
 				return userinfo(request);
+			case "/oauth2/end-session":
+			case "/oauth2/end-session/confirm":
+				return logout(path, request);
+			case "/oauth2/get-consent":
+			case "/oauth2/get-consents":
+			case "/oauth2/update-consent":
+			case "/oauth2/delete-consent":
+				return consentManagement(path, request);
 			case "/jwks": {
 				let keys = await readPlatformIssuerJwks(database);
 				if (keys.keyStoreEmpty) {
@@ -164,5 +290,9 @@ export function createPlatformIssuer(database: Pool, env: AuthEnvironment) {
 		}
 	}
 
-	return { dispatch };
+	return {
+		dispatch,
+		dispatchDevice,
+		continueAuthenticated: authorization.continueAuthenticated,
+	};
 }

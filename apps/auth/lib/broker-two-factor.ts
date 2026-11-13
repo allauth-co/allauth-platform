@@ -305,6 +305,7 @@ export async function verifyBrokerTwoFactor(
 export async function completeBrokerTwoFactor(
 	instance: AuthInstance,
 	request: Request,
+	dispatchContinuation?: (request: Request) => Promise<Response | undefined>,
 ): Promise<Response> {
 	const query = new URL(request.url).searchParams;
 	const receipt = query.get("receipt");
@@ -341,13 +342,14 @@ export async function completeBrokerTwoFactor(
 		const value = request.headers.get(name);
 		if (value) nativeHeaders.set(name, value);
 	}
-	const resumed = await instance.handler(
-		new Request(`${data.origin}/api/auth/oauth2/continue`, {
-			method: "POST",
-			headers: nativeHeaders,
-			body: JSON.stringify({ selected: true, oauth_query: data.query }),
-		}),
-	);
+	const continuation = new Request(`${data.origin}/api/auth/oauth2/continue`, {
+		method: "POST",
+		headers: nativeHeaders,
+		body: JSON.stringify({ selected: true, oauth_query: data.query }),
+	});
+	const resumed =
+		(await dispatchContinuation?.(continuation.clone() as Request)) ??
+		(await instance.handler(continuation));
 	const result: unknown = await resumed.json().catch(() => null);
 	if (
 		!resumed.ok ||

@@ -35,12 +35,14 @@ import type { AuthInstance } from "../api";
 import { auth, withAuthEngine } from "../auth";
 import { portalBranding } from "../branding/portal";
 import { defaultApplicationBranding } from "../branding/validation";
+import { clerkCompatiblePasswords } from "../clerk-password";
 import type { AuthEnvironment } from "../configuration";
 import { defaultSecurityPolicy } from "../control/security";
 import type { ControlDatabase } from "../control/types";
 import { discoveryDocument } from "../discovery";
 import { createPlatformIssuer } from "../platform-issuer";
 import { readPlatformIssuerContext } from "../platform-issuer-context";
+import { closePlatformIssuerRuntime } from "../platform-issuer-runtime";
 import { createPlatformIssuerSessionReader } from "../platform-issuer-session";
 import { openLegacyMfaRecord } from "../projects/legacy-mfa-record";
 import { ownedProjectIssuerMetadata } from "../projects/owned-project-issuer-metadata";
@@ -388,6 +390,7 @@ describe.skipIf(!existsSync(fixturePath))(
 		afterAll(async () => {
 			try {
 				const results = await Promise.allSettled([
+					closePlatformIssuerRuntime(),
 					closeProjectInstances(),
 					platformDatabase?.destroy(),
 					database?.destroy(),
@@ -995,6 +998,134 @@ describe.skipIf(!existsSync(fixturePath))(
 					).payload.sub,
 				).toBe(rootUserId);
 			} finally {
+				await db.query('DELETE FROM public."oauthClient" WHERE id=$1', [
+					clientId,
+				]);
+			}
+		});
+
+		it("selects the shared writer through the installed root route and rolls back at a new revision", async () => {
+			const db = projectRegistryPool(env);
+			const clientId = randomUUID();
+			const callback = "https://shared-live-route.fixture.example/callback";
+			await db.query(
+				`INSERT INTO public."oauthClient" (id,"clientId",name,"redirectUris","tokenEndpointAuthMethod",scopes,"requirePKCE","skipConsent")
+			VALUES ($1,$1,'Shared route app',$2,'none','["openid","email"]',true,true)`,
+				[clientId, JSON.stringify([callback])],
+			);
+			const verifier = "y".repeat(43);
+			const existingPassword = (
+				await db.query<{ password: string }>(
+					`SELECT password FROM public."account" WHERE "userId"=$1 AND "providerId"='credential'`,
+					[rootUserId],
+				)
+			).rows[0]?.password;
+			await db.query(
+				`UPDATE public."account" SET password=$2 WHERE "userId"=$1 AND "providerId"='credential'`,
+				[rootUserId, await clerkCompatiblePasswords.hash(password)],
+			);
+			const params = new URLSearchParams({
+				client_id: clientId,
+				redirect_uri: callback,
+				response_type: "code",
+				scope: "openid email",
+				code_challenge: createHash("sha256")
+					.update(verifier)
+					.digest("base64url"),
+				code_challenge_method: "S256",
+			});
+			const authorization = (request: URLSearchParams, cookie?: string) =>
+				nativeGET(
+					new Request(
+						`${platformOrigin}/api/auth/oauth2/authorize?${request}`,
+						{ headers: cookie ? { cookie } : undefined },
+					),
+				);
+			const exchange = (code: string) =>
+				nativePOST(
+					new Request(`${platformOrigin}/api/auth/oauth2/token`, {
+						method: "POST",
+						body: new URLSearchParams({
+							grant_type: "authorization_code",
+							client_id: clientId,
+							code,
+							redirect_uri: callback,
+							code_verifier: verifier,
+						}),
+					}),
+				);
+			let active = false;
+			try {
+				const original = await authorization(params, rootCookie);
+				const oldCode = new URL(
+					original.headers.get("location")!,
+					platformOrigin,
+				).searchParams.get("code");
+				expect(oldCode).toBeTruthy();
+				await db.query(
+					"SELECT * FROM public.allauth_switch_platform_issuer_writer('legacy',0,'allauth')",
+				);
+				active = true;
+				const consumed = await exchange(oldCode!);
+				expect(consumed.status, await consumed.clone().text()).toBe(200);
+				const initial = await authorization(params);
+				const loginURL = new URL(
+					initial.headers.get("location")!,
+					platformOrigin,
+				);
+				expect(loginURL.pathname).toBe("/oauth/login");
+				const signed = loginURL.searchParams.toString();
+				const signIn = await nativePOST(
+					new Request(`${platformOrigin}/api/auth/sign-in/email`, {
+						method: "POST",
+						headers: {
+							origin: platformOrigin,
+							accept: "application/json",
+							"content-type": "application/json",
+							"x-real-ip": "192.0.2.239",
+						},
+						body: JSON.stringify({
+							email: sharedEmail,
+							password,
+							oauth_query: signed,
+							callbackURL: `${platformOrigin}/oauth2/continue?${signed}`,
+						}),
+					}),
+				);
+				const signedIn = (await signIn.json()) as {
+					redirect?: boolean;
+					url?: string;
+				};
+				expect(signIn.status, JSON.stringify(signedIn)).toBe(200);
+				expect(signedIn.redirect).toBe(true);
+				expect(
+					signIn.headers
+						.getSetCookie()
+						.some((cookie) => cookie.startsWith("better-auth.session_token=")),
+				).toBe(true);
+				const newCode = new URL(signedIn.url!, platformOrigin).searchParams.get(
+					"code",
+				);
+				expect(newCode).toBeTruthy();
+				await db.query(
+					"SELECT * FROM public.allauth_switch_platform_issuer_writer('allauth',1,'legacy')",
+				);
+				active = false;
+				const restored = await exchange(newCode!);
+				expect(restored.status, await restored.clone().text()).toBe(200);
+			} finally {
+				if (active)
+					await db.query(
+						"SELECT * FROM public.allauth_switch_platform_issuer_writer('allauth',1,'legacy')",
+					);
+				// The entire database is synthetic. Restore its original revision for the other route fixtures.
+				await db.query(
+					`UPDATE public."allauthPlatformIssuerWriter" SET writer='legacy',revision=0 WHERE singleton`,
+				);
+				await db.query(
+					`UPDATE public."account" SET password=$2 WHERE "userId"=$1 AND "providerId"='credential'`,
+					[rootUserId, existingPassword],
+				);
 				await db.query('DELETE FROM public."oauthClient" WHERE id=$1', [
 					clientId,
 				]);

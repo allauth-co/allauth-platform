@@ -1,4 +1,5 @@
 # syntax=docker/dockerfile:1
+# cspell:ignore tsdown
 # Build with the repository root as context:
 # docker build -f apps/auth/Dockerfile -t allauth-auth .
 FROM node:22.22.3-bookworm-slim@sha256:e21fc383b50d5347dc7a9f1cae45b8f4e2f0d39f7ade28e4eef7d2934522b752 AS build-input
@@ -71,6 +72,7 @@ COPY --from=build-input --chown=node:node /app/apps/auth/public ./public
 COPY --from=build-input --chown=node:node /app/apps/auth/migrations ./migrations
 COPY --from=build-input --chown=node:node /app/apps/auth/scripts/database.mjs ./scripts/database.mjs
 COPY --from=build-input --chown=node:node /app/apps/auth/scripts/project-engine-writer.mjs ./scripts/project-engine-writer.mjs
+COPY --from=build-input --chown=node:node /app/apps/auth/scripts/platform-issuer-writer.mjs ./scripts/platform-issuer-writer.mjs
 COPY --from=build-input --chown=node:node /app/apps/auth/scripts/project-engine-rollout-selection.mjs ./scripts/project-engine-rollout-selection.mjs
 COPY --from=build-input --chown=node:node /app/apps/auth/scripts/project-engine-oauth-grant-admission.mjs ./scripts/project-engine-oauth-grant-admission.mjs
 COPY --from=build-input --chown=node:node /app/apps/auth/scripts/project-engine-saml-approval.mjs ./scripts/project-engine-saml-approval.mjs
