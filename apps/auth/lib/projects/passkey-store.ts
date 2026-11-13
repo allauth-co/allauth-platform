@@ -1,3 +1,4 @@
+// cspell:ignore xact
 import { randomUUID } from "node:crypto";
 import type { Pool, PoolClient } from "pg";
 import { checkedProjectSchema } from "./validation";
@@ -45,7 +46,8 @@ export function projectPasskeyStore(
 	database: Pick<Pool, "query" | "connect">,
 	schemaName: string,
 ) {
-	const schema = checkedProjectSchema(schemaName);
+	const schema =
+		schemaName === "public" ? "public" : checkedProjectSchema(schemaName);
 	const table = `"${schema}"."passkey"`;
 	return {
 		/** Return no credential when legacy data has more than one matching owner or row. */

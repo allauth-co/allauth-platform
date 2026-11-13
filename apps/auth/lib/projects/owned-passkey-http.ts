@@ -12,7 +12,10 @@ import type { Pool, PoolClient } from "pg";
 import * as z from "zod";
 import type { ControlEventInput } from "../control/types";
 import { readLegacySessionCookie } from "./legacy-session-cookie";
-import { createProjectEngineStore } from "./owned-project-engine-store";
+import {
+	createProjectEngineStore,
+	recordOwnedProjectEvent,
+} from "./owned-project-engine-store";
 import { admitOwnedProjectNativeRoute } from "./owned-project-native-admission";
 import type { StoredProjectPasskey } from "./passkey-store";
 import { projectPasskeyStore } from "./passkey-store";
@@ -96,6 +99,7 @@ interface PasskeySession {
 interface Options {
 	database: Pool;
 	schemaName: string;
+	transaction?: <T>(work: (client: PoolClient) => Promise<T>) => Promise<T>;
 	cookiePrefix: string;
 	signingSecret: string;
 	rp: {
@@ -193,9 +197,14 @@ function withExpiredCookie(
 
 /** Own the project passkey HTTP contract while accepting in-flight legacy ceremonies. */
 export function createOwnedProjectPasskeyHttp(options: Options) {
-	const schema = checkedProjectSchema(options.schemaName);
+	const schema =
+		options.schemaName === "public"
+			? "public"
+			: checkedProjectSchema(options.schemaName);
 	const store = projectPasskeyStore(options.database, schema);
-	const events = createProjectEngineStore(options.database, schema);
+	const transaction =
+		options.transaction ??
+		createProjectEngineStore(options.database, schema).transaction;
 	const cookie = `${options.cookiePrefix}better-auth-passkey`;
 	const verify = projectPasskeyVerification(store, {
 		rpId: options.rp.id,
@@ -228,7 +237,7 @@ export function createOwnedProjectPasskeyHttp(options: Options) {
 		path: PasskeyMutationPath,
 		outcome: { userId?: string; targetId?: string; errorCode?: string },
 	) {
-		return events.recordEvent(client, {
+		return recordOwnedProjectEvent(client, {
 			...options.auditContext(request),
 			type: passkeyMutationEvents[path],
 			outcome: outcome.errorCode ? "failure" : "success",
@@ -255,7 +264,7 @@ export function createOwnedProjectPasskeyHttp(options: Options) {
 				.json()
 				.catch(() => null),
 		);
-		await events.transaction((client) =>
+		await transaction((client) =>
 			recordMutation(client, request, path, {
 				userId,
 				targetId,
@@ -441,7 +450,8 @@ export function createOwnedProjectPasskeyHttp(options: Options) {
 				return response !== null;
 			},
 		});
-		if (result.ok && response) return outcome(withExpiredCookie(response, clear));
+		if (result.ok && response)
+			return outcome(withExpiredCookie(response, clear));
 		const failed =
 			!result.ok && result.reason === "challenge"
 				? challengeNotFound()
@@ -568,7 +578,7 @@ export function createOwnedProjectPasskeyHttp(options: Options) {
 		if (request.method === "POST") {
 			if (Object.hasOwn(passkeyMutationEvents, path)) {
 				const ip = options.auditContext(request).ipAddress ?? null;
-				const refused = await events.transaction((client) =>
+				const refused = await transaction((client) =>
 					admitOwnedProjectNativeRoute(client, ip, path, {
 						max: 100,
 						windowMs: 60_000,

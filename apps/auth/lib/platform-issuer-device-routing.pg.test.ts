@@ -19,6 +19,7 @@ import {
 } from "./projects/owned-project-issuer-device";
 import { maximumIssuerFormBytes } from "./projects/owned-project-issuer-http";
 import { dropClosedFixtureDatabase } from "./testing/postgres-fixture";
+import { virtualCredential } from "./testing/virtual-passkey";
 
 const fixture = new URL(
 	"../../../.secrets/local-postgres.json",
@@ -455,6 +456,57 @@ describe.skipIf(!existsSync(fixture))(
 					headers: new Headers({ cookie: current }),
 				}),
 			).toBeNull();
+		});
+
+		it("accepts an existing platform passkey and a pending native assertion", async () => {
+			const userId = randomUUID();
+			const token = randomUUID();
+			const signature = createHmac("sha256", secret)
+				.update(token)
+				.digest("base64");
+			const current = `${cookieName}=${encodeURIComponent(`${token}.${signature}`)}`;
+			await database.query(
+				'INSERT INTO public."user" (id,name,email,"emailVerified") VALUES ($1,$2,$3,true)',
+				[userId, "Passkey Fixture", `${userId}@fixture.example`],
+			);
+			await database.query(
+				`INSERT INTO public."session" (id,token,"userId","expiresAt","updatedAt") VALUES ($1,$2,$3,now()+interval '1 hour',now())`,
+				[randomUUID(), token, userId],
+			);
+			const virtual = virtualCredential(issuer);
+			const options = await platform.dispatch(
+				request("/passkey/generate-register-options", undefined, current),
+			);
+			expect(options?.status).toBe(200);
+			const registration = (await options?.json()) as { challenge: string };
+			const cookiePair = (response: Response) =>
+				response.headers.getSetCookie()[0]!.split(";", 1)[0]!;
+			const registered = await native.handler(
+				request(
+					"/passkey/verify-registration",
+					{ response: virtual.registration(registration.challenge) },
+					`${current}; ${cookiePair(options!)}`,
+				),
+			);
+			expect(registered.status).toBe(200);
+			const authOptions = await native.handler(
+				request("/passkey/generate-authenticate-options"),
+			);
+			const assertion = (await authOptions.json()) as { challenge: string };
+			const completed = await platform.dispatch(
+				request(
+					"/passkey/verify-authentication",
+					{ response: virtual.assertion(assertion.challenge, 1) },
+					cookiePair(authOptions),
+				),
+			);
+			expect(completed?.status).toBe(200);
+			expect(await completed?.json()).toMatchObject({ user: { id: userId } });
+			const credential = await database.query(
+				'SELECT counter FROM public."passkey" WHERE "credentialID"=$1',
+				[virtual.id],
+			);
+			expect(credential.rows).toEqual([{ counter: 1 }]);
 		});
 
 		it("routes a root managed OAuth client to AllAuth and retains the wrong-endpoint response", async () => {

@@ -1,13 +1,6 @@
-import {
-	createHash,
-	generateKeyPairSync,
-	randomBytes,
-	randomUUID,
-	sign,
-} from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { passkey } from "@better-auth/passkey";
-import { isoCBOR } from "@simplewebauthn/server/helpers";
 import { betterAuth } from "better-auth";
 import { symmetricDecrypt, symmetricEncrypt } from "better-auth/crypto";
 import { admin, anonymous } from "better-auth/plugins";
@@ -26,6 +19,7 @@ import type { ControlWebhookEnvelope } from "../control/webhooks";
 import { deliverPendingWebhooks } from "../control/webhooks";
 import { featureBoundaries } from "../features/server";
 import { productionTwoFactor } from "../mfa";
+import { virtualCredential } from "../testing/virtual-passkey";
 import { requireWorkspacePrincipal } from "../workspaces/authorization";
 import { readLegacySessionCookie } from "./legacy-session-cookie";
 import { createOwnedProjectEngine } from "./owned-project-engine";
@@ -53,98 +47,6 @@ const foreignEmail = "other@passkey-storage.fixture.example";
 const fixtureSecret = "synthetic-passkey-storage-fixture-signing-secret";
 const fixturePassword = "synthetic-passkey-fixture-password";
 const publicKey = new Uint8Array([0xfb, 0xff, 0x04, 0x00, 0x99]);
-const hash = (value: string | Uint8Array) =>
-	createHash("sha256").update(value).digest();
-
-function virtualCredential() {
-	const pair = generateKeyPairSync("ec", { namedCurve: "prime256v1" });
-	const point = pair.publicKey.export({ format: "jwk" });
-	const key = isoCBOR.encode(
-		new Map<number, number | Uint8Array>([
-			[1, 2],
-			[3, -7],
-			[-1, 1],
-			[-2, Buffer.from(point.x!, "base64url")],
-			[-3, Buffer.from(point.y!, "base64url")],
-		]),
-	);
-	const id = randomBytes(32);
-	const encodedId = id.toString("base64url");
-	const credential = {
-		id: encodedId,
-		rawId: encodedId,
-		type: "public-key" as const,
-		clientExtensionResults: {},
-	};
-	return {
-		id: encodedId,
-		registration(challenge: string) {
-			const client = Buffer.from(
-				JSON.stringify({ type: "webauthn.create", challenge, origin }),
-			);
-			const idSize = Buffer.alloc(2);
-			idSize.writeUInt16BE(id.length);
-			const authData = Buffer.concat([
-				hash(rpId),
-				Buffer.from([0x45]),
-				Buffer.alloc(4),
-				Buffer.alloc(16),
-				idSize,
-				id,
-				key,
-			]);
-			const attestation = isoCBOR.encode(
-				new Map<string, string | Uint8Array | Map<string, never>>([
-					["fmt", "none"],
-					["attStmt", new Map<string, never>()],
-					["authData", authData],
-				]),
-			);
-			return {
-				...credential,
-				response: {
-					clientDataJSON: client.toString("base64url"),
-					attestationObject: Buffer.from(attestation).toString("base64url"),
-					transports: ["internal" as const],
-				},
-			};
-		},
-		assertion(
-			challenge: string,
-			count: number,
-			clientOrigin = origin,
-			relyingParty = rpId,
-		) {
-			const client = Buffer.from(
-				JSON.stringify({
-					type: "webauthn.get",
-					challenge,
-					origin: clientOrigin,
-				}),
-			);
-			const counter = Buffer.alloc(4);
-			counter.writeUInt32BE(count);
-			const authData = Buffer.concat([
-				hash(relyingParty),
-				Buffer.from([0x05]),
-				counter,
-			]);
-			const signature = sign(
-				"sha256",
-				Buffer.concat([authData, hash(client)]),
-				pair.privateKey,
-			);
-			return {
-				...credential,
-				response: {
-					clientDataJSON: client.toString("base64url"),
-					authenticatorData: authData.toString("base64url"),
-					signature: signature.toString("base64url"),
-				},
-			};
-		},
-	};
-}
 
 function legacyFixture(
 	database: ReturnType<typeof postgresDatabase>,
@@ -320,7 +222,7 @@ describe.skipIf(!existsSync(fixturePath))(
 			}
 
 			const issuedByLegacy = await challenge("register", existing);
-			const credential = virtualCredential();
+			const credential = virtualCredential(origin);
 			const enrolled = await call(
 				"passkey/verify-registration",
 				`${existing}; ${issuedByLegacy.cookie}`,
@@ -337,7 +239,7 @@ describe.skipIf(!existsSync(fixturePath))(
 				existing,
 			);
 			expect(issuedByOwned.status).toBe(200);
-			const otherCredential = virtualCredential();
+			const otherCredential = virtualCredential(origin);
 			const ownedChallenge = (await issuedByOwned.json()) as {
 				challenge: string;
 			};
@@ -632,7 +534,7 @@ describe.skipIf(!existsSync(fixturePath))(
 				}
 				const originalSession = await browser(owner.email);
 				const original = originalSession.primary;
-				const credential = virtualCredential();
+				const credential = virtualCredential(origin);
 				const registration = await installed.handler(
 					request("/passkey/generate-register-options", original),
 				);
@@ -1014,7 +916,7 @@ describe.skipIf(!existsSync(fixturePath))(
 				const options = await send("generate-register-options");
 				expect(options.status).toBe(200);
 				const { challenge } = (await options.json()) as { challenge: string };
-				const proof = virtualCredential();
+				const proof = virtualCredential(origin);
 				const response = proof.registration(challenge);
 				const request = { response, name: label };
 				expect((await send("verify-registration", request)).status).toBe(400);
@@ -1373,7 +1275,7 @@ describe.skipIf(!existsSync(fixturePath))(
 						[user.id],
 					);
 				const cookie = sessionCookie(session);
-				const proof = virtualCredential();
+				const proof = virtualCredential(origin);
 				const nativeOptions = await auth.handler(
 					makeRequest("passkey/generate-register-options", cookie),
 				);
@@ -1504,7 +1406,7 @@ describe.skipIf(!existsSync(fixturePath))(
 				const nextChallenge = (await candidateOptions.json()) as {
 					challenge: string;
 				};
-				const nextProof = virtualCredential();
+				const nextProof = virtualCredential(origin);
 				const candidateRegistration = await candidate.dispatch(
 					makeRequest(
 						"passkey/verify-registration",
@@ -1608,7 +1510,7 @@ describe.skipIf(!existsSync(fixturePath))(
 			);
 			const guestCookie = cookieFrom(guest, "session_token");
 			expect(guestCookie).toBeTruthy();
-			const proof = virtualCredential();
+			const proof = virtualCredential(origin);
 			const options = await send(
 				legacyDispatch,
 				"passkey/generate-register-options",
@@ -1768,7 +1670,7 @@ describe.skipIf(!existsSync(fixturePath))(
 				);
 				expect(options.status).toBe(200);
 				const { challenge } = (await options.json()) as { challenge: string };
-				const next = virtualCredential();
+				const next = virtualCredential(origin);
 				const before = await sessionIds();
 				const registered = await send(
 					dispatch,
@@ -1868,7 +1770,7 @@ describe.skipIf(!existsSync(fixturePath))(
 				[user.id],
 			);
 			const guestCookie = cookieFrom(guest, "session_token");
-			const proof = virtualCredential();
+			const proof = virtualCredential(origin);
 			const registration = await send(
 				native,
 				"passkey/generate-register-options",
@@ -1979,7 +1881,7 @@ describe.skipIf(!existsSync(fixturePath))(
 			const endpointId = randomUUID();
 			const endpoint = "https://passkey-role-webhook.fixture.example/receive";
 			const signingKey = newWebhookSigningSecret();
-			const administratorKey = virtualCredential();
+			const administratorKey = virtualCredential(origin);
 			const adminOptions = await send(
 				native,
 				"passkey/generate-register-options",
@@ -2043,7 +1945,7 @@ describe.skipIf(!existsSync(fixturePath))(
 							restoredCookie,
 						);
 						expect(baseline.status).toBe(expectedAdminStatus);
-						const next = virtualCredential();
+						const next = virtualCredential(origin);
 						const options = await send(
 							reader,
 							"passkey/generate-register-options",
@@ -2565,7 +2467,7 @@ describe.skipIf(!existsSync(fixturePath))(
 		});
 
 		it("verifies a real credential and rolls its counter forward across both engines", async () => {
-			const credential = virtualCredential();
+			const credential = virtualCredential(origin);
 			const register = await challenge("register", headers.get("cookie")!);
 			const verification = verificationService();
 			expect(
@@ -2611,7 +2513,7 @@ describe.skipIf(!existsSync(fixturePath))(
 		});
 
 		it("reads an actual legacy registration and rejects the wrong owner, origin and relying party", async () => {
-			const credential = virtualCredential();
+			const credential = virtualCredential(origin);
 			const register = await challenge("register", headers.get("cookie")!);
 			const verification = verificationService();
 			expect(
