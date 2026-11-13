@@ -11,6 +11,7 @@ import { Kysely, PostgresDialect } from "kysely";
 import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { GET as discovery } from "../../app/.well-known/openid-configuration/route";
+import { GET as consoleApplications } from "../../app/api/admin/applications/route";
 import { GET as platformWorkspacesGET } from "../../app/api/admin/platform/workspaces/route";
 import { POST as projectPOST } from "../../app/api/admin/projects/route";
 import { GET as consoleUser } from "../../app/api/admin/users/[userId]/route";
@@ -1300,6 +1301,36 @@ describe.skipIf(!existsSync(fixturePath))(
 				).rows,
 			).toHaveLength(0);
 		}, 30000);
+		it("lists registered platform applications only for a live platform administrator", async () => {
+			const clientId = `fixture-${randomUUID()}`;
+			const database = projectRegistryPool(env);
+			await database.query(
+				`INSERT INTO public."oauthClient"(id,"clientId","clientSecret","referenceId","redirectUris",name,metadata)
+				 VALUES ($1,$1,'fixture-stored-secret','allauth:platform','[]','Console fixture','{"allauthAllowLocalhost":true}')`,
+				[clientId],
+			);
+			const read = (headers: Headers) =>
+				consoleApplications(
+					new Request(`${env.BETTER_AUTH_URL}/api/admin/applications`, {
+						headers,
+					}),
+				);
+			expect((await read(alice.headers)).status).toBe(403);
+			const result = await read(global.headers);
+			expect(result.status).toBe(200);
+			const body = await result.text();
+			expect(JSON.parse(body)).toMatchObject({
+				applications: expect.arrayContaining([
+					expect.objectContaining({
+						client_id: clientId,
+						client_name: "Console fixture",
+						allowLocalhost: true,
+					}),
+				]),
+			});
+			expect(body).not.toContain("fixture-stored-secret");
+		});
+
 		it("uses the parent's actual scoped native console guards for owners and rejects foreign/root/revoked authority", async () => {
 			rootUsed = true;
 			await withProjectAuth(
