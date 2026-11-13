@@ -11,7 +11,14 @@ import { Kysely, PostgresDialect } from "kysely";
 import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { GET as discovery } from "../../app/.well-known/openid-configuration/route";
-import { GET as consoleApplications } from "../../app/api/admin/applications/route";
+import {
+	DELETE as deleteConsoleApplication,
+	PATCH as updateConsoleApplication,
+} from "../../app/api/admin/applications/[clientId]/route";
+import {
+	GET as consoleApplications,
+	POST as createConsoleApplication,
+} from "../../app/api/admin/applications/route";
 import { GET as platformWorkspacesGET } from "../../app/api/admin/platform/workspaces/route";
 import { POST as projectPOST } from "../../app/api/admin/projects/route";
 import { GET as consoleUser } from "../../app/api/admin/users/[userId]/route";
@@ -1329,6 +1336,76 @@ describe.skipIf(!existsSync(fixturePath))(
 				]),
 			});
 			expect(body).not.toContain("fixture-stored-secret");
+		});
+
+		it("writes platform application settings and resources atomically", async () => {
+			const headers = new Headers(global.headers);
+			headers.set("content-type", "application/json");
+			const path = `${env.BETTER_AUTH_URL}/api/admin/applications`;
+			const create = await createConsoleApplication(
+				new Request(path, {
+					method: "POST",
+					headers,
+					body: JSON.stringify({
+						name: "Console write fixture",
+						kind: "confidential",
+						redirectUris: ["https://client.fixture.example/callback"],
+						resourceURI: "https://api.fixture.example/first",
+					}),
+				}),
+			);
+			expect(create.status).toBe(201);
+			const created = (await create.json()) as {
+				application: { client_id: string };
+				clientSecret: string;
+			};
+			expect(created.clientSecret).toMatch(/^[a-zA-Z]{32}$/);
+			const clientId = created.application.client_id;
+			const context = { params: Promise.resolve({ clientId }) };
+			const url = `${path}/${clientId}`;
+			const change = await updateConsoleApplication(
+				new Request(url, {
+					method: "PATCH",
+					headers,
+					body: JSON.stringify({
+						name: "Renamed console fixture",
+						redirectUris: ["https://client.fixture.example/updated"],
+						resourceURI: "https://api.fixture.example/second",
+					}),
+				}),
+				context,
+			);
+			expect(change.status).toBe(200);
+			expect(await change.json()).toMatchObject({
+				application: {
+					client_id: clientId,
+					client_name: "Renamed console fixture",
+					resourceURI: "https://api.fixture.example/second",
+				},
+			});
+			const { rows } = await projectRegistryPool(env).query(
+				'SELECT "resourceId" FROM public."oauthClientResource" WHERE "clientId"=$1',
+				[clientId],
+			);
+			expect(rows).toEqual([
+				{ resourceId: "https://api.fixture.example/second" },
+			]);
+			expect(
+				(
+					await deleteConsoleApplication(
+						new Request(url, { method: "DELETE", headers }),
+						context,
+					)
+				).status,
+			).toBe(200);
+			expect(
+				(
+					await projectRegistryPool(env).query(
+						'SELECT 1 FROM public."oauthClient" WHERE "clientId"=$1',
+						[clientId],
+					)
+				).rowCount,
+			).toBe(0);
 		});
 
 		it("uses the parent's actual scoped native console guards for owners and rejects foreign/root/revoked authority", async () => {

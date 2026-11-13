@@ -115,7 +115,11 @@ function values(input: Client) {
 	});
 }
 
-async function validate(input: Client, trustedOrigins: ReadonlySet<string>) {
+async function validate(
+	input: Client,
+	trustedOrigins: ReadonlySet<string>,
+	allowLocalhost?: boolean,
+) {
 	const grantTypes = input.grant_types ?? ["authorization_code"];
 	const auth = input.token_endpoint_auth_method ?? "client_secret_basic";
 	const kind = input.application_type ?? "web";
@@ -133,7 +137,7 @@ async function validate(input: Client, trustedOrigins: ReadonlySet<string>) {
 		);
 	if (input.redirect_uris) {
 		try {
-			validateRedirectUris(input.redirect_uris);
+			validateRedirectUris(input.redirect_uris, { allowLocalhost });
 			if (
 				kind === "web" &&
 				input.redirect_uris.some((uri) => new URL(uri).protocol !== "https:")
@@ -210,10 +214,11 @@ export async function createProjectIssuerClient(
 	input: unknown,
 	trustedOrigins: ReadonlySet<string>,
 	reference: string,
+	allowLocalhost?: boolean,
 ) {
 	const parsed = client.safeParse(input);
 	if (!parsed.success) throw invalid("The client registration is invalid.");
-	const data = await validate(parsed.data, trustedOrigins);
+	const data = await validate(parsed.data, trustedOrigins, allowLocalhost);
 	const clientId = projectIssuerClientCredential();
 	const secret =
 		data.token_endpoint_auth_method === "client_secret_basic" ||
