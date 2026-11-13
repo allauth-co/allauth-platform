@@ -20,6 +20,7 @@ import { createPlatformIssuerSigner } from "./platform-issuer-signing";
 import { createPlatformIssuerStore } from "./platform-issuer-store";
 import { createPlatformMcpDeviceToken } from "./platform-mcp-device-token";
 import { createPlatformMfaEnrollment } from "./platform-mfa-enrollment";
+import { createPlatformPasskeys } from "./platform-passkeys";
 import { createPlatformPasswordSignIn } from "./platform-password-sign-in";
 import { createPlatformPendingMfa } from "./platform-pending-mfa";
 import { createPlatformSessionIssuer } from "./platform-session-issuance";
@@ -54,7 +55,10 @@ const protocolRoutes = new Map([
 	["/jwks", { methods: ["GET"], max: 100 }],
 ]);
 
-async function readBrowserBody(request: Request): Promise<unknown> {
+async function readBrowserBody(
+	request: Request,
+	limit = 24 * 1024,
+): Promise<unknown> {
 	if (
 		request.headers
 			.get("content-type")
@@ -74,7 +78,7 @@ async function readBrowserBody(request: Request): Promise<unknown> {
 			const { done, value } = await reader.read();
 			if (done) return JSON.parse(body + decoder.decode());
 			size += value.byteLength;
-			if (size > 24 * 1024) {
+			if (size > limit) {
 				void reader.cancel().catch(() => {});
 				return;
 			}
@@ -231,6 +235,21 @@ export function createPlatformIssuer(database: Pool, env: AuthEnvironment) {
 		keys: encryptionKeys,
 		readSession,
 	});
+	const mfa = createOwnedPendingMfa({
+		schema: store.schemaName,
+		cookiePrefix: "better-auth",
+		transaction: store.transaction,
+		signingSecret,
+		secureCookies: secure,
+		keys: encryptionKeys,
+	});
+	const passkeys = createPlatformPasskeys({
+		...credentialOptions,
+		database,
+		mfa,
+		readSession,
+		readBody: readBrowserBody,
+	});
 	const signInWithPassword = createPlatformPasswordSignIn({
 		...credentialOptions,
 		database,
@@ -242,14 +261,7 @@ export function createPlatformIssuer(database: Pool, env: AuthEnvironment) {
 						signingSecret: securitySecret,
 						trustedIP,
 					}),
-		mfa: createOwnedPendingMfa({
-			schema: store.schemaName,
-			cookiePrefix: "better-auth",
-			transaction: store.transaction,
-			signingSecret,
-			secureCookies: secure,
-			keys: encryptionKeys,
-		}),
+		mfa,
 	});
 	const deviceOptions = {
 		database,
@@ -334,6 +346,8 @@ export function createPlatformIssuer(database: Pool, env: AuthEnvironment) {
 		const url = new URL(request.url);
 		if (url.origin !== issuer || !url.pathname.startsWith("/api/auth/")) return;
 		const path = url.pathname.slice("/api/auth".length);
+		const passkey = await passkeys(path, request);
+		if (passkey) return passkey;
 		const primary = await signInWithPassword(request);
 		if (primary) return primary;
 		const mfa = (await manageMfa(request)) ?? (await verifyPendingMfa(request));
