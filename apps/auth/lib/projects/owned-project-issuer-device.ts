@@ -2,6 +2,7 @@ import { randomInt, randomUUID } from "node:crypto";
 import type { PoolClient } from "pg";
 import * as z from "zod";
 import { freshFeatureSession } from "../features/helpers";
+import type { createPlatformIssuerStore } from "../platform-issuer-store";
 import { createProjectEngineStore } from "./owned-project-engine-store";
 import type { OwnedProjectIssuerAuthorizationOptions } from "./owned-project-issuer-authorization";
 import type {
@@ -14,6 +15,7 @@ import {
 } from "./owned-project-issuer-client";
 import {
 	issuerForm,
+	issuerFormParameters,
 	issuerJSON,
 	ProjectOAuthError,
 } from "./owned-project-issuer-http";
@@ -50,6 +52,21 @@ const standaloneTokenInput = z.object({
 const scopeToken = /^[\x21\x23-\x5b\x5d-\x7e]{1,256}$/;
 const codeColumns = `id,"deviceCode","userCode","userId","expiresAt",status,"lastPolledAt","pollingInterval","clientId",scope,resources,"oauthClientId"`;
 
+export interface PreparedIssuerDeviceBody {
+	body: unknown;
+}
+
+/** Preserve exact installed custom user codes before trying the default alphabet. */
+export function deviceUserCodeCandidates(value: unknown) {
+	const parsed = codeInput.safeParse(value);
+	if (!parsed.success) return;
+	const exact = parsed.data;
+	const normalized = exact.replace(/[^a-zA-Z0-9]/g, "").toUpperCase();
+	return normalized !== exact && defaultUserCode.test(normalized)
+		? [exact, normalized]
+		: [exact];
+}
+
 type DeviceRow = {
 	id: string;
 	deviceCode: string;
@@ -71,7 +88,12 @@ export interface OwnedProjectIssuerDeviceOptions
 		"database" | "schemaName" | "issuer" | "readBody" | "readSession"
 	> {
 	platformOrigin: string;
-	projectSlug: string;
+	projectSlug?: string;
+	endpointBase?: string;
+	store?: Pick<
+		ReturnType<typeof createPlatformIssuerStore>,
+		"transaction" | "lockUser"
+	>;
 	trustedOrigins?: readonly string[];
 	trustedIP(request: Request): string | null;
 	authenticateClient?: IssuerClientAuthenticator;
@@ -166,7 +188,10 @@ export async function consumeDeviceGrant<T>(
 	_request: Request,
 	form: URLSearchParams,
 	authClient: ProjectIssuerClient,
-	options: { issuer: string; issue(grant: ProjectDeviceGrant): Promise<T> },
+	options: {
+		endpointBase: string;
+		issue(grant: ProjectDeviceGrant): Promise<T>;
+	},
 ): Promise<T> {
 	const raw = form.get("device_code");
 	if (!raw)
@@ -235,7 +260,7 @@ export async function consumeDeviceGrant<T>(
 		authClient,
 		resources,
 		scopes,
-		`${options.issuer}/oauth2/userinfo`,
+		`${options.endpointBase}/oauth2/userinfo`,
 	);
 	const result = await options.issue({
 		userId: row.userId,
@@ -258,17 +283,25 @@ export async function consumeDeviceGrant<T>(
 export function createOwnedProjectIssuerDevice(
 	options: OwnedProjectIssuerDeviceOptions,
 ) {
-	const store = createProjectEngineStore(options.database, options.schemaName);
+	const store =
+		options.store ??
+		createProjectEngineStore(options.database, options.schemaName);
 	const platform = projectOrigin.parse(options.platformOrigin);
-	const slug = projectSlug.parse(options.projectSlug);
 	const origin = new URL(options.issuer).origin;
+	const endpointBase = options.endpointBase ?? options.issuer;
+	const sharedIssuer =
+		options.endpointBase !== undefined && options.projectSlug === undefined;
 	const browserOrigins = new Set([
 		origin,
 		...(options.trustedOrigins?.map((value) => projectOrigin.parse(value)) ??
 			[]),
 	]);
 	const verificationURL = new URL("/device", platform);
-	verificationURL.searchParams.set("project", slug);
+	if (options.projectSlug !== undefined || options.endpointBase === undefined)
+		verificationURL.searchParams.set(
+			"project",
+			projectSlug.parse(options.projectSlug),
+		);
 	const authenticateClient =
 		options.authenticateClient ??
 		createIssuerClientAuthenticator(options.issuer, browserOrigins);
@@ -283,9 +316,22 @@ export function createOwnedProjectIssuerDevice(
 		);
 	}
 
-	async function initiationForm(request: Request) {
-		if (formEncoded(request)) return issuerForm(request);
-		const parsed = initiationInput.safeParse(await options.readBody(request));
+	async function initiationForm(
+		request: Request,
+		prepared?: PreparedIssuerDeviceBody,
+	) {
+		if (formEncoded(request)) {
+			if (!prepared) return issuerForm(request);
+			if (!(prepared.body instanceof URLSearchParams))
+				throw new ProjectOAuthError(
+					"invalid_request",
+					"Supply a form-encoded OAuth request.",
+				);
+			return issuerFormParameters(prepared.body);
+		}
+		const parsed = initiationInput.safeParse(
+			prepared ? prepared.body : await options.readBody(request),
+		);
 		if (!parsed.success) {
 			if (parsed.error.issues.every(({ path }) => path[0] === "resource"))
 				throw new ProjectOAuthError(
@@ -339,8 +385,8 @@ export function createOwnedProjectIssuerDevice(
 		});
 	}
 
-	async function create(request: Request) {
-		const form = await initiationForm(request);
+	async function create(request: Request, prepared?: PreparedIssuerDeviceBody) {
+		const form = await initiationForm(request, prepared);
 		return store.transaction(async (database) => {
 			const bodyId = form.get("client_id");
 			const hasCredentials =
@@ -366,7 +412,7 @@ export function createOwnedProjectIssuerDevice(
 					client,
 					resources,
 					scopes,
-					`${options.issuer}/oauth2/userinfo`,
+					`${endpointBase}/oauth2/userinfo`,
 				);
 				const userId = form.get("user_id") || null;
 				if (userId && userId.length > 256)
@@ -463,13 +509,9 @@ export function createOwnedProjectIssuerDevice(
 			)
 				throw denied();
 			try {
-				if (!codeInput.safeParse(userCode).success)
+				const candidates = deviceUserCodeCandidates(userCode);
+				if (!candidates)
 					throw new ProjectOAuthError("invalid_request", "Invalid user code");
-				const normalized = userCode.replace(/[^a-zA-Z0-9]/g, "").toUpperCase();
-				const candidates =
-					normalized !== userCode && defaultUserCode.test(normalized)
-						? [userCode, normalized]
-						: [userCode];
 				const {
 					rows: [row],
 				} = await database.query<DeviceRow>(
@@ -477,7 +519,7 @@ export function createOwnedProjectIssuerDevice(
 					 ORDER BY ("userCode"=$2) DESC LIMIT 1 FOR UPDATE`,
 					[candidates, userCode],
 				);
-				if (!row)
+				if (!row || (sharedIssuer && !row.oauthClientId))
 					throw new ProjectOAuthError("invalid_request", "Invalid user code");
 				if (row.expiresAt.getTime() <= Date.now())
 					throw new ProjectOAuthError("expired_token", "User code has expired");
@@ -529,7 +571,11 @@ export function createOwnedProjectIssuerDevice(
 		});
 	}
 
-	return async function dispatch(path: string, request: Request) {
+	return async function dispatch(
+		path: string,
+		request: Request,
+		prepared?: PreparedIssuerDeviceBody,
+	) {
 		if (
 			path !== "/device/code" &&
 			path !== "/device/token" &&
@@ -540,7 +586,7 @@ export function createOwnedProjectIssuerDevice(
 			return;
 		const url = new URL(request.url);
 		if (
-			url.origin + url.pathname !== `${options.issuer}${path}` ||
+			url.origin + url.pathname !== `${endpointBase}${path}` ||
 			request.method !== (path === "/device" ? "GET" : "POST")
 		)
 			return new ProjectOAuthError(
@@ -562,7 +608,7 @@ export function createOwnedProjectIssuerDevice(
 				),
 			);
 			if (limited) return limited;
-			if (path === "/device/code") return await create(request);
+			if (path === "/device/code") return await create(request, prepared);
 			if (path === "/device/token") return await rejectStandaloneToken(request);
 			if (path === "/device") {
 				const codes = url.searchParams.getAll("user_code");
@@ -573,7 +619,9 @@ export function createOwnedProjectIssuerDevice(
 					);
 				return await browser(request, codes[0]!);
 			}
-			const parsed = browserInput.safeParse(await options.readBody(request));
+			const parsed = browserInput.safeParse(
+				prepared ? prepared.body : await options.readBody(request),
+			);
 			if (!parsed.success)
 				throw new ProjectOAuthError("invalid_request", "Invalid user code");
 			return await browser(

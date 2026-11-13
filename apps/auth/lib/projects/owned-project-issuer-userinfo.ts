@@ -1,4 +1,4 @@
-import type { Pool, PoolClient } from "pg";
+import type { PoolClient } from "pg";
 import { createProjectEngineStore } from "./owned-project-engine-store";
 import { requireIssuerDpop } from "./owned-project-issuer-dpop";
 import {
@@ -6,7 +6,10 @@ import {
 	issuerJSON,
 	ProjectOAuthError,
 } from "./owned-project-issuer-http";
-import type { ActiveProjectIssuerAccess } from "./owned-project-issuer-introspection";
+import type {
+	ActiveProjectIssuerAccess,
+	IssuerTransactionOptions,
+} from "./owned-project-issuer-introspection";
 
 interface UserInfoUser {
 	id: string;
@@ -74,17 +77,21 @@ async function authorization(request: Request) {
 	return { scheme: match[1]!.toLowerCase(), token: match[2]! };
 }
 
-export function createOwnedProjectIssuerUserInfo(options: {
-	database: Pool;
-	schemaName: string;
-	issuer: string;
-	activeAccess(
-		client: PoolClient,
-		token: string,
-	): Promise<ActiveProjectIssuerAccess | null>;
-}) {
-	const store = createProjectEngineStore(options.database, options.schemaName);
-	const endpoint = `${options.issuer}/oauth2/userinfo`;
+export function createOwnedProjectIssuerUserInfo(
+	options: IssuerTransactionOptions & {
+		issuer: string;
+		endpointBase?: string;
+		activeAccess(
+			client: PoolClient,
+			token: string,
+		): Promise<ActiveProjectIssuerAccess | null>;
+	},
+) {
+	const store =
+		"store" in options
+			? options.store
+			: createProjectEngineStore(options.database, options.schemaName);
+	const endpoint = `${options.endpointBase ?? options.issuer}/oauth2/userinfo`;
 	return async function userinfo(request: Request) {
 		const url = new URL(request.url);
 		if (

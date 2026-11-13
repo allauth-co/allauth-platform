@@ -78,6 +78,7 @@ export function createOwnedProjectIssuer(
 	);
 	const device = createOwnedProjectIssuerDevice({
 		...options,
+		store,
 		authenticateClient,
 	});
 	const logout = createOwnedProjectIssuerLogout({
@@ -87,6 +88,7 @@ export function createOwnedProjectIssuer(
 	const keyring = createOwnedProjectIssuerKeys(options);
 	const token = createOwnedProjectIssuerToken({
 		...options,
+		store,
 		authenticateClient,
 	});
 	const { activeAccess, introspect, revoke } =

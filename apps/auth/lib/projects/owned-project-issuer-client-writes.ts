@@ -1,10 +1,11 @@
 import { randomInt, randomUUID } from "node:crypto";
-import { type JWK, importJWK } from "jose";
+import type { JWK } from "jose";
+import { importJWK } from "jose";
 import type { PoolClient } from "pg";
 import * as z from "zod";
 import { validateRedirectUris } from "../configuration";
+import { issuerAssertionAlgorithms } from "../issuer-algorithms";
 import { publicProjectHttpsURL } from "./owned-project-https";
-import { issuerAssertionAlgorithms } from "./owned-project-issuer-client";
 import { issuerDigest, ProjectOAuthError } from "./owned-project-issuer-http";
 
 const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";

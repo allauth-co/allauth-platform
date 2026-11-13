@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 
-const maximumFormBytes = 24 * 1024;
+export const maximumIssuerFormBytes = 24 * 1024;
 const noStore = { "cache-control": "no-store", pragma: "no-cache" };
 
 export class ProjectOAuthError extends Error {
@@ -39,7 +39,7 @@ export async function issuerForm(request: Request) {
 		.toLowerCase();
 	if (
 		contentType !== "application/x-www-form-urlencoded" ||
-		Number(request.headers.get("content-length")) > maximumFormBytes
+		Number(request.headers.get("content-length")) > maximumIssuerFormBytes
 	) {
 		throw new ProjectOAuthError(
 			"invalid_request",
@@ -56,7 +56,7 @@ export async function issuerForm(request: Request) {
 				const part = await reader.read();
 				if (part.done) break;
 				bytes += part.value.byteLength;
-				if (bytes > maximumFormBytes) {
+				if (bytes > maximumIssuerFormBytes) {
 					void reader.cancel().catch(() => {});
 					throw new ProjectOAuthError(
 						"invalid_request",
@@ -76,7 +76,11 @@ export async function issuerForm(request: Request) {
 			reader.releaseLock();
 		}
 	}
-	const form = new URLSearchParams(body);
+	return issuerFormParameters(new URLSearchParams(body));
+}
+
+/** Recheck a bounded, already-decoded form without consuming its request again. */
+export function issuerFormParameters(form: URLSearchParams) {
 	const fields = new Set<string>();
 	for (const [name] of form) {
 		if (name !== "resource" && fields.has(name))

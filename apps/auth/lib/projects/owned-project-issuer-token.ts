@@ -1,6 +1,8 @@
 import { createHash, randomInt, randomUUID } from "node:crypto";
+import type { JWTHeaderParameters, JWTPayload } from "jose";
 import { SignJWT } from "jose";
 import type { Pool, PoolClient } from "pg";
+import type { createPlatformIssuerStore } from "../platform-issuer-store";
 import type { LegacyMfaKeys } from "./legacy-mfa-record";
 import { createProjectEngineStore } from "./owned-project-engine-store";
 import type {
@@ -20,6 +22,7 @@ import {
 	issuerJSON,
 	ProjectOAuthError,
 } from "./owned-project-issuer-http";
+import type { IssuerSigningPin } from "./owned-project-issuer-keys";
 import { createOwnedProjectIssuerKeys } from "./owned-project-issuer-keys";
 import {
 	issuerObject,
@@ -62,8 +65,48 @@ interface RefreshOptions {
 	database: Pool;
 	schemaName: string;
 	issuer: string;
+	endpointBase?: string;
 	keys: LegacyMfaKeys;
+	store?: Pick<
+		ReturnType<typeof createPlatformIssuerStore>,
+		"transaction" | "lockUser"
+	>;
+	keyring?: IssuerTokenKeyring;
 	authenticateClient?: IssuerClientAuthenticator;
+}
+
+interface IssuerTokenKeyring {
+	signingKey(
+		client: PoolClient,
+		pin?: IssuerSigningPin,
+	): Promise<{
+		alg: string;
+		sign(
+			payload: JWTPayload,
+			header?: Pick<JWTHeaderParameters, "typ">,
+		): Promise<string>;
+	}>;
+}
+
+function projectTokenKeyring(options: RefreshOptions): IssuerTokenKeyring {
+	const keyring = createOwnedProjectIssuerKeys(options);
+	return {
+		async signingKey(client, pin) {
+			const signing = await keyring.signingKey(client, pin);
+			return {
+				alg: signing.alg,
+				sign(payload, header) {
+					return new SignJWT(payload)
+						.setProtectedHeader({
+							alg: signing.alg,
+							kid: signing.id,
+							...header,
+						})
+						.sign(signing.key);
+				},
+			};
+		},
+	};
 }
 
 function tokenValue() {
@@ -222,9 +265,14 @@ async function saveRefresh(
 }
 
 export function createOwnedProjectIssuerToken(options: RefreshOptions) {
-	const store = createProjectEngineStore(options.database, options.schemaName);
-	const keyring = createOwnedProjectIssuerKeys(options);
+	const store =
+		options.store ??
+		createProjectEngineStore(options.database, options.schemaName);
+	const keyring = options.keyring ?? projectTokenKeyring(options);
 	const origin = new URL(options.issuer).origin;
+	const endpointBase = options.endpointBase ?? options.issuer;
+	const tokenEndpoint = `${endpointBase}/oauth2/token`;
+	const userInfoEndpoint = `${endpointBase}/oauth2/userinfo`;
 	const authenticateClient =
 		options.authenticateClient ??
 		createIssuerClientAuthenticator(options.issuer);
@@ -267,15 +315,10 @@ export function createOwnedProjectIssuerToken(options: RefreshOptions) {
 			const previous = issuerObject(grant.confirmation);
 			if (grant.confirmation) {
 				if (typeof previous.jkt !== "string") throw invalidGrant();
-				await requireIssuerDpop(
-					database,
-					request,
-					`${options.issuer}/oauth2/token`,
-					{
-						required: true,
-						expectedJkt: previous.jkt,
-					},
-				);
+				await requireIssuerDpop(database, request, tokenEndpoint, {
+					required: true,
+					expectedJkt: previous.jkt,
+				});
 			}
 			// The foreign key deletes opaque access tokens minted in this family.
 			await database.query(
@@ -387,7 +430,7 @@ export function createOwnedProjectIssuerToken(options: RefreshOptions) {
 			client,
 			requestedResources,
 			requestedScopes,
-			`${options.issuer}/oauth2/userinfo`,
+			userInfoEndpoint,
 		);
 		if (actor && requestedScopes.includes("offline_access"))
 			throw new ProjectOAuthError(
@@ -407,7 +450,7 @@ export function createOwnedProjectIssuerToken(options: RefreshOptions) {
 		const confirmation = await requireIssuerDpop(
 			database,
 			request,
-			`${options.issuer}/oauth2/token`,
+			tokenEndpoint,
 			{
 				required: policy.dpopRequired,
 				expectedJkt:
@@ -451,24 +494,21 @@ export function createOwnedProjectIssuerToken(options: RefreshOptions) {
 		let accessToken: string;
 		if (policy.audience.length) {
 			const signing = await keyring.signingKey(database, policy.pin);
-			accessToken = await new SignJWT({
-				...accessClaims,
-				aud:
-					policy.audience.length === 1 ? policy.audience[0] : policy.audience,
-			})
-				.setProtectedHeader({
-					alg: signing.alg,
-					kid: signing.id,
-					typ: "at+jwt",
-				})
-				.sign(signing.key);
+			accessToken = await signing.sign(
+				{
+					...accessClaims,
+					aud:
+						policy.audience.length === 1 ? policy.audience[0] : policy.audience,
+				},
+				{ typ: "at+jwt" },
+			);
 		} else {
 			accessToken = tokenValue();
 		}
 		let idToken: string | undefined;
 		if (policy.scopes.includes("openid")) {
 			const signing = await keyring.signingKey(database);
-			idToken = await new SignJWT({
+			idToken = await signing.sign({
 				...actorClaims,
 				acr: "0",
 				nonce: input.nonce,
@@ -485,9 +525,7 @@ export function createOwnedProjectIssuerToken(options: RefreshOptions) {
 					client.enableEndSession || client.backchannelLogoutUri
 						? (grant.sessionId ?? undefined)
 						: undefined,
-			})
-				.setProtectedHeader({ alg: signing.alg, kid: signing.id })
-				.sign(signing.key);
+			});
 		}
 
 		if (!input.rotation && grant.authorizationCodeId) {
@@ -553,7 +591,7 @@ export function createOwnedProjectIssuerToken(options: RefreshOptions) {
 		const url = new URL(request.url);
 		if (
 			request.method !== "POST" ||
-			url.origin + url.pathname !== `${options.issuer}/oauth2/token`
+			url.origin + url.pathname !== tokenEndpoint
 		)
 			return new ProjectOAuthError(
 				"invalid_request",
@@ -582,7 +620,7 @@ export function createOwnedProjectIssuerToken(options: RefreshOptions) {
 					if (grantType === "authorization_code")
 						return await exchangeCode(database, request, form, client);
 					return await consumeDeviceGrant(database, request, form, client, {
-						issuer: options.issuer,
+						endpointBase,
 						issue: (grant) =>
 							issue(
 								database,

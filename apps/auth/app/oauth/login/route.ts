@@ -1,5 +1,6 @@
 import { APIError } from "better-auth";
 import { apiRoute } from "@/lib/api";
+import { dispatchPlatformAuth } from "@/lib/auth";
 import { brokerLogin } from "@/lib/broker-login";
 import { withPortalAuthEngine } from "@/lib/domains/hosting";
 
@@ -13,7 +14,9 @@ export const GET = (request: Request) =>
 					throw new APIError("BAD_REQUEST", {
 						message: "Use the platform identity connection for this request.",
 					});
-				return brokerLogin(bound, instance, env);
+				return brokerLogin(bound, instance, env, (input) =>
+					dispatchPlatformAuth(input, instance, env),
+				);
 			}),
 		{ platformOnly: true },
 	);

@@ -35,7 +35,7 @@ const unauthorized = () =>
 
 /** Read and manage existing user consent in the active project schema. */
 export function createOwnedProjectConsentManagement(options: {
-	store: ReturnType<typeof createProjectEngineStore>;
+	store: Pick<ReturnType<typeof createProjectEngineStore>, "transaction">;
 	authorize(
 		client: PoolClient,
 		request: Request,

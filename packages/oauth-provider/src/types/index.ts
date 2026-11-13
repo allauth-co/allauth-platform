@@ -935,6 +935,15 @@ export interface OAuthOptions<
 	 * prompt.
 	 */
 	loginPage: string;
+	/** Continue a verified sign-in through an external authorization handler. */
+	onAuthenticatedAuthorization?: (input: {
+		request: Request;
+		headers: Headers;
+		query: URLSearchParams;
+		session: { id: string; userId: string };
+		signedQueryIssuedAt?: Date;
+		responseMode: "navigation" | "json";
+	}) => Promise<Response | undefined>;
 	/**
 	 * A URL to the consent page where the user will be redirected if the client
 	 * requests consent.

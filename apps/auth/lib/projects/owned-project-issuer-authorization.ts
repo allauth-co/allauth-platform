@@ -3,6 +3,7 @@ import type { Pool, PoolClient } from "pg";
 import * as z from "zod";
 import { hostedOAuthBrowserActionRequests } from "../domains/hosted-oauth-requests";
 import { oauthBrowserQuery } from "../oauth-browser";
+import type { createPlatformIssuerStore } from "../platform-issuer-store";
 import { createProjectEngineStore } from "./owned-project-engine-store";
 import {
 	filteredProjectIssuerClaims,
@@ -70,6 +71,14 @@ export interface OwnedProjectIssuerAuthorizationOptions {
 	database: Pool;
 	schemaName: string;
 	issuer: string;
+	endpointBase?: string;
+	loginPage?: string;
+	allowImpersonatedSession?: boolean;
+	store?: Pick<ReturnType<typeof createPlatformIssuerStore>, "transaction">;
+	readAuthenticatedSession?(
+		client: PoolClient,
+		identity: { id: string; userId: string },
+	): Promise<ProjectIssuerBrowserSession | null>;
 	signingSecret: string;
 	errorURL?: string;
 	readBody(request: Request): Promise<unknown>;
@@ -155,8 +164,10 @@ function covers(
 export function createOwnedProjectIssuerAuthorization(
 	options: OwnedProjectIssuerAuthorizationOptions,
 ) {
-	const base = new URL(options.issuer);
-	const store = createProjectEngineStore(options.database, options.schemaName);
+	const base = new URL(options.endpointBase ?? options.issuer);
+	const store =
+		options.store ??
+		createProjectEngineStore(options.database, options.schemaName);
 	const errorURL = new URL(options.errorURL ?? "/auth-error", base.origin);
 	if (
 		base.username ||
@@ -253,7 +264,7 @@ export function createOwnedProjectIssuerAuthorization(
 				registration,
 				query.resources,
 				query.scopes,
-				`${options.issuer}/oauth2/userinfo`,
+				`${options.endpointBase ?? options.issuer}/oauth2/userinfo`,
 			);
 	}
 
@@ -264,11 +275,15 @@ export function createOwnedProjectIssuerAuthorization(
 	) {
 		const session =
 			authorizationHeaders && options.readAuthorizationSession
-				? await options.readAuthorizationSession(request, client, authorizationHeaders)
+				? await options.readAuthorizationSession(
+						request,
+						client,
+						authorizationHeaders,
+					)
 				: await options.readSession(request, client);
 		return session?.user.id &&
 			session.user.id === session.session.userId &&
-			!session.session.impersonatedBy &&
+			(!session.session.impersonatedBy || options.allowImpersonatedSession) &&
 			Number.isFinite(authTime(session))
 			? session
 			: null;
@@ -448,11 +463,18 @@ export function createOwnedProjectIssuerAuthorization(
 		request: Request,
 		input: URLSearchParams,
 		signed?: SignedQuery,
+		authenticated?: {
+			identity: { id: string; userId: string };
+			responseMode: "navigation" | "json";
+		},
 	) {
-		const authorizationHeaders = signed ? undefined : new Headers();
+		const authorizationHeaders =
+			signed || authenticated ? undefined : new Headers();
 		const response = await store.transaction(async (client) => {
 			let target: string | undefined;
-			const asJSON = Boolean(signed);
+			const asJSON = authenticated
+				? authenticated.responseMode === "json"
+				: Boolean(signed);
 			try {
 				const params = projectIssuerAuthorizationParams(input);
 				const registration = await registeredClient(client, params);
@@ -467,7 +489,7 @@ export function createOwnedProjectIssuerAuthorization(
 						"invalid redirect uri",
 					);
 				const query = validateQuery(params, registration);
-				if (query.prompt.has("select_account") && !signed)
+				if (query.prompt.has("select_account") && !signed && !authenticated)
 					return protocolError(
 						request,
 						new ProjectOAuthError(
@@ -477,7 +499,12 @@ export function createOwnedProjectIssuerAuthorization(
 						asJSON,
 					);
 				await assertResources(client, registration, query);
-				const ordinary = await liveSession(request, client, authorizationHeaders);
+				const ordinary = authenticated
+					? await options.readAuthenticatedSession?.(
+							client,
+							authenticated.identity,
+						)
+					: await liveSession(request, client, authorizationHeaders);
 				const consoleSession =
 					!ordinary &&
 					!signed &&
@@ -493,7 +520,7 @@ export function createOwnedProjectIssuerAuthorization(
 					Number.isFinite(authTime(consoleSession))
 						? consoleSession
 						: null);
-				if (signed && !session)
+				if ((signed || authenticated) && !session)
 					return new ProjectOAuthError(
 						"login_required",
 						"Authentication is required.",
@@ -514,7 +541,12 @@ export function createOwnedProjectIssuerAuthorization(
 							"login_required",
 							"authentication required",
 						);
-					return browserPrompt(request, "/sign-in", query, asJSON);
+					return browserPrompt(
+						request,
+						options.loginPage ?? "/sign-in",
+						query,
+						asJSON,
+					);
 				}
 				if (
 					query.prompt.has("login") ||
@@ -812,14 +844,18 @@ export function createOwnedProjectIssuerAuthorization(
 				return readSignedProjectIssuerQuery(query, options.signingSecret);
 			}
 			if (path === "/oauth2/consent") {
-				const body = (extended ? hostedConsentBody : consentBody).safeParse(input);
+				const body = (extended ? hostedConsentBody : consentBody).safeParse(
+					input,
+				);
 				if (!body.success) throw invalid("Invalid consent request.");
 				const signed = signedQuery(body.data.oauth_query);
 				if (!signed)
 					throw invalid("The authorization request is invalid or expired.");
 				return await consent(request, body.data, signed);
 			}
-			const body = (extended ? hostedContinueBody : continueBody).safeParse(input);
+			const body = (extended ? hostedContinueBody : continueBody).safeParse(
+				input,
+			);
 			if (
 				!body.success ||
 				[body.data.selected, body.data.created, body.data.postLogin].filter(
@@ -837,5 +873,15 @@ export function createOwnedProjectIssuerAuthorization(
 		}
 	}
 
-	return Object.assign(dispatch, { readContext });
+	return Object.assign(dispatch, {
+		readContext,
+		continueAuthenticated(
+			request: Request,
+			query: URLSearchParams,
+			identity: { id: string; userId: string },
+			responseMode: "navigation" | "json",
+		) {
+			return authorize(request, query, undefined, { identity, responseMode });
+		},
+	});
 }

@@ -3,6 +3,7 @@ import type { JWTPayload } from "jose";
 import { createLocalJWKSet, decodeJwt, errors, jwtVerify } from "jose";
 import type { PoolClient } from "pg";
 import * as z from "zod";
+import { issuerAssertionAlgorithms } from "../issuer-algorithms";
 import {
 	fetchPublicProjectHttps,
 	ProjectHttpsResponseTooLarge,
@@ -10,19 +11,6 @@ import {
 	UnsafeProjectHttpsTarget,
 } from "./owned-project-https";
 import { issuerDigest, ProjectOAuthError } from "./owned-project-issuer-http";
-
-export const issuerAssertionAlgorithms = [
-	"RS256",
-	"RS384",
-	"RS512",
-	"PS256",
-	"PS384",
-	"PS512",
-	"ES256",
-	"ES384",
-	"ES512",
-	"EdDSA",
-];
 
 export interface ProjectIssuerClient {
 	id: string;
@@ -174,7 +162,10 @@ function createRegisteredClientKeys(trustedOrigins: ReadonlySet<string>) {
 				throw error;
 			return;
 		}
-		if (response.redirected || (response.status >= 300 && response.status < 400))
+		if (
+			response.redirected ||
+			(response.status >= 300 && response.status < 400)
+		)
 			throw invalidClient("The registered key document redirected.");
 		if (Number(response.headers.get("content-length")) > maximumJwksBytes)
 			throw invalidClient("Could not read registered client keys.");

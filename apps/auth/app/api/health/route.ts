@@ -1,8 +1,9 @@
 import { createHash } from "node:crypto";
-import { readFile, readdir } from "node:fs/promises";
+import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import { Pool } from "pg";
 import { setting } from "@/lib/configuration";
+import { readPlatformIssuerWriter } from "@/lib/platform-issuer-writer-lease";
 import {
 	developmentProjectEngineRevisions,
 	internalProjectEngineIdSetting,
@@ -55,15 +56,13 @@ export async function GET() {
 		);
 		if (migration.rows[0]?.checksum !== checksum)
 			throw new Error("Schema migration is pending or mismatched");
+		await readPlatformIssuerWriter(pool);
 		const bridgeSettings = [
 			["production", productionAgentReplayBridgeIdsSetting],
 			["development", developmentAgentReplayBridgeIdsSetting],
 		] as const;
 		for (const [scope, name] of bridgeSettings) {
-			const bridges = readProjectAgentReplayBridgeIds(
-				setting({}, name),
-				scope,
-			);
+			const bridges = readProjectAgentReplayBridgeIds(setting({}, name), scope);
 			if (!bridges.size) continue;
 			const registered = await pool.query(
 				`SELECT id FROM public."allauthProject" p
