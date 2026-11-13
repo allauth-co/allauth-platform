@@ -9,6 +9,7 @@ import {
 } from "./configuration";
 import { authenticationEmail } from "./email/authentication";
 import { emailConfigured, sendAuthEmail } from "./email/send";
+import { createPlatformGoogle } from "./platform-google";
 import {
 	platformIssuerDevicePath,
 	routePlatformIssuerDevice,
@@ -243,6 +244,14 @@ export function createPlatformIssuer(database: Pool, env: AuthEnvironment) {
 		secureCookies: secure,
 		keys: encryptionKeys,
 	});
+	const google = createPlatformGoogle({
+		...credentialOptions,
+		database,
+		keys: encryptionKeys,
+		mfa,
+		clientId: setting(env, "GOOGLE_CLIENT_ID"),
+		clientSecret: setting(env, "GOOGLE_CLIENT_SECRET"),
+	});
 	const passkeys = createPlatformPasskeys({
 		...credentialOptions,
 		database,
@@ -346,6 +355,8 @@ export function createPlatformIssuer(database: Pool, env: AuthEnvironment) {
 		const url = new URL(request.url);
 		if (url.origin !== issuer || !url.pathname.startsWith("/api/auth/")) return;
 		const path = url.pathname.slice("/api/auth".length);
+		const social = await google(path, request);
+		if (social) return social;
 		const passkey = await passkeys(path, request);
 		if (passkey) return passkey;
 		const primary = await signInWithPassword(request);

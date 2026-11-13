@@ -109,7 +109,8 @@ export async function checkpointOwnedProjectWrites(client: PoolClient) {
 
 /** All calls in a transaction, including database triggers, use the selected realm's schema. */
 export function createProjectEngineStore(database: Pool, schemaName: string) {
-	const schema = checkedProjectSchema(schemaName);
+	const schema =
+		schemaName === "public" ? "public" : checkedProjectSchema(schemaName);
 
 	async function transaction<T>(work: (client: PoolClient) => Promise<T>) {
 		const client = await database.connect();
@@ -119,7 +120,7 @@ export function createProjectEngineStore(database: Pool, schemaName: string) {
 		commitEffects.set(client, effects);
 		try {
 			await client.query("BEGIN");
-			await client.query(`SET LOCAL search_path TO "${schema}"`);
+			await client.query(`SET LOCAL search_path TO "${schema}", pg_temp`);
 			result = await work(client);
 			await client.query("COMMIT");
 		} catch (error) {

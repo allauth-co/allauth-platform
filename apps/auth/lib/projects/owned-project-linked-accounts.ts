@@ -143,7 +143,8 @@ export function createOwnedProjectLinkedAccounts(
 	authorize?: AuthorizeLinkedAccounts,
 	availability?: LinkedAccountAvailability,
 ) {
-	const schema = checkedProjectSchema(schemaName);
+	const schema =
+		schemaName === "public" ? "public" : checkedProjectSchema(schemaName);
 	const store = createProjectEngineStore(database, schema);
 
 	async function lockAuthority(

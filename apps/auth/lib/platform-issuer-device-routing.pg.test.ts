@@ -1,6 +1,7 @@
 import { createHmac, randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { symmetricDecrypt, symmetricEncrypt } from "better-auth/crypto";
+import { exportJWK, generateKeyPair, SignJWT } from "jose";
 import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { createAuth } from "./auth";
@@ -13,6 +14,7 @@ import {
 import { createPlatformIssuerSessionReader } from "./platform-issuer-session";
 import { createPlatformIssuerStore } from "./platform-issuer-store";
 import { postgresDatabase } from "./postgres-database";
+import { signProjectIssuerQuery } from "./projects/owned-project-issuer-authorization-query";
 import {
 	createOwnedProjectIssuerDevice,
 	projectDeviceGrantType,
@@ -29,7 +31,10 @@ const issuer = "https://platform-device.fixture.example";
 const endpointBase = `${issuer}/api/auth`;
 const secret = "synthetic-platform-device-session-secret";
 const cookieName = "__Secure-better-auth.session_token";
+const googleClient = "fixture-google-client.apps.googleusercontent.com";
 const env = {
+	GOOGLE_CLIENT_ID: googleClient,
+	GOOGLE_CLIENT_SECRET: "synthetic-platform-google-secret",
 	AUTH_RUNTIME: "node",
 	ALLAUTH_AUTH_URL: issuer,
 	ALLAUTH_AUTH_SECRET: secret,
@@ -175,6 +180,165 @@ describe.skipIf(!existsSync(fixture))(
 			);
 			return row;
 		}
+
+		it("reuses a linked Google account and issues a native-readable platform session", async () => {
+			const account = randomUUID();
+			const subject = "previously-linked-google-account";
+			await database.query(
+				`INSERT INTO public."account" (id,"accountId","providerId","userId","updatedAt") VALUES ($1,$2,'google',$3,now())`,
+				[account, subject, user],
+			);
+			const redirect = "https://connected-app.fixture.example/callback";
+			const clientId = randomUUID();
+			await database.query(
+				`INSERT INTO public."oauthClient" (id,"clientId","redirectUris","grantTypes","responseTypes","skipConsent","tokenEndpointAuthMethod",scopes,"applicationType")
+				VALUES ($1,$2,$3,'["authorization_code"]','["code"]',true,'none','["openid"]','web')`,
+				[randomUUID(), clientId, JSON.stringify([redirect])],
+			);
+			const appQuery = signProjectIssuerQuery(
+				new URLSearchParams({
+					client_id: clientId,
+					redirect_uri: redirect,
+					response_type: "code",
+					scope: "openid",
+					state: "fixture-connected-app-state",
+					code_challenge: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+					code_challenge_method: "S256",
+					prompt: "login",
+					max_age: "0",
+				}),
+				secret,
+			);
+			const startRequest = request("/sign-in/social", {
+				provider: "google",
+				callbackURL: `${issuer}/oauth2/continue?${appQuery}`,
+				oauth_query: appQuery.toString(),
+				disableRedirect: true,
+			});
+			startRequest.headers.set("origin", issuer);
+			const started = await platform.dispatch(startRequest);
+			expect(started?.status).toBe(200);
+			const { url } = (await started!.json()) as { url: string };
+			const authz = new URL(url);
+			expect(authz.origin).toBe("https://accounts.google.com");
+			expect(authz.searchParams.get("redirect_uri")).toBe(
+				`${endpointBase}/callback/google`,
+			);
+			expect(authz.searchParams.get("code_challenge_method")).toBe("S256");
+			const pair = await generateKeyPair("RS256");
+			const kid = "fixture-google-key";
+			const jwk = {
+				...(await exportJWK(pair.publicKey)),
+				kid,
+				alg: "RS256",
+				use: "sig",
+			};
+			const idToken = await new SignJWT({
+				email: `${user}@fixture.example`,
+				email_verified: true,
+				name: "Fixture",
+				nonce: authz.searchParams.get("nonce"),
+			})
+				.setProtectedHeader({ alg: "RS256", kid })
+				.setIssuer("accounts.google.com")
+				.setAudience(googleClient)
+				.setSubject(subject)
+				.setIssuedAt()
+				.setExpirationTime("5m")
+				.sign(pair.privateKey);
+			vi.stubGlobal(
+				"fetch",
+				async (input: RequestInfo | URL, init?: RequestInit) => {
+					const outgoing = new Request(input, init);
+					if (outgoing.url === "https://www.googleapis.com/oauth2/v3/certs")
+						return Response.json({ keys: [jwk] });
+					expect(outgoing.url).toBe("https://oauth2.googleapis.com/token");
+					return Response.json({
+						access_token: "fixture-access-token",
+						token_type: "Bearer",
+						expires_in: 300,
+						id_token: idToken,
+					});
+				},
+			);
+			try {
+				const query = new URLSearchParams({
+					state: authz.searchParams.get("state")!,
+					code: "fixture-code",
+				});
+				const callbacks = started!.headers
+					.getSetCookie()
+					.map((value) => value.split(";")[0])
+					.join("; ");
+				const providerCallback = request(
+					`/callback/google?${query}`,
+					undefined,
+					callbacks,
+				);
+				providerCallback.headers.set("sec-fetch-mode", "navigate");
+				const returnTime = Date.now() + 75_000;
+				vi.spyOn(Date, "now").mockReturnValue(returnTime);
+				const returned = await platform.dispatch(providerCallback);
+				expect(returned?.status).toBe(302);
+				const location = new URL(returned!.headers.get("location")!, issuer);
+				expect(location.origin + location.pathname).toBe(redirect);
+				expect(location.searchParams.get("state")).toBe(
+					"fixture-connected-app-state",
+				);
+				expect(location.searchParams.get("code")).toBeTruthy();
+				const sessionCookie = returned?.headers
+					.getSetCookie()
+					.find((value) => value.startsWith(`${cookieName}=`))
+					?.split(";")[0];
+				expect(sessionCookie).toBeDefined();
+				const session = await native.api.getSession({
+					headers: new Headers({ cookie: sessionCookie! }),
+				});
+				expect(session?.user.id).toBe(user);
+				const priorSession = await native.api.getSession({
+					headers: new Headers({ cookie }),
+				});
+				expect(priorSession?.user.id).toBe(user);
+				const { rows } = await database.query(
+					`SELECT id,"accountId" FROM public."account" WHERE "providerId"='google' AND "userId"=$1`,
+					[user],
+				);
+				expect(rows).toEqual([{ id: account, accountId: subject }]);
+			} finally {
+				vi.unstubAllGlobals();
+				vi.restoreAllMocks();
+			}
+		});
+
+		it("leaves an outstanding legacy Google callback with the writer that started it", async () => {
+			const start = request("/sign-in/social", {
+				provider: "google",
+				disableRedirect: true,
+			});
+			start.headers.set("origin", issuer);
+			const legacy = await native.handler(start);
+			expect(legacy.status).toBe(200);
+			const { url } = (await legacy.json()) as { url: string };
+			const state = new URL(url).searchParams.get("state");
+			expect(state).toHaveLength(32);
+			const cookies = legacy.headers
+				.getSetCookie()
+				.map((value) => value.split(";")[0])
+				.join("; ");
+			const callback = request(
+				`/callback/google?${new URLSearchParams({ state: state!, error: "access_denied" })}`,
+				undefined,
+				cookies,
+			);
+			expect(await platform.dispatch(callback)).toBeUndefined();
+			const cancelled = await native.handler(callback);
+			expect(cancelled.status).toBe(302);
+			expect(
+				new URL(cancelled.headers.get("location")!, issuer).searchParams.get(
+					"error",
+				),
+			).toBe("access_denied");
+		});
 
 		it("redeems a legacy standalone MCP code through AllAuth and preserves the native session handoff", async () => {
 			const form = new URLSearchParams([
